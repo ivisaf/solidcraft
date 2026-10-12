@@ -3306,6 +3306,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-cam"
+version = "0.5.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "solidcraft-geom",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "solidcraft-cli"
 version = "0.5.0"
 dependencies = [

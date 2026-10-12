@@ -186,7 +186,7 @@ configuration and an example session: [docs/mcp.md](docs/mcp.md).
 | Layer | Crates | Role |
 |---|---|---|
 | L0 | `geom` | vectors, planes, profiles, meshes and their measures |
-| L1 | `sketch`, `kernel`, `render` | constraint solver and profiles; the B-rep kernel boundary (truck); view math and CPU rasterizer |
+| L1 | `sketch`, `kernel`, `render`, `cam` | constraint solver and profiles; the B-rep kernel boundary (truck); view math and CPU rasterizer; toolpaths, 2.5D operations and G-code posts |
 | L2 | `doc` | parameters, expressions, the feature timeline and its incremental evaluation |
 | L3 | `io` | design files, STL/OBJ/STEP/3MF export, STEP and 3MF/STL import features |
 | L4 | `engine` | the session and the command registry (everything is a command) |
