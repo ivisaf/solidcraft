@@ -36,24 +36,30 @@ macro_rules! op_doc {
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define)
+        .at("MANUFACTURE", "SETUP")
+        .icon("cam_tool")
         .params("number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description? — adds the tool to the library or replaces the one with that number"),
     CommandSpec::new("cam.tool.remove", "Remove Tool", tool_remove).params("number (refused while an operation uses it)"),
     CommandSpec::new("cam.setup.create", "New Setup", setup_create)
+        .at("MANUFACTURE", "SETUP")
+        .icon("cam_setup")
         .params("name?; origin?: [x, y, z] work origin in world coordinates (default the world origin; work axes are the world's, tool along +Z); post?: rs274|grbl (default rs274) → setup: id, name"),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
-    CommandSpec::new("cam.op.face", "Face", op_face).params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles")),
-    CommandSpec::new("cam.op.contour", "2D Contour", op_contour).params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr")),
-    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; inner profiles are islands")),
-    CommandSpec::new("cam.op.drill", "Drill", op_drill).params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
+    CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles")),
+    CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr")),
+    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; inner profiles are islands")),
+    CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).params("op: id or name; setup?: id or name"),
-    CommandSpec::new("cam.list", "List Manufacture", list)
+    CommandSpec::new("cam.list", "Manufacture", list)
+        .at("MANUFACTURE", "ACTIONS")
+        .icon("cam_setup")
         .noundo()
         .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it"),
-    CommandSpec::new("cam.toolpath", "Toolpath", toolpath).noundo().params(
+    CommandSpec::new("cam.toolpath", "Show Toolpaths", toolpath).at("MANUFACTURE", "ACTIONS").icon("cam_contour").noundo().params(
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
     ),
-    CommandSpec::new("cam.post", "Post Process", post).noundo().params(
+    CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
         "setup?: id or name; post?: rs274|grbl or a post definition object (default: the setup's); path?: file to write → lines, extension, \
          cut_minutes, and gcode (the program text) when no path is given",
     ),

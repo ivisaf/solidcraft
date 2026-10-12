@@ -62,6 +62,7 @@ mod status_tests {
         assert!(app.session.log.last().is_some_and(|l| l.starts_with("Redo: ") && !l.contains("edit.redo")), "{:?}", app.session.log.last());
     }
 }
+pub mod cam_ui;
 mod expression_complete;
 #[cfg(test)]
 mod extrude_edit_tests;
@@ -209,6 +210,8 @@ pub struct SolveApp {
     pub dialog: Option<dialogs::Dialog>,
     /// The Change Parameters window, when open.
     pub params: Option<params_dialog::ParamsDialog>,
+    /// The Manufacture window and the toolpaths it shows.
+    pub manufacture: cam_ui::CamUi,
     pub palette: palette::Palette,
     /// Context menus, rename box and Properties window.
     pub menu: context_menu::MenuState,
@@ -290,6 +293,7 @@ impl SolveApp {
             tool: None,
             dialog: None,
             params: None,
+            manufacture: Default::default(),
             palette: palette::Palette::default(),
             menu: context_menu::MenuState::default(),
             tree: browser::TreeState::default(),
@@ -530,6 +534,9 @@ impl SolveApp {
         }
         if id == "parameters.change" {
             params_dialog::open(self);
+            return;
+        }
+        if cam_ui::start(self, id) {
             return;
         }
         if id == "sketch.finish" {
@@ -1017,6 +1024,7 @@ impl SolveApp {
         sketch_palette::show(self, ui.ctx());
         self.resolve_fit(ui.ctx());
         params_dialog::show(self, ui.ctx());
+        cam_ui::show(self, ui.ctx());
         recovery_ui::show(self, ui.ctx());
         stand_up::show(self, ui.ctx());
         prefs::show_reset_notice(self, ui.ctx());

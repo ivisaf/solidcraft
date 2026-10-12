@@ -6,7 +6,7 @@ use serde_json::json;
 use crate::theme::Tokens;
 use crate::{SolveApp, icons};
 
-pub const TABS: &[&str] = &["SOLID", "SURFACE", "MESH", "SHEET METAL", "PLASTIC", "UTILITIES"];
+pub const TABS: &[&str] = &["SOLID", "SURFACE", "MESH", "SHEET METAL", "PLASTIC", "MANUFACTURE", "UTILITIES"];
 
 /// Panels shown on each tab (in order). Commands come from the registry by (tab, panel).
 pub fn panels(tab: &str) -> &'static [&'static str] {
@@ -20,6 +20,7 @@ pub fn panels(tab: &str) -> &'static [&'static str] {
         "MESH" => &["CREATE", "PREPARE", "MODIFY", "ASSEMBLE", "CONSTRUCT", "INSPECT", "INSERT", "SELECT"],
         "SHEET METAL" => &["CREATE", "MODIFY", "ASSEMBLE", "CONSTRUCT", "INSPECT", "INSERT", "SELECT"],
         "PLASTIC" => &["CREATE", "MODIFY", "ASSEMBLE", "CONSTRUCT", "INSPECT", "INSERT", "SELECT"],
+        "MANUFACTURE" => &["SETUP", "MILLING", "DRILLING", "ACTIONS"],
         _ => &["MAKE", "ADD-INS", "UTILITY", "INSPECT", "SELECT"],
     }
 }
@@ -33,6 +34,7 @@ pub fn promoted(tab: &str, panel: &str) -> usize {
         ("SKETCH", "CREATE") => 6,
         ("SKETCH", "CONSTRAINTS") => 6,
         (_, "FINISH SKETCH") => 1,
+        ("MANUFACTURE", "MILLING" | "ACTIONS") => 3,
         _ => 2,
     }
 }

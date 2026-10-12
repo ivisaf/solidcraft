@@ -2467,6 +2467,7 @@ fn hover_highlight(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
 /// Sketch points and the status of the active sketch (constraint glyphs: `sketch_tools`).
 fn overlays(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let t = Tokens::get();
+    crate::cam_ui::draw(app, painter, proj);
     let st = app.session.world_state();
     for item in &app.session.selection {
         if let Sel::ExternalSketchPoint { sketch, id } = item
