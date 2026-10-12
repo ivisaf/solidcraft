@@ -46,8 +46,8 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("name?; origin?: [x, y, z] work origin in world coordinates (default the world origin; work axes are the world's, tool along +Z); post?: rs274|grbl (default rs274) → setup: id, name"),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles")),
-    CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr")),
-    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; inner profiles are islands")),
+    CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
+    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).params("op: id or name; setup?: id or name"),
     CommandSpec::new("cam.list", "Manufacture", list)
@@ -230,6 +230,7 @@ pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Too
     let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
     let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
+    let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
     let heights = Heights {
         clearance: len("clearance", &op.clearance)?,
         retract: len("retract", &op.retract)?,
@@ -253,16 +254,23 @@ pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Too
             }
             cam::face(min, max, tool, len("stepover", stepover)?, &cut)
         }
-        CamOperationKind::Contour { side, climb, stock_to_leave } => {
-            let params = ContourParams { side: *side, climb: *climb, stock_to_leave: len("stock_to_leave", stock_to_leave)?, tolerance: TOLERANCE };
+        CamOperationKind::Contour { side, climb, stock_to_leave, ramp_angle } => {
+            let params = ContourParams {
+                side: *side,
+                climb: *climb,
+                stock_to_leave: len("stock_to_leave", stock_to_leave)?,
+                tolerance: TOLERANCE,
+                ramp_angle: angle(ramp_angle)?,
+            };
             cam::contour(&regions, tool, &params, &cut)
         }
-        CamOperationKind::Pocket { stepover, climb, stock_to_leave } => {
+        CamOperationKind::Pocket { stepover, climb, stock_to_leave, ramp_angle } => {
             let params = PocketParams {
                 stepover: len("stepover", stepover)?,
                 climb: *climb,
                 stock_to_leave: len("stock_to_leave", stock_to_leave)?,
                 tolerance: TOLERANCE,
+                ramp_angle: angle(ramp_angle)?,
             };
             cam::pocket(&regions, tool, &params, &cut)
         }
@@ -359,6 +367,10 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     Ok(out)
 }
 
+fn ramp_angle(p: &Value) -> String {
+    expr(p, "ramp_angle").unwrap_or_else(|| "3 deg".into())
+}
+
 fn stock_to_leave(p: &Value) -> String {
     expr(p, "stock_to_leave").unwrap_or_else(|| mm(0.0))
 }
@@ -377,17 +389,19 @@ fn op_contour(s: &mut Session, p: &Value) -> Result<Value> {
         Some("on") => Side::On,
         _ => return Err(bad(cmd, "`side` must be outside, inside or on")),
     };
-    let kind = CamOperationKind::Contour { side, climb: bool_(p, "climb").unwrap_or(true), stock_to_leave: stock_to_leave(p) };
+    let kind =
+        CamOperationKind::Contour { side, climb: bool_(p, "climb").unwrap_or(true), stock_to_leave: stock_to_leave(p), ramp_angle: ramp_angle(p) };
     add_op(s, p, cmd, "Contour", |_| kind)
 }
 
 fn op_pocket(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.pocket";
-    let (stepover, climb, leave) = (expr(p, "stepover"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p));
+    let (stepover, climb, leave, ramp) = (expr(p, "stepover"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p), ramp_angle(p));
     add_op(s, p, cmd, "Pocket", |tool| CamOperationKind::Pocket {
         stepover: stepover.unwrap_or_else(|| mm(tool.diameter * 0.4)),
         climb,
         stock_to_leave: leave,
+        ramp_angle: ramp,
     })
 }
 

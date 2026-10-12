@@ -63,6 +63,17 @@ fn pocket_from_a_sketch_to_gcode() {
     let lowest = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
     close(lowest, -5.0, 1e-9);
     assert!(pts.iter().any(|p| (p.z + 2.5).abs() < 1e-9));
+    // The tool ramps in: straight-down feeds only go through air, to the top of the material
+    // and then to the depth the pass before cleared, never to a new depth.
+    let moves = solidcraft_cam::parse(gcode).unwrap();
+    let mut at = solidcraft_geom::Vec3::ZERO;
+    for m in &moves {
+        let Some(to) = m.target() else { continue };
+        if matches!(m, Move::Feed { .. }) && to.x == at.x && to.y == at.y {
+            assert!(to.z >= -2.5 - 1e-9, "plunge to {to:?}");
+        }
+        at = to;
+    }
     // Written to a file with Grbl's post, the program has no tool change.
     let path = std::env::temp_dir().join(format!("solidcraft-cam-{}.nc", std::process::id()));
     let written = run(&mut s, "cam.post", json!({"post": "grbl", "path": path.to_string_lossy()}));
@@ -123,7 +134,7 @@ fn contour_face_and_drill_from_sketches() {
     let face = run(&mut s, "cam.op.face", with(json!({"top": 1, "bottom": 0, "stepover": 5, "stepdown": 1, "retract": 3})));
     close(face["cut_length"].as_f64().unwrap(), 7.0 * 48.0 + 6.0 * 5.0 + 3.0, 1e-9);
     // Two passes round the part 3 mm outside it, and 8 mm of plunging (see the cam crate's test).
-    let contour = run(&mut s, "cam.op.contour", with(json!({"bottom": -6, "stepdown": 3})));
+    let contour = run(&mut s, "cam.op.contour", with(json!({"bottom": -6, "stepdown": 3, "ramp_angle": 0})));
     close(contour["cut_length"].as_f64().unwrap(), 2.0 * (140.0 + 6.0 * std::f64::consts::PI) + 8.0, 1e-6);
     close(contour["cut_minutes"].as_f64().unwrap(), 2.0 * (140.0 + 6.0 * std::f64::consts::PI) / 600.0 + 8.0 / 200.0, 1e-9);
     // Two holes, 2 → −10 each.
@@ -257,6 +268,7 @@ fn hostile_cam_params_never_panic() {
         "stepdown",
         "stepover",
         "stock_to_leave",
+        "ramp_angle",
         "side",
         "peck",
         "dwell",

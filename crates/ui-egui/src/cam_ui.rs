@@ -68,6 +68,7 @@ pub struct OpForm {
     pub side: usize,
     pub climb: bool,
     pub stock_to_leave: String,
+    pub ramp_angle: String,
     pub peck: String,
     pub dwell: String,
     pub coolant: bool,
@@ -128,6 +129,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             side: 0,
             climb: true,
             stock_to_leave: String::new(),
+            ramp_angle: String::new(),
             peck: String::new(),
             dwell: String::new(),
             coolant: false,
@@ -190,10 +192,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             optional("stepdown", &f.stepdown);
             match f.kind {
                 OpKind::Face => optional("stepover", &f.stepover),
-                OpKind::Contour => optional("stock_to_leave", &f.stock_to_leave),
+                OpKind::Contour => {
+                    optional("stock_to_leave", &f.stock_to_leave);
+                    optional("ramp_angle", &f.ramp_angle);
+                }
                 OpKind::Pocket => {
                     optional("stepover", &f.stepover);
                     optional("stock_to_leave", &f.stock_to_leave);
+                    optional("ramp_angle", &f.ramp_angle);
                 }
                 OpKind::Drill => optional("peck", &f.peck),
             }
@@ -344,6 +350,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) {
                 }
             }
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
+                field(ui, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
                 ui.label("Direction");
                 ui.checkbox(&mut f.climb, "Climb");
                 ui.end_row();

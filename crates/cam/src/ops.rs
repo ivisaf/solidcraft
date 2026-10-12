@@ -21,6 +21,8 @@ const MAX_RINGS: usize = 2_000;
 const MAX_ROWS: usize = 100_000;
 /// Most holes of one drilling operation.
 const MAX_HOLES: usize = 100_000;
+/// Most times a ramp goes round its loop; a loop too short for that is plunged into instead.
+const MAX_RAMP_LAPS: f64 = 2000.0;
 /// Largest coordinate or height (mm).
 const MAX_COORD: f64 = 1.0e6;
 
@@ -116,6 +118,8 @@ pub struct ContourParams {
     pub stock_to_leave: f64,
     /// Chord error allowed on spline boundaries (mm).
     pub tolerance: f64,
+    /// Steepest descent into each depth pass, along the profile (radians); 0 plunges straight down.
+    pub ramp_angle: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,6 +131,8 @@ pub struct PocketParams {
     pub stock_to_leave: f64,
     /// Chord error allowed on spline boundaries (mm).
     pub tolerance: f64,
+    /// Steepest descent into uncut material, along the first pass (radians); 0 plunges straight down.
+    pub ramp_angle: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -197,16 +203,18 @@ impl Builder {
         self.push(Move::Feed { to: p.extend(z), feed: self.feeds.cut })
     }
 
-    /// Cuts along `piece` at depth `z` from wherever the tool is (within the offsetting's joining tolerance of the piece's start).
-    fn cut_piece(&mut self, piece: &Piece, z: f64) -> Result<()> {
+    /// Cuts along `piece` from wherever the tool is (within the offsetting's joining tolerance
+    /// of the piece's start), going evenly from depth `z0` to `z1`.
+    fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
         match *piece {
-            Piece::Line { b, .. } => self.cut_to(b, z),
+            Piece::Line { b, .. } => self.cut_to(b, z1),
             Piece::Arc { c, sweep, .. } => {
                 // Halves, so that no arc move comes near a full turn.
                 let parts = if sweep.abs() > PI { 2 } else { 1 };
                 for k in 1..=parts {
-                    let to = piece.point_at(k as f64 / parts as f64);
-                    self.push(Move::Arc { to: to.extend(z), center: c, ccw: sweep > 0.0, feed: self.feeds.cut })?;
+                    let t = k as f64 / parts as f64;
+                    let to = piece.point_at(t).extend(z0 + (z1 - z0) * t);
+                    self.push(Move::Arc { to, center: c, ccw: sweep > 0.0, feed: self.feeds.cut })?;
                 }
                 Ok(())
             }
@@ -214,7 +222,37 @@ impl Builder {
     }
 
     fn cut_loop(&mut self, lp: &[Piece], z: f64) -> Result<()> {
-        lp.iter().try_for_each(|piece| self.cut_piece(piece, z))
+        lp.iter().try_for_each(|piece| self.cut_piece(piece, z, z))
+    }
+
+    /// Goes down to `z` along `lp`, no steeper than `angle`, round as often as that takes; the
+    /// tool ends where the loop starts. Straight down when there is no angle or the loop is too
+    /// short to ramp along.
+    fn ramp_loop(&mut self, lp: &[Piece], z: f64, angle: f64) -> Result<()> {
+        let Some(from) = self.pos.map(|p| p.z) else { return Err(CamError::Unsafe("a ramp before the first positioning move".into())) };
+        let drop = from - z;
+        if !(drop > 1e-9) {
+            return Ok(());
+        }
+        let length: f64 = lp.iter().map(Piece::length).sum();
+        let laps = (drop / angle.tan() / length - 1e-9).ceil().max(1.0);
+        if !(angle > 0.0) || !(length > 1e-3) || !(laps <= MAX_RAMP_LAPS) {
+            return self.plunge_to(z);
+        }
+        let total = laps * length;
+        let mut done = 0.0;
+        for _ in 0..laps as usize {
+            for piece in lp {
+                let z0 = from - drop * done / total;
+                done += piece.length();
+                self.cut_piece(piece, z0, from - drop * (done / total).min(1.0))?;
+            }
+        }
+        // Exactly at depth, whatever the rounding of the last step.
+        match self.pos {
+            Some(p) => self.cut_to(Vec2::new(p.x, p.y), z),
+            None => Ok(()),
+        }
     }
 
     fn retract(&mut self) -> Result<()> {
@@ -234,6 +272,10 @@ impl Builder {
 
 fn check_point(p: Vec2) -> Result<()> {
     if p.is_finite() && p.x.abs() <= MAX_COORD && p.y.abs() <= MAX_COORD { Ok(()) } else { invalid("a coordinate is not a usable number") }
+}
+
+fn check_ramp(angle: f64) -> Result<()> {
+    if (0.0..=1.5).contains(&angle) { Ok(()) } else { invalid("the ramp angle must be between 0 and 85 degrees") }
 }
 
 fn check_leave(leave: f64) -> Result<()> {
@@ -288,6 +330,7 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     tool.validate()?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
+    check_ramp(params.ramp_angle)?;
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let away = tool.radius() + params.stock_to_leave;
     let loops = match params.side {
@@ -307,8 +350,10 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
         let Some(first) = lp.first() else { continue };
         b.travel_to(first.start())?;
+        // Down to the last pass (through what it cut), then into the material along the loop.
+        b.plunge_to(cut.heights.top)?;
         for &z in &levels {
-            b.plunge_to(z)?;
+            b.ramp_loop(&lp, z, params.ramp_angle)?;
             b.cut_loop(&lp, z)?;
             b.cut_to(first.start(), z)?;
         }
@@ -322,6 +367,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     tool.validate()?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
+    check_ramp(params.ramp_angle)?;
     let r = tool.radius();
     if !(params.stepover > 0.0) || !(params.stepover <= r) {
         return invalid("the stepover must be above 0 and at most the tool radius");
@@ -343,6 +389,8 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         return invalid("the tool does not fit the pocket");
     }
     let mut b = Builder::new(cut);
+    // The depth already cut wherever this pass's rings run.
+    let mut cleared = cut.heights.top;
     for z in cut.levels()? {
         // Whether the tool is down in this level's cut.
         let mut down: Option<Vec2> = None;
@@ -356,13 +404,15 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
                 Some(from) if link_is_clear(&shape, from, start, wall, r) => b.cut_to(start, z)?,
                 _ => {
                     b.travel_to(start)?;
-                    b.plunge_to(z)?;
+                    b.plunge_to(cleared)?;
+                    b.ramp_loop(&lp, z, params.ramp_angle)?;
                 }
             }
             b.cut_loop(&lp, z)?;
             b.cut_to(start, z)?;
             down = Some(start);
         }
+        cleared = z;
         b.retract()?;
     }
     b.finish()

@@ -67,18 +67,21 @@ pub struct CamOperation {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CamOperationKind {
     /// Faces the box around the profiles.
-    Face {
-        stepover: String,
-    },
+    Face { stepover: String },
     Contour {
         side: Side,
         climb: bool,
         stock_to_leave: String,
+        /// Steepest descent into each depth pass (an angle expression; 0 plunges).
+        #[serde(default = "default_ramp")]
+        ramp_angle: String,
     },
     Pocket {
         stepover: String,
         climb: bool,
         stock_to_leave: String,
+        #[serde(default = "default_ramp")]
+        ramp_angle: String,
     },
     /// Drills at the centre of each profile.
     Drill {
@@ -87,6 +90,10 @@ pub enum CamOperationKind {
         #[serde(default)]
         dwell: f64,
     },
+}
+
+fn default_ramp() -> String {
+    "3 deg".into()
 }
 
 impl CamOperationKind {
