@@ -26,6 +26,7 @@ mod history_names;
 pub use format_offsets::whole_profile_selection_from_value;
 pub mod joints;
 mod lineage;
+pub mod manufacture;
 pub mod motion;
 mod name_lookup;
 pub mod naming;
@@ -47,6 +48,7 @@ pub use eval::{
     state_in_frame_at, through_all_distance, world_state,
 };
 pub use params::{ParamRow, ParamUser, cycles};
+pub use solidcraft_cam as cam;
 pub use solidcraft_kernel as kernel;
 pub use solidcraft_sketch as sketch;
 

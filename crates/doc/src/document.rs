@@ -1690,6 +1690,9 @@ pub struct Document {
     /// Named views: saved cameras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named_views: Vec<NamedView>,
+    /// Manufacturing: the tool library and the setups with their operations.
+    #[serde(default, skip_serializing_if = "crate::manufacture::Manufacture::is_empty")]
+    pub manufacture: crate::manufacture::Manufacture,
 }
 
 /// A saved camera (orbit camera: target, yaw, pitch, distance; `fov` 0 for orthographic).
@@ -1758,6 +1761,7 @@ impl Document {
             browser_groups: Vec::new(),
             browser_order: Default::default(),
             named_views: Vec::new(),
+            manufacture: Default::default(),
         }
     }
 

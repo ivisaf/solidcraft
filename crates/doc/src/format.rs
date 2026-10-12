@@ -46,13 +46,16 @@
 //!   legacy mark (`?F2:top#2`) and are found again as the build that saved them found them.
 //!   Pieces a feature splits a body into are named after their faces; features saved before
 //!   keep the kernel's shell order (`shell_piece_order`), which their stored body names mean.
+//! - 15: manufacturing data (`"manufacture"`: the tool library and setups with their
+//!   operations). Version 14 designs have none and need no transformation; the version stamp
+//!   keeps older readers from opening a design and dropping its setups on the next save.
 
 use serde_json::Value;
 
 use crate::{DocError, Document, Result};
 
 /// The format this build writes.
-pub const FORMAT: u32 = 14;
+pub const FORMAT: u32 = 15;
 
 pub fn format_string(n: u32) -> String {
     format!("solidcraft/{n}")
@@ -69,7 +72,7 @@ pub fn version_of(s: &str) -> Option<u32> {
 
 /// JSON-level upgrades: entry `i` turns format `i + 1` into `i + 2`.
 type JsonStep = fn(&mut Value) -> Result<()>;
-const JSON_STEPS: [JsonStep; 13] = [
+const JSON_STEPS: [JsonStep; 14] = [
     |_| Ok(()),
     v2_to_v3,
     v3_to_v4,
@@ -83,6 +86,7 @@ const JSON_STEPS: [JsonStep; 13] = [
     |_| Ok(()),
     |_| Ok(()),
     v13_to_v14,
+    |_| Ok(()),
 ];
 
 /// Stored face and edge names were worked out from geometry before format 14; they get the
