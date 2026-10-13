@@ -462,7 +462,8 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
         Form::Tool(f) => {
             optional(&mut p, "diameter", &f.diameter);
             optional(&mut p, "flute_length", &f.flute_length);
-            optional(&mut p, "description", &f.description);
+            // Sent even when empty, so that a description can be removed.
+            p.insert("description".into(), json!(f.description.trim()));
             p.insert("number".into(), json!(number("The tool number", &f.number)? as u64));
             p.insert("kind".into(), json!(TOOL_KINDS.get(f.kind).copied().unwrap_or("flat")));
             if !f.flutes.trim().is_empty() {

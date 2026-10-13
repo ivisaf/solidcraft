@@ -163,7 +163,8 @@ fn next_id(s: &mut Session) -> u64 {
     id
 }
 
-/// A tool from a command's inputs. Cutting data: a number sets it, null clears it, left out keeps what the tool `was`.
+/// A tool from a command's inputs. Number, kind and diameter are always given; the rest, left
+/// out, keeps what the tool `was`. Cutting data: a number sets it, null clears it.
 fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<Tool> {
     let number =
         p.get("number").and_then(Value::as_u64).filter(|n| (1..=9999).contains(n)).ok_or_else(|| bad(cmd, "`number` must be 1 to 9999"))? as u32;
@@ -174,11 +175,15 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         _ => return Err(bad(cmd, "`kind` must be flat, ball or drill")),
     };
     let diameter = length(s, cmd, "diameter", &req_expr(cmd, p, "diameter")?)?;
+    // What is not named stays as the tool had it.
     let flute_length = match expr(p, "flute_length") {
         Some(e) => length(s, cmd, "flute_length", &e)?,
-        None => diameter * 3.0,
+        None => was.map_or(diameter * 3.0, |t| t.flute_length),
     };
-    let description: String = str_(p, "description").unwrap_or("").chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
+    let description: String = match p.get("description") {
+        None => was.map(|t| t.description.clone()).unwrap_or_default(),
+        Some(_) => str_(p, "description").unwrap_or("").chars().filter(|c| !c.is_control()).take(MAX_NAME).collect(),
+    };
     let data = |k: &str, was: Option<f64>| match p.get(k) {
         None => Ok(was),
         Some(Value::Null) => Ok(None),

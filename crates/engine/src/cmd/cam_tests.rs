@@ -603,8 +603,9 @@ fn machine_library_tools_are_used_by_any_design_which_keeps_its_own_copy() {
     assert_eq!(run(&mut s, "cam.tool.update", json!({"library": lib}))["updated"], json!([7]));
     close(lowest_x(&mut s), 4.0, 1e-6);
     assert_eq!(run(&mut s, "cam.tool.update", json!({"library": lib}))["updated"], json!([]));
-    // The redefinition kept the data it did not name.
-    assert_eq!(s.doc.manufacture.tool(7).map(|t| (t.spindle_rpm, t.stepover)), Some((Some(16000.0), Some(2.0))));
+    // The redefinition kept what it did not name: cutting data, description, flute length.
+    let t = s.doc.manufacture.tool(7).cloned().unwrap();
+    assert_eq!((t.spindle_rpm, t.stepover, t.description.as_str(), t.flute_length), (Some(16000.0), Some(2.0), "Rougher", 18.0));
     run(&mut s, "edit.undo", json!({}));
     close(lowest_x(&mut s), 3.0, 1e-6);
 
