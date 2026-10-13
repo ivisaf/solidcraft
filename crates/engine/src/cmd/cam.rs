@@ -50,6 +50,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
+    CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).params(
+        "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
+         plunge_feed, coolant, stepdown, sketch with profiles?, faces, stepover, side, climb, stock_to_leave, ramp_angle, peck, dwell); a height \
+         (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
+    ),
     CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).params("op: id or name; setup?: id or name"),
     CommandSpec::new("cam.list", "Manufacture", list)
         .at("MANUFACTURE", "ACTIONS")
@@ -70,8 +75,9 @@ fn cam_error(e: cam::CamError) -> EngineError {
     EngineError::Other(e.to_string())
 }
 
+/// A length as an expression, to the nanometre (so 6 × 0.4 reads `2.4 mm`).
 fn mm(v: f64) -> String {
-    format!("{v} mm")
+    format!("{} mm", (v * 1e6).round() / 1e6)
 }
 
 fn length(s: &Session, cmd: &str, key: &str, e: &str) -> Result<f64> {
@@ -549,14 +555,18 @@ fn op_face(s: &mut Session, p: &Value) -> Result<Value> {
     add_op(s, p, cmd, "Face", |_| CamOperationKind::Face { stepover })
 }
 
+fn side_param(p: &Value, cmd: &str) -> Result<Side> {
+    match (p.get("side"), str_(p, "side").map(|k| k.trim().to_ascii_lowercase()).as_deref()) {
+        (None, _) | (_, Some("outside")) => Ok(Side::Outside),
+        (_, Some("inside")) => Ok(Side::Inside),
+        (_, Some("on")) => Ok(Side::On),
+        _ => Err(bad(cmd, "`side` must be outside, inside or on")),
+    }
+}
+
 fn op_contour(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.contour";
-    let side = match str_(p, "side").map(|k| k.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("outside") => Side::Outside,
-        Some("inside") => Side::Inside,
-        Some("on") => Side::On,
-        _ => return Err(bad(cmd, "`side` must be outside, inside or on")),
-    };
+    let side = side_param(p, cmd)?;
     let kind =
         CamOperationKind::Contour { side, climb: bool_(p, "climb").unwrap_or(true), stock_to_leave: stock_to_leave(p), ramp_angle: ramp_angle(p) };
     add_op(s, p, cmd, "Contour", |_| kind)
@@ -587,6 +597,111 @@ fn op_position(setup: &Setup, k: &str) -> Option<usize> {
     setup.operations.iter().position(|o| o.id.to_string() == k).or_else(|| setup.operations.iter().position(|o| o.name.eq_ignore_ascii_case(k)))
 }
 
+/// Changes the inputs of an operation that are given; the change is kept only if the operation can still be cut.
+fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.edit";
+    let k = key(p, "op").ok_or_else(|| bad(cmd, "`op` is required"))?;
+    let si = setup_index(s, p, cmd)?;
+    let setup = s.doc.manufacture.setups.get(si).ok_or_else(|| bad(cmd, "no such setup"))?.clone();
+    let oi = op_position(&setup, &k).ok_or_else(|| bad(cmd, format!("no operation `{k}`")))?;
+    let mut op = setup.operations.get(oi).cloned().ok_or_else(|| bad(cmd, "no such operation"))?;
+    let positive = |k: &str| num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6).ok_or_else(|| bad(cmd, format!("`{k}` must be above 0")));
+    let has = |k: &str| p.get(k).is_some();
+    // An expression checked now, so that a bad one names its input.
+    let checked = |k: &str, kind: Kind| -> Result<String> {
+        let e = req_expr(cmd, p, k)?;
+        s.doc.eval(&e, kind).map_err(|err| bad(cmd, format!("{k}: {err}")))?;
+        Ok(e)
+    };
+    // `null` puts an optional expression back to automatic.
+    let optional =
+        |k: &str| -> Result<Option<String>> { if p.get(k).is_some_and(Value::is_null) { Ok(None) } else { checked(k, Kind::Length).map(Some) } };
+    if let Some(n) = name_param(p, cmd)? {
+        if setup.operations.iter().enumerate().any(|(i, o)| i != oi && o.name.eq_ignore_ascii_case(&n)) {
+            return Err(bad(cmd, format!("the setup already has an operation `{n}`")));
+        }
+        op.name = n;
+    }
+    if has("tool") {
+        let number = p.get("tool").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
+        op.tool = s
+            .doc
+            .manufacture
+            .tools
+            .iter()
+            .find(|t| u64::from(t.number) == number)
+            .map(|t| t.number)
+            .ok_or_else(|| bad(cmd, format!("no tool {number}")))?;
+    }
+    if has("spindle_rpm") {
+        op.spindle_rpm = positive("spindle_rpm")?;
+    }
+    if has("feed") {
+        op.cut_feed = positive("feed")?;
+    }
+    if has("plunge_feed") {
+        op.plunge_feed = positive("plunge_feed")?;
+    }
+    if has("coolant") {
+        op.coolant = bool_(p, "coolant").ok_or_else(|| bad(cmd, "`coolant` must be true or false"))?;
+    }
+    if has("stepdown") {
+        op.stepdown = checked("stepdown", Kind::Length)?;
+    }
+    for (k, slot) in [("clearance", &mut op.clearance), ("retract", &mut op.retract), ("top", &mut op.top), ("bottom", &mut op.bottom)] {
+        if has(k) {
+            *slot = optional(k)?;
+        }
+    }
+    match (p.get("faces"), p.get("sketch")) {
+        (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
+        (Some(faces), None) => op.geometry = CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
+        (None, Some(sketch)) => {
+            op.geometry = CamGeometry::Sketch {
+                sketch: super::features::sketch_id(s, Some(sketch), cmd, "sketch")?,
+                profiles: super::features::profiles(p, cmd)?,
+            }
+        }
+        (None, None) => {}
+    }
+    let unknown = |k: &str| bad(cmd, format!("a {} operation has no `{k}`", op.kind.label()));
+    let mut kind = op.kind.clone();
+    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "peck", "dwell"] {
+        if !has(k) {
+            continue;
+        }
+        match (&mut kind, k) {
+            (CamOperationKind::Face { stepover } | CamOperationKind::Pocket { stepover, .. }, "stepover") => *stepover = checked(k, Kind::Length)?,
+            (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
+            (CamOperationKind::Contour { climb, .. } | CamOperationKind::Pocket { climb, .. }, "climb") => {
+                *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?
+            }
+            (CamOperationKind::Contour { stock_to_leave, .. } | CamOperationKind::Pocket { stock_to_leave, .. }, "stock_to_leave") => {
+                *stock_to_leave = checked(k, Kind::Length)?
+            }
+            (CamOperationKind::Contour { ramp_angle, .. } | CamOperationKind::Pocket { ramp_angle, .. }, "ramp_angle") => {
+                *ramp_angle = checked(k, Kind::Angle)?
+            }
+            (CamOperationKind::Drill { peck, .. }, "peck") => *peck = optional(k)?,
+            (CamOperationKind::Drill { dwell, .. }, "dwell") => {
+                *dwell = num(p, k).filter(|d| (0.0..=3600.0).contains(d)).ok_or_else(|| bad(cmd, "`dwell` must be 0 to 3600 seconds"))?
+            }
+            _ => return Err(unknown(k)),
+        }
+    }
+    op.kind = kind;
+    let path = build(s, &setup, &op).map_err(|e| bad(cmd, e.to_string()))?;
+    let (id, name) = (op.id, op.name.clone());
+    if let Some(slot) = s.doc_mut().manufacture.setups.get_mut(si).and_then(|x| x.operations.get_mut(oi)) {
+        *slot = op;
+    }
+    let mut out = stats_json(&path);
+    out["operation"] = json!(id);
+    out["name"] = json!(name);
+    out["setup"] = json!(setup.id);
+    Ok(out)
+}
+
 fn op_remove(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.remove";
     let k = key(p, "op").ok_or_else(|| bad(cmd, "`op` is required"))?;
@@ -607,6 +722,8 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 .iter()
                 .map(|op| {
                     let mut v = json!(op);
+                    // The kind's own inputs (stepover, side…) beside its name.
+                    v["inputs"] = v["kind"].take();
                     v["kind"] = json!(op.kind.label());
                     match build(s, setup, op) {
                         Ok(path) => v["toolpath"] = stats_json(&path),

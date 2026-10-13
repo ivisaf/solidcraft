@@ -257,6 +257,46 @@ fn manufacture_is_saved_undone_and_reported_when_it_breaks() {
 }
 
 #[test]
+fn operations_are_edited_in_place() {
+    let mut s = pocket_job(0.0, json!({}));
+    let made = run(&mut s, "cam.op.pocket", pocket_op());
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 4}));
+    // Deeper, with the smaller tool, renamed; what is not named stays.
+    let edited = run(&mut s, "cam.op.edit", json!({"op": "Pocket1", "bottom": -8, "tool": 2, "stepover": 1.5, "name": "Rough", "coolant": true}));
+    assert_eq!((edited["operation"].clone(), edited["lowest_z"].clone()), (made["operation"].clone(), json!(-8.0)));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let op = &listed["setups"][0]["operations"][0];
+    assert_eq!(
+        (op["name"].as_str(), op["tool"].as_u64(), op["spindle_rpm"].as_f64(), op["coolant"].as_bool()),
+        (Some("Rough"), Some(2), Some(12000.0), Some(true))
+    );
+    assert_eq!((op["kind"].as_str(), op["inputs"]["stepover"].as_str(), op["inputs"]["climb"].as_bool()), (Some("pocket"), Some("1.5"), Some(true)));
+    // The 4 mm tool runs 2 mm inside the walls.
+    let world = run(&mut s, "cam.toolpath", json!({}));
+    let min_x = world["operations"][0]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p[3] == true)
+        .map(|p| p[0].as_f64().unwrap())
+        .fold(f64::INFINITY, f64::min);
+    close(min_x, 2.0, 1e-6);
+    // A height given as null follows the geometry again; here the sketch gives no bottom, so the edit is refused and nothing changes.
+    let before = s.doc.manufacture.clone();
+    let refused = |s: &mut Session, p: Value| s.execute("cam.op.edit", &p).err().map(|e| e.to_string()).unwrap_or_else(|| panic!("{p} was accepted"));
+    assert!(refused(&mut s, json!({"op": "Rough", "bottom": null})).contains("`bottom` is required"));
+    assert!(refused(&mut s, json!({"op": "Rough", "tool": 9})).contains("no tool 9"));
+    assert!(refused(&mut s, json!({"op": "Rough", "peck": 2})).contains("a pocket operation has no `peck`"));
+    assert!(refused(&mut s, json!({"op": "Rough", "stepover": 3})).contains("stepover"));
+    assert!(refused(&mut s, json!({"op": "Nope", "bottom": -1})).contains("no operation"));
+    assert_eq!(s.doc.manufacture, before);
+    run(&mut s, "cam.op.edit", json!({"op": "Rough", "top": 1, "retract": null}));
+    assert_eq!(s.doc.manufacture.setups[0].operations[0].top.as_deref(), Some("1"));
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.manufacture, before);
+}
+
+#[test]
 fn what_cannot_be_cut_is_refused() {
     let mut s = pocket_job(0.0, json!({}));
     let refused =
@@ -310,6 +350,7 @@ fn hostile_cam_params_never_panic() {
         json!(18446744073709551615u64),
     ];
     let commands = [
+        "cam.op.edit",
         "cam.tool.define",
         "cam.tool.remove",
         "cam.setup.create",
@@ -358,6 +399,7 @@ fn hostile_cam_params_never_panic() {
                 let mut p = pocket_op();
                 p["number"] = json!(3);
                 p["kind"] = json!("flat");
+                p["op"] = json!("Pocket1");
                 p["diameter"] = json!(4);
                 p[key] = value.clone();
                 if let Err(e) = s.execute(cmd, &p) {

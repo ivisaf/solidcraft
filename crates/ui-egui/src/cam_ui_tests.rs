@@ -113,11 +113,49 @@ fn selected_faces_become_the_operation_s_geometry() {
 }
 
 #[test]
+fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
+    let mut h = sketched();
+    fill(&mut h, "cam.tool.define", |_| {});
+    fill(&mut h, "cam.setup.create", |_| {});
+    fill(&mut h, "cam.op.pocket", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        op.bottom = "-3 mm".into();
+    });
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let (setup, op) = (&listed["setups"][0], &listed["setups"][0]["operations"][0]);
+    let Some(Form::Op(mut form)) = edit_form(&h.app, setup, op) else { panic!("no form") };
+    // The form shows what the operation has, defaults included.
+    assert_eq!(
+        (form.name.as_str(), form.sketch.as_str(), form.tool.as_str(), form.bottom.as_str(), form.top.as_str()),
+        ("Pocket1", "Pocket", "1", "-3 mm", "")
+    );
+    assert_eq!((form.stepover.as_str(), form.ramp_angle.as_str(), form.feed.as_str(), form.climb), ("2.4 mm", "3 deg", "600", true));
+    // Unchanged, it changes nothing (and does not reset which profiles are cut).
+    let before = h.app.session.doc.manufacture.clone();
+    let (id, p) = command(&Form::Op(form.clone())).unwrap();
+    assert_eq!(id, "cam.op.edit");
+    assert!(p.get("sketch").is_none() && p.get("faces").is_none() && p["top"].is_null(), "{p}");
+    h.app.manufacture.form = Some(Form::Op(form.clone()));
+    apply(&mut h.app);
+    assert_eq!((h.app.manufacture.error.clone(), &h.app.session.doc.manufacture), (None, &before));
+    // Deeper and renamed: the same operation, changed.
+    form.bottom = "-6 mm".into();
+    form.name = "Deep".into();
+    h.app.manufacture.form = Some(Form::Op(form));
+    apply(&mut h.app);
+    let ops = &h.app.session.doc.manufacture.setups[0].operations;
+    assert_eq!((ops.len(), ops[0].id, ops[0].name.as_str(), ops[0].bottom.as_deref()), (1, before.setups[0].operations[0].id, "Deep", Some("-6 mm")));
+    assert_eq!(paths(&mut h.app).iter().flatten().map(|p| p.0.z).fold(f64::INFINITY, f64::min), -6.0);
+    h.frames(2);
+    assert!(h.widget("Edit").is_some());
+}
+
+#[test]
 fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 9);
+    assert_eq!(on_tab.len(), 9, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);

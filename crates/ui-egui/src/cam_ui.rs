@@ -53,9 +53,21 @@ pub enum Form {
     Op(Box<OpForm>),
 }
 
+/// The operation a form edits, and the geometry it had when the form opened.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Editing {
+    pub setup: u64,
+    pub op: u64,
+    pub sketch: String,
+    pub faces: Vec<(String, Vec3)>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpForm {
     pub kind: OpKind,
+    /// The operation being changed (`None`: a new one).
+    pub editing: Option<Editing>,
+    pub name: String,
     /// Picked faces (body, a point on the face); when there are any they are cut, not the sketch.
     pub faces: Vec<(String, Vec3)>,
     pub sketch: String,
@@ -129,6 +141,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         let faces = selected_faces(app);
         Form::Op(Box::new(OpForm {
             kind,
+            editing: None,
+            name: String::new(),
             bottom: if faces.is_empty() { "-5 mm".into() } else { String::new() },
             faces,
             sketch,
@@ -177,48 +191,68 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
 pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
     let number = |what: &str, s: &str| s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| format!("{what} must be a number"));
     let mut p = serde_json::Map::new();
-    let mut optional = |k: &str, s: &str| {
+    fn optional(p: &mut serde_json::Map<String, Value>, k: &str, s: &str) {
         if !s.trim().is_empty() {
             p.insert(k.into(), json!(s.trim()));
         }
-    };
+    }
     match form {
         Form::Tool { number: n, kind, diameter, flute_length, description } => {
-            optional("diameter", diameter);
-            optional("flute_length", flute_length);
-            optional("description", description);
+            optional(&mut p, "diameter", diameter);
+            optional(&mut p, "flute_length", flute_length);
+            optional(&mut p, "description", description);
             p.insert("number".into(), json!(number("The tool number", n)? as u64));
             p.insert("kind".into(), json!(TOOL_KINDS.get(*kind).copied().unwrap_or("flat")));
             Ok(("cam.tool.define", Value::Object(p)))
         }
         Form::Setup { name, origin, post } => {
-            optional("name", name);
+            optional(&mut p, "name", name);
             let [x, y, z] = origin;
             p.insert("origin".into(), json!([number("The origin's X", x)?, number("The origin's Y", y)?, number("The origin's Z", z)?]));
             p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(*post).copied().unwrap_or("rs274")));
             Ok(("cam.setup.create", Value::Object(p)))
         }
         Form::Op(f) => {
-            if f.faces.is_empty() {
-                optional("sketch", &f.sketch);
+            optional(&mut p, "name", &f.name);
+            optional(&mut p, "stepdown", &f.stepdown);
+            match &f.editing {
+                // A new operation: what is empty is left to the command.
+                None => {
+                    if f.faces.is_empty() {
+                        optional(&mut p, "sketch", &f.sketch);
+                    }
+                    optional(&mut p, "top", &f.top);
+                    optional(&mut p, "bottom", &f.bottom);
+                }
+                // An edit: an emptied height goes back to automatic; geometry is sent only when it changed.
+                Some(e) => {
+                    for (k, text) in [("top", &f.top), ("bottom", &f.bottom)] {
+                        p.insert(k.into(), if text.trim().is_empty() { Value::Null } else { json!(text.trim()) });
+                    }
+                    if f.kind == OpKind::Drill && f.peck.trim().is_empty() {
+                        p.insert("peck".into(), Value::Null);
+                    }
+                    if f.faces.is_empty() && (f.sketch.trim() != e.sketch || !e.faces.is_empty()) {
+                        p.insert("sketch".into(), json!(f.sketch.trim()));
+                    }
+                    p.insert("op".into(), json!(e.op));
+                    p.insert("setup".into(), json!(e.setup));
+                }
             }
-            optional("top", &f.top);
-            optional("bottom", &f.bottom);
-            optional("stepdown", &f.stepdown);
             match f.kind {
-                OpKind::Face => optional("stepover", &f.stepover),
+                OpKind::Face => optional(&mut p, "stepover", &f.stepover),
                 OpKind::Contour => {
-                    optional("stock_to_leave", &f.stock_to_leave);
-                    optional("ramp_angle", &f.ramp_angle);
+                    optional(&mut p, "stock_to_leave", &f.stock_to_leave);
+                    optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
                 OpKind::Pocket => {
-                    optional("stepover", &f.stepover);
-                    optional("stock_to_leave", &f.stock_to_leave);
-                    optional("ramp_angle", &f.ramp_angle);
+                    optional(&mut p, "stepover", &f.stepover);
+                    optional(&mut p, "stock_to_leave", &f.stock_to_leave);
+                    optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
-                OpKind::Drill => optional("peck", &f.peck),
+                OpKind::Drill => optional(&mut p, "peck", &f.peck),
             }
-            if !f.faces.is_empty() {
+            if !f.faces.is_empty() && f.editing.as_ref().is_none_or(|e| e.faces != f.faces) {
                 let faces: Vec<Value> = f.faces.iter().map(|(body, at)| json!({"body": body, "point": [at.x, at.y, at.z]})).collect();
                 p.insert("faces".into(), json!(faces));
             }
@@ -238,9 +272,51 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("climb".into(), json!(f.climb));
             }
             p.insert("coolant".into(), json!(f.coolant));
-            Ok((f.kind.command(), Value::Object(p)))
+            Ok((if f.editing.is_some() { "cam.op.edit" } else { f.kind.command() }, Value::Object(p)))
         }
     }
+}
+
+/// A form filled in from an operation as `cam.list` reports it.
+pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
+    let kind = match op["kind"].as_str()? {
+        "face" => OpKind::Face,
+        "contour" => OpKind::Contour,
+        "pocket" => OpKind::Pocket,
+        "drill" => OpKind::Drill,
+        _ => return None,
+    };
+    let number = |v: &Value| v.as_f64().map(|x| x.to_string()).unwrap_or_default();
+    let sketch = op["geometry"]["sketch"].as_u64().and_then(|id| app.session.doc.feature(id)).map(|f| f.name.clone()).unwrap_or_default();
+    let faces: Vec<(String, Vec3)> = op["geometry"]["faces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| Some((f["body"].as_str()?.to_string(), Vec3::new(f["at"]["x"].as_f64()?, f["at"]["y"].as_f64()?, f["at"]["z"].as_f64()?))))
+        .collect();
+    let inputs = &op["inputs"];
+    Some(Form::Op(Box::new(OpForm {
+        kind,
+        editing: Some(Editing { setup: setup["id"].as_u64()?, op: op["id"].as_u64()?, sketch: sketch.clone(), faces: faces.clone() }),
+        name: text(op, "name"),
+        faces,
+        sketch,
+        tool: op["tool"].as_u64()?.to_string(),
+        spindle_rpm: number(&op["spindle_rpm"]),
+        feed: number(&op["cut_feed"]),
+        plunge_feed: number(&op["plunge_feed"]),
+        top: text(op, "top"),
+        bottom: text(op, "bottom"),
+        stepdown: text(op, "stepdown"),
+        stepover: text(inputs, "stepover"),
+        side: SIDES.iter().position(|s| Some(*s) == inputs["side"].as_str()).unwrap_or(0),
+        climb: inputs["climb"].as_bool().unwrap_or(true),
+        stock_to_leave: text(inputs, "stock_to_leave"),
+        ramp_angle: text(inputs, "ramp_angle"),
+        peck: text(inputs, "peck"),
+        dwell: inputs["dwell"].as_f64().filter(|d| *d > 0.0).map(|d| d.to_string()).unwrap_or_default(),
+        coolant: op["coolant"].as_bool().unwrap_or(false),
+    })))
 }
 
 /// Runs the open form's command; the form closes when the command succeeds.
@@ -343,6 +419,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)]) {
             choice(ui, "sc_cam_setup_post", "Post", post, solidcraft_engine::cam::Post::BUILTIN);
         }
         Form::Op(f) => {
+            field(ui, "Name", &mut f.name, "automatic");
             if f.faces.is_empty() {
                 field(ui, "Sketch", &mut f.sketch, "name");
             } else {
@@ -413,11 +490,16 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut open = true;
     let mut run: Vec<(&'static str, Value)> = Vec::new();
     let mut apply_form = false;
+    let mut edit: Option<(Value, Value)> = None;
     let mut post_to: Option<String> = None;
     let selected = selected_faces(app);
+    let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
     let mut cam = std::mem::take(&mut app.manufacture);
     crate::frame::window(ctx, RichText::new("MANUFACTURE").strong().size(13.0), crate::frame::Width::Normal)
         .id(egui::Id::new("sc_cam_window"))
+        // Beside the model, not over it.
+        .pivot(egui::Align2::LEFT_TOP)
+        .default_pos(corner)
         .open(&mut open)
         .resizable(true)
         .show(ctx, |ui| {
@@ -470,6 +552,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                 );
                             }
                         }
+                        if ui.small_button("Edit").clicked() {
+                            edit = Some((setup.clone(), op.clone()));
+                        }
                         if ui.small_button("Remove").clicked() {
                             run.push(("cam.op.remove", json!({ "setup": setup["id"], "op": op["id"] })));
                         }
@@ -494,6 +579,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 let title = match form {
                     Form::Tool { .. } => "DEFINE TOOL",
                     Form::Setup { .. } => "NEW SETUP",
+                    Form::Op(f) if f.editing.is_some() => "EDIT OPERATION",
                     Form::Op(f) => f.kind.title(),
                 };
                 ui.label(RichText::new(title).strong());
@@ -511,6 +597,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     app.manufacture = cam;
     for (id, p) in run {
         app.manufacture.error = app.run(id, p).err();
+    }
+    if let Some((setup, op)) = edit {
+        app.manufacture.form = edit_form(app, &setup, &op);
+        app.manufacture.error = None;
     }
     if apply_form {
         apply(app);
