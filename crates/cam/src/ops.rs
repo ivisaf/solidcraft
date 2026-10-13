@@ -124,7 +124,7 @@ pub struct ContourParams {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PocketParams {
-    /// Distance between passes (mm), at most the tool radius.
+    /// Distance between passes (mm), at most the tool diameter.
     pub stepover: f64,
     pub climb: bool,
     /// Material left on the walls (mm).
@@ -288,8 +288,23 @@ fn start_near(lp: &[Piece], p: Vec2) -> Vec<Piece> {
     lp.iter().cycle().skip(first).take(lp.len()).copied().collect()
 }
 
-/// Faces the rectangle `min`–`max` with passes along X, the tool running off the material at both ends.
-pub fn face(min: Vec2, max: Vec2, tool: &Tool, stepover: f64, cut: &Cut) -> Result<Toolpath> {
+/// How a facing operation treats its boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceParams {
+    /// Distance between passes (mm), at most the tool diameter.
+    pub stepover: f64,
+    /// `true`: the tool stays inside the boundary, `margin` away from it (the corners keep the
+    /// tool's radius). `false`: everything up to `margin` beyond the boundary is cut.
+    pub inside: bool,
+    /// How far inside or beyond the boundary (mm, 0 or more).
+    pub margin: f64,
+}
+
+/// Faces the rectangle `min`–`max` with passes along X. Over the boundary, the area out to the
+/// margin is cut whole: passes run from one end of it to the other (the tool's nose a radius
+/// past) and the outer passes have the tool's edge on the area's edge. Inside it, the tool
+/// never leaves the area.
+pub fn face(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
     cut.validate()?;
     check_point(min)?;
@@ -297,24 +312,37 @@ pub fn face(min: Vec2, max: Vec2, tool: &Tool, stepover: f64, cut: &Cut) -> Resu
     if !(max.x > min.x) || !(max.y > min.y) {
         return invalid("the area to face is empty");
     }
-    if !(stepover > 0.0) || !(stepover <= tool.diameter) {
+    if !(params.stepover > 0.0) || !(params.stepover <= tool.diameter) {
         return invalid("the stepover must be above 0 and at most the tool diameter");
     }
+    if !(0.0..=MAX_COORD).contains(&params.margin) {
+        return invalid("the distance inside or beyond the boundary must be 0 or more");
+    }
     let r = tool.radius();
-    let height = max.y - min.y;
-    let rows = (height / stepover - 1e-9).ceil().max(1.0) + 1.0;
+    let grow = if params.inside { -params.margin } else { params.margin };
+    let (lo, hi) = (Vec2::new(min.x - grow, min.y - grow), Vec2::new(max.x + grow, max.y + grow));
+    // Where the tool's centre goes: along the passes, and from the first pass to the last.
+    let (x0, x1) = if params.inside { (lo.x + r, hi.x - r) } else { (lo.x, hi.x) };
+    let (mut y0, mut y1) = (lo.y + r, hi.y - r);
+    if params.inside && (x0 > x1 || y0 > y1) {
+        return invalid("the tool does not fit inside the boundary");
+    }
+    if y0 > y1 {
+        // An area narrower than the tool: one pass down its middle.
+        (y0, y1) = ((lo.y + hi.y) * 0.5, (lo.y + hi.y) * 0.5);
+    }
+    let height = y1 - y0;
+    let rows = if height > 1e-9 { (height / params.stepover - 1e-9).ceil().max(1.0) + 1.0 } else { 1.0 };
     if !(rows <= MAX_ROWS as f64) {
         return Err(CamError::TooLarge(format!("more than {MAX_ROWS} passes")));
     }
     let rows = rows as usize;
-    // Start and end with the whole tool off the material.
-    let (x0, x1) = (min.x - r - 1.0, max.x + r + 1.0);
     let mut b = Builder::new(cut);
     for z in cut.levels()? {
-        b.travel_to(Vec2::new(x0, min.y))?;
+        b.travel_to(Vec2::new(x0, y0))?;
         b.plunge_to(z)?;
         for k in 0..rows {
-            let y = min.y + height * k as f64 / (rows - 1).max(1) as f64;
+            let y = y0 + height * k as f64 / (rows - 1).max(1) as f64;
             let (from, to) = if k % 2 == 0 { (x0, x1) } else { (x1, x0) };
             b.cut_to(Vec2::new(from, y), z)?;
             b.cut_to(Vec2::new(to, y), z)?;
@@ -369,8 +397,8 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     check_leave(params.stock_to_leave)?;
     check_ramp(params.ramp_angle)?;
     let r = tool.radius();
-    if !(params.stepover > 0.0) || !(params.stepover <= r) {
-        return invalid("the stepover must be above 0 and at most the tool radius");
+    if !(params.stepover > 0.0) || !(params.stepover <= tool.diameter) {
+        return invalid("the stepover must be above 0 and at most the tool diameter");
     }
     let shape = Shape::from_regions(regions, params.tolerance)?;
     let wall = r + params.stock_to_leave;
@@ -387,6 +415,27 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     }
     if rings.is_empty() {
         return invalid("the tool does not fit the pocket");
+    }
+    // Rings more than a radius apart leave material wherever the next ring in does not run
+    // within a radius: the middle of a part of the pocket it no longer fits in, a passage that
+    // narrows. A ring a radius further in clears it; it is cut where some stretch of it is out
+    // of the next ring's reach (corners between rings are cleared by the spurs below).
+    if params.stepover > r + 1e-9 {
+        let mut passes = Vec::new();
+        for (k, ring) in rings.iter().enumerate() {
+            passes.push(ring.clone());
+            let next: Vec<&Piece> = rings.get(k + 1).into_iter().flatten().flatten().collect();
+            let reached = |p: Vec2| next.iter().any(|piece| piece.dist(p) <= r + 1e-6);
+            let extra: Vec<Vec<Piece>> = shape
+                .offset(wall + params.stepover * k as f64 + r)?
+                .into_iter()
+                .filter(|lp| lp.iter().any(|piece| [0.25, 0.5, 0.75].iter().any(|t| !reached(piece.point_at(*t)))))
+                .collect();
+            if !extra.is_empty() {
+                passes.push(extra);
+            }
+        }
+        rings = passes;
     }
     let mut b = Builder::new(cut);
     // The depth already cut wherever this pass's rings run.
@@ -408,7 +457,16 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
                     b.ramp_loop(&lp, z, params.ramp_angle)?;
                 }
             }
-            b.cut_loop(&lp, z)?;
+            // Rings far apart do not reach into a sharp corner between them: there the tool
+            // steps towards the next ring's corner and back.
+            let inward = if params.climb { 1.0 } else { -1.0 };
+            for (piece, next) in lp.iter().zip(lp.iter().cycle().skip(1)) {
+                b.cut_piece(piece, z, z)?;
+                if let Some(to) = corner_spur(piece, next, inward, params.stepover, r).filter(|to| link_is_clear(&shape, piece.end(), *to, wall, r)) {
+                    b.cut_to(to, z)?;
+                    b.cut_to(piece.end(), z)?;
+                }
+            }
             b.cut_to(start, z)?;
             down = Some(start);
         }
@@ -416,6 +474,22 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         b.retract()?;
     }
     b.finish()
+}
+
+/// Where to step to from the corner between `piece` and `next` so that the corner between
+/// this ring and the next one in (`gap` away) is cleared: along the corner's bisector, to within
+/// a radius of the next ring's corner. `inward`: 1 with the pocket on the loop's left, −1 on
+/// its right. `None` where the rings' own passes already clear the corner.
+fn corner_spur(piece: &Piece, next: &Piece, inward: f64, gap: f64, r: f64) -> Option<Vec2> {
+    let (t_in, t_out) = (piece.tangent_at(1.0), next.tangent_at(0.0));
+    let bend = crate::piece::turn(t_in, t_out);
+    // Half the corner's inside angle has this sine.
+    let sharp = (bend.abs() * 0.5).cos();
+    if bend * inward <= 1e-6 || sharp < 0.05 || gap <= r * (1.0 + sharp) + 1e-9 {
+        return None;
+    }
+    let dir = (t_out - t_in).normalized()?;
+    Some(piece.end() + dir * (gap / sharp - r))
 }
 
 /// Whether the tool can feed straight from `a` to `b` without touching a wall.

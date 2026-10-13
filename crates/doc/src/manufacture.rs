@@ -131,6 +131,8 @@ pub enum CamGeometry {
     Faces { faces: Vec<FaceRef> },
     /// The stock's top, seen along the tool: what a facing operation covers.
     Stock,
+    /// The box round the bodies, seen along the tool.
+    Part,
 }
 
 /// A body face: the one with the persistent name `name` on `body`, else the piece of it nearest `at`.
@@ -144,8 +146,16 @@ pub struct FaceRef {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CamOperationKind {
-    /// Faces the box around the profiles.
-    Face { stepover: String },
+    /// Faces the box around its boundary (profiles, faces, the stock or the part).
+    Face {
+        stepover: String,
+        /// The tool stays inside the boundary; otherwise it cuts over it.
+        #[serde(default)]
+        inside: bool,
+        /// How far inside or over the boundary (a length expression); left out: over by the tool's radius, inside by nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        margin: Option<String>,
+    },
     Contour {
         side: Side,
         climb: bool,

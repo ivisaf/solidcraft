@@ -276,6 +276,85 @@ fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
 }
 
 #[test]
+fn facing_boundary_and_posting_one_operation_or_the_setup() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Patch"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [30, 20]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.side = "5 mm".into();
+        setup.top = "1 mm".into();
+        setup.origin = 2;
+    });
+    let span = |h: &mut Harness, op: usize| {
+        let cuts = paths(&mut h.app)[op].iter().filter(|p| p.1).fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |m, p| {
+            ([m.0[0].min(p.0.x), m.0[1].min(p.0.y)], [m.1[0].max(p.0.x), m.1[1].max(p.0.y)])
+        });
+        [cuts.0[0], cuts.0[1], cuts.1[0], cuts.1[1]].map(|c| (c * 1e6).round() / 1e6)
+    };
+    // With a body in the design, facing starts on the stock, over it by the tool's radius.
+    fill(&mut h, "cam.op.face", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        assert_eq!((op.boundary, op.limit, op.margin.as_str()), (0, 0, ""));
+    });
+    assert_eq!(span(&mut h, 0), [-8.0, -5.0, 68.0, 45.0]);
+    h.frames(2);
+    assert!(h.widget("Post Process  (rs274)").is_some() && h.widget("Post").is_some());
+
+    // Edit: the part instead, staying 1 mm inside its outline.
+    let edit = |h: &mut Harness, change: &dyn Fn(&mut OpForm)| {
+        let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+        let Some(Form::Op(mut form)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][0]) else { panic!("no form") };
+        change(&mut form);
+        h.app.manufacture.form = Some(Form::Op(form));
+        apply(&mut h.app);
+        assert_eq!(h.app.manufacture.error, None);
+    };
+    edit(&mut h, &|f| {
+        assert_eq!((f.boundary, f.limit), (0, 0));
+        f.boundary = 1;
+        f.limit = 1;
+        f.margin = "1 mm".into();
+    });
+    assert_eq!(span(&mut h, 0), [4.0, 4.0, 56.0, 36.0]);
+    // A sketch's box, over it by 2 mm; the form shows what the operation has.
+    edit(&mut h, &|f| {
+        assert_eq!((f.boundary, f.limit, f.margin.as_str()), (1, 1, "1 mm"));
+        f.boundary = 2;
+        f.sketch = "Patch".into();
+        f.limit = 0;
+        f.margin = "2 mm".into();
+    });
+    assert_eq!(span(&mut h, 0), [8.0, 11.0, 32.0, 19.0]);
+    // Unchanged, an edit changes nothing; emptied, the margin goes back to the tool's radius.
+    let before = h.app.session.doc.manufacture.clone();
+    edit(&mut h, &|_| {});
+    assert_eq!(h.app.session.doc.manufacture, before);
+    edit(&mut h, &|f| f.margin = String::new());
+    assert_eq!(span(&mut h, 0), [7.0, 10.0, 33.0, 20.0]);
+
+    // One operation's program, and the setup's.
+    fill(&mut h, "cam.op.contour", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        op.sketch = "Patch".into();
+        op.bottom = "8 mm".into();
+    });
+    let dir = std::env::temp_dir().join(format!("solidcraft-post-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (one, all) = (dir.join("one.ngc"), dir.join("all.ngc"));
+    let (setup, op) = (h.app.session.doc.manufacture.setups[0].id, h.app.session.doc.manufacture.setups[0].operations[1].id);
+    post_to(&mut h.app, setup, Some(op), &one.to_string_lossy());
+    post_to(&mut h.app, setup, None, &all.to_string_lossy());
+    assert_eq!(h.app.manufacture.error, None);
+    let (one, all) = (std::fs::read_to_string(one).unwrap(), std::fs::read_to_string(all).unwrap());
+    assert!(one.contains("(Contour1:") && !one.contains("(Face1:") && all.contains("(Face1:") && all.contains("(Contour1:"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     let mut h = lab();
     fill(&mut h, "cam.tool.define", |f| {

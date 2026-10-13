@@ -74,13 +74,13 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(SETUP_DOC),
     CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).params("setup: id or name; then any of name, axis, origin, stock, post as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
-    CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles — or, without sketch or faces, the stock from its top down to the part's")),
+    CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
-    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most its radius); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
+    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, sketch with profiles?, faces, stepover, side, climb, stock_to_leave, ramp_angle, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move)
@@ -102,7 +102,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
-        "setup?: id or name; post?: rs274|grbl|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
+        "setup?: id or name; op?: id or name, to write that operation alone (default: every operation, in order); post?: rs274|grbl|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
          cut_minutes, and gcode (the program text) when no path is given",
     ),
 ];
@@ -778,12 +778,13 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
     let state = s.model.state();
     let frame = &at.frame;
     match source {
-        CamGeometry::Stock => {
-            let (lo, hi) = at.stock.ok_or("there is no body to take the stock from")?;
+        CamGeometry::Stock | CamGeometry::Part => {
+            let (lo, hi) = if *source == CamGeometry::Part { at.part } else { at.stock }.ok_or("there is no body to take the boundary from")?;
             let outer = Loop2::polygon(&[Vec2::new(lo.x, lo.y), Vec2::new(hi.x, lo.y), Vec2::new(hi.x, hi.y), Vec2::new(lo.x, hi.y)]);
             Ok(Geometry {
                 regions: vec![Region2 { outer, holes: Vec::new() }],
-                z: hi.z,
+                // Either box is faced from the top of the stock.
+                z: at.stock.map_or(hi.z, |(_, top)| top.z),
                 body_z: at.part.map(|(lo, hi)| (lo.z, hi.z)),
                 facing_away: false,
             })
@@ -856,7 +857,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         (CamOperationKind::Drill { .. }, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
         (CamOperationKind::Face { .. }, _) if picked => (Some(g.z), Some(g.z)),
         // Facing the stock: from its top down to the top of the part.
-        (CamOperationKind::Face { .. }, Some((_, hi))) if op.geometry == CamGeometry::Stock => (Some(g.z), Some(hi)),
+        (CamOperationKind::Face { .. }, Some((_, hi))) if matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
         _ => (Some(g.z), None),
     };
     let height = |what: &str, given: &Option<String>, auto: Option<f64>| match given {
@@ -874,12 +875,18 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     let cut = Cut { heights, feeds: Feeds { cut: op.cut_feed, plunge: op.plunge_feed }, stepdown: len("stepdown", &op.stepdown)? };
     let regions = &g.regions;
     let path = match &op.kind {
-        CamOperationKind::Face { stepover } => {
+        CamOperationKind::Face { stepover, inside, margin } => {
             let (mut min, mut max) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
             for p in regions.iter().flat_map(|r| r.outer.polyline(TOLERANCE)) {
                 (min, max) = (Vec2::new(min.x.min(p.x), min.y.min(p.y)), Vec2::new(max.x.max(p.x), max.y.max(p.y)));
             }
-            cam::face(min, max, tool, len("stepover", stepover)?, &cut)
+            // Left out: over the boundary by the tool's radius (its nose clear of the ends), inside it by nothing.
+            let margin = match margin {
+                Some(e) => len("margin", e)?,
+                None if *inside => 0.0,
+                None => tool.radius(),
+            };
+            cam::face(min, max, tool, &cam::FaceParams { stepover: len("stepover", stepover)?, inside: *inside, margin }, &cut)
         }
         CamOperationKind::Contour { side, climb, stock_to_leave, ramp_angle } => {
             let params = ContourParams {
@@ -962,7 +969,7 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     let geometry = match (p.get("faces"), p.get("sketch")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
-        (None, None) if cmd == "cam.op.face" => CamGeometry::Stock,
+        (None, None) if cmd == "cam.op.face" => boundary_param(p, cmd)?,
         _ => CamGeometry::Sketch {
             sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
             profiles: super::features::profiles(p, cmd)?,
@@ -1052,9 +1059,40 @@ fn stock_to_leave(p: &Value) -> String {
 fn op_face(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.face";
     let stepover = expr(p, "stepover");
+    let inside = limit_param(p, cmd)?;
+    let margin = match p.get("margin") {
+        Some(v) if !v.is_null() => Some(margin_param(s, p, cmd)?),
+        _ => None,
+    };
     add_op(s, p, cmd, "Face", |tool| CamOperationKind::Face {
         stepover: stepover.unwrap_or_else(|| mm(tool.stepover.unwrap_or(tool.diameter * 0.5))),
+        inside,
+        margin,
     })
+}
+
+/// Whether a facing operation's tool stays inside its boundary (`limit`: over|inside; default over).
+fn limit_param(p: &Value, cmd: &str) -> Result<bool> {
+    match (p.get("limit"), str_(p, "limit").map(|k| k.trim().to_ascii_lowercase()).as_deref()) {
+        (None, _) | (_, Some("over")) => Ok(false),
+        (_, Some("inside")) => Ok(true),
+        _ => Err(bad(cmd, "`limit` must be over or inside")),
+    }
+}
+
+/// How far inside or over its boundary a facing operation cuts: a length of 0 or more.
+fn margin_param(s: &Session, p: &Value, cmd: &str) -> Result<String> {
+    let e = req_expr(cmd, p, "margin")?;
+    if length(s, cmd, "margin", &e)? >= 0.0 { Ok(e) } else { Err(bad(cmd, "`margin` must be 0 or more")) }
+}
+
+/// The box a facing operation covers when no sketch or faces are given (`boundary`: stock|part; default stock).
+fn boundary_param(p: &Value, cmd: &str) -> Result<CamGeometry> {
+    match (p.get("boundary"), str_(p, "boundary").map(|k| k.trim().to_ascii_lowercase()).as_deref()) {
+        (None, _) | (_, Some("stock")) => Ok(CamGeometry::Stock),
+        (_, Some("part" | "body" | "bodies")) => Ok(CamGeometry::Part),
+        _ => Err(bad(cmd, "`boundary` must be stock or part (or give `sketch` or `faces`)")),
+    }
 }
 
 fn side_param(p: &Value, cmd: &str) -> Result<Side> {
@@ -1078,8 +1116,7 @@ fn op_pocket(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.pocket";
     let (stepover, climb, leave, ramp) = (expr(p, "stepover"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p), ramp_angle(p));
     add_op(s, p, cmd, "Pocket", |tool| CamOperationKind::Pocket {
-        // The tool's own stepover, as far as a pocket allows (its radius).
-        stepover: stepover.unwrap_or_else(|| mm(tool.stepover.map_or(tool.diameter * 0.4, |own| own.min(tool.diameter * 0.5)))),
+        stepover: stepover.unwrap_or_else(|| mm(tool.stepover.unwrap_or(tool.diameter * 0.4))),
         climb,
         stock_to_leave: leave,
         ramp_angle: ramp,
@@ -1165,16 +1202,29 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 profiles: super::features::profiles(p, cmd)?,
             }
         }
-        (None, None) => {}
+        (None, None) => {
+            if p.get("boundary").is_some() {
+                if !matches!(op.kind, CamOperationKind::Face { .. }) {
+                    return Err(bad(cmd, format!("a {} operation has no `boundary`", op.kind.label())));
+                }
+                op.geometry = boundary_param(p, cmd)?;
+            }
+        }
     }
     let unknown = |k: &str| bad(cmd, format!("a {} operation has no `{k}`", op.kind.label()));
     let mut kind = op.kind.clone();
-    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "peck", "dwell"] {
+    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "peck", "dwell", "limit", "margin"] {
         if !has(k) {
             continue;
         }
         match (&mut kind, k) {
-            (CamOperationKind::Face { stepover } | CamOperationKind::Pocket { stepover, .. }, "stepover") => *stepover = checked(k, Kind::Length)?,
+            (CamOperationKind::Face { stepover, .. } | CamOperationKind::Pocket { stepover, .. }, "stepover") => {
+                *stepover = checked(k, Kind::Length)?
+            }
+            (CamOperationKind::Face { inside, .. }, "limit") => *inside = limit_param(p, cmd)?,
+            (CamOperationKind::Face { margin, .. }, "margin") => {
+                *margin = if p.get(k).is_some_and(Value::is_null) { None } else { Some(margin_param(s, p, cmd)?) }
+            }
             (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
             (CamOperationKind::Contour { climb, .. } | CamOperationKind::Pocket { climb, .. }, "climb") => {
                 *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?
@@ -1417,10 +1467,19 @@ fn post(s: &mut Session, p: &Value) -> Result<Value> {
     if setup.operations.is_empty() {
         return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
     }
-    let mut program = cam::Program { name: format!("{} {}", s.doc.name, setup.name), operations: Vec::new() };
+    // One operation on its own, or the setup's whole program.
+    let only = match key(p, "op") {
+        Some(k) => Some(op_position(setup, &k).ok_or_else(|| bad(cmd, format!("no operation `{k}`")))?),
+        None => None,
+    };
+    let name = match only.and_then(|i| setup.operations.get(i)) {
+        Some(op) => format!("{} {} {}", s.doc.name, setup.name, op.name),
+        None => format!("{} {}", s.doc.name, setup.name),
+    };
+    let mut program = cam::Program { name, operations: Vec::new() };
     let mut minutes = 0.0;
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
-    for op in &setup.operations {
+    for (_, op) in setup.operations.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {
         let path = build_in(s, &at, op)?;
         minutes += path.stats().cut_minutes;
         let tool = s.doc.manufacture.tool(op.tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;

@@ -128,9 +128,9 @@ fn contour_face_and_drill_from_sketches() {
         }
         v
     };
-    // One level 1 mm down: 30/5 + 1 = 7 passes 5 apart, each 40 + 2 × (3 + 1) long, six 5 mm steps and the 3 mm plunge.
+    // One level 1 mm down, over the sketch's box by the tool's radius: 30/5 + 1 = 7 passes 5 apart, each 40 + 2 × 3 long, six 5 mm steps and the 3 mm plunge.
     let face = run(&mut s, "cam.op.face", with(json!({"top": 1, "bottom": 0, "stepover": 5, "stepdown": 1, "retract": 3})));
-    close(face["cut_length"].as_f64().unwrap(), 7.0 * 48.0 + 6.0 * 5.0 + 3.0, 1e-9);
+    close(face["cut_length"].as_f64().unwrap(), 7.0 * 46.0 + 6.0 * 5.0 + 3.0, 1e-9);
     // Two passes round the part 3 mm outside it, and 8 mm of plunging (see the cam crate's test).
     let contour = run(&mut s, "cam.op.contour", with(json!({"bottom": -6, "stepdown": 3, "ramp_angle": 0})));
     close(contour["cut_length"].as_f64().unwrap(), 2.0 * (140.0 + 6.0 * std::f64::consts::PI) + 8.0, 1e-6);
@@ -342,16 +342,40 @@ fn stock_offsets_and_an_origin_on_the_stock_or_part_box() {
     let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
     let pts = cuts(&gcode);
     close(pts.iter().filter(|p| p.z < -2.5).map(|p| p.x).fold(f64::INFINITY, f64::min), 18.0, 1e-4);
-    // The faced area is the stock's, the tool running off it: X from −(3 + 1) to 70 + 3 + 1.
+    // The faced area is the stock's, over it by the tool's radius: the centre runs from X −3 to 70 + 3.
     let faced = pts.iter().filter(|p| p.z > -2.5 && p.z < 0.5);
     let (lo, hi) = faced.fold((f64::INFINITY, f64::NEG_INFINITY), |m, p| (m.0.min(p.x), m.1.max(p.x)));
-    close(lo, -4.0, 1e-6);
-    close(hi, 74.0, 1e-6);
+    close(lo, -3.0, 1e-6);
+    close(hi, 73.0, 1e-6);
+    // Facing the part instead, 1 mm inside its outline: the 6 mm tool's centre stays 4 mm in from the 60 × 40 part (5 mm from the stock's edge).
+    run(&mut s, "cam.op.edit", json!({"op": "Face1", "boundary": "part", "limit": "inside", "margin": 1}));
+    let b = world_box(&mut s, "Setup1", "Face1");
+    assert!(near([b.0[0], b.0[1], 0.0], [4.0, 4.0, 0.0]) && near([b.1[0], b.1[1], 0.0], [56.0, 36.0, 0.0]), "{b:?}");
+    // And over it by 2 mm, as a new operation would: passes from 2 mm before the part to 2 mm past it.
+    run(&mut s, "cam.op.edit", json!({"op": "Face1", "limit": "over", "margin": 2}));
+    let b = world_box(&mut s, "Setup1", "Face1");
+    assert!(near([b.0[0], b.0[1], 0.0], [-2.0, 1.0, 0.0]) && near([b.1[0], b.1[1], 0.0], [62.0, 39.0, 0.0]), "{b:?}");
+    for bad in [json!({"limit": "beside"}), json!({"margin": -1}), json!({"boundary": "table"})] {
+        let mut p = bad.clone();
+        p["op"] = json!("Face1");
+        assert!(s.execute("cam.op.edit", &p).is_err(), "{bad}");
+    }
+    assert!(s.execute("cam.op.edit", &json!({"op": "Pocket1", "boundary": "part"})).unwrap_err().to_string().contains("no `boundary`"));
+    run(&mut s, "cam.op.edit", json!({"op": "Face1", "boundary": "stock", "margin": null}));
+    // One operation posts on its own; the setup posts them all.
+    let alone = run(&mut s, "cam.post", json!({"op": "Pocket1"}))["gcode"].as_str().unwrap().to_string();
+    assert!(
+        alone.starts_with("(Untitled Setup1 Pocket1)") && alone.contains("(Pocket1:") && !alone.contains("(Face1:") && alone.ends_with("M30\n"),
+        "{alone}"
+    );
+    assert!(gcode.contains("(Face1:") && gcode.contains("(Pocket1:"));
+    assert!(s.execute("cam.post", &json!({"op": "Nope"})).is_err());
     // In the world the toolpath is where the part is.
     close(world_box(&mut s, "Setup1", "Pocket1").0[2], -4.0, 1e-9);
     // The simulation uses the setup's stock: the facing takes its top 2 mm off.
     let sim = run(&mut s, "cam.simulate", json!({}));
     close(sim["operations"][0]["removed_volume"].as_f64().unwrap(), 7000.0, 140.0);
+    // (the faced area is back to the stock's)
     assert_eq!(sim["max_gouge"], 0.0);
 
     // More stock on top lifts the origin with it: the same floor is deeper in work coordinates.
@@ -490,7 +514,7 @@ fn operations_are_edited_in_place() {
     assert!(refused(&mut s, json!({"op": "Rough", "bottom": null})).contains("`bottom` is required"));
     assert!(refused(&mut s, json!({"op": "Rough", "tool": 9})).contains("no tool 9"));
     assert!(refused(&mut s, json!({"op": "Rough", "peck": 2})).contains("a pocket operation has no `peck`"));
-    assert!(refused(&mut s, json!({"op": "Rough", "stepover": 3})).contains("stepover"));
+    assert!(refused(&mut s, json!({"op": "Rough", "stepover": 5})).contains("stepover"));
     assert!(refused(&mut s, json!({"op": "Nope", "bottom": -1})).contains("no operation"));
     assert_eq!(s.doc.manufacture, before);
     run(&mut s, "cam.op.edit", json!({"op": "Rough", "top": 1, "retract": null}));
@@ -704,7 +728,7 @@ fn what_cannot_be_cut_is_refused() {
         p
     };
     assert!(refused(&mut s, "cam.op.pocket", with("tool", json!(7))).contains("no tool 7"));
-    assert!(refused(&mut s, "cam.op.pocket", with("stepover", json!(5))).contains("stepover"));
+    assert!(refused(&mut s, "cam.op.pocket", with("stepover", json!(7))).contains("stepover"));
     assert!(refused(&mut s, "cam.op.pocket", with("bottom", json!(5))).contains("heights"));
     assert!(refused(&mut s, "cam.op.pocket", with("sketch", json!("Nope"))).contains("no sketch"));
     assert!(refused(&mut s, "cam.op.pocket", with("setup", json!("Nope"))).contains("no setup"));
@@ -798,6 +822,9 @@ fn hostile_cam_params_never_panic() {
         "faces",
         "to",
         "by",
+        "limit",
+        "margin",
+        "boundary",
         "cell",
         "stock",
         "axis",

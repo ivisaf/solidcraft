@@ -279,15 +279,77 @@ fn ramps_replace_plunges_into_material() {
 }
 
 #[test]
-fn face_covers_the_stock_with_the_tool_running_off_both_ends() {
+fn face_cuts_over_the_boundary_or_stays_inside_it() {
     let c =
         Cut { heights: Heights { clearance: 10.0, retract: 3.0, top: 1.0, bottom: 0.0 }, feeds: Feeds { cut: 800.0, plunge: 300.0 }, stepdown: 1.0 };
-    let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), 15.0, &c).unwrap();
-    // ceil(50/15) + 1 = 5 passes 12.5 apart, each 100 + 2 × (10 + 1) long, four 12.5 mm
-    // moves between them and one 3 mm plunge.
-    close(path.stats().cut_length, 5.0 * 122.0 + 4.0 * 12.5 + 3.0, 1e-9);
-    assert_eq!(path.stats().lowest_z, Some(0.0));
-    assert!(face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), 25.0, &c).is_err(), "stepover above the tool diameter");
+    let span = |path: &Toolpath| {
+        let pts = cutting_points(path, 0.5);
+        pts.iter().fold((v(f64::INFINITY, f64::INFINITY), v(f64::NEG_INFINITY, f64::NEG_INFINITY)), |m, p| {
+            (v(m.0.x.min(p.x), m.0.y.min(p.y)), v(m.1.x.max(p.x), m.1.y.max(p.y)))
+        })
+    };
+    // Over by the tool's radius: the centre runs from 10 before the 100 × 50 area to 10 past it,
+    // in passes from Y 0 to Y 50: ceil(50/15) + 1 = 5 of them 12.5 apart, 120 long, and one 3 mm plunge.
+    let over = FaceParams { stepover: 15.0, inside: false, margin: 10.0 };
+    let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &over, &c).unwrap();
+    close(path.stats().cut_length, 5.0 * 120.0 + 4.0 * 12.5 + 3.0, 1e-9);
+    assert_eq!((span(&path), path.stats().lowest_z), ((v(-10.0, 0.0), v(110.0, 50.0)), Some(0.0)));
+    // Over by nothing: the area itself is cut whole, the tool's nose a radius past its ends.
+    let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { margin: 0.0, ..over }, &c).unwrap();
+    assert_eq!(span(&path), (v(0.0, 10.0), v(100.0, 40.0)));
+    // Inside by 2: the tool's edge stays 2 from the boundary all round.
+    let inside = FaceParams { stepover: 15.0, inside: true, margin: 2.0 };
+    let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &inside, &c).unwrap();
+    assert_eq!(span(&path), (v(12.0, 12.0), v(88.0, 38.0)));
+    // An area narrower than the tool is one pass down its middle; inside, the tool must fit.
+    let path = face(v(0.0, 0.0), v(100.0, 10.0), &tool(20.0), &FaceParams { margin: 0.0, ..over }, &c).unwrap();
+    assert_eq!(span(&path), (v(0.0, 5.0), v(100.0, 5.0)));
+    assert!(face(v(0.0, 0.0), v(100.0, 10.0), &tool(20.0), &inside, &c).is_err());
+    assert!(face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { stepover: 25.0, ..over }, &c).is_err(), "stepover above the tool diameter");
+    assert!(face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { margin: -1.0, ..over }, &c).is_err());
+}
+
+#[test]
+fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
+    // A 40 × 30 pocket, a 6 mm tool, passes 5 apart: rings 3, 8 and 13 from the walls. The last
+    // leaves a strip down the middle (15 from the long walls) more than a radius from it.
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    for (stepover, name) in [(5.0, "wide"), (6.0, "a diameter"), (4.0, "moderate")] {
+        let params = PocketParams { stepover, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+        let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
+        for p in cutting_points(&path, 0.0) {
+            assert!(p.x >= 3.0 - 1e-6 && p.x <= 37.0 + 1e-6 && p.y >= 3.0 - 1e-6 && p.y <= 27.0 + 1e-6, "{name}: gouge at {p:?}");
+        }
+        for i in 0..=68 {
+            for j in 0..=48 {
+                let q = v(3.0 + i as f64 * 0.5, 3.0 + j as f64 * 0.5);
+                let d = dist_to_cuts(&path, -2.0 + 1e-6, q);
+                assert!(d <= 3.0 + 0.01, "{name}: {q:?} is {d} from the nearest pass");
+            }
+        }
+    }
+    // Two rooms joined by a wide door, one room narrower: each is cleared to its own middle, round an island too.
+    let rooms = Region2 {
+        outer: polygon(&[(0.0, 0.0), (30.0, 0.0), (30.0, 8.0), (60.0, 8.0), (60.0, 26.0), (30.0, 26.0), (30.0, 40.0), (0.0, 40.0)]).outer,
+        holes: vec![Loop2::circle(v(15.0, 20.0), 4.0)],
+    };
+    let params = PocketParams { stepover: 5.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let path = pocket(std::slice::from_ref(&rooms), &tool(6.0), &params, &cut(0.0, -2.0, 2.0)).unwrap();
+    let shape = Shape::from_regions(std::slice::from_ref(&rooms), 0.01).unwrap();
+    for p in cutting_points(&path, 0.0) {
+        assert!(shape.clear(v(p.x, p.y), 3.0 - 1e-4), "gouge at {p:?}");
+    }
+    for i in 0..=120 {
+        for j in 0..=80 {
+            let q = v(i as f64 * 0.5, j as f64 * 0.5);
+            if shape.clear(q, 3.0 + 1e-3) {
+                let d = dist_to_cuts(&path, -2.0 + 1e-6, q);
+                assert!(d <= 3.0 + 0.01, "{q:?} is {d} from the nearest pass");
+            }
+        }
+    }
+    let too_wide = PocketParams { stepover: 6.5, ..params };
+    assert!(pocket(&regions, &tool(6.0), &too_wide, &cut(0.0, -2.0, 2.0)).is_err(), "passes more than a diameter apart");
 }
 
 #[test]
@@ -538,8 +600,8 @@ fn hostile_values_are_errors_never_panics() {
                 let _ = pocket(&regions, tl, &pocket_params, &c);
                 let _ = pocket(&regions, tl, &PocketParams { stepover: 2.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 }, &c);
                 let _ = contour(&regions, tl, &contour_params, &c);
-                let _ = face(v(0.0, b), v(b, 10.0), tl, b, &c);
-                let _ = face(v(0.0, 0.0), v(10.0, 10.0), tl, 2.0, &c);
+                let _ = face(v(0.0, b), v(b, 10.0), tl, &FaceParams { stepover: b, inside: false, margin: b }, &c);
+                let _ = face(v(0.0, 0.0), v(10.0, 10.0), tl, &FaceParams { stepover: 2.0, inside: true, margin: b }, &c);
                 let _ = drill(&[v(b, 0.0)], tl, &DrillParams { peck: Some(b), dwell: b }, &c);
                 let _ = drill(&[v(1.0, 0.0)], tl, &DrillParams { peck: Some(b), dwell: 0.0 }, &c);
             }

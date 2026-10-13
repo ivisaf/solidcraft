@@ -15,6 +15,10 @@ use crate::viewport::Proj;
 
 const TOOL_KINDS: [&str; 3] = ["flat", "ball", "drill"];
 const SIDES: [&str; 3] = ["outside", "inside", "on"];
+/// What a facing operation's boundary is, when no faces are picked.
+const FACE_BOUNDS: [&str; 3] = ["stock", "part", "sketch"];
+/// Whether a facing operation cuts over its boundary or stays inside it.
+const FACE_LIMITS: [&str; 2] = ["over", "inside"];
 /// Tool axes a setup form offers; the last stands for a direction set by command, kept as it is.
 const AXES: [&str; 7] = ["+z", "-z", "+x", "-x", "+y", "-y", "custom"];
 const ANCHORS: [&str; 3] = ["min", "center", "max"];
@@ -103,6 +107,8 @@ pub struct SetupForm {
 pub struct Editing {
     pub setup: u64,
     pub op: u64,
+    /// Index into [`FACE_BOUNDS`] (facing only).
+    pub boundary: usize,
     pub sketch: String,
     pub faces: Vec<(String, Vec3)>,
 }
@@ -115,6 +121,11 @@ pub struct OpForm {
     /// That tool's flute count (0: not known), and the chip load the feed and speed make with it.
     pub flutes: u32,
     pub chip_load: String,
+    /// Facing: the boundary (index into [`FACE_BOUNDS`]), whether the tool cuts over it or stays
+    /// inside it (index into [`FACE_LIMITS`]), and by how much.
+    pub boundary: usize,
+    pub limit: usize,
+    pub margin: String,
     /// The operation being changed (`None`: a new one).
     pub editing: Option<Editing>,
     pub name: String,
@@ -378,6 +389,10 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             filled_for: String::new(),
             flutes: 0,
             chip_load: String::new(),
+            // Facing covers the stock when there is a body to have stock round, else a sketch.
+            boundary: if app.session.world_state().bodies.is_empty() { 2 } else { 0 },
+            limit: 0,
+            margin: String::new(),
             editing: None,
             name: String::new(),
             bottom: if faces.is_empty() { "-5 mm".into() } else { String::new() },
@@ -545,7 +560,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 // A new operation: what is empty is left to the command.
                 None => {
                     if f.faces.is_empty() {
-                        optional(&mut p, "sketch", &f.sketch);
+                        match (f.kind, f.boundary) {
+                            // Facing the stock is what the command does with nothing named.
+                            (OpKind::Face, 0) => {}
+                            (OpKind::Face, 1) => {
+                                p.insert("boundary".into(), json!("part"));
+                            }
+                            _ => optional(&mut p, "sketch", &f.sketch),
+                        }
                     }
                     optional(&mut p, "top", &f.top);
                     optional(&mut p, "bottom", &f.bottom);
@@ -558,15 +580,28 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     if f.kind == OpKind::Drill && f.peck.trim().is_empty() {
                         p.insert("peck".into(), Value::Null);
                     }
-                    if f.faces.is_empty() && (f.sketch.trim() != e.sketch || !e.faces.is_empty()) {
+                    let on_sketch = f.kind != OpKind::Face || f.boundary == 2;
+                    let was_on_sketch = f.kind != OpKind::Face || e.boundary == 2;
+                    if f.faces.is_empty() && on_sketch && (f.sketch.trim() != e.sketch || !e.faces.is_empty() || !was_on_sketch) {
                         p.insert("sketch".into(), json!(f.sketch.trim()));
+                    } else if f.faces.is_empty() && !on_sketch && (f.boundary != e.boundary || !e.faces.is_empty()) {
+                        p.insert("boundary".into(), json!(FACE_BOUNDS.get(f.boundary).copied().unwrap_or("stock")));
                     }
                     p.insert("op".into(), json!(e.op));
                     p.insert("setup".into(), json!(e.setup));
                 }
             }
             match f.kind {
-                OpKind::Face => optional(&mut p, "stepover", &f.stepover),
+                OpKind::Face => {
+                    optional(&mut p, "stepover", &f.stepover);
+                    p.insert("limit".into(), json!(FACE_LIMITS.get(f.limit).copied().unwrap_or("over")));
+                    // Left empty: over by the tool's radius, inside by nothing.
+                    if !f.margin.trim().is_empty() {
+                        p.insert("margin".into(), json!(f.margin.trim()));
+                    } else if f.editing.is_some() {
+                        p.insert("margin".into(), Value::Null);
+                    }
+                }
                 OpKind::Contour => {
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
@@ -687,6 +722,11 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         .filter_map(|f| Some((f["body"].as_str()?.to_string(), Vec3::new(f["at"]["x"].as_f64()?, f["at"]["y"].as_f64()?, f["at"]["z"].as_f64()?))))
         .collect();
     let inputs = &op["inputs"];
+    let boundary = match op["geometry"]["type"].as_str() {
+        Some("part") => 1,
+        Some("sketch") => 2,
+        _ => 0,
+    };
     Some(Form::Op(Box::new(OpForm {
         kind,
         // An operation's own values are shown; they are only replaced when another tool is chosen.
@@ -696,7 +736,10 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
             (Some(feed), Some(rpm)) if flutes > 0 && rpm > 0.0 => shown(feed / (rpm * f64::from(flutes)), 4),
             _ => String::new(),
         },
-        editing: Some(Editing { setup: setup["id"].as_u64()?, op: op["id"].as_u64()?, sketch: sketch.clone(), faces: faces.clone() }),
+        boundary,
+        limit: usize::from(inputs["inside"].as_bool().unwrap_or(false)),
+        margin: text(inputs, "margin"),
+        editing: Some(Editing { setup: setup["id"].as_u64()?, op: op["id"].as_u64()?, boundary, sketch: sketch.clone(), faces: faces.clone() }),
         name: text(op, "name"),
         faces,
         sketch,
@@ -768,11 +811,7 @@ fn prefill(f: &mut OpForm, lists: &Choices) {
     };
     let length = |v: Option<f64>| v.map(|x| format!("{x} mm")).unwrap_or_default();
     f.stepdown = length(data.stepdown);
-    // A pocket's passes are at most a radius apart.
-    f.stepover = length(match f.kind {
-        OpKind::Pocket => data.stepover.map(|s| s.min(data.diameter * 0.5)),
-        _ => data.stepover,
-    });
+    f.stepover = length(data.stepover);
 }
 
 /// Runs the open form's command; the form closes when the command succeeds.
@@ -1097,7 +1136,13 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
         Form::Op(f) => {
             field(ui, "Name", &mut f.name, "automatic");
             if f.faces.is_empty() {
-                pick(ui, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
+                // Facing covers a box: the stock's, the part's, or the one round a sketch's profiles.
+                if f.kind == OpKind::Face {
+                    choice(ui, "sc_cam_face_boundary", "Boundary", &mut f.boundary, &FACE_BOUNDS);
+                }
+                if f.kind != OpKind::Face || f.boundary == 2 {
+                    pick(ui, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
+                }
             } else {
                 ui.label("Faces");
                 ui.horizontal(|ui| {
@@ -1133,13 +1178,20 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             match f.kind {
                 OpKind::Face => {
                     field(ui, "Stepover", &mut f.stepover, "the tool's, or half its diameter");
+                    choice(ui, "sc_cam_face_limit", "Cut", &mut f.limit, &["over the boundary", "inside the boundary"]);
+                    field(
+                        ui,
+                        if f.limit == 0 { "Over by" } else { "Inside by" },
+                        &mut f.margin,
+                        if f.limit == 0 { "the tool's radius" } else { "0 mm" },
+                    );
                 }
                 OpKind::Contour => {
                     choice(ui, "sc_cam_side", "Side", &mut f.side, &SIDES);
                     field(ui, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                 }
                 OpKind::Pocket => {
-                    field(ui, "Stepover", &mut f.stepover, "40% of the tool diameter");
+                    field(ui, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
                     field(ui, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                 }
                 OpKind::Drill => {
@@ -1201,7 +1253,8 @@ struct Asked {
     edit_op: Option<(Value, Value)>,
     apply: bool,
     simulate: Option<u64>,
-    post: Option<(u64, String)>,
+    /// Write a program: the setup, one operation of it or all (`None`), and the setup's post.
+    post: Option<(u64, Option<(u64, String)>, String)>,
     import: bool,
     export: bool,
 }
@@ -1388,9 +1441,6 @@ fn manufacture_window(
                         if ui.add_enabled(has_ops, egui::Button::new("Simulate").small()).clicked() {
                             asked.simulate = Some(id);
                         }
-                        if ui.add_enabled(has_ops, egui::Button::new("Post…").small()).clicked() {
-                            asked.post = Some((id, text(setup, "post")));
-                        }
                         if ui.small_button("Remove").clicked() {
                             asked.run.push(("cam.setup.remove", json!({ "setup": id })));
                         }
@@ -1420,10 +1470,27 @@ fn manufacture_window(
                             if ui.small_button("Edit").clicked() {
                                 asked.edit_op = Some((setup.clone(), op.clone()));
                             }
+                            if ui
+                                .add_enabled(op.get("error").is_none(), egui::Button::new("Post").small())
+                                .on_hover_text("Write this operation alone as G-code")
+                                .clicked()
+                                && let Some(op_id) = op["id"].as_u64()
+                            {
+                                asked.post = Some((id, Some((op_id, text(op, "name"))), text(setup, "post")));
+                            }
                             if ui.small_button("Remove").clicked() {
                                 asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
                             }
                         });
+                    }
+                    // The setup's whole program: the one thing everything here leads to.
+                    ui.add_space(6.0);
+                    let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
+                    let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(14.0).color(t.text);
+                    let button = egui::Button::new(label).fill(t.accent_soft).min_size(egui::vec2(ui.available_width(), 32.0));
+                    if ui.add_enabled(has_ops, button).on_hover_text("Write every operation of this setup, in order, as one G-code program").clicked()
+                    {
+                        asked.post = Some((id, None, text(setup, "post")));
                     }
                 });
                 ui.add_space(4.0);
@@ -1500,17 +1567,30 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     {
         app.manufacture.error = run(app, "cam.library.export", json!({ "path": path })).err();
     }
-    if let Some((setup, post)) = asked.post {
+    if let Some((setup, op, post)) = asked.post {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());
-        if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f(&format!("program.{extension}"), &[extension.as_str()])) {
-            match app.run("cam.post", json!({ "setup": setup, "path": path })) {
-                Ok(v) => {
-                    app.manufacture.error = None;
-                    app.set_status(format!("Wrote {} lines of G-code", v["lines"].as_u64().unwrap_or(0)), false);
-                }
-                Err(e) => app.manufacture.error = Some(e),
-            }
+        // A file named after what is in it.
+        let stem: String =
+            op.as_ref().map_or("program", |(_, name)| name.as_str()).chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
+        let stem = if stem.trim().is_empty() { "program".to_string() } else { stem };
+        if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f(&format!("{stem}.{extension}"), &[extension.as_str()])) {
+            post_to(app, setup, op.map(|(id, _)| id), &path);
         }
+    }
+}
+
+/// Writes a setup's program, or one operation of it, to `path`.
+pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
+    let mut p = json!({ "setup": setup, "path": path });
+    if let Some(op) = op {
+        p["op"] = json!(op);
+    }
+    match app.run("cam.post", p) {
+        Ok(v) => {
+            app.manufacture.error = None;
+            app.set_status(format!("Wrote {} lines of G-code", v["lines"].as_u64().unwrap_or(0)), false);
+        }
+        Err(e) => app.manufacture.error = Some(e),
     }
 }
 
