@@ -521,7 +521,36 @@ fn tools_carry_cutting_data_and_libraries_move_between_designs() {
     run(&mut s, "cam.tool.define", json!({"number": 5, "kind": "flat", "diameter": 6, "feed": 1200, "plunge_feed": null}));
     let t = s.doc.manufacture.tool(5).unwrap().clone();
     assert_eq!((t.flutes, t.spindle_rpm, t.feed, t.plunge_feed), (3, Some(18000.0), Some(1200.0), None));
-    for bad in [json!({"flutes": 0}), json!({"flutes": 2.5}), json!({"feed": -1}), json!({"spindle_rpm": "fast"})] {
+    // Chip load ties feed to speed and flutes: 18000 rev/min × 3 flutes × 0.02 mm = 1080 mm/min.
+    let made =
+        run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "flutes": 3, "spindle_rpm": 18000, "chip_load": 0.02}));
+    close(made["tool"]["feed"].as_f64().unwrap(), 1080.0, 1e-6);
+    close(made["tool"]["chip_load"].as_f64().unwrap(), 0.02, 1e-9);
+    // A listing works it out from what the tool has: tool 5 runs 1200 mm/min at 18000 with 3 flutes.
+    let listed = run(&mut s, "cam.list", json!({}));
+    let five = listed["tools"].as_array().unwrap().iter().find(|t| t["number"] == 5).unwrap();
+    close(five["chip_load"].as_f64().unwrap(), 1200.0 / 54000.0, 1e-12);
+    assert!(listed["tools"][0].get("chip_load").is_none(), "tool 1 has no speed or feed");
+    // More flutes at the same chip load feed faster; a feed that contradicts the chip load is refused.
+    let made = run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "flutes": 4, "chip_load": 0.02}));
+    close(made["tool"]["feed"].as_f64().unwrap(), 1440.0, 1e-6);
+    let p = json!({"number": 8, "kind": "flat", "diameter": 6, "chip_load": 0.02, "feed": 900});
+    assert!(s.execute("cam.tool.define", &p).unwrap_err().to_string().contains("disagree"));
+    run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "chip_load": 0.02, "feed": 1440}));
+    assert!(
+        s.execute("cam.tool.define", &json!({"number": 9, "kind": "flat", "diameter": 6, "chip_load": 0.02}))
+            .unwrap_err()
+            .to_string()
+            .contains("needs a `spindle_rpm`")
+    );
+    run(&mut s, "cam.tool.remove", json!({"number": 8}));
+    for bad in [
+        json!({"flutes": 0}),
+        json!({"flutes": 2.5}),
+        json!({"feed": -1}),
+        json!({"spindle_rpm": "fast"}),
+        json!({"chip_load": 0, "spindle_rpm": 1000}),
+    ] {
         let mut p = json!({"number": 6, "kind": "flat", "diameter": 6});
         for (k, v) in bad.as_object().unwrap() {
             p[k] = v.clone();

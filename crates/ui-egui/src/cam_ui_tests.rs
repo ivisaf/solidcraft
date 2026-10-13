@@ -292,6 +292,17 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     assert!(h.app.session.doc.manufacture.tools.is_empty());
     h.frames(2);
     assert!(h.widget("TOOL LIBRARY").is_some() && h.widget("T1  Rougher").is_some() && h.widget("18000").is_some() && h.widget("New Tool").is_some());
+    // 1500 mm/min at 18000 rev/min with 3 flutes is 0.0278 mm a tooth; no form is open until one is asked for.
+    assert!(h.widget("0.0278").is_some() && h.widget("Pick a tool to change or remove it").is_some());
+    assert!(
+        h.app.manufacture.form.is_none()
+            && h.widget("NEW TOOL").is_none()
+            && h.widget("Diameter").is_some_and(|_| h.widget("Flute length").is_none())
+    );
+    // Picking the tool offers what can be done with it.
+    h.app.manufacture.selected_tool = Some((true, 1));
+    h.frames(2);
+    assert!(h.widget("Edit").is_some() && h.widget("Remove").is_some() && h.widget("Pick a tool to change or remove it").is_none());
     // Edit fills the form from the tool; an emptied feed is cleared, the number stays.
     let library = library_listing(&mut h.app, true);
     let Some(Form::Tool(mut form)) = tool_form(&library["tools"][0], true) else { panic!("no form") };
@@ -299,10 +310,33 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
         (form.number.as_str(), form.diameter.as_str(), form.flutes.as_str(), form.feed.as_str(), form.plunge_feed.as_str(), form.stepover.as_str()),
         ("1", "6 mm", "3", "1500", "", "2")
     );
+    assert_eq!(form.chip_load, "0.0278");
     form.plunge_feed = "400".into();
-    h.app.manufacture.form = Some(Form::Tool(form));
+    h.app.manufacture.form = Some(Form::Tool(form.clone()));
     apply(&mut h.app);
     assert_eq!(h.app.manufacture.error, None);
+    // Speed, flutes, chip load and feed move together.
+    let (mut feed, mut chip) = ("1500".to_string(), "0.0278".to_string());
+    link_chip_load("18000", Some(3.0), &mut feed, &mut chip, false, false, true);
+    assert_eq!(feed, "1501.2", "a typed chip load gives the feed");
+    chip = "0.02".into();
+    link_chip_load("18000", Some(4.0), &mut feed, &mut chip, true, false, false);
+    assert_eq!((feed.as_str(), chip.as_str()), ("1440", "0.02"), "another flute count at the same chip load");
+    feed = "720".into();
+    link_chip_load("18000", Some(4.0), &mut feed, &mut chip, false, true, false);
+    assert_eq!(chip, "0.01", "a typed feed gives the chip load");
+    link_chip_load("", Some(4.0), &mut feed, &mut chip, false, true, false);
+    assert_eq!((feed.as_str(), chip.as_str()), ("720", "0.01"), "nothing to work out without a speed");
+    // A new tool given a chip load and no feed gets its feed from the engine: 20000 × 2 × 0.015.
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        tool.number = "40".into();
+        tool.spindle_rpm = "20000".into();
+        tool.chip_load = "0.015".into();
+    });
+    let library = library_listing(&mut h.app, true);
+    assert_eq!(library["tools"][1]["feed"], 600.0);
+    run(&mut h.app, "cam.library.remove", json!({"number": 40})).unwrap();
 
     // An operation form shows the tool's speed, feeds, stepdown and stepover, to keep or change.
     h.app.run("sketch.create", json!({"plane": "XY", "name": "Pocket"})).unwrap();
@@ -312,6 +346,7 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     fill(&mut h, "cam.op.pocket", |f| {
         let Form::Op(op) = f else { panic!("not an operation form") };
         assert_eq!((op.tool.as_str(), op.spindle_rpm.as_str(), op.feed.as_str(), op.plunge_feed.as_str()), ("1", "18000", "1500", "400"));
+        assert_eq!((op.flutes, op.chip_load.as_str()), (3, "0.0278"));
         assert_eq!((op.stepdown.as_str(), op.stepover.as_str()), ("1.5 mm", "2 mm"));
         // This operation runs slower; the tool keeps its own feed.
         op.feed = "900".into();
@@ -349,6 +384,9 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     h.app.manufacture.form = Some(Form::Tool(form));
     apply(&mut h.app);
     h.frames(2);
+    assert!(h.widget("changed since this design copied it").is_some());
+    h.app.manufacture.selected_tool = Some((true, 1));
+    h.frames(2);
     assert!(h.widget("Update this design").is_some());
     assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1500.0));
     run(&mut h.app, "cam.tool.update", json!({"number": 1})).unwrap();
@@ -357,7 +395,10 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     h.app.run("cam.tool.define", json!({"number": 30, "kind": "drill", "diameter": 3})).unwrap();
     h.app.manufacture.form = None;
     h.frames(2);
-    assert!(h.widget("Only in this design").is_some() && h.widget("Add to library").is_some());
+    assert!(h.widget("Only in this design").is_some());
+    h.app.manufacture.selected_tool = Some((false, 30));
+    h.frames(2);
+    assert!(h.widget("Add to library").is_some());
     run(&mut h.app, "cam.library.add", json!({"number": 30})).unwrap();
     assert_eq!(library_listing(&mut h.app, true)["tools"].as_array().map(Vec::len), Some(3));
 }
@@ -375,7 +416,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
         h.app.start(c.id);
         assert_eq!(
             (h.app.manufacture.open, h.app.manufacture.tools_open),
-            (!c.id.starts_with("cam.tool."), c.id.starts_with("cam.tool.")),
+            (!c.id.starts_with("cam.library."), c.id.starts_with("cam.library.")),
             "{}",
             c.id
         );

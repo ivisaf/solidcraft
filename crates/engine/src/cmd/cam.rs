@@ -43,16 +43,16 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define)
-        .at("MANUFACTURE", "SETUP")
-        .icon("cam_tool")
         .params(
             "number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
-             from (null clears one) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
+             from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
     CommandSpec::new("cam.tool.update", "Update Design Tools", tool_update)
         .params("number?: one tool (default: every tool) — replaces this design's copy with the machine library's tool of that number where they differ; library? → updated: tool numbers"),
-    CommandSpec::new("cam.library.list", "Machine Tool Library", library_list)
+    CommandSpec::new("cam.library.list", "Tool Library", library_list)
+        .at("MANUFACTURE", "SETUP")
+        .icon("cam_tool")
         .noundo()
         .params("library?: file (default: the machine's library) → path, tools (each with design: absent|same|differs, this design's copy against it), only_in_design"),
     CommandSpec::new("cam.library.define", "Define Library Tool", library_define)
@@ -193,6 +193,24 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         None => was.map_or(2, |t| t.flutes),
         Some(v) => v.as_u64().filter(|n| (1..=100).contains(n)).ok_or_else(|| bad(cmd, "`flutes` must be 1 to 100"))? as u32,
     };
+    let spindle_rpm = data("spindle_rpm", was.and_then(|t| t.spindle_rpm))?;
+    let mut feed = data("feed", was.and_then(|t| t.feed))?;
+    // Chip load (feed per tooth) ties the feed to the speed and the flutes: feed = speed × flutes × chip load.
+    if p.get("chip_load").is_some_and(|v| !v.is_null()) {
+        let chip = num(p, "chip_load").filter(|c| *c > 0.0 && *c <= 100.0).ok_or_else(|| bad(cmd, "`chip_load` must be above 0 (mm per tooth)"))?;
+        let rpm = spindle_rpm.ok_or_else(|| bad(cmd, "`chip_load` needs a `spindle_rpm` to work the feed out from"))?;
+        let from_chip = (rpm * f64::from(flutes) * chip * 1e6).round() / 1e6;
+        match p.get("feed").filter(|v| !v.is_null()).and(feed) {
+            Some(given) if (given - from_chip).abs() > from_chip * 0.005 => {
+                return Err(bad(
+                    cmd,
+                    format!("`feed` {given} and `chip_load` {chip} disagree: at {rpm} rev/min with {flutes} flutes the chip load gives {from_chip}"),
+                ));
+            }
+            Some(_) => {}
+            None => feed = Some(from_chip),
+        }
+    }
     let tool = Tool {
         number,
         kind,
@@ -200,14 +218,23 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         flute_length,
         description,
         flutes,
-        spindle_rpm: data("spindle_rpm", was.and_then(|t| t.spindle_rpm))?,
-        feed: data("feed", was.and_then(|t| t.feed))?,
+        spindle_rpm,
+        feed,
         plunge_feed: data("plunge_feed", was.and_then(|t| t.plunge_feed))?,
         stepdown: data("stepdown", was.and_then(|t| t.stepdown))?,
         stepover: data("stepover", was.and_then(|t| t.stepover))?,
     };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(tool)
+}
+
+/// A tool for a listing: itself, and its chip load (mm per tooth) when its speed and feed say what it is.
+fn tool_json(tool: &Tool) -> Value {
+    let mut v = json!(tool);
+    if let (Some(rpm), Some(feed)) = (tool.spindle_rpm, tool.feed) {
+        v["chip_load"] = json!(feed / (rpm * f64::from(tool.flutes)));
+    }
+    v
 }
 
 fn tool_define(s: &mut Session, p: &Value) -> Result<Value> {
@@ -222,7 +249,7 @@ fn tool_define(s: &mut Session, p: &Value) -> Result<Value> {
     tools.retain(|t| t.number != tool.number);
     tools.push(tool.clone());
     tools.sort_by_key(|t| t.number);
-    Ok(json!({ "tool": tool }))
+    Ok(json!({ "tool": tool_json(&tool) }))
 }
 
 /// The machine's library file a command works on: `library`, else the default.
@@ -245,7 +272,7 @@ fn library_list(s: &mut Session, p: &Value) -> Result<Value> {
     let tools: Vec<Value> = toollib::load(&path)?
         .iter()
         .map(|tool| {
-            let mut v = json!(tool);
+            let mut v = tool_json(tool);
             // How this design's copy of the tool stands: none, the same, or changed since.
             v["design"] = json!(match s.doc.manufacture.tool(tool.number) {
                 None => "absent",
@@ -256,7 +283,7 @@ fn library_list(s: &mut Session, p: &Value) -> Result<Value> {
         })
         .collect();
     let numbers: Vec<u32> = tools.iter().filter_map(|t| t["number"].as_u64()).map(|n| n as u32).collect();
-    let only_in_design: Vec<&Tool> = s.doc.manufacture.tools.iter().filter(|t| !numbers.contains(&t.number)).collect();
+    let only_in_design: Vec<Value> = s.doc.manufacture.tools.iter().filter(|t| !numbers.contains(&t.number)).map(tool_json).collect();
     Ok(json!({"path": path, "tools": tools, "only_in_design": only_in_design}))
 }
 
@@ -274,7 +301,7 @@ fn library_define(s: &mut Session, p: &Value) -> Result<Value> {
     tools.push(tool.clone());
     tools.sort_by_key(|t| t.number);
     toollib::save(&path, &tools)?;
-    Ok(json!({ "tool": tool, "path": path }))
+    Ok(json!({ "tool": tool_json(&tool), "path": path }))
 }
 
 fn library_remove(_: &mut Session, p: &Value) -> Result<Value> {
@@ -1243,7 +1270,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
             v
         })
         .collect();
-    Ok(json!({ "tools": m.tools, "setups": setups, "posts": Post::BUILTIN }))
+    Ok(json!({ "tools": m.tools.iter().map(tool_json).collect::<Vec<_>>(), "setups": setups, "posts": Post::BUILTIN }))
 }
 
 fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
