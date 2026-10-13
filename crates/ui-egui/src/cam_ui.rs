@@ -15,6 +15,11 @@ use crate::viewport::Proj;
 
 const TOOL_KINDS: [&str; 3] = ["flat", "ball", "drill"];
 const SIDES: [&str; 3] = ["outside", "inside", "on"];
+/// Tool axes a setup form offers; the last stands for a direction set by command, kept as it is.
+const AXES: [&str; 7] = ["+z", "-z", "+x", "-x", "+y", "-y", "custom"];
+const ANCHORS: [&str; 3] = ["min", "center", "max"];
+/// What the work origin is on.
+const ORIGINS: [&str; 3] = ["stock box", "part box", "world point"];
 /// Most toolpath segments drawn.
 const MAX_SEGMENTS: usize = 400_000;
 
@@ -48,9 +53,42 @@ impl OpKind {
 /// What is being typed for the command the toolbar started.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Form {
-    Tool { number: String, kind: usize, diameter: String, flute_length: String, description: String },
-    Setup { name: String, origin: [String; 3], post: usize },
+    Tool(Box<ToolForm>),
+    Setup(Box<SetupForm>),
     Op(Box<OpForm>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolForm {
+    /// Changing a tool that is in the library (its number then stays).
+    pub editing: bool,
+    pub number: String,
+    pub kind: usize,
+    pub diameter: String,
+    pub flute_length: String,
+    pub description: String,
+    pub flutes: String,
+    pub spindle_rpm: String,
+    pub feed: String,
+    pub plunge_feed: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupForm {
+    /// The setup being changed (`None`: a new one).
+    pub editing: Option<u64>,
+    pub name: String,
+    /// Index into [`AXES`].
+    pub axis: usize,
+    /// Index into [`ORIGINS`], then where on the box ([`ANCHORS`] per axis) or which point.
+    pub origin: usize,
+    pub anchors: [usize; 3],
+    pub point: [String; 3],
+    /// Stock offsets.
+    pub side: String,
+    pub top: String,
+    pub bottom: String,
+    pub post: usize,
 }
 
 /// The operation a form edits, and the geometry it had when the form opened.
@@ -91,6 +129,8 @@ pub struct OpForm {
 /// The cut stock as columns in world coordinates (see `cam.simulate`'s `field`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StockField {
+    /// The setup's work frame in the world: origin, X, Y, Z. Columns are in work coordinates.
+    pub frame: [Vec3; 4],
     pub origin: [f64; 2],
     pub cell: f64,
     pub nx: usize,
@@ -107,7 +147,9 @@ impl StockField {
         let (nx, ny) = (v["nx"].as_u64()? as usize, v["ny"].as_u64()? as usize);
         let z = numbers("z")?;
         let deviation = numbers("deviation").unwrap_or_default();
+        let f = &v["frame"];
         (nx.checked_mul(ny) == Some(z.len()) && (deviation.is_empty() || deviation.len() == z.len())).then_some(StockField {
+            frame: [point(&f["origin"])?, point(&f["x"])?, point(&f["y"])?, point(&f["z"])?],
             origin: [v["origin"][0].as_f64()?, v["origin"][1].as_f64()?],
             cell: v["cell"].as_f64()?,
             nx,
@@ -118,12 +160,19 @@ impl StockField {
         })
     }
 
-    /// The top of column `(i, j)`: its centre at its height, and its deviation from the part.
-    fn column(&self, i: usize, j: usize) -> Option<(Vec3, f64)> {
+    /// A point in work coordinates, in the world.
+    fn world(&self, q: Vec3) -> Vec3 {
+        let [o, x, y, z] = self.frame;
+        o + x * q.x + y * q.y + z * q.z
+    }
+
+    /// Column `(i, j)` in the world: the top of it at its centre, the point on the floor
+    /// under that, and its deviation from the part.
+    fn column(&self, i: usize, j: usize) -> Option<(Vec3, Vec3, f64)> {
         let k = j.checked_mul(self.nx)?.checked_add(i)?;
         let z = *self.z.get(k).filter(|_| i < self.nx && j < self.ny)?;
-        let p = Vec3::new(self.origin[0] + (i as f64 + 0.5) * self.cell, self.origin[1] + (j as f64 + 0.5) * self.cell, z);
-        Some((p, self.deviation.get(k).copied().unwrap_or(0.0)))
+        let (cx, cy) = (self.origin[0] + (i as f64 + 0.5) * self.cell, self.origin[1] + (j as f64 + 0.5) * self.cell);
+        Some((self.world(Vec3::new(cx, cy, z)), self.world(Vec3::new(cx, cy, self.floor)), self.deviation.get(k).copied().unwrap_or(0.0)))
     }
 }
 
@@ -170,16 +219,15 @@ pub fn stock_triangles(field: &StockField) -> Vec<([Vec3; 3], StockMark)> {
             else {
                 continue;
             };
-            out.push(([a.0, b.0, c.0], mark([a.1, b.1, c.1])));
-            out.push(([a.0, c.0, d.0], mark([a.1, c.1, d.1])));
+            out.push(([a.0, b.0, c.0], mark([a.2, b.2, c.2])));
+            out.push(([a.0, c.0, d.0], mark([a.2, c.2, d.2])));
         }
     }
     // Walls round the edge, outward-facing: along each side, from the top's rim down to the floor.
-    let down = |p: Vec3| Vec3::new(p.x, p.y, field.floor);
-    let mut wall = |a: Option<(Vec3, f64)>, b: Option<(Vec3, f64)>| {
-        if let (Some((a, _)), Some((b, _))) = (a, b) {
-            out.push(([a, down(a), down(b)], StockMark::Fine));
-            out.push(([a, down(b), b], StockMark::Fine));
+    let mut wall = |a: Option<(Vec3, Vec3, f64)>, b: Option<(Vec3, Vec3, f64)>| {
+        if let (Some((a, a_floor, _)), Some((b, b_floor, _))) = (a, b) {
+            out.push(([a, a_floor, b_floor], StockMark::Fine));
+            out.push(([a, b_floor, b], StockMark::Fine));
         }
     };
     let (lx, ly) = (field.nx.saturating_sub(1), field.ny.saturating_sub(1));
@@ -217,12 +265,22 @@ pub fn stock_scene(app: &SolveApp, sc: &mut crate::gpu::GpuScene) {
 /// One operation's toolpath in world coordinates: `(point, reached at feed)`.
 pub type Path = Vec<(Vec3, bool)>;
 
+/// A setup as the viewport shows it: its work frame (origin, X, Y, Z in the world) and its
+/// stock box in work coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetupView {
+    pub frame: [Vec3; 4],
+    pub stock: Option<(Vec3, Vec3)>,
+}
+
 pub struct CamUi {
     pub open: bool,
+    /// The Tool Library window.
+    pub tools_open: bool,
+    /// Whether setups' stock boxes and work origins are drawn.
+    pub show_setups: bool,
     pub form: Option<Form>,
     pub show_paths: bool,
-    /// Index into the engine's post list.
-    pub post: usize,
     pub error: Option<String>,
     /// The last simulation: what it found, and its warnings.
     pub simulation: Option<(Vec<String>, Vec<String>)>,
@@ -232,16 +290,17 @@ pub struct CamUi {
     /// Counts changes of `stock` (the viewport redraws when it moves on).
     stock_stamp: u64,
     /// The toolpaths of every setup, for the design revision they were worked out at.
-    cache: Option<(u64, Vec<Path>)>,
+    cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
 }
 
 impl Default for CamUi {
     fn default() -> Self {
         CamUi {
             open: false,
+            tools_open: false,
+            show_setups: true,
             form: None,
             show_paths: true,
-            post: 0,
             error: None,
             simulation: None,
             stock: None,
@@ -250,6 +309,12 @@ impl Default for CamUi {
             cache: None,
         }
     }
+}
+
+/// A point as the engine writes one: `[x, y, z]` or `{x, y, z}`.
+fn point(v: &Value) -> Option<Vec3> {
+    let c = |i: usize, k: &str| v.get(i).or_else(|| v.get(k)).and_then(Value::as_f64);
+    Some(Vec3::new(c(0, "x")?, c(1, "y")?, c(2, "z")?))
 }
 
 fn text(v: &Value, k: &str) -> String {
@@ -272,6 +337,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     }
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
     let first_tool = listed["tools"].get(0).and_then(|t| t["number"].as_u64()).map(|n| n.to_string()).unwrap_or_default();
+    let tool_has = |k: &str| listed["tools"].get(0).is_some_and(|t| t[k].as_f64().is_some());
     let op = |kind: OpKind| {
         let sketch = app
             .session
@@ -291,8 +357,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             faces,
             sketch,
             tool: first_tool.clone(),
-            spindle_rpm: "10000".into(),
-            feed: "600".into(),
+            // Left empty, speed and feeds are the tool's own.
+            spindle_rpm: if tool_has("spindle_rpm") { String::new() } else { "10000".into() },
+            feed: if tool_has("feed") { String::new() } else { "600".into() },
             plunge_feed: String::new(),
             top: String::new(),
             stepdown: String::new(),
@@ -308,14 +375,31 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     };
     let next_number = (1u64..).find(|n| !listed["tools"].as_array().is_some_and(|a| a.iter().any(|t| t["number"].as_u64() == Some(*n)))).unwrap_or(1);
     let form = match id {
-        "cam.tool.define" => Some(Form::Tool {
+        "cam.tool.define" => Some(Form::Tool(Box::new(ToolForm {
+            editing: false,
             number: next_number.to_string(),
             kind: 0,
             diameter: "6 mm".into(),
             flute_length: String::new(),
             description: String::new(),
-        }),
-        "cam.setup.create" => Some(Form::Setup { name: String::new(), origin: ["0".into(), "0".into(), "0".into()], post: 0 }),
+            flutes: "2".into(),
+            spindle_rpm: String::new(),
+            feed: String::new(),
+            plunge_feed: String::new(),
+        }))),
+        "cam.setup.create" => Some(Form::Setup(Box::new(SetupForm {
+            editing: None,
+            name: String::new(),
+            axis: 0,
+            // With a body to put a box round: the stock's top at its lowest X and Y.
+            origin: if app.session.world_state().bodies.is_empty() { 2 } else { 0 },
+            anchors: [0, 0, 2],
+            point: ["0".into(), "0".into(), "0".into()],
+            side: String::new(),
+            top: String::new(),
+            bottom: String::new(),
+            post: 0,
+        }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
         "cam.op.pocket" => Some(op(OpKind::Pocket)),
@@ -328,7 +412,12 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     if id == "cam.simulate" {
         simulate(app);
     }
-    app.manufacture.open = true;
+    // Tools have a window of their own.
+    if id.starts_with("cam.tool.") {
+        app.manufacture.tools_open = true;
+    } else {
+        app.manufacture.open = true;
+    }
     app.manufacture.form = form;
     app.manufacture.error = None;
     true
@@ -344,20 +433,65 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
         }
     }
     match form {
-        Form::Tool { number: n, kind, diameter, flute_length, description } => {
-            optional(&mut p, "diameter", diameter);
-            optional(&mut p, "flute_length", flute_length);
-            optional(&mut p, "description", description);
-            p.insert("number".into(), json!(number("The tool number", n)? as u64));
-            p.insert("kind".into(), json!(TOOL_KINDS.get(*kind).copied().unwrap_or("flat")));
+        Form::Tool(f) => {
+            optional(&mut p, "diameter", &f.diameter);
+            optional(&mut p, "flute_length", &f.flute_length);
+            optional(&mut p, "description", &f.description);
+            p.insert("number".into(), json!(number("The tool number", &f.number)? as u64));
+            p.insert("kind".into(), json!(TOOL_KINDS.get(f.kind).copied().unwrap_or("flat")));
+            if !f.flutes.trim().is_empty() {
+                p.insert("flutes".into(), json!(number("The number of flutes", &f.flutes)? as u64));
+            }
+            // An emptied speed or feed is cleared on a tool being edited.
+            for (k, what, text) in [
+                ("spindle_rpm", "The spindle speed", &f.spindle_rpm),
+                ("feed", "The feed", &f.feed),
+                ("plunge_feed", "The plunge feed", &f.plunge_feed),
+            ] {
+                if !text.trim().is_empty() {
+                    p.insert(k.into(), json!(number(what, text)?));
+                } else if f.editing {
+                    p.insert(k.into(), Value::Null);
+                }
+            }
             Ok(("cam.tool.define", Value::Object(p)))
         }
-        Form::Setup { name, origin, post } => {
-            optional(&mut p, "name", name);
-            let [x, y, z] = origin;
-            p.insert("origin".into(), json!([number("The origin's X", x)?, number("The origin's Y", y)?, number("The origin's Z", z)?]));
-            p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(*post).copied().unwrap_or("rs274")));
-            Ok(("cam.setup.create", Value::Object(p)))
+        Form::Setup(f) => {
+            optional(&mut p, "name", &f.name);
+            if let Some(axis) = AXES.get(f.axis).filter(|a| **a != "custom") {
+                p.insert("axis".into(), json!(axis));
+            }
+            let origin = match f.origin {
+                2 => {
+                    let [x, y, z] = &f.point;
+                    json!([number("The origin's X", x)?, number("The origin's Y", y)?, number("The origin's Z", z)?])
+                }
+                of => {
+                    let at = |i: usize| f.anchors.get(i).and_then(|a| ANCHORS.get(*a)).copied().unwrap_or("min");
+                    json!({"of": if of == 1 { "part" } else { "stock" }, "x": at(0), "y": at(1), "z": at(2)})
+                }
+            };
+            p.insert("origin".into(), origin);
+            let mut stock = serde_json::Map::new();
+            for (k, text) in [("side", &f.side), ("top", &f.top), ("bottom", &f.bottom)] {
+                // Emptied on an edit means no offset; left empty on a new setup too.
+                if !text.trim().is_empty() {
+                    stock.insert(k.into(), json!(text.trim()));
+                } else if f.editing.is_some() {
+                    stock.insert(k.into(), json!(0));
+                }
+            }
+            if !stock.is_empty() {
+                p.insert("stock".into(), Value::Object(stock));
+            }
+            p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(f.post).copied().unwrap_or("rs274")));
+            match f.editing {
+                Some(id) => {
+                    p.insert("setup".into(), json!(id));
+                    Ok(("cam.setup.edit", Value::Object(p)))
+                }
+                None => Ok(("cam.setup.create", Value::Object(p))),
+            }
         }
         Form::Op(f) => {
             optional(&mut p, "name", &f.name);
@@ -404,10 +538,15 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("faces".into(), json!(faces));
             }
             p.insert("tool".into(), json!(number("The tool", &f.tool)? as u64));
-            p.insert("spindle_rpm".into(), json!(number("The spindle speed", &f.spindle_rpm)?));
-            p.insert("feed".into(), json!(number("The feed", &f.feed)?));
-            if !f.plunge_feed.trim().is_empty() {
-                p.insert("plunge_feed".into(), json!(number("The plunge feed", &f.plunge_feed)?));
+            // Left empty, speed and feeds are the tool's own (or, on an edit, stay as they are).
+            for (k, what, text) in [
+                ("spindle_rpm", "The spindle speed", &f.spindle_rpm),
+                ("feed", "The feed", &f.feed),
+                ("plunge_feed", "The plunge feed", &f.plunge_feed),
+            ] {
+                if !text.trim().is_empty() {
+                    p.insert(k.into(), json!(number(what, text)?));
+                }
             }
             if f.kind == OpKind::Drill && !f.dwell.trim().is_empty() {
                 p.insert("dwell".into(), json!(number("The dwell", &f.dwell)?));
@@ -422,6 +561,55 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             Ok((if f.editing.is_some() { "cam.op.edit" } else { f.kind.command() }, Value::Object(p)))
         }
     }
+}
+
+/// A form filled in from a tool as `cam.list` reports it.
+pub fn tool_form(tool: &Value) -> Option<Form> {
+    let number = |k: &str| tool[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
+    let kind = match tool["kind"].as_str()? {
+        "ball_endmill" => 1,
+        "drill" => 2,
+        _ => 0,
+    };
+    Some(Form::Tool(Box::new(ToolForm {
+        editing: true,
+        number: tool["number"].as_u64()?.to_string(),
+        kind,
+        diameter: format!("{} mm", tool["diameter"].as_f64()?),
+        flute_length: format!("{} mm", tool["flute_length"].as_f64()?),
+        description: text(tool, "description"),
+        flutes: number("flutes"),
+        spindle_rpm: number("spindle_rpm"),
+        feed: number("feed"),
+        plunge_feed: number("plunge_feed"),
+    })))
+}
+
+/// A form filled in from a setup as `cam.list` reports it.
+pub fn setup_form(setup: &Value) -> Option<Form> {
+    let axis = point(&setup["axis"])?;
+    let named = [(0.0, 0.0, 1.0), (0.0, 0.0, -1.0), (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)];
+    let axis = named.iter().position(|d| axis.dist(Vec3::new(d.0, d.1, d.2)) < 1e-9).unwrap_or(AXES.len() - 1);
+    let origin = &setup["origin"];
+    let anchor = |k: &str| ANCHORS.iter().position(|a| Some(*a) == origin[k].as_str()).unwrap_or(0);
+    let at = point(&origin["at"]).unwrap_or(Vec3::ZERO);
+    let offset = |k: &str| Some(text(&setup["stock"], k)).filter(|e| !matches!(e.as_str(), "0" | "0 mm")).unwrap_or_default();
+    Some(Form::Setup(Box::new(SetupForm {
+        editing: Some(setup["id"].as_u64()?),
+        name: text(setup, "name"),
+        axis,
+        origin: match (origin["type"].as_str(), origin["of"].as_str()) {
+            (Some("box"), Some("part")) => 1,
+            (Some("box"), _) => 0,
+            _ => 2,
+        },
+        anchors: [anchor("x"), anchor("y"), anchor("z")],
+        point: [at.x.to_string(), at.y.to_string(), at.z.to_string()],
+        side: offset("side"),
+        top: offset("top"),
+        bottom: offset("bottom"),
+        post: solidcraft_engine::cam::Post::BUILTIN.iter().position(|p| Some(*p) == setup["post"].as_str()).unwrap_or(0),
+    })))
 }
 
 /// A form filled in from an operation as `cam.list` reports it.
@@ -478,12 +666,16 @@ pub fn apply(app: &mut SolveApp) {
     }
 }
 
-/// Runs `cam.simulate` on the first setup and keeps what it found for the window.
+/// Simulates the first setup (what the toolbar's Simulate does).
 pub fn simulate(app: &mut SolveApp) {
-    let Some(setup) = app.session.doc.manufacture.setups.first().map(|s| s.id) else {
-        app.manufacture.error = Some("There is no setup to simulate".into());
-        return;
-    };
+    match app.session.doc.manufacture.setups.first().map(|s| s.id) {
+        Some(setup) => simulate_setup(app, setup),
+        None => app.manufacture.error = Some("There is no setup to simulate".into()),
+    }
+}
+
+/// Runs `cam.simulate` on a setup and keeps what it found for the window.
+pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
     app.manufacture.stock_stamp += 1;
     match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true })) {
         Ok(v) => {
@@ -506,33 +698,72 @@ pub fn simulate(app: &mut SolveApp) {
     }
 }
 
-/// The toolpaths to draw, worked out again when the design has changed.
-pub fn paths(app: &mut SolveApp) -> &[Path] {
+/// Works the toolpaths and the setups' frames out again when the design has changed.
+fn refresh(app: &mut SolveApp) {
     let revision = app.session.revision;
-    if app.manufacture.cache.as_ref().is_none_or(|(r, _)| *r != revision) {
-        let setups: Vec<u64> = app.session.doc.manufacture.setups.iter().map(|s| s.id).collect();
-        let mut all = Vec::new();
-        for setup in setups {
-            // A setup with an operation that cannot be cut draws nothing; the window says why.
-            let Ok(v) = app.session.execute("cam.toolpath", &json!({ "setup": setup })) else { continue };
-            for op in v["operations"].as_array().into_iter().flatten() {
-                let path: Path = op["points"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|p| Some((Vec3::new(p.get(0)?.as_f64()?, p.get(1)?.as_f64()?, p.get(2)?.as_f64()?), p.get(3)?.as_bool()?)))
-                    .collect();
-                all.push(path);
+    if app.manufacture.cache.as_ref().is_some_and(|(r, ..)| *r == revision) {
+        return;
+    }
+    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let (mut all, mut views) = (Vec::new(), Vec::new());
+    for setup in listed["setups"].as_array().into_iter().flatten() {
+        let f = &setup["frame"];
+        if let (Some(o), Some(x), Some(y), Some(z)) = (point(&f["origin"]), point(&f["x"]), point(&f["y"]), point(&f["z"])) {
+            let b = &setup["stock_box"];
+            views.push(SetupView { frame: [o, x, y, z], stock: point(&b["min"]).zip(point(&b["max"])) });
+        }
+        // A setup with an operation that cannot be cut draws no toolpath; the window says why.
+        let Ok(v) = app.session.execute("cam.toolpath", &json!({ "setup": setup["id"] })) else { continue };
+        for op in v["operations"].as_array().into_iter().flatten() {
+            let path: Path = op["points"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| Some((Vec3::new(p.get(0)?.as_f64()?, p.get(1)?.as_f64()?, p.get(2)?.as_f64()?), p.get(3)?.as_bool()?)))
+                .collect();
+            all.push(path);
+        }
+    }
+    // A simulation of the design as it was says nothing about it now.
+    app.manufacture.simulation = None;
+    app.manufacture.stock = None;
+    app.manufacture.stock_stamp += 1;
+    // These commands are not changes, but keep the key the revision as it is now.
+    app.manufacture.cache = Some((app.session.revision, all, views));
+}
+
+/// The toolpaths to draw.
+pub fn paths(app: &mut SolveApp) -> &[Path] {
+    refresh(app);
+    app.manufacture.cache.as_ref().map_or(&[], |(_, p, _)| p.as_slice())
+}
+
+/// The setups to draw.
+pub fn setup_views(app: &mut SolveApp) -> &[SetupView] {
+    refresh(app);
+    app.manufacture.cache.as_ref().map_or(&[], |(_, _, v)| v.as_slice())
+}
+
+/// The world edges of a setup's stock box and the three arms of its work origin (`X`, `Y`, `Z`).
+pub fn setup_lines(view: &SetupView) -> (Vec<(Vec3, Vec3)>, [(Vec3, Vec3); 3]) {
+    let [o, x, y, z] = view.frame;
+    let world = |q: Vec3| o + x * q.x + y * q.y + z * q.z;
+    let mut edges = Vec::new();
+    let mut size = 20.0;
+    if let Some((lo, hi)) = view.stock {
+        let corner = |i: usize| {
+            world(Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }))
+        };
+        for i in 0..8usize {
+            for bit in [1usize, 2, 4] {
+                if i & bit == 0 {
+                    edges.push((corner(i), corner(i | bit)));
+                }
             }
         }
-        // A simulation of the design as it was says nothing about it now.
-        app.manufacture.simulation = None;
-        app.manufacture.stock = None;
-        app.manufacture.stock_stamp += 1;
-        // `cam.toolpath` is not a change, but keep the key the revision as it is now.
-        app.manufacture.cache = Some((app.session.revision, all));
+        size = (hi - lo).len() * 0.15;
     }
-    app.manufacture.cache.as_ref().map_or(&[], |(_, p)| p.as_slice())
+    (edges, [(o, o + x * size), (o, o + y * size), (o, o + z * size)])
 }
 
 /// The screen segments of the toolpaths: `(from, to, cutting)`.
@@ -541,7 +772,7 @@ pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, boo
     if !(app.manufacture.open && app.manufacture.show_paths) {
         return out;
     }
-    for path in app.manufacture.cache.iter().flat_map(|(_, p)| p) {
+    for path in app.manufacture.cache.iter().flat_map(|(_, p, _)| p) {
         for (a, b) in path.iter().zip(path.iter().skip(1)) {
             if out.len() >= MAX_SEGMENTS {
                 return out;
@@ -557,6 +788,22 @@ pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, boo
 /// Draws the toolpaths over the model: cuts in the accent colour, rapids thin and dim.
 pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let t = Tokens::get();
+    if app.manufacture.open && app.manufacture.show_setups {
+        for view in app.manufacture.cache.iter().flat_map(|(_, _, v)| v) {
+            let (edges, arms) = setup_lines(view);
+            for (a, b) in edges {
+                if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
+                    painter.line_segment([a, b], Stroke::new(1.0, t.text_dim));
+                }
+            }
+            for ((a, b), (label, colour)) in arms.into_iter().zip([("X", t.error), ("Y", t.sketch_accent), ("Z", t.accent)]) {
+                if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
+                    painter.line_segment([a, b], Stroke::new(2.0, colour));
+                    painter.text(b, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), colour);
+                }
+            }
+        }
+    }
     for (from, to, cutting) in segments(app, proj) {
         let stroke = if cutting { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.warning.gamma_multiply(0.7)) };
         painter.line_segment([from, to], stroke);
@@ -625,20 +872,43 @@ fn choices(app: &SolveApp, listed: &Value) -> Choices {
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
-        Form::Tool { number, kind, diameter, flute_length, description } => {
-            field(ui, "Number", number, "1");
-            choice(ui, "sc_cam_tool_kind", "Kind", kind, &TOOL_KINDS);
-            field(ui, "Diameter", diameter, "6 mm");
-            field(ui, "Flute length", flute_length, "3 × diameter");
-            field(ui, "Description", description, "");
+        Form::Tool(f) => {
+            if f.editing {
+                ui.label("Number");
+                ui.label(format!("T{}", f.number));
+                ui.end_row();
+            } else {
+                field(ui, "Number", &mut f.number, "1");
+            }
+            choice(ui, "sc_cam_tool_kind", "Kind", &mut f.kind, &TOOL_KINDS);
+            field(ui, "Diameter", &mut f.diameter, "6 mm");
+            field(ui, "Flute length", &mut f.flute_length, "3 × diameter");
+            field(ui, "Flutes", &mut f.flutes, "2");
+            field(ui, "Description", &mut f.description, "");
+            field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
+            field(ui, "Feed (mm/min)", &mut f.feed, "none");
+            field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
         }
-        Form::Setup { name, origin, post } => {
-            field(ui, "Name", name, "Setup1");
-            let [x, y, z] = origin;
-            field(ui, "Origin X", x, "0");
-            field(ui, "Origin Y", y, "0");
-            field(ui, "Origin Z", z, "0");
-            choice(ui, "sc_cam_setup_post", "Post", post, solidcraft_engine::cam::Post::BUILTIN);
+        Form::Setup(f) => {
+            field(ui, "Name", &mut f.name, "automatic");
+            choice(ui, "sc_cam_setup_axis", "Tool axis", &mut f.axis, &AXES);
+            field(ui, "Stock on the sides", &mut f.side, "0 mm");
+            field(ui, "Stock on top", &mut f.top, "0 mm");
+            field(ui, "Stock below", &mut f.bottom, "0 mm");
+            choice(ui, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
+            if f.origin == 2 {
+                let [x, y, z] = &mut f.point;
+                field(ui, "Origin X", x, "0");
+                field(ui, "Origin Y", y, "0");
+                field(ui, "Origin Z", z, "0");
+            } else {
+                // Where on the box, along each of the setup's own axes.
+                let [x, y, z] = &mut f.anchors;
+                choice(ui, "sc_cam_setup_x", "Origin X", x, &["min", "center", "max"]);
+                choice(ui, "sc_cam_setup_y", "Origin Y", y, &["min", "center", "max"]);
+                choice(ui, "sc_cam_setup_z", "Origin Z", z, &["bottom", "middle", "top"]);
+            }
+            choice(ui, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
         }
         Form::Op(f) => {
             field(ui, "Name", &mut f.name, "automatic");
@@ -663,9 +933,9 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             }
             let from_faces = !f.faces.is_empty();
             pick(ui, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
-            field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "10000");
-            field(ui, "Feed (mm/min)", &mut f.feed, "600");
-            field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
+            field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "the tool's");
+            field(ui, "Feed (mm/min)", &mut f.feed, "the tool's");
+            field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
             field(ui, "Top", &mut f.top, if from_faces { "from the faces" } else { "the sketch plane" });
             field(ui, "Bottom", &mut f.bottom, if from_faces { "from the faces" } else { "-5 mm" });
             if f.kind != OpKind::Drill {
@@ -699,26 +969,120 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
     });
 }
 
-/// Draw the window when it is open, and keep the toolpaths up to date. Called once per frame.
-pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
-    if !app.manufacture.open {
-        return;
-    }
-    if app.manufacture.show_paths {
-        paths(app);
-    }
+/// The form's title, grid and OK / Cancel; `true` when OK was pressed.
+fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], lists: &Choices) -> bool {
+    let Some(form) = &mut cam.form else { return false };
+    ui.separator();
+    let title = match form {
+        Form::Tool(f) if f.editing => "EDIT TOOL",
+        Form::Tool(_) => "NEW TOOL",
+        Form::Setup(f) if f.editing.is_some() => "EDIT SETUP",
+        Form::Setup(_) => "NEW SETUP",
+        Form::Op(f) if f.editing.is_some() => "EDIT OPERATION",
+        Form::Op(f) => f.kind.title(),
+    };
+    ui.label(RichText::new(title).strong());
+    form_ui(ui, form, selected, lists);
+    let mut ok = false;
+    ui.horizontal(|ui| {
+        ok = ui.button("OK").clicked();
+        if ui.button("Cancel").clicked() {
+            cam.form = None;
+            cam.error = None;
+        }
+    });
+    ok
+}
+
+/// What a window asks for once it has been drawn.
+#[derive(Default)]
+struct Asked {
+    run: Vec<(&'static str, Value)>,
+    form: Option<Form>,
+    /// An operation to open for editing: its setup and itself, as listed.
+    edit_op: Option<(Value, Value)>,
+    apply: bool,
+    simulate: Option<u64>,
+    post: Option<(u64, String)>,
+    import: bool,
+    export: bool,
+}
+
+/// The Tool Library window: every tool with its cutting data; add, change, remove, and move libraries between designs.
+fn tools_window(ctx: &egui::Context, cam: &mut CamUi, listed: &Value, lists: &Choices, corner: egui::Pos2, asked: &mut Asked) {
     let t = Tokens::get();
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
     let mut open = true;
-    let mut run: Vec<(&'static str, Value)> = Vec::new();
-    let mut apply_form = false;
-    let mut run_simulation = false;
-    let mut edit: Option<(Value, Value)> = None;
-    let mut post_to: Option<String> = None;
-    let selected = selected_faces(app);
-    let lists = choices(app, &listed);
-    let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
-    let mut cam = std::mem::take(&mut app.manufacture);
+    crate::frame::window(ctx, RichText::new("TOOL LIBRARY").strong().size(13.0), crate::frame::Width::Wide)
+        .id(egui::Id::new("sc_cam_tools"))
+        // In the viewport's lower corner, clear of the Manufacture window above it.
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .default_pos(corner)
+        .open(&mut open)
+        .resizable(true)
+        .show(ctx, |ui| {
+            if let Some(e) = cam.error.as_ref().filter(|_| !cam.open) {
+                ui.label(RichText::new(e).color(t.error));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("New Tool").clicked() {
+                    asked.run.push(("", json!("new tool")));
+                }
+                asked.import = ui.button("Import…").on_hover_text("Add the tools of a library file").clicked();
+                asked.export = ui.button("Export…").on_hover_text("Write this library to a file").clicked();
+            });
+            ui.separator();
+            let tools = listed["tools"].as_array().cloned().unwrap_or_default();
+            if tools.is_empty() {
+                ui.label(RichText::new("No tools yet").color(t.text_dim));
+            }
+            egui::Grid::new("sc_cam_tool_table").num_columns(8).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                if !tools.is_empty() {
+                    for head in ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Feed", "Plunge", ""] {
+                        ui.label(RichText::new(head).color(t.text_dim));
+                    }
+                    ui.end_row();
+                }
+                for tool in &tools {
+                    let number = tool["number"].as_u64().unwrap_or(0);
+                    let data = |k: &str| tool[k].as_f64().map_or("—".to_string(), |v| format!("{v}"));
+                    let name = text(tool, "description");
+                    ui.label(if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") });
+                    ui.label(text(tool, "kind").replace('_', " "));
+                    ui.label(format!("{} mm", tool["diameter"].as_f64().unwrap_or(0.0)));
+                    ui.label(data("flutes"));
+                    ui.label(data("spindle_rpm"));
+                    ui.label(data("feed"));
+                    ui.label(data("plunge_feed"));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Edit").clicked() {
+                            asked.form = tool_form(tool);
+                        }
+                        if ui.small_button("Remove").clicked() {
+                            asked.run.push(("cam.tool.remove", json!({ "number": number })));
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+            if matches!(cam.form, Some(Form::Tool(_))) {
+                asked.apply |= form_block(ui, cam, &[], lists);
+            }
+        });
+    cam.tools_open = open;
+}
+
+/// The Manufacture window: setups with their operations, what is drawn, and the open setup or operation form.
+fn manufacture_window(
+    ctx: &egui::Context,
+    cam: &mut CamUi,
+    listed: &Value,
+    lists: &Choices,
+    selected: &[(String, Vec3)],
+    corner: egui::Pos2,
+    asked: &mut Asked,
+) {
+    let t = Tokens::get();
+    let mut open = true;
     crate::frame::window(ctx, RichText::new("MANUFACTURE").strong().size(13.0), crate::frame::Width::Normal)
         .id(egui::Id::new("sc_cam_window"))
         // Beside the model, not over it.
@@ -730,38 +1094,44 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
             }
-            ui.label(RichText::new("Tools").strong());
-            let tools = listed["tools"].as_array().cloned().unwrap_or_default();
-            if tools.is_empty() {
-                ui.label(RichText::new("No tools yet").color(t.text_dim));
-            }
-            for tool in &tools {
-                ui.horizontal(|ui| {
-                    let number = tool["number"].as_u64().unwrap_or(0);
-                    ui.label(format!(
-                        "T{number}  D{} mm  {}  {}",
-                        tool["diameter"].as_f64().unwrap_or(0.0),
-                        text(tool, "kind").replace('_', " "),
-                        text(tool, "description")
-                    ));
-                    if ui.small_button("Remove").clicked() {
-                        run.push(("cam.tool.remove", json!({ "number": number })));
-                    }
-                });
-            }
+            ui.horizontal(|ui| {
+                let tools = listed["tools"].as_array().map_or(0, Vec::len);
+                if ui.button(format!("Tool Library ({tools})…")).clicked() {
+                    cam.tools_open = true;
+                }
+                ui.checkbox(&mut cam.show_paths, "Toolpaths");
+                ui.checkbox(&mut cam.show_setups, "Stock and origin");
+                if cam.stock.is_some() {
+                    ui.checkbox(&mut cam.show_stock, "Simulated stock");
+                }
+            });
             ui.separator();
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
             if setups.is_empty() {
                 ui.label(RichText::new("No setup yet").color(t.text_dim));
             }
             for setup in &setups {
+                let id = setup["id"].as_u64().unwrap_or(0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(text(setup, "name")).strong());
                     ui.label(RichText::new(format!("post: {}", text(setup, "post"))).color(t.text_dim));
+                    if ui.small_button("Edit").clicked() {
+                        asked.form = setup_form(setup);
+                    }
+                    let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
+                    if ui.add_enabled(has_ops, egui::Button::new("Simulate").small()).clicked() {
+                        asked.simulate = Some(id);
+                    }
+                    if ui.add_enabled(has_ops, egui::Button::new("Post…").small()).clicked() {
+                        asked.post = Some((id, text(setup, "post")));
+                    }
                     if ui.small_button("Remove").clicked() {
-                        run.push(("cam.setup.remove", json!({ "setup": setup["id"] })));
+                        asked.run.push(("cam.setup.remove", json!({ "setup": id })));
                     }
                 });
+                if let Some(e) = setup.get("error").and_then(Value::as_str) {
+                    ui.label(RichText::new(e).color(t.error));
+                }
                 for op in setup["operations"].as_array().into_iter().flatten() {
                     ui.horizontal(|ui| {
                         ui.add_space(12.0);
@@ -778,36 +1148,20 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         }
                         for (label, by) in [("Up", -1), ("Down", 1)] {
                             if ui.small_button(label).clicked() {
-                                run.push(("cam.op.move", json!({ "setup": setup["id"], "op": op["id"], "by": by })));
+                                asked.run.push(("cam.op.move", json!({ "setup": id, "op": op["id"], "by": by })));
                             }
                         }
                         if ui.small_button("Edit").clicked() {
-                            edit = Some((setup.clone(), op.clone()));
+                            asked.edit_op = Some((setup.clone(), op.clone()));
                         }
                         if ui.small_button("Remove").clicked() {
-                            run.push(("cam.op.remove", json!({ "setup": setup["id"], "op": op["id"] })));
+                            asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
                         }
                     });
                 }
             }
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut cam.show_paths, "Show toolpaths");
-                let posts = solidcraft_engine::cam::Post::BUILTIN;
-                egui::ComboBox::from_id_salt("sc_cam_post").selected_text(posts.get(cam.post).copied().unwrap_or_default()).show_ui(ui, |ui| {
-                    for (i, name) in posts.iter().enumerate() {
-                        ui.selectable_value(&mut cam.post, i, *name);
-                    }
-                });
-                if ui.add_enabled(!setups.is_empty(), egui::Button::new("Post Process…")).clicked() {
-                    post_to = posts.get(cam.post).map(|p| p.to_string());
-                }
-                run_simulation = ui.add_enabled(!setups.is_empty(), egui::Button::new("Simulate")).clicked();
-            });
-            if cam.stock.is_some() {
-                ui.checkbox(&mut cam.show_stock, "Show simulated stock");
-            }
             if let Some((found, warnings)) = &cam.simulation {
+                ui.separator();
                 for line in found {
                     ui.label(RichText::new(line).color(t.text_dim));
                 }
@@ -815,44 +1169,69 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     ui.label(RichText::new(line).color(t.warning));
                 }
             }
-            if let Some(form) = &mut cam.form {
-                ui.separator();
-                let title = match form {
-                    Form::Tool { .. } => "DEFINE TOOL",
-                    Form::Setup { .. } => "NEW SETUP",
-                    Form::Op(f) if f.editing.is_some() => "EDIT OPERATION",
-                    Form::Op(f) => f.kind.title(),
-                };
-                ui.label(RichText::new(title).strong());
-                form_ui(ui, form, &selected, &lists);
-                ui.horizontal(|ui| {
-                    apply_form = ui.button("OK").clicked();
-                    if ui.button("Cancel").clicked() {
-                        cam.form = None;
-                        cam.error = None;
-                    }
-                });
+            if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
+                asked.apply |= form_block(ui, cam, selected, lists);
             }
         });
     cam.open = open;
-    app.manufacture = cam;
-    for (id, p) in run {
-        app.manufacture.error = app.run(id, p).err();
+}
+
+/// Draw the windows that are open, and keep what the viewport shows up to date. Called once per frame.
+pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
+    if !app.manufacture.open && !app.manufacture.tools_open {
+        return;
     }
-    if let Some((setup, op)) = edit {
-        app.manufacture.form = edit_form(app, &setup, &op);
+    if app.manufacture.open && (app.manufacture.show_paths || app.manufacture.show_setups) {
+        refresh(app);
+    }
+    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let selected = selected_faces(app);
+    let lists = choices(app, &listed);
+    let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
+    let mut asked = Asked::default();
+    let mut cam = std::mem::take(&mut app.manufacture);
+    if cam.open {
+        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, corner, &mut asked);
+    }
+    if cam.tools_open {
+        let low = app.viewport.rect.map_or(egui::pos2(16.0, 700.0), |r| r.left_bottom() + egui::vec2(12.0, -60.0));
+        tools_window(ctx, &mut cam, &listed, &lists, low, &mut asked);
+    }
+    app.manufacture = cam;
+    for (id, p) in std::mem::take(&mut asked.run) {
+        if id.is_empty() {
+            start(app, "cam.tool.define");
+        } else {
+            app.manufacture.error = app.run(id, p).err();
+        }
+    }
+    if let Some((setup, op)) = asked.edit_op {
+        asked.form = edit_form(app, &setup, &op);
+    }
+    if let Some(form) = asked.form {
+        app.manufacture.form = Some(form);
         app.manufacture.error = None;
     }
-    if apply_form {
+    if asked.apply {
         apply(app);
     }
-    if run_simulation {
-        simulate(app);
+    if let Some(setup) = asked.simulate {
+        simulate_setup(app, setup);
     }
-    if let Some(post) = post_to {
+    if asked.import
+        && let Some(path) = app.services.pick_open.as_ref().and_then(|f| f())
+    {
+        app.manufacture.error = app.run("cam.tool.import", json!({ "path": path })).err();
+    }
+    if asked.export
+        && let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("tools.json", &["json"]))
+    {
+        app.manufacture.error = app.run("cam.tool.export", json!({ "path": path })).err();
+    }
+    if let Some((setup, post)) = asked.post {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());
         if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f(&format!("program.{extension}"), &[extension.as_str()])) {
-            match app.run("cam.post", json!({ "post": post, "path": path })) {
+            match app.run("cam.post", json!({ "setup": setup, "path": path })) {
                 Ok(v) => {
                     app.manufacture.error = None;
                     app.set_status(format!("Wrote {} lines of G-code", v["lines"].as_u64().unwrap_or(0)), false);

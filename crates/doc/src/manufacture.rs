@@ -26,17 +26,70 @@ impl Manufacture {
     }
 }
 
-/// One clamping of the part: where the work origin is, and what is cut in order.
+/// One clamping of the part: which way the tool points, where the work origin is, the stock
+/// the part is cut from, and what is cut in order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Setup {
     pub id: u64,
     pub name: String,
-    /// The work origin in world coordinates. The work axes are the world's: tool along +Z.
-    pub origin: Vec3,
+    /// The tool axis: the setup's +Z as a direction in the world (the tool points along −Z).
+    #[serde(default = "world_up")]
+    pub axis: Vec3,
+    pub origin: SetupOrigin,
+    #[serde(default)]
+    pub stock: StockDef,
     /// The built-in post processor programs are written with.
     pub post: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<CamOperation>,
+}
+
+fn world_up() -> Vec3 {
+    Vec3::new(0.0, 0.0, 1.0)
+}
+
+/// Where a setup's work origin is.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SetupOrigin {
+    /// A fixed point in the world.
+    Point { at: Vec3 },
+    /// A point of the box around the stock or the part, in the setup's own axes: a corner, the
+    /// middle of an edge or a face, or the centre. It follows the design.
+    Box { of: BoxOf, x: Anchor, y: Anchor, z: Anchor },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoxOf {
+    Stock,
+    Part,
+}
+
+/// Where along one axis of a box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Anchor {
+    Min,
+    Center,
+    Max,
+}
+
+/// The stock: the box around the bodies (in the setup's axes) grown by these offsets (length expressions).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StockDef {
+    /// Added on each of the four sides.
+    pub side: String,
+    /// Added above the part (towards the tool).
+    pub top: String,
+    /// Added below the part.
+    pub bottom: String,
+}
+
+impl Default for StockDef {
+    fn default() -> Self {
+        StockDef { side: "0 mm".into(), top: "0 mm".into(), bottom: "0 mm".into() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -76,6 +129,8 @@ pub enum CamGeometry {
     Sketch { sketch: u64, profiles: ProfileSel },
     /// The outlines of planar body faces (their inner loops are islands, or holes to drill).
     Faces { faces: Vec<FaceRef> },
+    /// The stock's top, seen along the tool: what a facing operation covers.
+    Stock,
 }
 
 /// A body face: the one with the persistent name `name` on `body`, else the piece of it nearest `at`.

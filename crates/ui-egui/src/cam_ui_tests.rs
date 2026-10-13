@@ -15,7 +15,7 @@ fn sketched() -> Harness {
 /// Starts `id` from the toolbar, lets `edit` fill the form in, and presses OK.
 fn fill(h: &mut Harness, id: &str, edit: impl FnOnce(&mut Form)) {
     h.app.start(id);
-    assert!(h.app.manufacture.open, "{id} opens the Manufacture window");
+    assert!(h.app.manufacture.open || h.app.manufacture.tools_open, "{id} opens its window");
     edit(h.app.manufacture.form.as_mut().unwrap_or_else(|| panic!("{id} has no form")));
     apply(&mut h.app);
     assert_eq!(h.app.manufacture.error, None, "{id}");
@@ -37,7 +37,7 @@ fn toolbar_forms_make_a_job_and_its_toolpath_is_drawn() {
     assert_eq!((m.tools.len(), m.setups.len(), m.setups[0].operations.len()), (1, 1, 1));
 
     h.frames(3);
-    assert!(h.widget("Show toolpaths").is_some() && h.widget("Pocket1  (pocket, T1)").is_some(), "the window lists the operation");
+    assert!(h.widget("Toolpaths").is_some() && h.widget("Pocket1  (pocket, T1)").is_some(), "the window lists the operation");
     let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
     let drawn = segments(&h.app, &proj);
     assert!(drawn.iter().any(|s| s.2) && drawn.iter().any(|s| !s.2), "cuts and rapids are drawn: {}", drawn.len());
@@ -176,7 +176,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     let (low, high) = tris.iter().flat_map(|t| t.0).fold((f64::INFINITY, f64::NEG_INFINITY), |m, p| (m.0.min(p.z), m.1.max(p.z)));
     assert!((low - 0.0).abs() < 1e-9 && (high - 10.0).abs() < 1e-9, "{low} {high}");
     h.frames(2);
-    assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some() && h.widget("Show simulated stock").is_some());
+    assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some() && h.widget("Simulated stock").is_some());
     // Cutting inside the outline instead goes into the part, and says so.
     h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "inside"})).unwrap();
     h.frames(2);
@@ -207,6 +207,95 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
 }
 
 #[test]
+fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    // With a body in the design a new setup starts on the stock's top corner; 5 mm of stock is typed.
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        assert_eq!((setup.origin, setup.anchors), (0, [0, 0, 2]));
+        setup.side = "5 mm".into();
+        setup.top = "2 mm".into();
+    });
+    let view = setup_views(&mut h.app).first().cloned().expect("a setup to draw");
+    let close = |a: Vec3, b: [f64; 3]| a.dist(Vec3::new(b[0], b[1], b[2])) < 1e-6;
+    assert!(close(view.frame[0], [-5.0, -5.0, 12.0]), "{view:?}");
+    let (lo, hi) = view.stock.unwrap();
+    assert!(close(lo, [0.0, 0.0, -12.0]) && close(hi, [70.0, 50.0, 0.0]), "{view:?}");
+    // Twelve edges of the stock box, in the world, and the origin's three arms along the work axes.
+    let (edges, arms) = setup_lines(&view);
+    assert_eq!(edges.len(), 12);
+    let (min, max) =
+        edges.iter().flat_map(|e| [e.0, e.1]).fold((Vec3::new(1e9, 1e9, 1e9), Vec3::new(-1e9, -1e9, -1e9)), |m, p| (m.0.min(p), m.1.max(p)));
+    assert!(close(min, [-5.0, -5.0, 0.0]) && close(max, [65.0, 45.0, 12.0]));
+    assert!(arms.iter().all(|a| close(a.0, [-5.0, -5.0, 12.0])) && (arms[2].1 - arms[2].0).normalized().is_some_and(|d| close(d, [0.0, 0.0, 1.0])));
+    h.frames(2);
+    assert!(h.widget("Stock and origin").is_some());
+
+    // Edit shows what the setup has; turned over with the origin in the middle of the part's far face.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!(
+        (form.name.as_str(), form.axis, form.origin, form.side.as_str(), form.top.as_str(), form.bottom.as_str()),
+        ("Setup1", 0, 0, "5 mm", "2 mm", "")
+    );
+    form.axis = 1;
+    form.origin = 1;
+    form.anchors = [1, 1, 2];
+    form.top = String::new();
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let view = setup_views(&mut h.app).first().cloned().unwrap();
+    // The underside is the top of this setup: the middle of the box's bottom face, Z pointing down in the world.
+    assert!(close(view.frame[0], [30.0, 20.0, 0.0]) && close(view.frame[3], [0.0, 0.0, -1.0]), "{view:?}");
+    let setup = &h.app.session.doc.manufacture.setups[0];
+    assert_eq!((setup.stock.side.as_str(), setup.stock.top.as_str()), ("5 mm", "0"));
+    h.frames(2);
+}
+
+#[test]
+fn tool_library_is_its_own_window() {
+    let mut h = Harness::new();
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        tool.description = "Rougher".into();
+        tool.flutes = "3".into();
+        tool.spindle_rpm = "18000".into();
+        tool.feed = "1500".into();
+    });
+    assert!(h.app.manufacture.tools_open && !h.app.manufacture.open);
+    h.frames(2);
+    assert!(h.widget("TOOL LIBRARY").is_some() && h.widget("T1  Rougher").is_some() && h.widget("18000").is_some() && h.widget("New Tool").is_some());
+    assert!(h.widget("MANUFACTURE").is_none() || h.widget("Tool Library (1)…").is_none(), "the setups window is not open");
+    // Edit fills the form from the tool; an emptied feed is cleared, the number stays.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Tool(mut form)) = tool_form(&listed["tools"][0]) else { panic!("no form") };
+    assert_eq!(
+        (form.number.as_str(), form.diameter.as_str(), form.flutes.as_str(), form.feed.as_str(), form.plunge_feed.as_str()),
+        ("1", "6 mm", "3", "1500", "")
+    );
+    form.feed = String::new();
+    form.diameter = "8 mm".into();
+    h.app.manufacture.form = Some(Form::Tool(form));
+    apply(&mut h.app);
+    let tool = h.app.session.doc.manufacture.tool(1).unwrap();
+    assert_eq!((tool.diameter, tool.flutes, tool.spindle_rpm, tool.feed), (8.0, 3, Some(18000.0), None));
+    // An operation started now leaves the speed to the tool and asks only for what the tool lacks.
+    h.app.run("sketch.create", json!({"plane": "XY", "name": "Pocket"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    fill(&mut h, "cam.op.pocket", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        assert_eq!((op.spindle_rpm.as_str(), op.feed.as_str()), ("", "600"));
+    });
+    assert_eq!(h.app.session.doc.manufacture.setups[0].operations[0].spindle_rpm, 18000.0);
+    h.frames(2);
+    assert!(h.widget("Tool Library (1)…").is_some());
+}
+
+#[test]
 fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
@@ -217,7 +306,12 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
         let mut h = Harness::new();
         h.app.start(c.id);
-        assert!(h.app.manufacture.open, "{} opens the window", c.id);
+        assert_eq!(
+            (h.app.manufacture.open, h.app.manufacture.tools_open),
+            (!c.id.starts_with("cam.tool."), c.id.starts_with("cam.tool.")),
+            "{}",
+            c.id
+        );
         h.frames(2);
     }
 }

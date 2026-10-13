@@ -5,7 +5,7 @@
 use serde_json::{Value, json};
 use solidcraft_cam::{self as cam, ContourParams, Cut, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
 use solidcraft_doc::expr::Kind;
-use solidcraft_doc::manufacture::{CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup};
+use solidcraft_doc::manufacture::{Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup, SetupOrigin, StockDef};
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 
@@ -14,6 +14,8 @@ use crate::params::{bad, bool_, expr, num, req_expr, str_, vec3};
 use crate::{EngineError, Result, Session};
 
 const MAX_TOOLS: usize = 1000;
+/// What a tool library file says it is.
+const TOOL_LIBRARY_FORMAT: &str = "solidcraft-tools/1";
 const MAX_SETUPS: usize = 100;
 const MAX_OPERATIONS: usize = 1000;
 const MAX_NAME: usize = 128;
@@ -27,26 +29,40 @@ macro_rules! op_doc {
     ($own:literal) => {
         concat!(
             $own,
-            "; sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills); tool: number; spindle_rpm; feed: mm/min; plunge_feed?: mm/min \
-             (default feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
+            "; sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills); tool: number; spindle_rpm?, feed?: mm/min, plunge_feed?: mm/min \
+             (defaults: the tool's own; plunge_feed else feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
              retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default half the tool diameter); coolant?: bool; \
              setup?: id or name (default: the only setup); name? → operation: id, name, and its toolpath's cut_length, rapid_length, cut_minutes"
         )
     };
 }
 
+const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direction the tool comes from: the setup's +Z (default +z); \
+     stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0); origin?: the work origin: \
+     [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
+     the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|lnc|lnc_atc (default \
+     rs274) → setup: id, name";
+
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define)
         .at("MANUFACTURE", "SETUP")
         .icon("cam_tool")
-        .params("number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description? — adds the tool to the library or replaces the one with that number"),
+        .params(
+            "number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description?; flutes?: 1–100 \
+             (default 2); spindle_rpm?, feed?, plunge_feed?: the cutting data operations with this tool start from (null clears one) — adds the \
+             tool to the library or replaces the one with that number",
+        ),
+    CommandSpec::new("cam.tool.export", "Export Tools", tool_export).noundo().params("path: a JSON file to write the tool library to"),
+    CommandSpec::new("cam.tool.import", "Import Tools", tool_import)
+        .params("path: a tool library written by cam.tool.export; replace?: bool (default false: tools whose number is taken are skipped) → added, replaced, skipped: tool numbers"),
     CommandSpec::new("cam.tool.remove", "Remove Tool", tool_remove).params("number (refused while an operation uses it)"),
     CommandSpec::new("cam.setup.create", "New Setup", setup_create)
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
-        .params("name?; origin?: [x, y, z] work origin in world coordinates (default the world origin; work axes are the world's, tool along +Z); post?: rs274|grbl|lnc|lnc_atc (default rs274) → setup: id, name"),
+        .params(SETUP_DOC),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).params("setup: id or name; then any of name, axis, origin, stock, post as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
-    CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles")),
+    CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles — or, without sketch or faces, the stock from its top down to the part's")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default 40% of the tool diameter, at most its radius); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
@@ -68,10 +84,10 @@ pub static COMMANDS: &[CommandSpec] = &[
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
     ),
     CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_setup").noundo().params(
-        "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in world coordinates (default: the box around the bodies); cell?: column \
+        "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
          width in mm (default: the stock's longer side / 300) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
-         against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {origin, cell, nx, ny, floor, z: [nx × ny heights], \
-         deviation: [per column: below 0 cut into the part, above 0 left on it]} in world coordinates. Top-down: undercuts are not seen",
+         against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {frame, origin, cell, nx, ny, floor, z: [nx × ny heights], \
+         deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
         "setup?: id or name; post?: rs274|grbl|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
@@ -151,7 +167,28 @@ fn tool_define(s: &mut Session, p: &Value) -> Result<Value> {
         None => diameter * 3.0,
     };
     let description: String = str_(p, "description").unwrap_or("").chars().filter(|c| !c.is_control()).take(MAX_NAME).collect();
-    let tool = Tool { number, kind, diameter, flute_length, description };
+    // Cutting data: a number sets it, null clears it, left out keeps what the tool had.
+    let was = s.doc.manufacture.tool(number).cloned();
+    let data = |k: &str, was: Option<f64>| match p.get(k) {
+        None => Ok(was),
+        Some(Value::Null) => Ok(None),
+        Some(_) => num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6).map(Some).ok_or_else(|| bad(cmd, format!("`{k}` must be above 0"))),
+    };
+    let flutes = match p.get("flutes") {
+        None => was.as_ref().map_or(2, |t| t.flutes),
+        Some(v) => v.as_u64().filter(|n| (1..=100).contains(n)).ok_or_else(|| bad(cmd, "`flutes` must be 1 to 100"))? as u32,
+    };
+    let tool = Tool {
+        number,
+        kind,
+        diameter,
+        flute_length,
+        description,
+        flutes,
+        spindle_rpm: data("spindle_rpm", was.as_ref().and_then(|t| t.spindle_rpm))?,
+        feed: data("feed", was.as_ref().and_then(|t| t.feed))?,
+        plunge_feed: data("plunge_feed", was.as_ref().and_then(|t| t.plunge_feed))?,
+    };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
     if s.doc.manufacture.tool(number).is_none() && s.doc.manufacture.tools.len() >= MAX_TOOLS {
         return Err(bad(cmd, "the tool library is full"));
@@ -161,6 +198,58 @@ fn tool_define(s: &mut Session, p: &Value) -> Result<Value> {
     tools.push(tool.clone());
     tools.sort_by_key(|t| t.number);
     Ok(json!({ "tool": tool }))
+}
+
+fn tool_export(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.tool.export";
+    let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
+    let tools = &s.doc.manufacture.tools;
+    let text =
+        serde_json::to_string_pretty(&json!({"format": TOOL_LIBRARY_FORMAT, "tools": tools})).map_err(|e| EngineError::Other(e.to_string()))?;
+    solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    Ok(json!({"path": path, "tools": tools.len()}))
+}
+
+fn tool_import(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.tool.import";
+    let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
+    let bytes = solidcraft_io::vfs::read(path, 16 << 20).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let file: Value = serde_json::from_slice(&bytes).map_err(|e| bad(cmd, format!("{path} is not a tool library: {e}")))?;
+    if file.get("format").and_then(Value::as_str) != Some(TOOL_LIBRARY_FORMAT) {
+        return Err(bad(cmd, format!("{path} is not a tool library (no `format`: `{TOOL_LIBRARY_FORMAT}`)")));
+    }
+    let tools: Vec<Tool> = serde_json::from_value(file.get("tools").cloned().unwrap_or_default()).map_err(|e| bad(cmd, format!("{path}: {e}")))?;
+    if tools.len() > MAX_TOOLS {
+        return Err(bad(cmd, "the file has too many tools"));
+    }
+    for tool in &tools {
+        tool.validate().map_err(|e| bad(cmd, format!("tool {}: {e}", tool.number)))?;
+        if tool.number == 0 {
+            return Err(bad(cmd, "tool numbers start at 1"));
+        }
+    }
+    let replace = bool_(p, "replace").unwrap_or(false);
+    let (mut added, mut replaced, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    let mut library = s.doc.manufacture.tools.clone();
+    for tool in tools {
+        match library.iter_mut().find(|t| t.number == tool.number) {
+            Some(_) if !replace => skipped.push(tool.number),
+            Some(slot) => {
+                replaced.push(tool.number);
+                *slot = tool;
+            }
+            None => {
+                added.push(tool.number);
+                library.push(tool);
+            }
+        }
+    }
+    if library.len() > MAX_TOOLS {
+        return Err(bad(cmd, "the tool library would be too large"));
+    }
+    library.sort_by_key(|t| t.number);
+    s.doc_mut().manufacture.tools = library;
+    Ok(json!({"added": added, "replaced": replaced, "skipped": skipped}))
 }
 
 fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -189,16 +278,201 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
         None => (setups.len() + 1..).map(|k| format!("Setup{k}")).find(|n| !setups.iter().any(|x| x.name == *n)).unwrap_or_default(),
     };
     let origin = match p.get("origin") {
-        Some(v) => {
-            vec3(v).filter(|o| o.x.abs() <= 1e6 && o.y.abs() <= 1e6 && o.z.abs() <= 1e6).ok_or_else(|| bad(cmd, "`origin` must be [x, y, z]"))?
-        }
-        None => Vec3::ZERO,
+        Some(v) => origin_param(v, cmd)?,
+        None => SetupOrigin::Point { at: Vec3::ZERO },
+    };
+    let axis = match p.get("axis") {
+        Some(v) => axis_param(v, cmd)?,
+        None => Vec3::new(0.0, 0.0, 1.0),
+    };
+    let stock = match p.get("stock") {
+        Some(v) => stock_param(s, v, &StockDef::default(), cmd)?,
+        None => StockDef::default(),
     };
     let post = str_(p, "post").unwrap_or("rs274");
     let post = Post::builtin(post).ok_or_else(|| bad(cmd, format!("unknown post `{post}` (known: {})", Post::BUILTIN.join(", "))))?.name;
-    let id = next_id(s);
-    s.doc_mut().manufacture.setups.push(Setup { id, name: name.clone(), origin, post, operations: Vec::new() });
+    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, post, operations: Vec::new() };
+    resolve(s, &setup).map_err(|e| bad(cmd, e))?;
+    setup.id = next_id(s);
+    let id = setup.id;
+    s.doc_mut().manufacture.setups.push(setup);
     Ok(json!({ "setup": id, "name": name }))
+}
+
+/// Changes what is given of a setup: name, post, tool axis, origin, stock.
+fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.setup.edit";
+    let i = setup_index(s, p, cmd)?;
+    let mut setup = s.doc.manufacture.setups.get(i).cloned().ok_or_else(|| bad(cmd, "no such setup"))?;
+    if let Some(n) = name_param(p, cmd)? {
+        if s.doc.manufacture.setups.iter().enumerate().any(|(j, x)| j != i && x.name.eq_ignore_ascii_case(&n)) {
+            return Err(bad(cmd, format!("there is already a setup `{n}`")));
+        }
+        setup.name = n;
+    }
+    if let Some(post) = p.get("post") {
+        let post = post.as_str().unwrap_or_default();
+        setup.post = Post::builtin(post).ok_or_else(|| bad(cmd, format!("unknown post `{post}` (known: {})", Post::BUILTIN.join(", "))))?.name;
+    }
+    if let Some(v) = p.get("axis") {
+        setup.axis = axis_param(v, cmd)?;
+    }
+    if let Some(v) = p.get("origin") {
+        setup.origin = origin_param(v, cmd)?;
+    }
+    if let Some(v) = p.get("stock") {
+        setup.stock = stock_param(s, v, &setup.stock, cmd)?;
+    }
+    resolve(s, &setup).map_err(|e| bad(cmd, e))?;
+    let (id, name) = (setup.id, setup.name.clone());
+    if let Some(slot) = s.doc_mut().manufacture.setups.get_mut(i) {
+        *slot = setup;
+    }
+    Ok(json!({ "setup": id, "name": name }))
+}
+
+/// The tool axis from `"+z"`, `"-x"`… or a direction `[x, y, z]`.
+fn axis_param(v: &Value, cmd: &str) -> Result<Vec3> {
+    let named = v.as_str().map(|a| a.trim().to_ascii_lowercase()).and_then(|a| {
+        let (sign, letter) = match a.strip_prefix('-') {
+            Some(rest) => (-1.0, rest.to_string()),
+            None => (1.0, a.trim_start_matches('+').to_string()),
+        };
+        match letter.as_str() {
+            "x" => Some(Vec3::new(sign, 0.0, 0.0)),
+            "y" => Some(Vec3::new(0.0, sign, 0.0)),
+            "z" => Some(Vec3::new(0.0, 0.0, sign)),
+            _ => None,
+        }
+    });
+    named.or_else(|| vec3(v).and_then(|d| d.normalized())).ok_or_else(|| bad(cmd, "`axis` must be +x, -x, +y, -y, +z, -z or a direction [x, y, z]"))
+}
+
+/// The work origin from a world point `[x, y, z]` or `{of?: stock|part, x?, y?, z?: min|center|max}`.
+fn origin_param(v: &Value, cmd: &str) -> Result<SetupOrigin> {
+    if let Some(at) = vec3(v).filter(|o| o.x.abs() <= 1e6 && o.y.abs() <= 1e6 && o.z.abs() <= 1e6) {
+        return Ok(SetupOrigin::Point { at });
+    }
+    let wrong =
+        || bad(cmd, "`origin` must be [x, y, z] or {of?: stock|part, x?, y?, z?: min|center|max} (default: the stock's top, at its lowest X and Y)");
+    let o = v.as_object().ok_or_else(wrong)?;
+    if o.keys().any(|k| !matches!(k.as_str(), "of" | "x" | "y" | "z")) {
+        return Err(wrong());
+    }
+    let of = match o.get("of").map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
+        None | Some("stock") => BoxOf::Stock,
+        Some("part") => BoxOf::Part,
+        _ => return Err(wrong()),
+    };
+    let anchor = |k: &str, default: Anchor| match o.get(k).map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
+        None => Ok(default),
+        Some("min") => Ok(Anchor::Min),
+        Some("center" | "centre" | "mid" | "middle") => Ok(Anchor::Center),
+        Some("max") => Ok(Anchor::Max),
+        _ => Err(wrong()),
+    };
+    Ok(SetupOrigin::Box { of, x: anchor("x", Anchor::Min)?, y: anchor("y", Anchor::Min)?, z: anchor("z", Anchor::Max)? })
+}
+
+/// Stock offsets from `{side?, top?, bottom?}`; what is left out keeps its value in `was`.
+fn stock_param(s: &Session, v: &Value, was: &StockDef, cmd: &str) -> Result<StockDef> {
+    if !v.is_object() {
+        return Err(bad(cmd, "`stock` must be {side?, top?, bottom?}: lengths added to the box around the bodies"));
+    }
+    let offset = |k: &str, was: &str| -> Result<String> {
+        match v.get(k) {
+            None => Ok(was.to_string()),
+            Some(_) => {
+                let e = req_expr(cmd, v, k)?;
+                let d = length(s, cmd, k, &e)?;
+                if (0.0..=1.0e6).contains(&d) { Ok(e) } else { Err(bad(cmd, format!("the stock's `{k}` offset must be 0 or more"))) }
+            }
+        }
+    };
+    Ok(StockDef { side: offset("side", &was.side)?, top: offset("top", &was.top)?, bottom: offset("bottom", &was.bottom)? })
+}
+
+/// A setup's work coordinates: origin and axes in the world.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Frame {
+    o: Vec3,
+    x: Vec3,
+    y: Vec3,
+    z: Vec3,
+}
+
+impl Frame {
+    /// A world point in work coordinates.
+    fn local(&self, p: Vec3) -> Vec3 {
+        let d = p - self.o;
+        Vec3::new(d.dot(self.x), d.dot(self.y), d.dot(self.z))
+    }
+    fn world(&self, q: Vec3) -> Vec3 {
+        self.o + self.x * q.x + self.y * q.y + self.z * q.z
+    }
+    fn json(&self) -> Value {
+        json!({"origin": self.o, "x": self.x, "y": self.y, "z": self.z})
+    }
+}
+
+/// Work X and Y for a tool axis. Along a world axis they are world axes too: for +Z, world X
+/// and Y; for −Z, X and −Y; for ±X, ±Y and Z; for +Y, X and −Z; for −Y, X and Z. For any other
+/// direction X is level (square to world Z).
+fn axes(axis: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
+    let z = axis.normalized().filter(|z| z.is_finite())?;
+    let x = if z.z.abs() > 1.0 - 1e-9 || z.y.abs() > 1.0 - 1e-9 {
+        Vec3::new(1.0, 0.0, 0.0)
+    } else if z.x.abs() > 1.0 - 1e-9 {
+        Vec3::new(0.0, z.x.signum(), 0.0)
+    } else {
+        Vec3::new(0.0, 0.0, 1.0).cross(z).normalized()?
+    };
+    Some((x, z.cross(x), z))
+}
+
+/// A box in work coordinates.
+type Box3 = (Vec3, Vec3);
+
+/// A setup worked out against the model: its frame, and the boxes round the bodies and the stock.
+pub(crate) struct Resolved {
+    frame: Frame,
+    part: Option<Box3>,
+    stock: Option<Box3>,
+}
+
+fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> {
+    let (x, y, z) = axes(setup.axis).ok_or("the setup's tool axis is not a direction")?;
+    // The bodies' extent along the setup's axes, measured from the world origin.
+    let state = s.model.state();
+    let mut part: Option<Box3> = None;
+    for body in &state.bodies {
+        for p in &body.mesh().positions {
+            let q = Vec3::new(p.dot(x), p.dot(y), p.dot(z));
+            part = Some(part.map_or((q, q), |(lo, hi)| (lo.min(q), hi.max(q))));
+        }
+    }
+    let offset = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| format!("the stock's {what} offset: {e}")).map(|d| d.max(0.0));
+    let (side, top, bottom) = (offset("side", &setup.stock.side)?, offset("top", &setup.stock.top)?, offset("bottom", &setup.stock.bottom)?);
+    let stock = part.map(|(lo, hi)| (lo - Vec3::new(side, side, bottom), hi + Vec3::new(side, side, top)));
+    let o = match &setup.origin {
+        SetupOrigin::Point { at } => *at,
+        SetupOrigin::Box { of, x: ax, y: ay, z: az } => {
+            let (lo, hi) = match of {
+                BoxOf::Stock => stock,
+                BoxOf::Part => part,
+            }
+            .ok_or("the setup's origin is on the box round the bodies, and there is no body")?;
+            let at = |a: &Anchor, lo: f64, hi: f64| match a {
+                Anchor::Min => lo,
+                Anchor::Center => (lo + hi) * 0.5,
+                Anchor::Max => hi,
+            };
+            x * at(ax, lo.x, hi.x) + y * at(ay, lo.y, hi.y) + z * at(az, lo.z, hi.z)
+        }
+    };
+    let shift = Vec3::new(o.dot(x), o.dot(y), o.dot(z));
+    let moved = |b: Box3| (b.0 - shift, b.1 - shift);
+    Ok(Resolved { frame: Frame { o, x, y, z }, part: part.map(moved), stock: stock.map(moved) })
 }
 
 fn setup_remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -212,16 +486,16 @@ fn setup_remove(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Sketch-plane regions in a setup's XY. The sketch plane must face along the tool axis.
-fn to_setup(plane: &Plane, origin: Vec3, regions: &[Region2]) -> Result<Vec<Region2>> {
-    let n = plane.normal();
-    if !(n.z.abs() > 1.0 - 1e-9) {
-        return Err(EngineError::Other("not supported yet: operations on a sketch whose plane is not square to the setup's tool axis (Z)".into()));
+fn to_setup(plane: &Plane, frame: &Frame, regions: &[Region2]) -> Result<Vec<Region2>> {
+    let facing = plane.normal().dot(frame.z);
+    if !(facing.abs() > 1.0 - 1e-9) {
+        return Err(EngineError::Other("not supported yet: operations on a sketch or face that is not square to the setup's tool axis".into()));
     }
-    let mirrored = n.z < 0.0;
+    let mirrored = facing < 0.0;
     let x_axis = plane.dir_to_world(Vec2::new(1.0, 0.0));
-    let turn = x_axis.y.atan2(x_axis.x);
+    let turn = x_axis.dot(frame.y).atan2(x_axis.dot(frame.x));
     let point = |p: Vec2| {
-        let w = plane.to_world(p) - origin;
+        let w = frame.local(plane.to_world(p));
         Vec2::new(w.x, w.y)
     };
     let seg = |s: &Seg2| match *s {
@@ -319,22 +593,36 @@ struct Geometry {
     z: f64,
     /// Lowest and highest point of the picked faces' bodies.
     body_z: Option<(f64, f64)>,
+    /// A picked face looks away from the tool (the far side of the part).
+    facing_away: bool,
 }
 
-fn geometry(s: &Session, setup: &Setup, source: &CamGeometry) -> std::result::Result<Geometry, String> {
+fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Result<Geometry, String> {
     let state = s.model.state();
+    let frame = &at.frame;
     match source {
+        CamGeometry::Stock => {
+            let (lo, hi) = at.stock.ok_or("there is no body to take the stock from")?;
+            let outer = Loop2::polygon(&[Vec2::new(lo.x, lo.y), Vec2::new(hi.x, lo.y), Vec2::new(hi.x, hi.y), Vec2::new(lo.x, hi.y)]);
+            Ok(Geometry {
+                regions: vec![Region2 { outer, holes: Vec::new() }],
+                z: hi.z,
+                body_z: at.part.map(|(lo, hi)| (lo.z, hi.z)),
+                facing_away: false,
+            })
+        }
         CamGeometry::Sketch { sketch, profiles } => {
             let sketch =
                 state.sketches.iter().find(|k| k.feature == *sketch).ok_or("its sketch is not built (deleted, rolled back, suppressed or failed)")?;
             let regions = solidcraft_doc::select_profiles(sketch, profiles).map_err(|e| e.to_string())?;
-            let regions = to_setup(&sketch.plane, setup.origin, &regions).map_err(|e| e.to_string())?;
-            Ok(Geometry { regions, z: sketch.plane.origin.z - setup.origin.z, body_z: None })
+            let regions = to_setup(&sketch.plane, frame, &regions).map_err(|e| e.to_string())?;
+            Ok(Geometry { regions, z: frame.local(sketch.plane.origin).z, body_z: None, facing_away: false })
         }
         CamGeometry::Faces { faces } => {
             let mut regions = Vec::new();
             let mut z: Option<f64> = None;
             let mut body_z: Option<(f64, f64)> = None;
+            let mut facing_away = false;
             for face in faces {
                 let body = state.body(&face.body).ok_or_else(|| format!("body `{}` is gone", face.body))?;
                 let (index, ..) =
@@ -343,17 +631,18 @@ fn geometry(s: &Session, setup: &Setup, source: &CamGeometry) -> std::result::Re
                 let resolved = solidcraft_doc::project::resolve_face_indices(&state, &plane, LinkKind::Project, &face.body, &[index])
                     .map_err(|e| e.to_string())?;
                 let region = outline(&resolved.geom)?;
-                regions.extend(to_setup(&plane, setup.origin, &[region]).map_err(|e| e.to_string())?);
-                let height = plane.origin.z - setup.origin.z;
+                regions.extend(to_setup(&plane, frame, &[region]).map_err(|e| e.to_string())?);
+                facing_away |= plane.normal().dot(frame.z) < 0.0;
+                let height = frame.local(plane.origin).z;
                 if z.is_some_and(|other| (other - height).abs() > 1e-6) {
                     return Err("the picked faces are at different heights; use one operation per height".into());
                 }
                 z = Some(height);
-                let bounds = body.mesh().bounds();
-                let (lo, hi) = (bounds.min.z - setup.origin.z, bounds.max.z - setup.origin.z);
+                let (lo, hi) =
+                    body.mesh().positions.iter().map(|p| frame.local(*p).z).fold((f64::INFINITY, f64::NEG_INFINITY), |m, z| (m.0.min(z), m.1.max(z)));
                 body_z = Some(body_z.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
             }
-            Ok(Geometry { regions, z: z.ok_or("no face is picked")?, body_z })
+            Ok(Geometry { regions, z: z.ok_or("no face is picked")?, body_z, facing_away })
         }
     }
 }
@@ -364,19 +653,33 @@ fn geometry(s: &Session, setup: &Setup, source: &CamGeometry) -> std::result::Re
 /// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
 /// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
 /// the face; for drilling, the top (the face) and the bottom (the bottom of its body). Retract
-/// and clearance are 2 mm and 10 mm above the top (clearance above the whole body).
+/// and clearance are 2 mm and 10 mm above the top (clearance above the whole body and the
+/// stock). Facing without a sketch or faces covers the stock, from its top to the part's.
 pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
+    let at = resolve(s, setup).map_err(|e| EngineError::Other(format!("setup `{}`: {e}", setup.name)))?;
+    build_in(s, &at, op)
+}
+
+/// [`build`] in a setup already worked out.
+fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
     let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
     let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
-    let g = geometry(s, setup, &op.geometry).map_err(fail)?;
+    let g = geometry(s, at, &op.geometry).map_err(fail)?;
     let picked = matches!(op.geometry, CamGeometry::Faces { .. });
+    // Only a contour can use the outline of a face on the far side.
+    if g.facing_away && !matches!(op.kind, CamOperationKind::Contour { .. }) {
+        return Err(fail("a picked face points away from the tool; machine it in a setup whose axis faces it".into()));
+    }
+    let stock_top = at.stock.map(|(_, hi)| hi.z);
     let (auto_top, auto_bottom) = match (&op.kind, g.body_z) {
         (CamOperationKind::Pocket { .. }, Some((_, hi))) if picked => (Some(hi), Some(g.z)),
         (CamOperationKind::Contour { .. }, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
         (CamOperationKind::Drill { .. }, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
         (CamOperationKind::Face { .. }, _) if picked => (Some(g.z), Some(g.z)),
+        // Facing the stock: from its top down to the top of the part.
+        (CamOperationKind::Face { .. }, Some((_, hi))) if op.geometry == CamGeometry::Stock => (Some(g.z), Some(hi)),
         _ => (Some(g.z), None),
     };
     let height = |what: &str, given: &Option<String>, auto: Option<f64>| match given {
@@ -386,7 +689,7 @@ pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Too
     let top = height("top", &op.top, auto_top)?;
     let bottom = height("bottom", &op.bottom, auto_bottom)?;
     let heights = Heights {
-        clearance: height("clearance", &op.clearance, Some(g.body_z.map_or(top, |(_, hi)| hi.max(top)) + 10.0))?,
+        clearance: height("clearance", &op.clearance, Some(g.body_z.map_or(top, |(_, hi)| hi.max(top)).max(stock_top.unwrap_or(top)) + 10.0))?,
         retract: height("retract", &op.retract, Some(top + 2.0))?,
         top,
         bottom,
@@ -482,6 +785,7 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     let geometry = match (p.get("faces"), p.get("sketch")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
+        (None, None) if cmd == "cam.op.face" => CamGeometry::Stock,
         _ => CamGeometry::Sketch {
             sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
             profiles: super::features::profiles(p, cmd)?,
@@ -497,12 +801,14 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
         .cloned()
         .ok_or_else(|| bad(cmd, format!("no tool {number} (cam.tool.define first)")))?;
     let positive = |k: &str| num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6);
-    let spindle_rpm = positive("spindle_rpm").ok_or_else(|| bad(cmd, "`spindle_rpm` must be above 0"))?;
-    let cut_feed = positive("feed").ok_or_else(|| bad(cmd, "`feed` must be above 0 (mm/min)"))?;
-    let plunge_feed = match p.get("plunge_feed") {
-        Some(_) => positive("plunge_feed").ok_or_else(|| bad(cmd, "`plunge_feed` must be above 0 (mm/min)"))?,
-        None => cut_feed / 3.0,
+    // Speed and feeds left out are the tool's own.
+    let given = |k: &str, what: &str, tools: Option<f64>| match p.get(k) {
+        Some(_) => positive(k).ok_or_else(|| bad(cmd, format!("`{k}` must be above 0{what}"))),
+        None => tools.ok_or_else(|| bad(cmd, format!("`{k}` is required: tool {} has none of its own", tool.number))),
     };
+    let spindle_rpm = given("spindle_rpm", "", tool.spindle_rpm)?;
+    let cut_feed = given("feed", " (mm/min)", tool.feed)?;
+    let plunge_feed = given("plunge_feed", " (mm/min)", Some(tool.plunge_feed.unwrap_or(cut_feed / 3.0)))?;
     // A height left out follows the geometry (see `build`).
     let heights = ["clearance", "retract", "top", "bottom"].map(|k| match p.get(k) {
         Some(_) => req_expr(cmd, p, k).and_then(|e| length(s, cmd, k, &e).map(|_| Some(e))),
@@ -760,7 +1066,19 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     v
                 })
                 .collect();
-            json!({"id": setup.id, "name": setup.name, "origin": setup.origin, "post": setup.post, "operations": ops})
+            let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
+                "post": setup.post, "operations": ops});
+            // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
+            match resolve(s, setup) {
+                Ok(at) => {
+                    let boxed = |b: Option<Box3>| b.map(|(min, max)| json!({"min": min, "max": max}));
+                    v["frame"] = at.frame.json();
+                    v["stock_box"] = json!(boxed(at.stock));
+                    v["part_box"] = json!(boxed(at.part));
+                }
+                Err(e) => v["error"] = json!(e),
+            }
+            v
         })
         .collect();
     Ok(json!({ "tools": m.tools, "setups": setups, "posts": Post::BUILTIN }))
@@ -774,12 +1092,13 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
         None => None,
     };
     let with_points = bool_(p, "points").unwrap_or(true);
+    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     let mut out = Vec::new();
     for (i, op) in setup.operations.iter().enumerate() {
         if only.is_some_and(|o| o != i) {
             continue;
         }
-        let path = build(s, setup, op)?;
+        let path = build_in(s, &at, op)?;
         let mut v = stats_json(&path);
         v["id"] = json!(op.id);
         v["name"] = json!(op.name);
@@ -790,8 +1109,13 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
             if points.len() > MAX_POINTS {
                 v["points_omitted"] = json!(points.len());
             } else {
-                v["points"] =
-                    points.iter().map(|(q, cutting)| json!([q.x + setup.origin.x, q.y + setup.origin.y, q.z + setup.origin.z, cutting])).collect();
+                v["points"] = points
+                    .iter()
+                    .map(|(q, cutting)| {
+                        let w = at.frame.world(*q);
+                        json!([w.x, w.y, w.z, cutting])
+                    })
+                    .collect();
             }
         }
         out.push(v);
@@ -808,6 +1132,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     if setup.operations.is_empty() {
         return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
     }
+    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     let state = s.model.state();
     let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
     let (min, max) = match p.get("stock") {
@@ -815,15 +1140,8 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
             let corner = |k: &str| v.get(k).and_then(vec3).ok_or_else(|| bad(cmd, "`stock` must be {min: [x, y, z], max: [x, y, z]}"));
             (corner("min")?, corner("max")?)
         }
-        None => {
-            let bounds = meshes.iter().fold(solidcraft_geom::Aabb3::EMPTY, |a, m| a.union(&m.bounds()));
-            if bounds.is_empty() {
-                return Err(bad(cmd, "there is no body to take the stock from; give `stock`"));
-            }
-            (bounds.min, bounds.max)
-        }
+        None => at.stock.ok_or_else(|| bad(cmd, "there is no body to take the stock from; give `stock`"))?,
     };
-    let (min, max) = (min - setup.origin, max - setup.origin);
     let cell = match p.get("cell") {
         Some(_) => num(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| bad(cmd, "`cell` must be above 0"))?,
         None => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
@@ -833,7 +1151,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut warnings: Vec<String> = Vec::new();
     let mut removed = 0.0;
     for op in &setup.operations {
-        let path = build(s, setup, op)?;
+        let path = build_in(s, &at, op)?;
         let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         let report = cam::simulate(&mut stock, &path, tool).map_err(cam_error)?;
         removed += report.removed_volume;
@@ -862,8 +1180,8 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         for j in 0..part.ny {
             for i in 0..part.nx {
                 let c = part.centre(i, j);
-                let from = Vec3::new(c.x, c.y, above) + setup.origin;
-                let top = meshes.iter().filter_map(|m| m.raycast(from, Vec3::new(0.0, 0.0, -1.0))).map(|(t, _)| above - t).fold(part.floor, f64::max);
+                let from = at.frame.world(Vec3::new(c.x, c.y, above));
+                let top = meshes.iter().filter_map(|m| m.raycast(from, -at.frame.z)).map(|(t, _)| above - t).fold(part.floor, f64::max);
                 if let Some(z) = part.z.get_mut(j * part.nx + i) {
                     *z = top;
                 }
@@ -881,15 +1199,16 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         deviation = Some(cam::deviations(&stock, &part).map_err(cam_error)?);
     }
     if bool_(p, "field").unwrap_or(false) {
-        // Heights in world Z; `deviation` per column: below 0 cut into the part, above 0 left on it.
-        let lift = setup.origin.z;
+        // Columns in work coordinates, with the frame that puts them in the world; `deviation`
+        // per column: below 0 cut into the part, above 0 left on it.
         out["field"] = json!({
-            "origin": [stock.origin.x + setup.origin.x, stock.origin.y + setup.origin.y],
+            "frame": at.frame.json(),
+            "origin": [stock.origin.x, stock.origin.y],
             "cell": stock.cell,
             "nx": stock.nx,
             "ny": stock.ny,
-            "floor": stock.floor + lift,
-            "z": stock.z.iter().map(|z| z + lift).collect::<Vec<_>>(),
+            "floor": stock.floor,
+            "z": stock.z,
             "deviation": deviation,
         });
     }
@@ -911,8 +1230,9 @@ fn post(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut program = cam::Program { name: format!("{} {}", s.doc.name, setup.name), operations: Vec::new() };
     let mut minutes = 0.0;
+    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     for op in &setup.operations {
-        let path = build(s, setup, op)?;
+        let path = build_in(s, &at, op)?;
         minutes += path.stats().cut_minutes;
         let tool = s.doc.manufacture.tool(op.tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         program.operations.push(cam::Operation { name: op.name.clone(), tool, spindle_rpm: op.spindle_rpm, coolant: op.coolant, path });

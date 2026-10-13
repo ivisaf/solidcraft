@@ -38,11 +38,25 @@ pub struct Tool {
     pub flute_length: f64,
     #[serde(default)]
     pub description: String,
+    /// Number of cutting edges.
+    #[serde(default = "two")]
+    pub flutes: u32,
+    /// The cutting data operations start from: spindle speed (rev/min) and feeds (mm/min).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spindle_rpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plunge_feed: Option<f64>,
+}
+
+fn two() -> u32 {
+    2
 }
 
 impl Tool {
     pub fn new(number: u32, kind: ToolKind, diameter: f64, flute_length: f64) -> Tool {
-        Tool { number, kind, diameter, flute_length, description: String::new() }
+        Tool { number, kind, diameter, flute_length, description: String::new(), flutes: 2, spindle_rpm: None, feed: None, plunge_feed: None }
     }
     pub fn radius(&self) -> f64 {
         self.diameter * 0.5
@@ -56,6 +70,12 @@ impl Tool {
         }
         if !(self.flute_length > 0.0) || !self.flute_length.is_finite() {
             return invalid("the tool's flute length must be above 0");
+        }
+        if !(1..=100).contains(&self.flutes) {
+            return invalid("a tool has 1 to 100 flutes");
+        }
+        if [self.spindle_rpm, self.feed, self.plunge_feed].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
+            return invalid("a tool's spindle speed and feeds must be above 0");
         }
         Ok(())
     }

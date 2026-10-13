@@ -293,6 +293,145 @@ fn simulation_checks_the_program_against_the_model() {
     }
 }
 
+fn work_frame(s: &mut Session) -> Value {
+    run(s, "cam.list", json!({}))["setups"][0].clone()
+}
+
+fn near(a: [f64; 3], b: [f64; 3]) -> bool {
+    a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6)
+}
+
+fn xyz(v: &Value) -> [f64; 3] {
+    let p = crate::params::vec3(v).unwrap_or_else(|| panic!("not a point: {v}"));
+    [p.x, p.y, p.z]
+}
+
+/// The world box round the cutting moves of `op` in `setup`.
+fn world_box(s: &mut Session, setup: &str, op: &str) -> ([f64; 3], [f64; 3]) {
+    let v = run(s, "cam.toolpath", json!({"setup": setup, "op": op}));
+    let mut b = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in v["operations"][0]["points"].as_array().unwrap().iter().filter(|p| p[3] == true) {
+        for k in 0..3 {
+            let c = p[k].as_f64().unwrap();
+            (b.0[k], b.1[k]) = (b.0[k].min(c), b.1[k].max(c));
+        }
+    }
+    b
+}
+
+fn lowest(s: &mut Session, op: &str) -> f64 {
+    run(s, "cam.toolpath", json!({"op": op, "points": false}))["operations"][0]["lowest_z"].as_f64().unwrap()
+}
+
+#[test]
+fn stock_offsets_and_an_origin_on_the_stock_or_part_box() {
+    let mut s = machined_plate();
+    // The plate is 60 × 40 × 10 with its top at world Z 0. Stock: 5 mm round it and 2 mm on top;
+    // origin: the stock's top at its lowest X and Y, which is world (−5, −5, 2).
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"side": 5, "top": 2}, "origin": {}}));
+    let setup = work_frame(&mut s);
+    assert!(near(xyz(&setup["frame"]["origin"]), [-5.0, -5.0, 2.0]), "{setup}");
+    assert!(near(xyz(&setup["stock_box"]["min"]), [0.0, 0.0, -12.0]) && near(xyz(&setup["stock_box"]["max"]), [70.0, 50.0, 0.0]), "{setup}");
+    assert!(near(xyz(&setup["part_box"]["min"]), [5.0, 5.0, -12.0]) && near(xyz(&setup["part_box"]["max"]), [65.0, 45.0, -2.0]), "{setup}");
+    // Facing with nothing picked covers the stock, from its top (0) down to the part's top (−2).
+    let face = run(&mut s, "cam.op.face", json!({"tool": 1, "spindle_rpm": 10000, "feed": 800, "stepover": 5, "stepdown": 1}));
+    close(face["lowest_z"].as_f64().unwrap(), -2.0, 1e-9);
+    // The pocket's floor, world Z −4, is at −6 in work coordinates; its walls start 13 mm in from the part: 18 from the stock.
+    let pocket = json!({"faces": [{"point": [30, 20, -4]}], "tool": 1, "spindle_rpm": 10000, "feed": 600, "ramp_angle": 0});
+    close(run(&mut s, "cam.op.pocket", pocket)["lowest_z"].as_f64().unwrap(), -6.0, 1e-9);
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    let pts = cuts(&gcode);
+    close(pts.iter().filter(|p| p.z < -2.5).map(|p| p.x).fold(f64::INFINITY, f64::min), 18.0, 1e-4);
+    // The faced area is the stock's, the tool running off it: X from −(3 + 1) to 70 + 3 + 1.
+    let faced = pts.iter().filter(|p| p.z > -2.5 && p.z < 0.5);
+    let (lo, hi) = faced.fold((f64::INFINITY, f64::NEG_INFINITY), |m, p| (m.0.min(p.x), m.1.max(p.x)));
+    close(lo, -4.0, 1e-6);
+    close(hi, 74.0, 1e-6);
+    // In the world the toolpath is where the part is.
+    close(world_box(&mut s, "Setup1", "Pocket1").0[2], -4.0, 1e-9);
+    // The simulation uses the setup's stock: the facing takes its top 2 mm off.
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    close(sim["operations"][0]["removed_volume"].as_f64().unwrap(), 7000.0, 140.0);
+    assert_eq!(sim["max_gouge"], 0.0);
+
+    // More stock on top lifts the origin with it: the same floor is deeper in work coordinates.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"top": "2 mm + depth"}}));
+    assert!(near(xyz(&work_frame(&mut s)["frame"]["origin"]), [-5.0, -5.0, 6.0]));
+    close(lowest(&mut s, "Pocket1"), -10.0, 1e-9);
+    // The middle of the part's top face, and the middle of the bottom of the stock.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "origin": {"of": "part", "x": "center", "y": "center", "z": "max"}}));
+    assert!(near(xyz(&work_frame(&mut s)["frame"]["origin"]), [30.0, 20.0, 0.0]));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "origin": {"x": "center", "y": "center", "z": "min"}}));
+    assert!(near(xyz(&work_frame(&mut s)["frame"]["origin"]), [30.0, 20.0, -10.0]));
+    // A fixed world point still works, and what was not named was kept.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "origin": [1, 2, 3], "name": "Top", "post": "lnc_atc"}));
+    let setup = work_frame(&mut s);
+    assert!(near(xyz(&setup["frame"]["origin"]), [1.0, 2.0, 3.0]));
+    assert_eq!((setup["name"].as_str(), setup["post"].as_str(), setup["stock"]["side"].as_str()), (Some("Top"), Some("lnc_atc"), Some("5")));
+
+    let before = s.doc.manufacture.clone();
+    for bad in [
+        json!({"axis": "q"}),
+        json!({"axis": [0, 0, 0]}),
+        json!({"origin": {"of": "table"}}),
+        json!({"origin": {"x": "left"}}),
+        json!({"origin": {"corner": 1}}),
+        json!({"origin": "top"}),
+        json!({"stock": {"side": -1}}),
+        json!({"stock": 5}),
+        json!({"post": "fanuc"}),
+        json!({"name": "Top", "setup": "Nope"}),
+    ] {
+        let mut p = bad.clone();
+        if p.get("setup").is_none() {
+            p["setup"] = json!("Top");
+        }
+        assert!(s.execute("cam.setup.edit", &p).is_err(), "{bad}");
+    }
+    assert_eq!(s.doc.manufacture, before);
+    // An origin on the box needs a body to put a box round.
+    let mut empty = Session::default();
+    assert!(empty.execute("cam.setup.create", &json!({"origin": {"of": "stock"}})).unwrap_err().to_string().contains("there is no body"));
+}
+
+#[test]
+fn tool_axis_turns_the_setup() {
+    let mut s = machined_plate();
+    let contour = |setup: &str, point: [f64; 3]| json!({"setup": setup, "faces": [{"point": point}], "tool": 1, "spindle_rpm": 10000, "feed": 600, "ramp_angle": 0});
+    // From below: the setup's +Z is world −Z, its X world X and its Y world −Y.
+    run(&mut s, "cam.setup.create", json!({"name": "Bottom", "axis": "-z"}));
+    let f = run(&mut s, "cam.list", json!({}))["setups"][1]["frame"].clone();
+    assert!(near(xyz(&f["x"]), [1.0, 0.0, 0.0]) && near(xyz(&f["y"]), [0.0, -1.0, 0.0]) && near(xyz(&f["z"]), [0.0, 0.0, -1.0]), "{f}");
+    // The plate's underside (world Z −10) is the top of this setup: 10 in work coordinates, cut down to 0.
+    let made = run(&mut s, "cam.op.contour", contour("Bottom", [5.0, 5.0, -10.0]));
+    close(made["lowest_z"].as_f64().unwrap(), 0.0, 1e-9);
+    // In the world it runs round the plate 3 mm out, between its underside and its top.
+    let b = world_box(&mut s, "Bottom", "Contour1");
+    assert!(near(b.0, [-3.0, -3.0, -10.0]) && near(b.1, [63.0, 43.0, 0.0]), "{b:?}");
+    // The pocket opens upwards: from below its floor points away, and only a contour may use such a face.
+    assert!(s.execute("cam.op.pocket", &contour("Bottom", [30.0, 20.0, -4.0])).unwrap_err().to_string().contains("points away from the tool"));
+    // A face on the side cannot be cut from above or below.
+    assert!(s.execute("cam.op.contour", &contour("Bottom", [60.0, 20.0, -5.0])).unwrap_err().to_string().contains("not supported yet"));
+
+    // From the side: +X is the tool axis, work X is world Y and work Y world Z.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Bottom", "axis": "+x", "name": "Side"}));
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert!(
+        listed["setups"][1]["operations"][0]["error"].as_str().unwrap().contains("not supported yet"),
+        "the old operation no longer faces the tool"
+    );
+    run(&mut s, "cam.op.remove", json!({"setup": "Side", "op": "Contour1"}));
+    run(&mut s, "cam.op.contour", contour("Side", [60.0, 20.0, -5.0]));
+    // Round the 40 × 10 end face, 3 mm out, from X 60 back through the plate's length to X 0.
+    let b = world_box(&mut s, "Side", "Contour1");
+    assert!(near(b.0, [0.0, -3.0, -13.0]) && near(b.1, [60.0, 43.0, 3.0]), "{b:?}");
+    // Any direction will do; a tilted one keeps work X level.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Side", "axis": [1, 0, 1]}));
+    let f = run(&mut s, "cam.list", json!({}))["setups"][1]["frame"].clone();
+    let (x, z) = (xyz(&f["x"]), xyz(&f["z"]));
+    assert!(x[2].abs() < 1e-12 && near(z, [0.5f64.sqrt(), 0.0, 0.5f64.sqrt()]), "{f}");
+}
+
 #[test]
 fn manufacture_is_saved_undone_and_reported_when_it_breaks() {
     let mut s = pocket_job(0.0, json!({}));
@@ -361,6 +500,64 @@ fn operations_are_edited_in_place() {
 }
 
 #[test]
+fn tools_carry_cutting_data_and_libraries_move_between_designs() {
+    let mut s = pocket_job(0.0, json!({}));
+    // A tool with its own speed and feeds: operations need not repeat them.
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 5, "kind": "flat", "diameter": 6, "flutes": 3, "spindle_rpm": 18000, "feed": 1500, "plunge_feed": 400, "description": "3-flute"}),
+    );
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 5, "bottom": -2}));
+    let op = &s.doc.manufacture.setups[0].operations[0];
+    assert_eq!((op.spindle_rpm, op.cut_feed, op.plunge_feed), (18000.0, 1500.0, 400.0));
+    // Given values win; a tool without data needs them.
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 5, "bottom": -2, "feed": 900}));
+    let op = &s.doc.manufacture.setups[0].operations[1];
+    assert_eq!((op.spindle_rpm, op.cut_feed, op.plunge_feed), (18000.0, 900.0, 400.0));
+    let refused = s.execute("cam.op.pocket", &json!({"sketch": "Pocket", "tool": 1, "bottom": -2, "feed": 600})).unwrap_err().to_string();
+    assert!(refused.contains("`spindle_rpm` is required: tool 1 has none of its own"), "{refused}");
+    // Redefining a tool keeps the data that is not named; null clears it.
+    run(&mut s, "cam.tool.define", json!({"number": 5, "kind": "flat", "diameter": 6, "feed": 1200, "plunge_feed": null}));
+    let t = s.doc.manufacture.tool(5).unwrap().clone();
+    assert_eq!((t.flutes, t.spindle_rpm, t.feed, t.plunge_feed), (3, Some(18000.0), Some(1200.0), None));
+    for bad in [json!({"flutes": 0}), json!({"flutes": 2.5}), json!({"feed": -1}), json!({"spindle_rpm": "fast"})] {
+        let mut p = json!({"number": 6, "kind": "flat", "diameter": 6});
+        for (k, v) in bad.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        assert!(s.execute("cam.tool.define", &p).is_err(), "{bad}");
+    }
+
+    // The library goes to a file and into another design.
+    let path = std::env::temp_dir().join(format!("solidcraft-tools-{}.json", std::process::id()));
+    let path = path.to_string_lossy().to_string();
+    assert_eq!(run(&mut s, "cam.tool.export", json!({"path": path}))["tools"], 2);
+    let mut other = Session::default();
+    run(&mut other, "cam.tool.define", json!({"number": 5, "kind": "drill", "diameter": 3}));
+    let merged = run(&mut other, "cam.tool.import", json!({"path": path}));
+    assert_eq!((merged["added"].clone(), merged["skipped"].clone()), (json!([1]), json!([5])));
+    assert_eq!(other.doc.manufacture.tool(5).unwrap().diameter, 3.0);
+    let merged = run(&mut other, "cam.tool.import", json!({"path": path, "replace": true}));
+    assert_eq!(merged["replaced"], json!([1, 5]));
+    assert_eq!(other.doc.manufacture.tools, s.doc.manufacture.tools);
+    run(&mut other, "edit.undo", json!({}));
+    assert_eq!(other.doc.manufacture.tool(5).unwrap().diameter, 3.0);
+    // Files that are not tool libraries, or hold tools that cannot exist, are refused whole.
+    for text in [
+        "{}",
+        "not json",
+        r#"{"format": "solidcraft-tools/1", "tools": [{"number": 1, "kind": "flat_endmill", "diameter": -6, "flute_length": 10}]}"#,
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let before = other.doc.manufacture.clone();
+        assert!(other.execute("cam.tool.import", &json!({"path": path})).is_err(), "{text}");
+        assert_eq!(other.doc.manufacture, before);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn what_cannot_be_cut_is_refused() {
     let mut s = pocket_job(0.0, json!({}));
     let refused =
@@ -417,6 +614,9 @@ fn hostile_cam_params_never_panic() {
         "cam.op.edit",
         "cam.op.move",
         "cam.simulate",
+        "cam.setup.edit",
+        "cam.tool.import",
+        "cam.tool.export",
         "cam.tool.define",
         "cam.tool.remove",
         "cam.setup.create",
@@ -456,6 +656,7 @@ fn hostile_cam_params_never_panic() {
         "by",
         "cell",
         "stock",
+        "axis",
         "side",
         "peck",
         "dwell",
