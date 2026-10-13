@@ -48,6 +48,11 @@ pub struct Tool {
     pub feed: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plunge_feed: Option<f64>,
+    /// The depth per pass and the distance between passes operations start from (mm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepdown: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepover: Option<f64>,
 }
 
 fn two() -> u32 {
@@ -56,7 +61,19 @@ fn two() -> u32 {
 
 impl Tool {
     pub fn new(number: u32, kind: ToolKind, diameter: f64, flute_length: f64) -> Tool {
-        Tool { number, kind, diameter, flute_length, description: String::new(), flutes: 2, spindle_rpm: None, feed: None, plunge_feed: None }
+        Tool {
+            number,
+            kind,
+            diameter,
+            flute_length,
+            description: String::new(),
+            flutes: 2,
+            spindle_rpm: None,
+            feed: None,
+            plunge_feed: None,
+            stepdown: None,
+            stepover: None,
+        }
     }
     pub fn radius(&self) -> f64 {
         self.diameter * 0.5
@@ -74,8 +91,8 @@ impl Tool {
         if !(1..=100).contains(&self.flutes) {
             return invalid("a tool has 1 to 100 flutes");
         }
-        if [self.spindle_rpm, self.feed, self.plunge_feed].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
-            return invalid("a tool's spindle speed and feeds must be above 0");
+        if [self.spindle_rpm, self.feed, self.plunge_feed, self.stepdown, self.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
+            return invalid("a tool's spindle speed, feeds, stepdown and stepover must be above 0");
         }
         Ok(())
     }

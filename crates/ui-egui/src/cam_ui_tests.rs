@@ -4,8 +4,29 @@ use super::*;
 use crate::scenario::Harness;
 
 /// A 40 × 30 rectangle sketched on XY.
-fn sketched() -> Harness {
+/// An app with a tool library file of its own, so tests do not share one.
+fn lab() -> Harness {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("solidcraft-ui-tools-{}-{n}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
     let mut h = Harness::new();
+    h.app.manufacture.library = Some(path.to_string_lossy().to_string());
+    h
+}
+
+/// Defines the library's next tool from the toolbar: a 6 mm end mill at 10000 rev/min and 600 mm/min.
+fn define_tool(h: &mut Harness) {
+    fill(h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        assert!(tool.library && !tool.editing);
+        tool.spindle_rpm = "10000".into();
+        tool.feed = "600".into();
+    });
+}
+
+fn sketched() -> Harness {
+    let mut h = lab();
     h.app.run("sketch.create", json!({"plane": "XY", "name": "Pocket"})).unwrap();
     h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]})).unwrap();
     h.app.run("sketch.finish", json!({})).unwrap();
@@ -25,7 +46,7 @@ fn fill(h: &mut Harness, id: &str, edit: impl FnOnce(&mut Form)) {
 #[test]
 fn toolbar_forms_make_a_job_and_its_toolpath_is_drawn() {
     let mut h = sketched();
-    fill(&mut h, "cam.tool.define", |_| {});
+    define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     // The form starts on the newest sketch and the first tool; only the depth is typed.
     fill(&mut h, "cam.op.pocket", |f| {
@@ -57,7 +78,7 @@ fn toolbar_forms_make_a_job_and_its_toolpath_is_drawn() {
 fn toolpath_follows_the_design_and_errors_stay_in_the_window() {
     let mut h = sketched();
     h.app.run("parameters.add", json!({"name": "depth", "expression": "2 mm"})).unwrap();
-    fill(&mut h, "cam.tool.define", |_| {});
+    define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     fill(&mut h, "cam.op.pocket", |f| {
         let Form::Op(op) = f else { panic!("not an operation form") };
@@ -88,9 +109,9 @@ fn toolpath_follows_the_design_and_errors_stay_in_the_window() {
 
 #[test]
 fn selected_faces_become_the_operation_s_geometry() {
-    let mut h = Harness::new();
+    let mut h = lab();
     h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
-    fill(&mut h, "cam.tool.define", |_| {});
+    define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
     h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
@@ -115,7 +136,7 @@ fn selected_faces_become_the_operation_s_geometry() {
 #[test]
 fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
     let mut h = sketched();
-    fill(&mut h, "cam.tool.define", |_| {});
+    define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     fill(&mut h, "cam.op.pocket", |f| {
         let Form::Op(op) = f else { panic!("not an operation form") };
@@ -156,9 +177,9 @@ fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
 
 #[test]
 fn simulate_reports_in_the_window_until_the_design_changes() {
-    let mut h = Harness::new();
+    let mut h = lab();
     h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
-    fill(&mut h, "cam.tool.define", |_| {});
+    define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
     h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
@@ -208,7 +229,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
 
 #[test]
 fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
-    let mut h = Harness::new();
+    let mut h = lab();
     h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
     // With a body in the design a new setup starts on the stock's top corner; 5 mm of stock is typed.
     fill(&mut h, "cam.setup.create", |f| {
@@ -255,44 +276,90 @@ fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
 }
 
 #[test]
-fn tool_library_is_its_own_window() {
-    let mut h = Harness::new();
+fn tool_library_is_the_machine_s_and_fills_operation_forms() {
+    let mut h = lab();
     fill(&mut h, "cam.tool.define", |f| {
         let Form::Tool(tool) = f else { panic!("not a tool form") };
         tool.description = "Rougher".into();
         tool.flutes = "3".into();
         tool.spindle_rpm = "18000".into();
         tool.feed = "1500".into();
+        tool.stepdown = "1.5".into();
+        tool.stepover = "2".into();
     });
     assert!(h.app.manufacture.tools_open && !h.app.manufacture.open);
+    // The tool is the machine's, not this design's.
+    assert!(h.app.session.doc.manufacture.tools.is_empty());
     h.frames(2);
     assert!(h.widget("TOOL LIBRARY").is_some() && h.widget("T1  Rougher").is_some() && h.widget("18000").is_some() && h.widget("New Tool").is_some());
-    assert!(h.widget("MANUFACTURE").is_none() || h.widget("Tool Library (1)…").is_none(), "the setups window is not open");
     // Edit fills the form from the tool; an emptied feed is cleared, the number stays.
-    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
-    let Some(Form::Tool(mut form)) = tool_form(&listed["tools"][0]) else { panic!("no form") };
+    let library = library_listing(&mut h.app, true);
+    let Some(Form::Tool(mut form)) = tool_form(&library["tools"][0], true) else { panic!("no form") };
     assert_eq!(
-        (form.number.as_str(), form.diameter.as_str(), form.flutes.as_str(), form.feed.as_str(), form.plunge_feed.as_str()),
-        ("1", "6 mm", "3", "1500", "")
+        (form.number.as_str(), form.diameter.as_str(), form.flutes.as_str(), form.feed.as_str(), form.plunge_feed.as_str(), form.stepover.as_str()),
+        ("1", "6 mm", "3", "1500", "", "2")
     );
-    form.feed = String::new();
-    form.diameter = "8 mm".into();
+    form.plunge_feed = "400".into();
     h.app.manufacture.form = Some(Form::Tool(form));
     apply(&mut h.app);
-    let tool = h.app.session.doc.manufacture.tool(1).unwrap();
-    assert_eq!((tool.diameter, tool.flutes, tool.spindle_rpm, tool.feed), (8.0, 3, Some(18000.0), None));
-    // An operation started now leaves the speed to the tool and asks only for what the tool lacks.
+    assert_eq!(h.app.manufacture.error, None);
+
+    // An operation form shows the tool's speed, feeds, stepdown and stepover, to keep or change.
     h.app.run("sketch.create", json!({"plane": "XY", "name": "Pocket"})).unwrap();
     h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]})).unwrap();
     h.app.run("sketch.finish", json!({})).unwrap();
     fill(&mut h, "cam.setup.create", |_| {});
     fill(&mut h, "cam.op.pocket", |f| {
         let Form::Op(op) = f else { panic!("not an operation form") };
-        assert_eq!((op.spindle_rpm.as_str(), op.feed.as_str()), ("", "600"));
+        assert_eq!((op.tool.as_str(), op.spindle_rpm.as_str(), op.feed.as_str(), op.plunge_feed.as_str()), ("1", "18000", "1500", "400"));
+        assert_eq!((op.stepdown.as_str(), op.stepover.as_str()), ("1.5 mm", "2 mm"));
+        // This operation runs slower; the tool keeps its own feed.
+        op.feed = "900".into();
+        op.bottom = "-3 mm".into();
     });
-    assert_eq!(h.app.session.doc.manufacture.setups[0].operations[0].spindle_rpm, 18000.0);
+    let op = &h.app.session.doc.manufacture.setups[0].operations[0];
+    assert_eq!((op.spindle_rpm, op.cut_feed, op.plunge_feed, op.stepdown.as_str()), (18000.0, 900.0, 400.0, "1.5 mm"));
+    // The design took a copy of the tool, which the library window says.
+    assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1500.0));
     h.frames(2);
-    assert!(h.widget("Tool Library (1)…").is_some());
+    assert!(h.widget("in this design").is_some() && h.widget("Tool Library…").is_some());
+
+    // A second tool with other data: choosing it in an open form brings its data in.
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        assert_eq!(tool.number, "2");
+        tool.diameter = "4 mm".into();
+        tool.spindle_rpm = "20000".into();
+        tool.feed = "700".into();
+    });
+    h.app.start("cam.op.contour");
+    h.frames(1);
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        assert_eq!(op.feed, "1500");
+        op.tool = "2".into();
+    }
+    h.frames(2);
+    let Some(Form::Op(op)) = &h.app.manufacture.form else { panic!("the form closed") };
+    assert_eq!((op.spindle_rpm.as_str(), op.feed.as_str(), op.stepdown.as_str()), ("20000", "700", ""));
+
+    // The library's tool changes: this design is offered the update and takes it.
+    let library = library_listing(&mut h.app, true);
+    let Some(Form::Tool(mut form)) = tool_form(&library["tools"][0], true) else { panic!("no form") };
+    form.feed = "1600".into();
+    h.app.manufacture.form = Some(Form::Tool(form));
+    apply(&mut h.app);
+    h.frames(2);
+    assert!(h.widget("Update this design").is_some());
+    assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1500.0));
+    run(&mut h.app, "cam.tool.update", json!({"number": 1})).unwrap();
+    assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1600.0));
+    // A tool made only in this design is listed apart and can join the library.
+    h.app.run("cam.tool.define", json!({"number": 30, "kind": "drill", "diameter": 3})).unwrap();
+    h.app.manufacture.form = None;
+    h.frames(2);
+    assert!(h.widget("Only in this design").is_some() && h.widget("Add to library").is_some());
+    run(&mut h.app, "cam.library.add", json!({"number": 30})).unwrap();
+    assert_eq!(library_listing(&mut h.app, true)["tools"].as_array().map(Vec::len), Some(3));
 }
 
 #[test]
@@ -304,7 +371,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
-        let mut h = Harness::new();
+        let mut h = lab();
         h.app.start(c.id);
         assert_eq!(
             (h.app.manufacture.open, h.app.manufacture.tools_open),

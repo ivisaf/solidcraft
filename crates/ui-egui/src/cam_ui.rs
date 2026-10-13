@@ -60,8 +60,10 @@ pub enum Form {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolForm {
-    /// Changing a tool that is in the library (its number then stays).
+    /// Changing a tool that exists (its number then stays).
     pub editing: bool,
+    /// A tool of the machine's library; otherwise one that is only in this design.
+    pub library: bool,
     pub number: String,
     pub kind: usize,
     pub diameter: String,
@@ -71,6 +73,9 @@ pub struct ToolForm {
     pub spindle_rpm: String,
     pub feed: String,
     pub plunge_feed: String,
+    /// Depth per pass and distance between passes (mm).
+    pub stepdown: String,
+    pub stepover: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +108,8 @@ pub struct Editing {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpForm {
     pub kind: OpKind,
+    /// The tool whose cutting data the form was last filled from: choosing another fills it again.
+    pub filled_for: String,
     /// The operation being changed (`None`: a new one).
     pub editing: Option<Editing>,
     pub name: String,
@@ -277,6 +284,10 @@ pub struct CamUi {
     pub open: bool,
     /// The Tool Library window.
     pub tools_open: bool,
+    /// The tool library file to use instead of the machine's own (tests).
+    pub library: Option<String>,
+    /// The machine library as last listed, and how many frames ago.
+    listing: Option<(u32, Value)>,
     /// Whether setups' stock boxes and work origins are drawn.
     pub show_setups: bool,
     pub form: Option<Form>,
@@ -298,6 +309,8 @@ impl Default for CamUi {
         CamUi {
             open: false,
             tools_open: false,
+            library: None,
+            listing: None,
             show_setups: true,
             form: None,
             show_paths: true,
@@ -336,8 +349,11 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         return false;
     }
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
-    let first_tool = listed["tools"].get(0).and_then(|t| t["number"].as_u64()).map(|n| n.to_string()).unwrap_or_default();
-    let tool_has = |k: &str| listed["tools"].get(0).is_some_and(|t| t[k].as_f64().is_some());
+    let lists = {
+        let library = library_listing(app, true);
+        choices(app, &listed, &library)
+    };
+    let first_tool = lists.tools.first().map(|t| t.0.clone()).unwrap_or_default();
     let op = |kind: OpKind| {
         let sketch = app
             .session
@@ -351,15 +367,15 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         let faces = selected_faces(app);
         Form::Op(Box::new(OpForm {
             kind,
+            filled_for: String::new(),
             editing: None,
             name: String::new(),
             bottom: if faces.is_empty() { "-5 mm".into() } else { String::new() },
             faces,
             sketch,
             tool: first_tool.clone(),
-            // Left empty, speed and feeds are the tool's own.
-            spindle_rpm: if tool_has("spindle_rpm") { String::new() } else { "10000".into() },
-            feed: if tool_has("feed") { String::new() } else { "600".into() },
+            spindle_rpm: String::new(),
+            feed: String::new(),
             plunge_feed: String::new(),
             top: String::new(),
             stepdown: String::new(),
@@ -373,20 +389,26 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             coolant: false,
         }))
     };
-    let next_number = (1u64..).find(|n| !listed["tools"].as_array().is_some_and(|a| a.iter().any(|t| t["number"].as_u64() == Some(*n)))).unwrap_or(1);
     let form = match id {
-        "cam.tool.define" => Some(Form::Tool(Box::new(ToolForm {
-            editing: false,
-            number: next_number.to_string(),
-            kind: 0,
-            diameter: "6 mm".into(),
-            flute_length: String::new(),
-            description: String::new(),
-            flutes: "2".into(),
-            spindle_rpm: String::new(),
-            feed: String::new(),
-            plunge_feed: String::new(),
-        }))),
+        "cam.tool.define" => {
+            let library = library_listing(app, true);
+            let taken = |n: u64| library["tools"].as_array().is_some_and(|a| a.iter().any(|t| t["number"].as_u64() == Some(n)));
+            Some(Form::Tool(Box::new(ToolForm {
+                editing: false,
+                library: true,
+                number: (1u64..).find(|n| !taken(*n)).unwrap_or(1).to_string(),
+                kind: 0,
+                diameter: "6 mm".into(),
+                flute_length: String::new(),
+                description: String::new(),
+                flutes: "2".into(),
+                spindle_rpm: String::new(),
+                feed: String::new(),
+                plunge_feed: String::new(),
+                stepdown: String::new(),
+                stepover: String::new(),
+            })))
+        }
         "cam.setup.create" => Some(Form::Setup(Box::new(SetupForm {
             editing: None,
             name: String::new(),
@@ -413,10 +435,14 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         simulate(app);
     }
     // Tools have a window of their own.
-    if id.starts_with("cam.tool.") {
+    if id.starts_with("cam.tool.") || id.starts_with("cam.library.") {
         app.manufacture.tools_open = true;
     } else {
         app.manufacture.open = true;
+    }
+    let mut form = form;
+    if let Some(Form::Op(f)) = &mut form {
+        prefill(f, &lists);
     }
     app.manufacture.form = form;
     app.manufacture.error = None;
@@ -442,11 +468,13 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             if !f.flutes.trim().is_empty() {
                 p.insert("flutes".into(), json!(number("The number of flutes", &f.flutes)? as u64));
             }
-            // An emptied speed or feed is cleared on a tool being edited.
+            // An emptied value is cleared on a tool being edited.
             for (k, what, text) in [
                 ("spindle_rpm", "The spindle speed", &f.spindle_rpm),
                 ("feed", "The feed", &f.feed),
                 ("plunge_feed", "The plunge feed", &f.plunge_feed),
+                ("stepdown", "The stepdown", &f.stepdown),
+                ("stepover", "The stepover", &f.stepover),
             ] {
                 if !text.trim().is_empty() {
                     p.insert(k.into(), json!(number(what, text)?));
@@ -454,7 +482,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     p.insert(k.into(), Value::Null);
                 }
             }
-            Ok(("cam.tool.define", Value::Object(p)))
+            Ok((if f.library { "cam.library.define" } else { "cam.tool.define" }, Value::Object(p)))
         }
         Form::Setup(f) => {
             optional(&mut p, "name", &f.name);
@@ -564,7 +592,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
 }
 
 /// A form filled in from a tool as `cam.list` reports it.
-pub fn tool_form(tool: &Value) -> Option<Form> {
+pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
     let number = |k: &str| tool[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
     let kind = match tool["kind"].as_str()? {
         "ball_endmill" => 1,
@@ -573,6 +601,7 @@ pub fn tool_form(tool: &Value) -> Option<Form> {
     };
     Some(Form::Tool(Box::new(ToolForm {
         editing: true,
+        library,
         number: tool["number"].as_u64()?.to_string(),
         kind,
         diameter: format!("{} mm", tool["diameter"].as_f64()?),
@@ -582,6 +611,8 @@ pub fn tool_form(tool: &Value) -> Option<Form> {
         spindle_rpm: number("spindle_rpm"),
         feed: number("feed"),
         plunge_feed: number("plunge_feed"),
+        stepdown: number("stepdown"),
+        stepover: number("stepover"),
     })))
 }
 
@@ -632,6 +663,8 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
     let inputs = &op["inputs"];
     Some(Form::Op(Box::new(OpForm {
         kind,
+        // An operation's own values are shown; they are only replaced when another tool is chosen.
+        filled_for: op["tool"].as_u64()?.to_string(),
         editing: Some(Editing { setup: setup["id"].as_u64()?, op: op["id"].as_u64()?, sketch: sketch.clone(), faces: faces.clone() }),
         name: text(op, "name"),
         faces,
@@ -654,10 +687,62 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
     })))
 }
 
+/// Runs a command with this window's tool library, if it has one of its own.
+fn run(app: &mut SolveApp, id: &str, mut p: Value) -> Result<Value, String> {
+    if let (Some(library), Some(o)) = (&app.manufacture.library, p.as_object_mut()) {
+        o.insert("library".into(), json!(library));
+    }
+    app.manufacture.listing = None;
+    app.run(id, p)
+}
+
+/// The machine's tool library as `cam.library.list` reports it, read again now and then (another
+/// design may have changed it) and whenever `fresh` is asked for.
+fn library_listing(app: &mut SolveApp, fresh: bool) -> Value {
+    if let Some((age, listing)) = &mut app.manufacture.listing
+        && !fresh
+        && *age < 120
+    {
+        *age += 1;
+        return listing.clone();
+    }
+    let p = match &app.manufacture.library {
+        Some(library) => json!({ "library": library }),
+        None => json!({}),
+    };
+    let listing = match app.session.execute("cam.library.list", &p) {
+        Ok(v) => v,
+        Err(e) => json!({ "error": e.to_string() }),
+    };
+    app.manufacture.listing = Some((0, listing.clone()));
+    listing
+}
+
+/// Fills an operation form's speed, feeds, stepdown and stepover from its tool, when the tool is
+/// not the one it was last filled from. They stay the operation's own to change.
+fn prefill(f: &mut OpForm, lists: &Choices) {
+    if f.filled_for == f.tool {
+        return;
+    }
+    f.filled_for = f.tool.clone();
+    let Some(data) = lists.data.iter().find(|(number, _)| *number == f.tool).map(|(_, d)| d) else { return };
+    let show = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_default();
+    f.spindle_rpm = show(data.spindle_rpm);
+    f.feed = show(data.feed);
+    f.plunge_feed = show(data.plunge_feed);
+    let length = |v: Option<f64>| v.map(|x| format!("{x} mm")).unwrap_or_default();
+    f.stepdown = length(data.stepdown);
+    // A pocket's passes are at most a radius apart.
+    f.stepover = length(match f.kind {
+        OpKind::Pocket => data.stepover.map(|s| s.min(data.diameter * 0.5)),
+        _ => data.stepover,
+    });
+}
+
 /// Runs the open form's command; the form closes when the command succeeds.
 pub fn apply(app: &mut SolveApp) {
     let Some(form) = app.manufacture.form.clone() else { return };
-    match command(&form).and_then(|(id, p)| app.run(id, p)) {
+    match command(&form).and_then(|(id, p)| run(app, id, p)) {
         Ok(_) => {
             app.manufacture.form = None;
             app.manufacture.error = None;
@@ -839,16 +924,29 @@ fn pick(ui: &mut egui::Ui, id: &str, label: &str, value: &mut String, options: &
     ui.end_row();
 }
 
+/// A tool's cutting data, as forms fill it in.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ToolData {
+    diameter: f64,
+    spindle_rpm: Option<f64>,
+    feed: Option<f64>,
+    plunge_feed: Option<f64>,
+    stepdown: Option<f64>,
+    stepover: Option<f64>,
+}
+
 /// What an operation form chooses from.
 #[derive(Default)]
 struct Choices {
     /// Sketch names, newest first.
     sketches: Vec<(String, String)>,
-    /// Tool numbers with what they are.
+    /// Tool numbers with what they are: this design's tools, then the library's others.
     tools: Vec<(String, String)>,
+    /// Each tool's cutting data, by number.
+    data: Vec<(String, ToolData)>,
 }
 
-fn choices(app: &SolveApp, listed: &Value) -> Choices {
+fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
     let sketches = app
         .session
         .doc
@@ -858,16 +956,31 @@ fn choices(app: &SolveApp, listed: &Value) -> Choices {
         .filter(|f| matches!(f.kind, solidcraft_engine::doc::FeatureKind::Sketch { .. }))
         .map(|f| (f.name.clone(), f.name.clone()))
         .collect();
-    let tools = listed["tools"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| {
-            let n = t["number"].as_u64()?;
-            Some((n.to_string(), format!("T{n}  D{} {}", t["diameter"].as_f64()?, text(t, "kind").replace('_', " "))))
-        })
-        .collect();
-    Choices { sketches, tools }
+    let (mut tools, mut data) = (Vec::new(), Vec::new());
+    // The design's own copy of a tool is the one its operations cut with.
+    for t in listed["tools"].as_array().into_iter().flatten().chain(library["tools"].as_array().into_iter().flatten()) {
+        let (Some(n), Some(diameter)) = (t["number"].as_u64(), t["diameter"].as_f64()) else { continue };
+        let n = n.to_string();
+        if tools.iter().any(|(number, _): &(String, String)| *number == n) {
+            continue;
+        }
+        let name = text(t, "description");
+        let what = if name.is_empty() { text(t, "kind").replace('_', " ") } else { name };
+        tools.push((n.clone(), format!("T{n}  D{diameter} {what}")));
+        let value = |k: &str| t[k].as_f64();
+        data.push((
+            n,
+            ToolData {
+                diameter,
+                spindle_rpm: value("spindle_rpm"),
+                feed: value("feed"),
+                plunge_feed: value("plunge_feed"),
+                stepdown: value("stepdown"),
+                stepover: value("stepover"),
+            },
+        ));
+    }
+    Choices { sketches, tools, data }
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices) {
@@ -888,6 +1001,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
             field(ui, "Feed (mm/min)", &mut f.feed, "none");
             field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
+            field(ui, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
+            field(ui, "Stepover (mm)", &mut f.stepover, "by operation");
         }
         Form::Setup(f) => {
             field(ui, "Name", &mut f.name, "automatic");
@@ -933,6 +1048,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             }
             let from_faces = !f.faces.is_empty();
             pick(ui, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
+            // Another tool brings its own speed, feeds, stepdown and stepover; all stay editable here.
+            prefill(f, choices);
             field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "the tool's");
             field(ui, "Feed (mm/min)", &mut f.feed, "the tool's");
             field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
@@ -998,6 +1115,7 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
 #[derive(Default)]
 struct Asked {
     run: Vec<(&'static str, Value)>,
+    new_tool: bool,
     form: Option<Form>,
     /// An operation to open for editing: its setup and itself, as listed.
     edit_op: Option<(Value, Value)>,
@@ -1008,8 +1126,26 @@ struct Asked {
     export: bool,
 }
 
-/// The Tool Library window: every tool with its cutting data; add, change, remove, and move libraries between designs.
-fn tools_window(ctx: &egui::Context, cam: &mut CamUi, listed: &Value, lists: &Choices, corner: egui::Pos2, asked: &mut Asked) {
+/// One row of the tool table: what the tool is and the cutting data operations start from.
+fn tool_row(ui: &mut egui::Ui, tool: &Value) {
+    let number = tool["number"].as_u64().unwrap_or(0);
+    let data = |k: &str| tool[k].as_f64().map_or("—".to_string(), |v| format!("{v}"));
+    let name = text(tool, "description");
+    ui.label(if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") });
+    ui.label(text(tool, "kind").replace('_', " "));
+    ui.label(format!("{} mm", tool["diameter"].as_f64().unwrap_or(0.0)));
+    ui.label(data("flutes"));
+    ui.label(data("spindle_rpm"));
+    ui.label(data("feed"));
+    ui.label(data("plunge_feed"));
+    ui.label(data("stepdown"));
+    ui.label(data("stepover"));
+}
+
+/// The Tool Library window: the machine's tools, which every design can use, with the cutting
+/// data operations start from; add, change, remove, move libraries between machines; and how
+/// this design's copies of them stand.
+fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &Choices, corner: egui::Pos2, asked: &mut Asked) {
     let t = Tokens::get();
     let mut open = true;
     crate::frame::window(ctx, RichText::new("TOOL LIBRARY").strong().size(13.0), crate::frame::Width::Wide)
@@ -1023,47 +1159,79 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, listed: &Value, lists: &Ch
             if let Some(e) = cam.error.as_ref().filter(|_| !cam.open) {
                 ui.label(RichText::new(e).color(t.error));
             }
+            if let Some(e) = library["error"].as_str() {
+                ui.label(RichText::new(e).color(t.error));
+            }
             ui.horizontal(|ui| {
                 if ui.button("New Tool").clicked() {
-                    asked.run.push(("", json!("new tool")));
+                    asked.new_tool = true;
                 }
-                asked.import = ui.button("Import…").on_hover_text("Add the tools of a library file").clicked();
-                asked.export = ui.button("Export…").on_hover_text("Write this library to a file").clicked();
+                asked.import = ui.button("Import…").on_hover_text("Add the tools of a library file to this machine's library").clicked();
+                asked.export = ui.button("Export…").on_hover_text("Write this machine's library to a file").clicked();
+                ui.label(RichText::new("Shared by every design on this machine").color(t.text_dim)).on_hover_text(text(library, "path"));
             });
             ui.separator();
-            let tools = listed["tools"].as_array().cloned().unwrap_or_default();
+            let tools = library["tools"].as_array().cloned().unwrap_or_default();
             if tools.is_empty() {
                 ui.label(RichText::new("No tools yet").color(t.text_dim));
             }
-            egui::Grid::new("sc_cam_tool_table").num_columns(8).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+            let heads = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Feed", "Plunge", "Stepdown", "Stepover", ""];
+            egui::Grid::new("sc_cam_tool_table").num_columns(heads.len()).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
                 if !tools.is_empty() {
-                    for head in ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Feed", "Plunge", ""] {
+                    for head in heads {
                         ui.label(RichText::new(head).color(t.text_dim));
                     }
                     ui.end_row();
                 }
                 for tool in &tools {
                     let number = tool["number"].as_u64().unwrap_or(0);
-                    let data = |k: &str| tool[k].as_f64().map_or("—".to_string(), |v| format!("{v}"));
-                    let name = text(tool, "description");
-                    ui.label(if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") });
-                    ui.label(text(tool, "kind").replace('_', " "));
-                    ui.label(format!("{} mm", tool["diameter"].as_f64().unwrap_or(0.0)));
-                    ui.label(data("flutes"));
-                    ui.label(data("spindle_rpm"));
-                    ui.label(data("feed"));
-                    ui.label(data("plunge_feed"));
+                    tool_row(ui, tool);
                     ui.horizontal(|ui| {
                         if ui.small_button("Edit").clicked() {
-                            asked.form = tool_form(tool);
+                            asked.form = tool_form(tool, true);
                         }
                         if ui.small_button("Remove").clicked() {
-                            asked.run.push(("cam.tool.remove", json!({ "number": number })));
+                            asked.run.push(("cam.library.remove", json!({ "number": number })));
+                        }
+                        // This design cuts with its own copy: say so when the library's tool has moved on.
+                        match tool["design"].as_str() {
+                            Some("differs") => {
+                                if ui.small_button("Update this design").on_hover_text("This design's copy of the tool is older").clicked() {
+                                    asked.run.push(("cam.tool.update", json!({ "number": number })));
+                                }
+                            }
+                            Some("same") => {
+                                ui.label(RichText::new("in this design").color(t.text_dim));
+                            }
+                            _ => {}
                         }
                     });
                     ui.end_row();
                 }
             });
+            let own = library["only_in_design"].as_array().cloned().unwrap_or_default();
+            if !own.is_empty() {
+                ui.separator();
+                ui.label(RichText::new("Only in this design").strong());
+                egui::Grid::new("sc_cam_design_tools").num_columns(heads.len()).spacing([14.0, 6.0]).striped(true).show(ui, |ui| {
+                    for tool in &own {
+                        let number = tool["number"].as_u64().unwrap_or(0);
+                        tool_row(ui, tool);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Add to library").clicked() {
+                                asked.run.push(("cam.library.add", json!({ "number": number })));
+                            }
+                            if ui.small_button("Edit").clicked() {
+                                asked.form = tool_form(tool, false);
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                asked.run.push(("cam.tool.remove", json!({ "number": number })));
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+            }
             if matches!(cam.form, Some(Form::Tool(_))) {
                 asked.apply |= form_block(ui, cam, &[], lists);
             }
@@ -1095,8 +1263,7 @@ fn manufacture_window(
                 ui.label(RichText::new(e).color(t.error));
             }
             ui.horizontal(|ui| {
-                let tools = listed["tools"].as_array().map_or(0, Vec::len);
-                if ui.button(format!("Tool Library ({tools})…")).clicked() {
+                if ui.button("Tool Library…").clicked() {
                     cam.tools_open = true;
                 }
                 ui.checkbox(&mut cam.show_paths, "Toolpaths");
@@ -1186,7 +1353,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
     let selected = selected_faces(app);
-    let lists = choices(app, &listed);
+    let library = library_listing(app, false);
+    let lists = choices(app, &listed, &library);
     let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
     let mut asked = Asked::default();
     let mut cam = std::mem::take(&mut app.manufacture);
@@ -1195,15 +1363,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if cam.tools_open {
         let low = app.viewport.rect.map_or(egui::pos2(16.0, 700.0), |r| r.left_bottom() + egui::vec2(12.0, -60.0));
-        tools_window(ctx, &mut cam, &listed, &lists, low, &mut asked);
+        tools_window(ctx, &mut cam, &library, &lists, low, &mut asked);
     }
     app.manufacture = cam;
     for (id, p) in std::mem::take(&mut asked.run) {
-        if id.is_empty() {
-            start(app, "cam.tool.define");
-        } else {
-            app.manufacture.error = app.run(id, p).err();
-        }
+        app.manufacture.error = run(app, id, p).err();
+    }
+    if asked.new_tool {
+        start(app, "cam.tool.define");
     }
     if let Some((setup, op)) = asked.edit_op {
         asked.form = edit_form(app, &setup, &op);
@@ -1221,12 +1388,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if asked.import
         && let Some(path) = app.services.pick_open.as_ref().and_then(|f| f())
     {
-        app.manufacture.error = app.run("cam.tool.import", json!({ "path": path })).err();
+        app.manufacture.error = run(app, "cam.library.import", json!({ "path": path })).err();
     }
     if asked.export
         && let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("tools.json", &["json"]))
     {
-        app.manufacture.error = app.run("cam.tool.export", json!({ "path": path })).err();
+        app.manufacture.error = run(app, "cam.library.export", json!({ "path": path })).err();
     }
     if let Some((setup, post)) = asked.post {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());

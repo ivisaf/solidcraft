@@ -557,6 +557,112 @@ fn tools_carry_cutting_data_and_libraries_move_between_designs() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A library file of this test's own.
+fn library_file(name: &str) -> String {
+    let path = std::env::temp_dir().join(format!("solidcraft-lib-{name}-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    path.to_string_lossy().to_string()
+}
+
+#[test]
+fn machine_library_tools_are_used_by_any_design_which_keeps_its_own_copy() {
+    let lib = library_file("machine");
+    let mut s = pocket_job(0.0, json!({}));
+    // A library that does not exist yet is empty; the design's own tool is the only one about.
+    let listed = run(&mut s, "cam.library.list", json!({"library": lib}));
+    assert_eq!((listed["tools"].clone(), listed["only_in_design"][0]["number"].clone()), (json!([]), json!(1)));
+    // A tool with everything an operation starts from.
+    let rougher = json!({"library": lib, "number": 7, "kind": "flat", "diameter": 6, "description": "Rougher", "flutes": 3,
+        "spindle_rpm": 16000, "feed": 1400, "plunge_feed": 350, "stepdown": 1.5, "stepover": 2});
+    run(&mut s, "cam.library.define", rougher);
+    assert!(s.doc.manufacture.tool(7).is_none(), "defining a library tool does not touch the design");
+    assert_eq!(run(&mut s, "cam.library.list", json!({"library": lib}))["tools"][0]["design"], "absent");
+
+    // An operation names only the tool: speed, feeds, stepdown and stepover are the tool's.
+    run(&mut s, "cam.op.pocket", json!({"library": lib, "sketch": "Pocket", "tool": 7, "bottom": -3}));
+    let op = s.doc.manufacture.setups[0].operations[0].clone();
+    assert_eq!((op.spindle_rpm, op.cut_feed, op.plunge_feed, op.stepdown.as_str()), (16000.0, 1400.0, 350.0, "1.5 mm"));
+    assert!(matches!(&op.kind, solidcraft_doc::manufacture::CamOperationKind::Pocket { stepover, .. } if stepover == "2 mm"));
+    // The design now has its own copy of the tool, the same as the library's.
+    assert_eq!(s.doc.manufacture.tool(7).map(|t| (t.diameter, t.flutes)), Some((6.0, 3)));
+    assert_eq!(run(&mut s, "cam.library.list", json!({"library": lib}))["tools"][0]["design"], "same");
+    // Each operation's values are its own: changed on one, they change nothing else.
+    run(&mut s, "cam.op.edit", json!({"op": "Pocket1", "feed": 900, "spindle_rpm": 12000, "stepdown": 3}));
+    run(&mut s, "cam.op.pocket", json!({"library": lib, "sketch": "Pocket", "tool": 7, "bottom": -3, "plunge_feed": 100}));
+    let ops = &s.doc.manufacture.setups[0].operations;
+    assert_eq!((ops[0].cut_feed, ops[0].spindle_rpm, ops[0].stepdown.as_str()), (900.0, 12000.0, "3"));
+    assert_eq!((ops[1].cut_feed, ops[1].spindle_rpm, ops[1].plunge_feed), (1400.0, 16000.0, 100.0));
+    assert_eq!(s.doc.manufacture.tool(7).and_then(|t| t.feed), Some(1400.0), "nor the tool");
+
+    // The library's tool becomes 8 mm: this design cuts as before until its copy is updated.
+    let before = lowest_x(&mut s);
+    close(before, 3.0, 1e-6);
+    run(&mut s, "cam.library.define", json!({"library": lib, "number": 7, "kind": "flat", "diameter": 8}));
+    assert_eq!(run(&mut s, "cam.library.list", json!({"library": lib}))["tools"][0]["design"], "differs");
+    close(lowest_x(&mut s), 3.0, 1e-6);
+    assert_eq!(run(&mut s, "cam.tool.update", json!({"library": lib}))["updated"], json!([7]));
+    close(lowest_x(&mut s), 4.0, 1e-6);
+    assert_eq!(run(&mut s, "cam.tool.update", json!({"library": lib}))["updated"], json!([]));
+    // The redefinition kept the data it did not name.
+    assert_eq!(s.doc.manufacture.tool(7).map(|t| (t.spindle_rpm, t.stepover)), Some((Some(16000.0), Some(2.0))));
+    run(&mut s, "edit.undo", json!({}));
+    close(lowest_x(&mut s), 3.0, 1e-6);
+
+    // Another design on this machine sees the same library.
+    let mut other = pocket_job(0.0, json!({}));
+    run(&mut other, "cam.op.pocket", json!({"library": lib, "sketch": "Pocket", "tool": 7, "bottom": -3}));
+    assert_eq!(other.doc.manufacture.tool(7).map(|t| t.diameter), Some(8.0));
+    // A tool that cannot cut the pocket is not copied in on the way to finding that out.
+    run(&mut other, "cam.library.define", json!({"library": lib, "number": 9, "kind": "flat", "diameter": 50, "spindle_rpm": 1000, "feed": 100}));
+    assert!(
+        other
+            .execute("cam.op.pocket", &json!({"library": lib, "sketch": "Pocket", "tool": 9, "bottom": -3}))
+            .unwrap_err()
+            .to_string()
+            .contains("does not fit")
+    );
+    assert!(other.doc.manufacture.tool(9).is_none());
+
+    // A design's own tool goes into the library; library files move between machines.
+    assert_eq!(run(&mut s, "cam.library.add", json!({"library": lib, "number": 1}))["added"], json!([1]));
+    let file = library_file("exported");
+    assert_eq!(run(&mut s, "cam.library.export", json!({"library": lib, "path": file}))["tools"], 3);
+    let elsewhere = library_file("elsewhere");
+    run(&mut s, "cam.library.define", json!({"library": elsewhere, "number": 7, "kind": "drill", "diameter": 3}));
+    let merged = run(&mut s, "cam.library.import", json!({"library": elsewhere, "path": file}));
+    assert_eq!((merged["added"].clone(), merged["skipped"].clone()), (json!([1, 9]), json!([7])));
+    run(&mut s, "cam.library.remove", json!({"library": elsewhere, "number": 9}));
+    let numbers: Vec<u64> = run(&mut s, "cam.library.list", json!({"library": elsewhere}))["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, [1, 7]);
+    assert!(s.execute("cam.library.remove", &json!({"library": elsewhere, "number": 9})).is_err());
+    // A damaged library is reported, never read as empty and written over.
+    std::fs::write(&elsewhere, "{ not a library").unwrap();
+    for (cmd, p) in [
+        ("cam.library.list", json!({})),
+        ("cam.library.define", json!({"number": 2, "kind": "flat", "diameter": 3})),
+        ("cam.library.add", json!({"all": true})),
+    ] {
+        let mut p = p;
+        p["library"] = json!(elsewhere);
+        assert!(s.execute(cmd, &p).unwrap_err().to_string().contains("not a tool library"), "{cmd}");
+    }
+    assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "{ not a library");
+    for f in [lib, file, elsewhere] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+/// Lowest X the first operation cuts at, in the world.
+fn lowest_x(s: &mut Session) -> f64 {
+    let v = run(s, "cam.toolpath", json!({}));
+    v["operations"][0]["points"].as_array().unwrap().iter().filter(|p| p[3] == true).map(|p| p[0].as_f64().unwrap()).fold(f64::INFINITY, f64::min)
+}
+
 #[test]
 fn what_cannot_be_cut_is_refused() {
     let mut s = pocket_job(0.0, json!({}));
@@ -591,6 +697,7 @@ fn what_cannot_be_cut_is_refused() {
 
 #[test]
 fn hostile_cam_params_never_panic() {
+    let lib = library_file("hostile");
     let mut s = pocket_job(0.0, json!({}));
     run(&mut s, "cam.op.pocket", pocket_op());
     let hostile = [
@@ -617,6 +724,13 @@ fn hostile_cam_params_never_panic() {
         "cam.setup.edit",
         "cam.tool.import",
         "cam.tool.export",
+        "cam.tool.update",
+        "cam.library.list",
+        "cam.library.define",
+        "cam.library.remove",
+        "cam.library.add",
+        "cam.library.import",
+        "cam.library.export",
         "cam.tool.define",
         "cam.tool.remove",
         "cam.setup.create",
@@ -671,6 +785,7 @@ fn hostile_cam_params_never_panic() {
                 p["number"] = json!(3);
                 p["kind"] = json!("flat");
                 p["op"] = json!("Pocket1");
+                p["library"] = json!(lib);
                 p["diameter"] = json!(4);
                 p[key] = value.clone();
                 if let Err(e) = s.execute(cmd, &p) {
