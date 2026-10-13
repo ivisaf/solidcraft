@@ -156,19 +156,19 @@ pub struct Comparison {
     pub leftover_volume: f64,
 }
 
-/// Compares the cut `stock` with the `part` (both over the same columns). A column is compared
-/// with the part's columns around it too, so an edge that falls one column over is neither a
-/// gouge nor leftover.
-pub fn compare(stock: &HeightField, part: &HeightField) -> Result<Comparison> {
+/// How each column of the cut `stock` stands against the `part` (both over the same columns):
+/// negative, the depth cut into the part; positive, the thickness left on it; zero, neither.
+/// A column is compared with the part's columns around it too, so an edge that falls one column
+/// over is neither a gouge nor leftover.
+pub fn deviations(stock: &HeightField, part: &HeightField) -> Result<Vec<f64>> {
     if stock.nx != part.nx || stock.ny != part.ny || stock.z.len() != part.z.len() {
         return invalid("the stock and the part are not on the same columns");
     }
     let tol = 1e-6;
-    let mut out = Comparison::default();
-    let area = stock.cell * stock.cell;
+    let mut out = Vec::with_capacity(stock.z.len());
     for j in 0..stock.ny {
         for i in 0..stock.nx {
-            let Some(h) = stock.get(i, j) else { continue };
+            let h = stock.get(i, j).unwrap_or(stock.floor);
             let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
             for (di, dj) in (-1i64..=1).flat_map(|di| (-1i64..=1).map(move |dj| (di, dj))) {
                 let (ni, nj) = (i as i64 + di, j as i64 + dj);
@@ -179,13 +179,29 @@ pub fn compare(stock: &HeightField, part: &HeightField) -> Result<Comparison> {
                     (lowest, highest) = (lowest.min(p), highest.max(p));
                 }
             }
-            if h < lowest - tol {
-                out.max_gouge = out.max_gouge.max(lowest - h);
-                out.gouge_area += area;
+            out.push(if h < lowest - tol {
+                h - lowest
             } else if h > highest + tol {
-                out.max_leftover = out.max_leftover.max(h - highest);
-                out.leftover_volume += (h - highest) * area;
-            }
+                h - highest
+            } else {
+                0.0
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Compares the cut `stock` with the `part` (see [`deviations`]).
+pub fn compare(stock: &HeightField, part: &HeightField) -> Result<Comparison> {
+    let area = stock.cell * stock.cell;
+    let mut out = Comparison::default();
+    for d in deviations(stock, part)? {
+        if d < 0.0 {
+            out.max_gouge = out.max_gouge.max(-d);
+            out.gouge_area += area;
+        } else if d > 0.0 {
+            out.max_leftover = out.max_leftover.max(d);
+            out.leftover_volume += d * area;
         }
     }
     Ok(out)

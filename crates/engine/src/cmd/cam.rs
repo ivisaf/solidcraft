@@ -70,7 +70,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_setup").noundo().params(
         "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in world coordinates (default: the box around the bodies); cell?: column \
          width in mm (default: the stock's longer side / 300) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
-         against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it). Top-down: undercuts are not seen",
+         against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {origin, cell, nx, ny, floor, z: [nx × ny heights], \
+         deviation: [per column: below 0 cut into the part, above 0 left on it]} in world coordinates. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
         "setup?: id or name; post?: rs274|grbl or a post definition object (default: the setup's); path?: file to write → lines, extension, \
@@ -850,6 +851,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = json!({"setup": setup.id, "cell": cell, "columns": [stock.nx, stock.ny], "operations": ops, "removed_volume": removed});
     // The bodies seen from above, on the stock's columns.
     let triangles: u64 = meshes.iter().map(|m| m.triangles.len() as u64).sum();
+    let mut deviation: Option<Vec<f64>> = None;
     if triangles == 0 {
         warnings.push("there is no body to compare the result with".into());
     } else if triangles.saturating_mul((stock.nx * stock.ny) as u64) > MAX_PART_WORK {
@@ -876,6 +878,20 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         out["gouge_area"] = json!(c.gouge_area);
         out["max_leftover"] = json!(c.max_leftover);
         out["leftover_volume"] = json!(c.leftover_volume);
+        deviation = Some(cam::deviations(&stock, &part).map_err(cam_error)?);
+    }
+    if bool_(p, "field").unwrap_or(false) {
+        // Heights in world Z; `deviation` per column: below 0 cut into the part, above 0 left on it.
+        let lift = setup.origin.z;
+        out["field"] = json!({
+            "origin": [stock.origin.x + setup.origin.x, stock.origin.y + setup.origin.y],
+            "cell": stock.cell,
+            "nx": stock.nx,
+            "ny": stock.ny,
+            "floor": stock.floor + lift,
+            "z": stock.z.iter().map(|z| z + lift).collect::<Vec<_>>(),
+            "deviation": deviation,
+        });
     }
     out["warnings"] = json!(warnings);
     Ok(out)

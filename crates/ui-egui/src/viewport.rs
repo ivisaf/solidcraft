@@ -265,6 +265,7 @@ fn scene_key(app: &SolveApp) -> u64 {
     app.tree.redefine.hash(&mut h);
     crate::theme::is_dark().hash(&mut h);
     app.session.active_sketch.hash(&mut h);
+    crate::cam_ui::stock_key(app).hash(&mut h);
     h.finish()
 }
 
@@ -301,8 +302,11 @@ fn build_scene(app: &SolveApp) -> GpuScene {
     // Bodies where their occurrences place them.
     let st = s.world_state();
     let active_bodies = s.active_occurrence_path.as_ref().and_then(|p| s.occurrence_bodies(p, true).ok());
+    // A simulated stock is drawn in place of the bodies it was cut for.
+    let stock = crate::cam_ui::stock_shown(app);
+    crate::cam_ui::stock_scene(app, &mut sc);
     for b in &st.bodies {
-        if !app.session.body_visible(&b.name) || app.preview.replaced.contains(&b.name) {
+        if stock || !app.session.body_visible(&b.name) || app.preview.replaced.contains(&b.name) {
             continue;
         }
         // With a component active, bodies outside it are drawn faded.

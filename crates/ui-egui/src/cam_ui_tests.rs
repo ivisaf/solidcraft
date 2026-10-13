@@ -169,13 +169,36 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     // The tool runs round the outside of the box: it removes nothing and cuts into nothing.
     assert_eq!(found, ["Removed 0.00 cm³", "Does not cut into the part", "Leaves up to 0.00 mm on the part (0.00 cm³)"]);
     assert!(warnings.is_empty(), "{warnings:?}");
+    // Nothing was cut: the whole stock is drawn as the part, its top at the box's top.
+    let field = h.app.manufacture.stock.clone().expect("the cut stock");
+    let tris = stock_triangles(&field);
+    assert!(!tris.is_empty() && tris.iter().all(|t| t.1 == StockMark::Fine));
+    let (low, high) = tris.iter().flat_map(|t| t.0).fold((f64::INFINITY, f64::NEG_INFINITY), |m, p| (m.0.min(p.z), m.1.max(p.z)));
+    assert!((low - 0.0).abs() < 1e-9 && (high - 10.0).abs() < 1e-9, "{low} {high}");
     h.frames(2);
-    assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some());
+    assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some() && h.widget("Show simulated stock").is_some());
     // Cutting inside the outline instead goes into the part, and says so.
     h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "inside"})).unwrap();
     h.frames(2);
     assert!(h.app.manufacture.simulation.is_none(), "the old result went with the change");
+    assert!(h.app.manufacture.stock.is_none() && !stock_shown(&h.app), "and so did the drawn stock");
     simulate(&mut h.app);
+    // The stock is drawn with the cut-into columns marked, and goes when it is hidden.
+    let field = h.app.manufacture.stock.clone().expect("the cut stock");
+    let marks: Vec<StockMark> = stock_triangles(&field).into_iter().map(|t| t.1).collect();
+    assert!(marks.contains(&StockMark::Gouge) && marks.contains(&StockMark::Fine), "{}", marks.len());
+    let mut scene = crate::gpu::GpuScene::default();
+    stock_scene(&h.app, &mut scene);
+    // 28 bytes a vertex, three a triangle.
+    assert_eq!(scene.tris.len(), marks.len() * 3 * 28);
+    let (shown, stamp) = stock_key(&h.app);
+    h.app.manufacture.show_stock = false;
+    assert_eq!((shown, stock_key(&h.app)), (true, (false, stamp)));
+    let mut scene = crate::gpu::GpuScene::default();
+    stock_scene(&h.app, &mut scene);
+    assert!(scene.tris.is_empty());
+    h.app.manufacture.show_stock = true;
+    h.frames(2);
     let (found, warnings) = h.app.manufacture.simulation.clone().unwrap();
     assert!(
         found[1].starts_with("Cuts up to 10.000 mm into the part") && warnings.iter().any(|w| w.contains("into the part")),

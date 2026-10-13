@@ -277,6 +277,15 @@ fn simulation_checks_the_program_against_the_model() {
     assert!(sim["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("rapid move(s) run into material")));
     assert_eq!(sim["columns"], json!([120, 80]));
 
+    // The cut stock itself, for drawing: one height and one deviation per column, in world coordinates.
+    let field = &run(&mut s, "cam.simulate", json!({"field": true, "cell": 1}))["field"];
+    let sizes = (field["nx"].as_u64(), field["ny"].as_u64(), field["z"].as_array().map(Vec::len), field["deviation"].as_array().map(Vec::len));
+    assert_eq!(sizes, (Some(60), Some(40), Some(2400), Some(2400)));
+    let column = |x: usize, y: usize, k: &str| field[k][y * 60 + x].as_f64().unwrap();
+    // The middle of the pocket is at its floor; the plate beside it is untouched.
+    assert_eq!((column(30, 20, "z"), column(30, 20, "deviation"), column(2, 2, "z"), column(2, 2, "deviation")), (-4.0, 0.0, 0.0, 0.0));
+    assert!(run(&mut s, "cam.simulate", json!({})).get("field").is_none());
+
     for bad in
         [json!({"cell": 0}), json!({"cell": 1e-9}), json!({"stock": {"min": [0, 0, 0]}}), json!({"stock": {"min": [0, 0, 0], "max": [0, 0, 0]}})]
     {

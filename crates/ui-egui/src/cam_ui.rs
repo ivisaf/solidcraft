@@ -88,6 +88,132 @@ pub struct OpForm {
     pub coolant: bool,
 }
 
+/// The cut stock as columns in world coordinates (see `cam.simulate`'s `field`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct StockField {
+    pub origin: [f64; 2],
+    pub cell: f64,
+    pub nx: usize,
+    pub ny: usize,
+    pub floor: f64,
+    pub z: Vec<f64>,
+    /// Per column: below 0 cut into the part, above 0 left on it. Empty when there was no part to compare with.
+    pub deviation: Vec<f64>,
+}
+
+impl StockField {
+    fn from_json(v: &Value) -> Option<StockField> {
+        let numbers = |k: &str| v[k].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect::<Vec<f64>>());
+        let (nx, ny) = (v["nx"].as_u64()? as usize, v["ny"].as_u64()? as usize);
+        let z = numbers("z")?;
+        let deviation = numbers("deviation").unwrap_or_default();
+        (nx.checked_mul(ny) == Some(z.len()) && (deviation.is_empty() || deviation.len() == z.len())).then_some(StockField {
+            origin: [v["origin"][0].as_f64()?, v["origin"][1].as_f64()?],
+            cell: v["cell"].as_f64()?,
+            nx,
+            ny,
+            floor: v["floor"].as_f64()?,
+            z,
+            deviation,
+        })
+    }
+
+    /// The top of column `(i, j)`: its centre at its height, and its deviation from the part.
+    fn column(&self, i: usize, j: usize) -> Option<(Vec3, f64)> {
+        let k = j.checked_mul(self.nx)?.checked_add(i)?;
+        let z = *self.z.get(k).filter(|_| i < self.nx && j < self.ny)?;
+        let p = Vec3::new(self.origin[0] + (i as f64 + 0.5) * self.cell, self.origin[1] + (j as f64 + 0.5) * self.cell, z);
+        Some((p, self.deviation.get(k).copied().unwrap_or(0.0)))
+    }
+}
+
+/// Deviations smaller than this are drawn as the part (mm).
+const SHOWN_DEVIATION: f64 = 1e-3;
+
+/// What a triangle of the drawn stock is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StockMark {
+    Fine,
+    /// Cut into the part.
+    Gouge,
+    /// Material left on the part.
+    Leftover,
+}
+
+/// Whether the simulated stock is drawn (in place of the bodies).
+pub fn stock_shown(app: &SolveApp) -> bool {
+    app.manufacture.open && app.manufacture.show_stock && app.manufacture.stock.is_some()
+}
+
+/// Changes when what the viewport draws of the stock changes.
+pub fn stock_key(app: &SolveApp) -> (bool, u64) {
+    (stock_shown(app), app.manufacture.stock_stamp)
+}
+
+/// The simulated stock as triangles: its top through the column centres and walls down to
+/// its floor round the edge, each with what it is.
+pub fn stock_triangles(field: &StockField) -> Vec<([Vec3; 3], StockMark)> {
+    let mut out = Vec::new();
+    let mark = |d: [f64; 3]| {
+        if d.iter().any(|d| *d < -SHOWN_DEVIATION) {
+            StockMark::Gouge
+        } else if d.iter().any(|d| *d > SHOWN_DEVIATION) {
+            StockMark::Leftover
+        } else {
+            StockMark::Fine
+        }
+    };
+    for j in 0..field.ny.saturating_sub(1) {
+        for i in 0..field.nx.saturating_sub(1) {
+            let (Some(a), Some(b), Some(c), Some(d)) =
+                (field.column(i, j), field.column(i + 1, j), field.column(i + 1, j + 1), field.column(i, j + 1))
+            else {
+                continue;
+            };
+            out.push(([a.0, b.0, c.0], mark([a.1, b.1, c.1])));
+            out.push(([a.0, c.0, d.0], mark([a.1, c.1, d.1])));
+        }
+    }
+    // Walls round the edge, outward-facing: along each side, from the top's rim down to the floor.
+    let down = |p: Vec3| Vec3::new(p.x, p.y, field.floor);
+    let mut wall = |a: Option<(Vec3, f64)>, b: Option<(Vec3, f64)>| {
+        if let (Some((a, _)), Some((b, _))) = (a, b) {
+            out.push(([a, down(a), down(b)], StockMark::Fine));
+            out.push(([a, down(b), b], StockMark::Fine));
+        }
+    };
+    let (lx, ly) = (field.nx.saturating_sub(1), field.ny.saturating_sub(1));
+    for i in 0..lx {
+        wall(field.column(i, 0), field.column(i + 1, 0));
+        wall(field.column(i + 1, ly), field.column(i, ly));
+    }
+    for j in 0..ly {
+        wall(field.column(0, j + 1), field.column(0, j));
+        wall(field.column(lx, j), field.column(lx, j + 1));
+    }
+    out
+}
+
+/// Adds the simulated stock to the model scene: the part's colour where it matches the part,
+/// the error colour where it is cut into, the warning colour where material is left.
+pub fn stock_scene(app: &SolveApp, sc: &mut crate::gpu::GpuScene) {
+    let Some(field) = app.manufacture.stock.as_ref().filter(|_| stock_shown(app)) else { return };
+    let t = Tokens::get();
+    let rgba = |c: egui::Color32| [c.r(), c.g(), c.b(), 255];
+    for (tri, mark) in stock_triangles(field) {
+        let [a, b, c] = tri;
+        let n = (b - a).cross(c - a).normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0)).to_f32();
+        let colour = rgba(match mark {
+            StockMark::Fine => t.body,
+            StockMark::Gouge => t.error,
+            StockMark::Leftover => t.warning,
+        });
+        for p in tri {
+            sc.tri(p.to_f32(), n, colour);
+        }
+    }
+}
+
 /// One operation's toolpath in world coordinates: `(point, reached at feed)`.
 pub type Path = Vec<(Vec3, bool)>;
 
@@ -100,13 +226,29 @@ pub struct CamUi {
     pub error: Option<String>,
     /// The last simulation: what it found, and its warnings.
     pub simulation: Option<(Vec<String>, Vec<String>)>,
+    /// The stock as the last simulation left it, drawn in place of the bodies.
+    pub stock: Option<StockField>,
+    pub show_stock: bool,
+    /// Counts changes of `stock` (the viewport redraws when it moves on).
+    stock_stamp: u64,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>)>,
 }
 
 impl Default for CamUi {
     fn default() -> Self {
-        CamUi { open: false, form: None, show_paths: true, post: 0, error: None, simulation: None, cache: None }
+        CamUi {
+            open: false,
+            form: None,
+            show_paths: true,
+            post: 0,
+            error: None,
+            simulation: None,
+            stock: None,
+            show_stock: true,
+            stock_stamp: 0,
+            cache: None,
+        }
     }
 }
 
@@ -342,7 +484,8 @@ pub fn simulate(app: &mut SolveApp) {
         app.manufacture.error = Some("There is no setup to simulate".into());
         return;
     };
-    match app.session.execute("cam.simulate", &json!({ "setup": setup })) {
+    app.manufacture.stock_stamp += 1;
+    match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true })) {
         Ok(v) => {
             let number = |k: &str| v[k].as_f64();
             let mut found = vec![format!("Removed {:.2} cm³", number("removed_volume").unwrap_or(0.0) / 1000.0)];
@@ -352,10 +495,12 @@ pub fn simulate(app: &mut SolveApp) {
             }
             let warnings = v["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
             app.manufacture.simulation = Some((found, warnings));
+            app.manufacture.stock = StockField::from_json(&v["field"]);
             app.manufacture.error = None;
         }
         Err(e) => {
             app.manufacture.simulation = None;
+            app.manufacture.stock = None;
             app.manufacture.error = Some(e.to_string());
         }
     }
@@ -382,6 +527,8 @@ pub fn paths(app: &mut SolveApp) -> &[Path] {
         }
         // A simulation of the design as it was says nothing about it now.
         app.manufacture.simulation = None;
+        app.manufacture.stock = None;
+        app.manufacture.stock_stamp += 1;
         // `cam.toolpath` is not a change, but keep the key the revision as it is now.
         app.manufacture.cache = Some((app.session.revision, all));
     }
@@ -657,6 +804,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 run_simulation = ui.add_enabled(!setups.is_empty(), egui::Button::new("Simulate")).clicked();
             });
+            if cam.stock.is_some() {
+                ui.checkbox(&mut cam.show_stock, "Show simulated stock");
+            }
             if let Some((found, warnings)) = &cam.simulation {
                 for line in found {
                     ui.label(RichText::new(line).color(t.text_dim));
