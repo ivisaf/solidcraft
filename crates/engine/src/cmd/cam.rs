@@ -44,7 +44,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.setup.create", "New Setup", setup_create)
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
-        .params("name?; origin?: [x, y, z] work origin in world coordinates (default the world origin; work axes are the world's, tool along +Z); post?: rs274|grbl (default rs274) → setup: id, name"),
+        .params("name?; origin?: [x, y, z] work origin in world coordinates (default the world origin; work axes are the world's, tool along +Z); post?: rs274|grbl|lnc|lnc_atc (default rs274) → setup: id, name"),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover: expr (at most the tool diameter); faces the box around the profiles")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
@@ -74,7 +74,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in world coordinates. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
-        "setup?: id or name; post?: rs274|grbl or a post definition object (default: the setup's); path?: file to write → lines, extension, \
+        "setup?: id or name; post?: rs274|grbl|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
          cut_minutes, and gcode (the program text) when no path is given",
     ),
 ];

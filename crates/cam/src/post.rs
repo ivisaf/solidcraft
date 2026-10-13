@@ -3,7 +3,8 @@
 //! switches for how the motion itself is written.
 //!
 //! Templates may use `{program}` (program name), `{units}` (`G21` or `G20`), `{tool}` (tool
-//! number), `{diameter}` (tool diameter in output units) and `{rpm}` (spindle speed).
+//! number), `{diameter}` (tool diameter in output units) and `{rpm}` (spindle speed); the dwell
+//! template uses `{seconds}` or `{milliseconds}`.
 
 use serde::{Deserialize, Serialize};
 
@@ -83,6 +84,27 @@ pub struct Post {
     pub arcs: bool,
     /// Chord error of arcs written as lines (mm).
     pub arc_tolerance: f64,
+    /// Whether an arc that also moves in Z (a helix, as ramps make) is written as an arc; otherwise as short lines.
+    #[serde(default = "yes")]
+    pub helical_arcs: bool,
+    /// Whether whole numbers are written with a decimal point (`X10.`), for controllers that
+    /// read `X10` as ten of their smallest unit.
+    #[serde(default)]
+    pub trailing_decimal: bool,
+    /// Whether motion codes are written with two digits (`G01` rather than `G1`).
+    #[serde(default)]
+    pub two_digit_codes: bool,
+    /// How a dwell is written: `{seconds}` or `{milliseconds}` (a whole number) stands for its length.
+    #[serde(default = "default_dwell")]
+    pub dwell: String,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_dwell() -> String {
+    "G4 P{seconds}".into()
 }
 
 fn lines(l: &[&str]) -> Vec<String> {
@@ -111,6 +133,10 @@ impl Post {
             footer: lines(&["M30"]),
             arcs: true,
             arc_tolerance: 0.005,
+            helical_arcs: true,
+            trailing_decimal: false,
+            two_digit_codes: false,
+            dwell: default_dwell(),
         }
     }
 
@@ -134,6 +160,55 @@ impl Post {
             footer: lines(&["M30"]),
             arcs: true,
             arc_tolerance: 0.005,
+            helical_arcs: true,
+            trailing_decimal: false,
+            two_digit_codes: false,
+            dwell: default_dwell(),
+        }
+    }
+
+    /// LNC MW/M-series controllers with a manual tool change, after the Advantech-LNC milling
+    /// programming manual (V01.02.000): numbers always carry a decimal point as in its
+    /// examples and motion codes two digits; `G04 X` dwells in seconds; arcs are `G02`/`G03` with `I` `J` (helical arcs are
+    /// not documented, so ramps go out as lines). `G21` is never written: on these controls it
+    /// raises an alert and resets the coordinate systems. Nothing here touches the work
+    /// offset or the tool length compensation: a second tool stops the spindle and the
+    /// program (`M00`) for a change by hand.
+    pub fn lnc() -> Post {
+        Post {
+            name: "lnc".into(),
+            extension: "nc".into(),
+            units: Units::Mm,
+            decimals: 3,
+            feed_decimals: 0,
+            line_numbers: None,
+            comments: CommentStyle::Parentheses,
+            header: lines(&["G17 G40 G80 G90 G94"]),
+            tool_change: lines(&["M05", "M00"]),
+            tool_change_first: false,
+            spindle_on: lines(&["M03 S{rpm}"]),
+            spindle_off: lines(&["M05"]),
+            coolant_on: lines(&["M08"]),
+            coolant_off: lines(&["M09"]),
+            footer: lines(&["M30"]),
+            arcs: true,
+            arc_tolerance: 0.005,
+            helical_arcs: false,
+            trailing_decimal: true,
+            two_digit_codes: true,
+            dwell: "G04 X{seconds}".into(),
+        }
+    }
+
+    /// [`Post::lnc`] for a machine with a tool changer: `T… M06` and `G43 H…` per tool, in
+    /// work offset `G54`. `M06` is defined by the machine builder, not by the controller.
+    pub fn lnc_atc() -> Post {
+        Post {
+            name: "lnc_atc".into(),
+            header: lines(&["G17 G40 G49 G80 G90 G94 G54"]),
+            tool_change: lines(&["M05", "T{tool} M06", "G43 H{tool}"]),
+            tool_change_first: true,
+            ..Post::lnc()
         }
     }
 
@@ -142,11 +217,13 @@ impl Post {
         match name.trim().to_ascii_lowercase().as_str() {
             "rs274" | "linuxcnc" => Some(Post::rs274()),
             "grbl" => Some(Post::grbl()),
+            "lnc" => Some(Post::lnc()),
+            "lnc_atc" => Some(Post::lnc_atc()),
             _ => None,
         }
     }
 
-    pub const BUILTIN: &'static [&'static str] = &["rs274", "grbl"];
+    pub const BUILTIN: &'static [&'static str] = &["rs274", "grbl", "lnc", "lnc_atc"];
 
     pub fn validate(&self) -> Result<()> {
         if self.decimals > 6 || self.feed_decimals > 4 {
@@ -161,6 +238,10 @@ impl Post {
         if self.extension.is_empty() || self.extension.len() > 8 || !self.extension.chars().all(|c| c.is_ascii_alphanumeric()) {
             return invalid("the post's file extension must be 1 to 8 letters or digits");
         }
+        if self.dwell.len() > MAX_TEMPLATE_LEN || self.dwell.chars().any(char::is_control) {
+            return invalid("the post's dwell template is too long or has control characters");
+        }
+        fill(&self.dwell, &Values::default())?;
         for block in [&self.header, &self.tool_change, &self.spindle_on, &self.spindle_off, &self.coolant_on, &self.coolant_off, &self.footer] {
             if block.len() > MAX_TEMPLATE_LINES {
                 return Err(CamError::TooLarge(format!("a post template has more than {MAX_TEMPLATE_LINES} lines")));
@@ -185,6 +266,8 @@ pub(crate) struct Values {
     pub tool: String,
     pub diameter: String,
     pub rpm: String,
+    pub seconds: String,
+    pub milliseconds: String,
 }
 
 /// `line` with its placeholders replaced.
@@ -202,6 +285,8 @@ pub(crate) fn fill(line: &str, v: &Values) -> Result<String> {
             "tool" => &v.tool,
             "diameter" => &v.diameter,
             "rpm" => &v.rpm,
+            "seconds" => &v.seconds,
+            "milliseconds" => &v.milliseconds,
             other => return invalid(format!("post template `{line}`: unknown placeholder `{{{other}}}`")),
         });
         rest = tail.strip_prefix('}').unwrap_or(tail);

@@ -344,6 +344,76 @@ M30
 }
 
 #[test]
+fn lnc_program_text() {
+    // As the Advantech-LNC milling programming manual writes programs: every coordinate and
+    // feed with a decimal point, `G04 X` in seconds, no `G21` (it resets the coordinate systems).
+    let text = emit(&drill_program(), &Post::lnc()).unwrap();
+    let expected = "\
+(Bracket rev 2)
+G17 G40 G80 G90 G94
+(Drill: T3 D5 drill)
+M03 S3000
+M08
+G00 X10. Y10.
+G00 Z10.
+G00 Z2.
+G01 Z-10. F200.
+G04 X0.25
+G00 Z10.
+G00 X30.5
+G00 Z2.
+G01 Z-10.
+G04 X0.25
+G00 Z10.
+M09
+M05
+M30
+";
+    assert_eq!(text, expected);
+    assert!(!text.contains("G21") && !text.contains("G43") && !text.contains("M06") && !text.contains("G54"));
+    let back = Toolpath { moves: parse(&text).unwrap() };
+    close(back.stats().cut_length, 24.0, 1e-9);
+    close(back.stats().cut_minutes, 24.0 / 200.0 + 2.0 * 0.25 / 60.0, 1e-9);
+
+    // With a tool changer: the tool call and its length offset, in G54.
+    let atc = emit(&drill_program(), &Post::lnc_atc()).unwrap();
+    assert!(atc.contains("G17 G40 G49 G80 G90 G94 G54\n") && atc.contains("M05\nT3 M06\nG43 H3\nM03 S3000\n"), "{atc}");
+
+    // A ramped pocket: flat arcs stay arcs with decimal points, the ramp's helical arcs become lines.
+    let island = Loop2::circle(v(30.0, 20.0), 5.0);
+    let regions = [Region2 { outer: rect(0.0, 0.0, 60.0, 40.0).outer, holes: vec![island] }];
+    let params = PocketParams { stepover: 3.0, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 3.0f64.to_radians() };
+    let path = pocket(&regions, &tool(6.0), &params, &cut(0.0, -4.0, 2.0)).unwrap();
+    assert!(
+        path.moves.windows(2).any(|w| matches!((w[0].target(), w[1]), (Some(a), Move::Arc { to, .. }) if (a.z - to.z).abs() > 1e-9)),
+        "the ramp has helical arcs"
+    );
+    let program = Program {
+        name: "p".into(),
+        operations: vec![Operation { name: "Pocket".into(), tool: tool(6.0), spindle_rpm: 12000.0, coolant: false, path: path.clone() }],
+    };
+    let text = emit(&program, &Post::lnc()).unwrap();
+    let mut z = String::new();
+    for line in text.lines() {
+        let arc = line.starts_with("G02 ") || line.starts_with("G03 ");
+        assert!(!(arc && line.contains(" Z")), "helical arc: {line}");
+        // Every coordinate, centre and feed has its decimal point.
+        for word in line.split(' ').filter(|w| w.starts_with(['X', 'Y', 'Z', 'I', 'J', 'F'])) {
+            assert!(word.contains('.'), "{word} in {line}");
+        }
+        if let Some(w) = line.split(' ').find(|w| w.starts_with('Z')) {
+            z = w.to_string();
+        }
+    }
+    assert!(text.contains("G02 ") || text.contains("G03 "));
+    assert!(!z.is_empty());
+    let back = Toolpath { moves: parse(&text).unwrap() };
+    verify(&back, &cut(0.0, -4.0, 2.0).heights).unwrap();
+    close(path.stats().cut_length, back.stats().cut_length, 0.5);
+    assert_eq!(back.stats().lowest_z, Some(-4.0));
+}
+
+#[test]
 fn grbl_stops_for_a_manual_tool_change_and_inches_are_converted() {
     let mut program = drill_program();
     let mut second = program.operations[0].clone();
@@ -604,6 +674,13 @@ fn posts_are_data_and_bad_ones_are_refused() {
     assert!(broken(|p| p.line_numbers = Some(LineNumbers { start: 1, step: 0 })));
     assert!(broken(|p| p.extension = "../x".into()));
     assert!(broken(|p| p.spindle_on = vec!["M3".into(); 1000]));
+    assert!(broken(|p| p.dwell = "G4 P{minutes}".into()));
+    // A post saved before these switches existed reads with what it meant.
+    let mut old = serde_json::to_value(Post::rs274()).unwrap();
+    for k in ["helical_arcs", "trailing_decimal", "two_digit_codes", "dwell"] {
+        old.as_object_mut().unwrap().remove(k);
+    }
+    assert_eq!(serde_json::from_value::<Post>(old).unwrap(), Post::rs274());
 }
 
 #[test]

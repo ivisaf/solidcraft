@@ -91,8 +91,14 @@ impl Writer<'_> {
         Ok(())
     }
 
+    /// A number as the controller wants it: with a decimal point even when whole, if the post says so.
+    fn value(&self, v: f64, decimals: u8) -> String {
+        let s = number(v, decimals);
+        if self.post.trailing_decimal && !s.contains('.') { format!("{s}.") } else { s }
+    }
+
     fn coord(&self, mm: f64) -> String {
-        number(mm / self.post.units.mm(), self.post.decimals)
+        self.value(mm / self.post.units.mm(), self.post.decimals)
     }
 
     /// Forget where the tool is: the next move states every axis.
@@ -101,7 +107,12 @@ impl Writer<'_> {
     }
 
     /// A `G0`/`G1` block for the axes among `xy` and `z` that change; nothing if none does.
-    fn linear(&mut self, code: &str, to: Vec3, xy: bool, z: bool, feed: Option<f64>) {
+    /// The word of motion code `n` (0–3): `G1`, or `G01` for a post that pads its codes.
+    fn motion(&self, n: u8) -> String {
+        if self.post.two_digit_codes { format!("G{n:02}") } else { format!("G{n}") }
+    }
+
+    fn linear(&mut self, code: u8, to: Vec3, xy: bool, z: bool, feed: Option<f64>) {
         let (nx, ny, nz) = (self.coord(to.x), self.coord(to.y), self.coord(to.z));
         let mut words = String::new();
         if xy && self.x.as_ref() != Some(&nx) {
@@ -120,13 +131,14 @@ impl Writer<'_> {
             return;
         }
         let feed = self.feed_word(feed);
+        let code = self.motion(code);
         self.block(&format!("{code}{words}{feed}"));
     }
 
     /// ` F…` when the feed changes.
     fn feed_word(&mut self, feed: Option<f64>) -> String {
         let Some(feed) = feed else { return String::new() };
-        let f = number(feed / self.post.units.mm(), self.post.feed_decimals);
+        let f = self.value(feed / self.post.units.mm(), self.post.feed_decimals);
         if self.feed.as_ref() == Some(&f) {
             return String::new();
         }
@@ -137,17 +149,17 @@ impl Writer<'_> {
     fn rapid(&mut self, to: Vec3) {
         // Never a diagonal rapid: up first when rising, across first when descending.
         if self.pos.is_some_and(|p| to.z > p.z) {
-            self.linear("G0", to, false, true, None);
-            self.linear("G0", to, true, false, None);
+            self.linear(0, to, false, true, None);
+            self.linear(0, to, true, false, None);
         } else {
-            self.linear("G0", to, true, false, None);
-            self.linear("G0", to, false, true, None);
+            self.linear(0, to, true, false, None);
+            self.linear(0, to, false, true, None);
         }
         self.pos = Some(to);
     }
 
     fn feed(&mut self, to: Vec3, feed: f64) {
-        self.linear("G1", to, true, true, Some(feed));
+        self.linear(1, to, true, true, Some(feed));
         self.pos = Some(to);
     }
 
@@ -159,7 +171,9 @@ impl Writer<'_> {
             self.feed(to, feed);
             return Ok(());
         }
-        if !self.post.arcs {
+        // A helix on a controller that only knows flat arcs goes out as lines too.
+        let helix = self.z.as_ref() != Some(&self.coord(to.z));
+        if !self.post.arcs || (helix && !self.post.helical_arcs) {
             let start = Vec2::new(from.x, from.y) - center;
             let (r, sweep) = (start.len(), arc_sweep(from, to, center, ccw));
             let tol = self.post.arc_tolerance;
@@ -174,7 +188,7 @@ impl Writer<'_> {
             return Ok(());
         }
         let nz = self.coord(to.z);
-        let mut words = format!("{} X{nx} Y{ny}", if ccw { "G3" } else { "G2" });
+        let mut words = format!("{} X{nx} Y{ny}", self.motion(if ccw { 3 } else { 2 }));
         if self.z.as_ref() != Some(&nz) {
             words.push_str(&format!(" Z{nz}"));
         }
@@ -245,7 +259,10 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
                     if !(seconds >= 0.0) || !seconds.is_finite() {
                         return Err(CamError::Unsafe("a dwell must be 0 seconds or longer".into()));
                     }
-                    w.block(&format!("G4 P{}", number(seconds, 3)));
+                    values.seconds = w.value(seconds, 3);
+                    values.milliseconds = number(seconds * 1000.0, 0);
+                    let dwell = fill(&post.dwell, &values)?;
+                    w.block(&dwell);
                 }
             }
         }
@@ -326,7 +343,8 @@ pub fn parse(text: &str) -> Result<Vec<Move>> {
         }
         let word = |letter: char| ws.iter().find(|(c, _)| *c == letter).map(|(_, v)| *v);
         if dwell {
-            moves.push(Move::Dwell { seconds: word('P').unwrap_or(0.0).max(0.0) });
+            // `G4 P` in seconds as this crate's own posts write it, or `G04 X` in seconds.
+            moves.push(Move::Dwell { seconds: word('X').or(word('P')).unwrap_or(0.0).max(0.0) });
             continue;
         }
         if let Some(f) = word('F') {
