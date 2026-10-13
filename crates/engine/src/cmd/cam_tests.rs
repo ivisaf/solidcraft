@@ -145,6 +145,16 @@ fn contour_face_and_drill_from_sketches() {
     let moves = solidcraft_cam::parse(&gcode).unwrap();
     assert!(moves.iter().any(|m| matches!(m, Move::Arc { .. })), "the contour's corners are arcs");
 
+    // Operations are cut in the setup's order, which can be changed.
+    assert_eq!(run(&mut s, "cam.op.move", json!({"op": "Drill1", "to": 0}))["order"], json!(["Drill1", "Face1", "Contour1"]));
+    let reordered = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(reordered.find("(Drill1").unwrap() < reordered.find("(Face1").unwrap());
+    assert_eq!(run(&mut s, "cam.op.move", json!({"op": "Drill1", "by": 1}))["order"], json!(["Face1", "Drill1", "Contour1"]));
+    assert_eq!(run(&mut s, "cam.op.move", json!({"op": "Drill1", "by": 99}))["order"], json!(["Face1", "Contour1", "Drill1"]));
+    assert_eq!(run(&mut s, "cam.op.move", json!({"op": "Face1", "to": -5}))["order"], json!(["Face1", "Contour1", "Drill1"]));
+    assert!(
+        s.execute("cam.op.move", &json!({"op": "Face1"})).is_err() && s.execute("cam.op.move", &json!({"op": "Face1", "to": 0, "by": 1})).is_err()
+    );
     // A tool in use stays; an unused one goes.
     assert!(s.execute("cam.tool.remove", &json!({"number": 2})).is_err());
     run(&mut s, "cam.op.remove", json!({"op": "Drill1"}));
@@ -227,6 +237,51 @@ fn operations_from_picked_faces_take_their_heights_from_the_model() {
     assert!(refused(&mut s, with(json!({"faces": [{"point": [30, 20, -7]}, {"point": [5, 5, 0]}]}))).contains("different heights"));
     // A sketch gives no bottom.
     assert!(refused(&mut s, with(json!({"sketch": "PocketSketch"}))).contains("`bottom` is required"));
+}
+
+#[test]
+fn simulation_checks_the_program_against_the_model() {
+    let mut s = machined_plate();
+    let pocket = json!({"faces": [{"point": [30, 20, -4]}], "tool": 1, "spindle_rpm": 10000, "feed": 600});
+    run(&mut s, "cam.op.pocket", pocket.clone());
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    // The 40 × 20 × 4 pocket less the four corners a 6 mm tool leaves: (4 − π) × 9 mm² each way round.
+    let swept = (800.0 - (4.0 - std::f64::consts::PI) * 9.0) * 4.0;
+    close(sim["removed_volume"].as_f64().unwrap(), swept, swept * 0.02);
+    assert_eq!((sim["max_gouge"].as_f64(), sim["operations"][0]["rapid_collisions"].as_u64()), (Some(0.0), Some(0)));
+    assert_eq!(sim["warnings"], json!([]));
+    // 4 mm in two passes of 2.
+    close(sim["operations"][0]["max_engagement"].as_f64().unwrap(), 2.0, 1e-6);
+    // The hole through the plate has not been drilled: 10 mm of material stands where the model has none.
+    close(sim["max_leftover"].as_f64().unwrap(), 10.0, 1e-6);
+    run(&mut s, "cam.op.drill", json!({"faces": [{"point": [5, 5, 0]}], "tool": 2, "spindle_rpm": 3000, "feed": 150}));
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    // Now the most left anywhere is the pocket's corners, at its full depth.
+    close(sim["max_leftover"].as_f64().unwrap(), 4.0, 1e-6);
+    assert_eq!((sim["max_gouge"].as_f64(), sim["warnings"].clone()), (Some(0.0), json!([])));
+
+    // Cut 1 mm deeper than the model's pocket, the program gouges its floor by 1 mm.
+    run(&mut s, "cam.op.edit", json!({"op": "Pocket1", "bottom": -5}));
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    close(sim["max_gouge"].as_f64().unwrap(), 1.0, 1e-6);
+    assert!(sim["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("cuts up to 1.000 mm into the part")), "{sim}");
+    run(&mut s, "cam.op.edit", json!({"op": "Pocket1", "bottom": null}));
+
+    // A tool with flutes shorter than a pass is deep, and a clearance height inside the stock, are warned about.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "flute_length": 1}));
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    assert!(sim["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("flutes are 1.00 mm long")), "{sim}");
+    let tall = json!({"min": [0, 0, -10], "max": [60, 40, 30]});
+    let sim = run(&mut s, "cam.simulate", json!({"stock": tall, "cell": 0.5}));
+    assert!(sim["operations"][0]["rapid_collisions"].as_u64().unwrap() > 0, "{sim}");
+    assert!(sim["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("rapid move(s) run into material")));
+    assert_eq!(sim["columns"], json!([120, 80]));
+
+    for bad in
+        [json!({"cell": 0}), json!({"cell": 1e-9}), json!({"stock": {"min": [0, 0, 0]}}), json!({"stock": {"min": [0, 0, 0], "max": [0, 0, 0]}})]
+    {
+        assert!(s.execute("cam.simulate", &bad).is_err(), "{bad}");
+    }
 }
 
 #[test]
@@ -351,6 +406,8 @@ fn hostile_cam_params_never_panic() {
     ];
     let commands = [
         "cam.op.edit",
+        "cam.op.move",
+        "cam.simulate",
         "cam.tool.define",
         "cam.tool.remove",
         "cam.setup.create",
@@ -386,6 +443,10 @@ fn hostile_cam_params_never_panic() {
         "stock_to_leave",
         "ramp_angle",
         "faces",
+        "to",
+        "by",
+        "cell",
+        "stock",
         "side",
         "peck",
         "dwell",

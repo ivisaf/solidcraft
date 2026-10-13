@@ -55,6 +55,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          plunge_feed, coolant, stepdown, sketch with profiles?, faces, stepover, side, climb, stock_to_leave, ramp_angle, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
+    CommandSpec::new("cam.op.move", "Move Operation", op_move)
+        .params("op: id or name; to: position in the setup's order (0 is cut first) — or by: places later (negative: earlier); setup?: id or name → order: the setup's operation names"),
     CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).params("op: id or name; setup?: id or name"),
     CommandSpec::new("cam.list", "Manufacture", list)
         .at("MANUFACTURE", "ACTIONS")
@@ -64,6 +66,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.toolpath", "Show Toolpaths", toolpath).at("MANUFACTURE", "ACTIONS").icon("cam_contour").noundo().params(
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
+    ),
+    CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_setup").noundo().params(
+        "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in world coordinates (default: the box around the bodies); cell?: column \
+         width in mm (default: the stock's longer side / 300) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
+         against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it). Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
         "setup?: id or name; post?: rs274|grbl or a post definition object (default: the setup's); path?: file to write → lines, extension, \
@@ -702,6 +709,26 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// Operations are cut in their setup's order; this moves one within it.
+fn op_move(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.move";
+    let k = key(p, "op").ok_or_else(|| bad(cmd, "`op` is required"))?;
+    let si = setup_index(s, p, cmd)?;
+    let setup = s.doc.manufacture.setups.get(si).ok_or_else(|| bad(cmd, "no such setup"))?;
+    let from = op_position(setup, &k).ok_or_else(|| bad(cmd, format!("no operation `{k}`")))?;
+    let last = setup.operations.len().saturating_sub(1) as i64;
+    let to = match (p.get("to").and_then(Value::as_i64), p.get("by").and_then(Value::as_i64)) {
+        (Some(to), None) => to,
+        (None, Some(by)) => (from as i64).saturating_add(by),
+        _ => return Err(bad(cmd, "give `to` (a position) or `by` (a number of places), as whole numbers")),
+    }
+    .clamp(0, last) as usize;
+    let Some(setup) = s.doc_mut().manufacture.setups.get_mut(si) else { return Err(bad(cmd, "no such setup")) };
+    let op = setup.operations.remove(from);
+    setup.operations.insert(to.min(setup.operations.len()), op);
+    Ok(json!({ "order": setup.operations.iter().map(|o| o.name.clone()).collect::<Vec<_>>() }))
+}
+
 fn op_remove(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.remove";
     let k = key(p, "op").ok_or_else(|| bad(cmd, "`op` is required"))?;
@@ -769,6 +796,89 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
         out.push(v);
     }
     Ok(json!({ "setup": setup.id, "operations": out }))
+}
+
+/// Most ray tests when the bodies are sampled for the comparison.
+const MAX_PART_WORK: u64 = 400_000_000;
+
+fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.simulate";
+    let setup = setup(s, p, cmd)?;
+    if setup.operations.is_empty() {
+        return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
+    }
+    let state = s.model.state();
+    let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
+    let (min, max) = match p.get("stock") {
+        Some(v) => {
+            let corner = |k: &str| v.get(k).and_then(vec3).ok_or_else(|| bad(cmd, "`stock` must be {min: [x, y, z], max: [x, y, z]}"));
+            (corner("min")?, corner("max")?)
+        }
+        None => {
+            let bounds = meshes.iter().fold(solidcraft_geom::Aabb3::EMPTY, |a, m| a.union(&m.bounds()));
+            if bounds.is_empty() {
+                return Err(bad(cmd, "there is no body to take the stock from; give `stock`"));
+            }
+            (bounds.min, bounds.max)
+        }
+    };
+    let (min, max) = (min - setup.origin, max - setup.origin);
+    let cell = match p.get("cell") {
+        Some(_) => num(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| bad(cmd, "`cell` must be above 0"))?,
+        None => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
+    };
+    let mut stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
+    let mut ops = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut removed = 0.0;
+    for op in &setup.operations {
+        let path = build(s, setup, op)?;
+        let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
+        let report = cam::simulate(&mut stock, &path, tool).map_err(cam_error)?;
+        removed += report.removed_volume;
+        let mut own = Vec::new();
+        if report.rapid_collisions > 0 {
+            own.push(format!("{} rapid move(s) run into material", report.rapid_collisions));
+        }
+        if report.max_engagement > tool.flute_length + 1e-6 {
+            own.push(format!("the tool is buried {:.2} mm deep but its flutes are {:.2} mm long", report.max_engagement, tool.flute_length));
+        }
+        warnings.extend(own.iter().map(|w| format!("{}: {w}", op.name)));
+        ops.push(json!({"id": op.id, "name": op.name, "removed_volume": report.removed_volume, "rapid_collisions": report.rapid_collisions,
+            "max_engagement": report.max_engagement, "flute_length": tool.flute_length, "warnings": own}));
+    }
+    let mut out = json!({"setup": setup.id, "cell": cell, "columns": [stock.nx, stock.ny], "operations": ops, "removed_volume": removed});
+    // The bodies seen from above, on the stock's columns.
+    let triangles: u64 = meshes.iter().map(|m| m.triangles.len() as u64).sum();
+    if triangles == 0 {
+        warnings.push("there is no body to compare the result with".into());
+    } else if triangles.saturating_mul((stock.nx * stock.ny) as u64) > MAX_PART_WORK {
+        warnings.push("the bodies are too detailed to compare at this cell size; use a larger `cell`".into());
+    } else {
+        let mut part = stock.clone();
+        let above = max.z + 1.0;
+        for j in 0..part.ny {
+            for i in 0..part.nx {
+                let c = part.centre(i, j);
+                let from = Vec3::new(c.x, c.y, above) + setup.origin;
+                let top = meshes.iter().filter_map(|m| m.raycast(from, Vec3::new(0.0, 0.0, -1.0))).map(|(t, _)| above - t).fold(part.floor, f64::max);
+                if let Some(z) = part.z.get_mut(j * part.nx + i) {
+                    *z = top;
+                }
+            }
+        }
+        let c = cam::compare(&stock, &part).map_err(cam_error)?;
+        // A column's width of error is expected at walls; less than that is not reported.
+        if c.max_gouge > 1e-3 {
+            warnings.push(format!("the program cuts up to {:.3} mm into the part, over {:.1} mm²", c.max_gouge, c.gouge_area));
+        }
+        out["max_gouge"] = json!(c.max_gouge);
+        out["gouge_area"] = json!(c.gouge_area);
+        out["max_leftover"] = json!(c.max_leftover);
+        out["leftover_volume"] = json!(c.leftover_volume);
+    }
+    out["warnings"] = json!(warnings);
+    Ok(out)
 }
 
 fn post(s: &mut Session, p: &Value) -> Result<Value> {

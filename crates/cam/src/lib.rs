@@ -20,6 +20,7 @@ mod ops;
 mod path;
 mod piece;
 mod post;
+mod sim;
 mod tool;
 
 pub use check::verify;
@@ -28,6 +29,7 @@ pub use offset::offset_regions;
 pub use ops::{ContourParams, Cut, DrillParams, Feeds, Heights, PocketParams, Side, contour, drill, face, pocket};
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, Units};
+pub use sim::{Comparison, CutReport, HeightField, MAX_CELLS, compare, simulate};
 pub use tool::{Tool, ToolKind};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

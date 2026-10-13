@@ -147,7 +147,40 @@ fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
     assert_eq!((ops.len(), ops[0].id, ops[0].name.as_str(), ops[0].bottom.as_deref()), (1, before.setups[0].operations[0].id, "Deep", Some("-6 mm")));
     assert_eq!(paths(&mut h.app).iter().flatten().map(|p| p.0.z).fold(f64::INFINITY, f64::min), -6.0);
     h.frames(2);
-    assert!(h.widget("Edit").is_some());
+    assert!(h.widget("Edit").is_some() && h.widget("Up").is_some() && h.widget("Down").is_some());
+    // An open form offers the design's sketches and the library's tools.
+    h.app.start("cam.op.contour");
+    h.frames(2);
+    assert!(h.widget("Pocket").is_some() && h.widget("T1  D6 flat endmill").is_some());
+}
+
+#[test]
+fn simulate_reports_in_the_window_until_the_design_changes() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    fill(&mut h, "cam.tool.define", |_| {});
+    fill(&mut h, "cam.setup.create", |_| {});
+    let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
+    h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
+    fill(&mut h, "cam.op.contour", |_| {});
+    h.frames(2);
+    h.app.start("cam.simulate");
+    let (found, warnings) = h.app.manufacture.simulation.clone().expect("a simulation");
+    // The tool runs round the outside of the box: it removes nothing and cuts into nothing.
+    assert_eq!(found, ["Removed 0.00 cm³", "Does not cut into the part", "Leaves up to 0.00 mm on the part (0.00 cm³)"]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    h.frames(2);
+    assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some());
+    // Cutting inside the outline instead goes into the part, and says so.
+    h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "inside"})).unwrap();
+    h.frames(2);
+    assert!(h.app.manufacture.simulation.is_none(), "the old result went with the change");
+    simulate(&mut h.app);
+    let (found, warnings) = h.app.manufacture.simulation.clone().unwrap();
+    assert!(
+        found[1].starts_with("Cuts up to 10.000 mm into the part") && warnings.iter().any(|w| w.contains("into the part")),
+        "{found:?} {warnings:?}"
+    );
 }
 
 #[test]
@@ -155,7 +188,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 9, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 10, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);

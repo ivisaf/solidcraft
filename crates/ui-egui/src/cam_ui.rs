@@ -98,13 +98,15 @@ pub struct CamUi {
     /// Index into the engine's post list.
     pub post: usize,
     pub error: Option<String>,
+    /// The last simulation: what it found, and its warnings.
+    pub simulation: Option<(Vec<String>, Vec<String>)>,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>)>,
 }
 
 impl Default for CamUi {
     fn default() -> Self {
-        CamUi { open: false, form: None, show_paths: true, post: 0, error: None, cache: None }
+        CamUi { open: false, form: None, show_paths: true, post: 0, error: None, simulation: None, cache: None }
     }
 }
 
@@ -180,6 +182,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     };
     if id == "cam.toolpath" {
         app.manufacture.show_paths = true;
+    }
+    if id == "cam.simulate" {
+        simulate(app);
     }
     app.manufacture.open = true;
     app.manufacture.form = form;
@@ -331,6 +336,31 @@ pub fn apply(app: &mut SolveApp) {
     }
 }
 
+/// Runs `cam.simulate` on the first setup and keeps what it found for the window.
+pub fn simulate(app: &mut SolveApp) {
+    let Some(setup) = app.session.doc.manufacture.setups.first().map(|s| s.id) else {
+        app.manufacture.error = Some("There is no setup to simulate".into());
+        return;
+    };
+    match app.session.execute("cam.simulate", &json!({ "setup": setup })) {
+        Ok(v) => {
+            let number = |k: &str| v[k].as_f64();
+            let mut found = vec![format!("Removed {:.2} cm³", number("removed_volume").unwrap_or(0.0) / 1000.0)];
+            if let (Some(gouge), Some(left), Some(volume)) = (number("max_gouge"), number("max_leftover"), number("leftover_volume")) {
+                found.push(if gouge > 1e-3 { format!("Cuts up to {gouge:.3} mm into the part") } else { "Does not cut into the part".into() });
+                found.push(format!("Leaves up to {left:.2} mm on the part ({:.2} cm³)", volume / 1000.0));
+            }
+            let warnings = v["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+            app.manufacture.simulation = Some((found, warnings));
+            app.manufacture.error = None;
+        }
+        Err(e) => {
+            app.manufacture.simulation = None;
+            app.manufacture.error = Some(e.to_string());
+        }
+    }
+}
+
 /// The toolpaths to draw, worked out again when the design has changed.
 pub fn paths(app: &mut SolveApp) -> &[Path] {
     let revision = app.session.revision;
@@ -350,6 +380,8 @@ pub fn paths(app: &mut SolveApp) -> &[Path] {
                 all.push(path);
             }
         }
+        // A simulation of the design as it was says nothing about it now.
+        app.manufacture.simulation = None;
         // `cam.toolpath` is not a change, but keep the key the revision as it is now.
         app.manufacture.cache = Some((app.session.revision, all));
     }
@@ -401,7 +433,50 @@ fn choice(ui: &mut egui::Ui, id: &str, label: &str, index: &mut usize, options: 
     ui.end_row();
 }
 
-fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)]) {
+/// A text value chosen from a list (`(value, label)`); a value not in the list is shown as it is.
+fn pick(ui: &mut egui::Ui, id: &str, label: &str, value: &mut String, options: &[(String, String)]) {
+    ui.label(label);
+    let shown = options.iter().find(|(v, _)| v == value).map_or(value.clone(), |(_, l)| l.clone());
+    egui::ComboBox::from_id_salt(id).selected_text(shown).width(140.0).show_ui(ui, |ui| {
+        for (v, l) in options {
+            ui.selectable_value(value, v.clone(), l);
+        }
+    });
+    ui.end_row();
+}
+
+/// What an operation form chooses from.
+#[derive(Default)]
+struct Choices {
+    /// Sketch names, newest first.
+    sketches: Vec<(String, String)>,
+    /// Tool numbers with what they are.
+    tools: Vec<(String, String)>,
+}
+
+fn choices(app: &SolveApp, listed: &Value) -> Choices {
+    let sketches = app
+        .session
+        .doc
+        .features
+        .iter()
+        .rev()
+        .filter(|f| matches!(f.kind, solidcraft_engine::doc::FeatureKind::Sketch { .. }))
+        .map(|f| (f.name.clone(), f.name.clone()))
+        .collect();
+    let tools = listed["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let n = t["number"].as_u64()?;
+            Some((n.to_string(), format!("T{n}  D{} {}", t["diameter"].as_f64()?, text(t, "kind").replace('_', " "))))
+        })
+        .collect();
+    Choices { sketches, tools }
+}
+
+fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
         Form::Tool { number, kind, diameter, flute_length, description } => {
             field(ui, "Number", number, "1");
@@ -421,7 +496,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)]) {
         Form::Op(f) => {
             field(ui, "Name", &mut f.name, "automatic");
             if f.faces.is_empty() {
-                field(ui, "Sketch", &mut f.sketch, "name");
+                pick(ui, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
             } else {
                 ui.label("Faces");
                 ui.horizontal(|ui| {
@@ -440,7 +515,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)]) {
                 ui.end_row();
             }
             let from_faces = !f.faces.is_empty();
-            field(ui, "Tool", &mut f.tool, "number");
+            pick(ui, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
             field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "10000");
             field(ui, "Feed (mm/min)", &mut f.feed, "600");
             field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
@@ -490,9 +565,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut open = true;
     let mut run: Vec<(&'static str, Value)> = Vec::new();
     let mut apply_form = false;
+    let mut run_simulation = false;
     let mut edit: Option<(Value, Value)> = None;
     let mut post_to: Option<String> = None;
     let selected = selected_faces(app);
+    let lists = choices(app, &listed);
     let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
     let mut cam = std::mem::take(&mut app.manufacture);
     crate::frame::window(ctx, RichText::new("MANUFACTURE").strong().size(13.0), crate::frame::Width::Normal)
@@ -552,6 +629,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                                 );
                             }
                         }
+                        for (label, by) in [("Up", -1), ("Down", 1)] {
+                            if ui.small_button(label).clicked() {
+                                run.push(("cam.op.move", json!({ "setup": setup["id"], "op": op["id"], "by": by })));
+                            }
+                        }
                         if ui.small_button("Edit").clicked() {
                             edit = Some((setup.clone(), op.clone()));
                         }
@@ -573,7 +655,16 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 if ui.add_enabled(!setups.is_empty(), egui::Button::new("Post Process…")).clicked() {
                     post_to = posts.get(cam.post).map(|p| p.to_string());
                 }
+                run_simulation = ui.add_enabled(!setups.is_empty(), egui::Button::new("Simulate")).clicked();
             });
+            if let Some((found, warnings)) = &cam.simulation {
+                for line in found {
+                    ui.label(RichText::new(line).color(t.text_dim));
+                }
+                for line in warnings {
+                    ui.label(RichText::new(line).color(t.warning));
+                }
+            }
             if let Some(form) = &mut cam.form {
                 ui.separator();
                 let title = match form {
@@ -583,7 +674,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     Form::Op(f) => f.kind.title(),
                 };
                 ui.label(RichText::new(title).strong());
-                form_ui(ui, form, &selected);
+                form_ui(ui, form, &selected, &lists);
                 ui.horizontal(|ui| {
                     apply_form = ui.button("OK").clicked();
                     if ui.button("Cancel").clicked() {
@@ -604,6 +695,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if apply_form {
         apply(app);
+    }
+    if run_simulation {
+        simulate(app);
     }
     if let Some(post) = post_to {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());

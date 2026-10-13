@@ -507,6 +507,84 @@ fn hostile_values_are_errors_never_panics() {
 }
 
 #[test]
+fn simulation_removes_what_the_tool_sweeps() {
+    let regions = [rect(10.0, 10.0, 50.0, 40.0)];
+    let c = cut(0.0, -5.0, 2.5);
+    let block = || HeightField::block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(60.0, 50.0, 0.0), 0.25).unwrap();
+    // The pocket as modelled: a 40 × 30 opening 5 deep in a 60 × 50 × 10 block.
+    let mut part = block();
+    for j in 0..part.ny {
+        for i in 0..part.nx {
+            let p = part.centre(i, j);
+            if p.x > 10.0 && p.x < 50.0 && p.y > 10.0 && p.y < 40.0 {
+                part.z[j * part.nx + i] = -5.0;
+            }
+        }
+    }
+    for ramp in [0.0, 3.0f64.to_radians()] {
+        let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: ramp };
+        let path = pocket(&regions, &tool(6.0), &params, &c).unwrap();
+        let mut stock = block();
+        let report = simulate(&mut stock, &path, &tool(6.0)).unwrap();
+        // Everything but the four corners the round tool cannot reach: (4 − π) r² of area.
+        let swept = (1200.0 - (4.0 - PI) * 9.0) * 5.0;
+        close(report.removed_volume, swept, swept * 0.01);
+        close(block().volume() - stock.volume(), report.removed_volume, 1e-6);
+        assert_eq!(report.rapid_collisions, 0);
+        // Never more than a pass deep.
+        close(report.max_engagement, 2.5, 1e-6);
+        let against = compare(&stock, &part).unwrap();
+        assert_eq!((against.max_gouge, against.gouge_area), (0.0, 0.0));
+        // The corners keep their full 5 mm.
+        close(against.max_leftover, 5.0, 1e-6);
+        // At most the corners' volume; less by the one-column band the comparison forgives.
+        let corners = (4.0 - PI) * 9.0 * 5.0;
+        assert!(against.leftover_volume > corners * 0.3 && against.leftover_volume <= corners, "{}", against.leftover_volume);
+    }
+    // A pocket cut 1 mm too deep is a 1 mm gouge over its floor.
+    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0 };
+    let deep = pocket(&regions, &tool(6.0), &params, &cut(0.0, -6.0, 3.0)).unwrap();
+    let mut stock = block();
+    simulate(&mut stock, &deep, &tool(6.0)).unwrap();
+    let against = compare(&stock, &part).unwrap();
+    close(against.max_gouge, 1.0, 1e-9);
+    close(against.gouge_area, 1200.0 - (4.0 - PI) * 9.0, 30.0);
+}
+
+#[test]
+fn simulation_knows_tool_shapes_and_rapids_through_material() {
+    let block = || HeightField::block(Vec3::new(-10.0, -10.0, -20.0), Vec3::new(10.0, 10.0, 0.0), 0.1).unwrap();
+    let down =
+        |z: f64| Toolpath { moves: vec![Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) }, Move::Feed { to: Vec3::new(0.0, 0.0, z), feed: 100.0 }] };
+    let volume = |kind: ToolKind| {
+        let mut stock = block();
+        simulate(&mut stock, &down(-8.0), &Tool::new(1, kind, 6.0, 20.0)).unwrap().removed_volume
+    };
+    // 6 mm tools 8 mm down: a cylinder; a cylinder less the gap round a hemisphere (π r³ / 3);
+    // a cylinder less the gap round a 118° point (two thirds of π r² × the point's height).
+    let cylinder = PI * 9.0 * 8.0;
+    close(volume(ToolKind::FlatEndmill), cylinder, cylinder * 0.01);
+    close(volume(ToolKind::BallEndmill), cylinder - PI * 27.0 / 3.0, cylinder * 0.01);
+    let point = 3.0 / 59.0f64.to_radians().tan();
+    close(volume(ToolKind::Drill), cylinder - PI * 9.0 * point * 2.0 / 3.0, cylinder * 0.01);
+    // A rapid across the top of the block is fine; one below the top is a collision and cuts nothing.
+    let across = |z: f64| Toolpath { moves: vec![Move::Rapid { to: Vec3::new(-20.0, 0.0, z) }, Move::Rapid { to: Vec3::new(20.0, 0.0, z) }] };
+    let mut stock = block();
+    assert_eq!(simulate(&mut stock, &across(0.0), &tool(6.0)).unwrap().rapid_collisions, 0);
+    let hit = simulate(&mut stock, &across(-1.0), &tool(6.0)).unwrap();
+    assert_eq!((hit.rapid_collisions, hit.removed_volume), (1, 0.0));
+    assert_eq!(stock, block());
+    // Nothing is cut below the stock's floor, and sizes that cannot be simulated are refused.
+    let mut stock = block();
+    close(simulate(&mut stock, &down(-50.0), &tool(6.0)).unwrap().max_engagement, 20.0, 1e-9);
+    for bad in [f64::NAN, 0.0, -1.0, 1e-9, f64::INFINITY] {
+        assert!(HeightField::block(Vec3::new(0.0, 0.0, 0.0), Vec3::new(100.0, 100.0, 10.0), bad).is_err(), "{bad}");
+        let _ = HeightField::block(Vec3::new(0.0, 0.0, 0.0), Vec3::new(bad, bad, bad), 1.0);
+    }
+    assert!(compare(&block(), &HeightField::block(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 0.5).unwrap()).is_err());
+}
+
+#[test]
 fn posts_are_data_and_bad_ones_are_refused() {
     let json = serde_json::to_string(&Post::grbl()).unwrap();
     let post: Post = serde_json::from_str(&json).unwrap();
