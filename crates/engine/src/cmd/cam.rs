@@ -830,7 +830,8 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
 /// Heights the operation leaves out follow its geometry. A sketch gives the top (its plane).
 /// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
 /// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
-/// the face; for drilling, the top (the face) and the bottom (the bottom of its body). Retract
+/// the face, and likewise down to a sketch's plane (from the stock's top when that is higher);
+/// for drilling, the top (the face) and the bottom (the bottom of its body). Retract
 /// and clearance are 2 mm and 10 mm above the top (clearance above the whole body and the
 /// stock). Facing without a sketch or faces covers the stock, from its top to the part's.
 pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
@@ -856,6 +857,10 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         (CamOperationKind::Contour { .. }, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
         (CamOperationKind::Drill { .. }, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
         (CamOperationKind::Face { .. }, _) if picked => (Some(g.z), Some(g.z)),
+        // Facing a sketch's box: down to the sketch's plane, from the top of the stock if that is above it.
+        (CamOperationKind::Face { .. }, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) => {
+            (Some(at.stock.map_or(g.z, |(_, hi)| hi.z.max(g.z))), Some(g.z))
+        }
         // Facing the stock: from its top down to the top of the part.
         (CamOperationKind::Face { .. }, Some((_, hi))) if matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
         _ => (Some(g.z), None),

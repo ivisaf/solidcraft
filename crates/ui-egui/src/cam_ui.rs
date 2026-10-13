@@ -300,6 +300,10 @@ pub struct CamUi {
     pub open: bool,
     /// The Tool Library window.
     pub tools_open: bool,
+    /// Whether each panel is folded to its header, and where the Manufacture panel was last drawn.
+    pub folded: bool,
+    pub tools_folded: bool,
+    panel: Option<egui::Rect>,
     /// The tool picked in the Tool Library window: whether it is the machine library's, and its number.
     pub selected_tool: Option<(bool, u64)>,
     /// The tool library file to use instead of the machine's own (tests).
@@ -327,6 +331,9 @@ impl Default for CamUi {
         CamUi {
             open: false,
             tools_open: false,
+            folded: false,
+            tools_folded: false,
+            panel: None,
             selected_tool: None,
             library: None,
             listing: None,
@@ -384,18 +391,20 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             .map(|f| f.name.clone())
             .unwrap_or_default();
         let faces = selected_faces(app);
+        let has_bodies = !app.session.world_state().bodies.is_empty();
         Form::Op(Box::new(OpForm {
             kind,
             filled_for: String::new(),
             flutes: 0,
             chip_load: String::new(),
             // Facing covers the stock when there is a body to have stock round, else a sketch.
-            boundary: if app.session.world_state().bodies.is_empty() { 2 } else { 0 },
+            boundary: if has_bodies { 0 } else { 2 },
             limit: 0,
             margin: String::new(),
             editing: None,
             name: String::new(),
-            bottom: if faces.is_empty() { "-5 mm".into() } else { String::new() },
+            // Faces, and the stock a facing operation covers, give the heights themselves.
+            bottom: if faces.is_empty() && !(kind == OpKind::Face && has_bodies) { "-5 mm".into() } else { String::new() },
             faces,
             sketch,
             tool: first_tool.clone(),
@@ -1088,6 +1097,8 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices) {
+    // A form's labels stay on one line each.
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
         Form::Tool(f) => {
             if f.editing {
@@ -1170,8 +1181,14 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             let flutes = Some(f64::from(f.flutes));
             link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
             field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
-            field(ui, "Top", &mut f.top, if from_faces { "from the faces" } else { "the sketch plane" });
-            field(ui, "Bottom", &mut f.bottom, if from_faces { "from the faces" } else { "-5 mm" });
+            let on_stock = f.kind == OpKind::Face && !from_faces && f.boundary < 2;
+            let (top, bottom) = match (from_faces, on_stock) {
+                (true, _) => ("from the faces", "from the faces"),
+                (_, true) => ("the stock's top", "the part's top"),
+                _ => ("the sketch plane", "-5 mm"),
+            };
+            field(ui, "Top", &mut f.top, top);
+            field(ui, "Bottom", &mut f.bottom, bottom);
             if f.kind != OpKind::Drill {
                 field(ui, "Stepdown", &mut f.stepdown, "half the tool diameter");
             }
@@ -1243,6 +1260,72 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
     ok
 }
 
+/// Where a panel docks, and how tall it may get.
+#[derive(Clone, Copy)]
+struct Dock {
+    /// The panel's top right corner.
+    anchor: egui::Pos2,
+    max_height: f32,
+}
+
+/// A panel docked at the right of the viewport, as the app's command dialogs are: no title
+/// bar, a header row with "−" to fold it, its name and "×" to close it, and a body that scrolls
+/// when it is taller than the viewport. → whether it stays open, and where it was drawn.
+fn docked_panel(
+    ctx: &egui::Context,
+    id: &str,
+    title: &str,
+    dock: Dock,
+    folded: &mut bool,
+    body: impl FnOnce(&mut egui::Ui),
+) -> (bool, Option<egui::Rect>) {
+    use crate::frame::{DIALOG_WIDE_MAX_W, Width};
+    let t = Tokens::get();
+    let frame = egui::Frame::window(&ctx.global_style())
+        .fill(t.dialog_bg)
+        .stroke(Stroke::new(1.0, t.dialog_border))
+        .corner_radius(egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 })
+        .shadow(egui::Shadow { offset: [-2, 2], blur: 8, spread: 0, color: egui::Color32::from_black_alpha(40) });
+    let margin = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
+    let mut keep = true;
+    let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), dock.anchor, dock.max_height, Width::Wide)
+        .frame(frame)
+        .show(ctx, |ui| {
+            // Long texts (errors, notes) wrap instead of widening the panel.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let min_w = 480.0 - margin;
+            ui.set_min_width(min_w);
+            ui.set_max_width(DIALOG_WIDE_MAX_W - margin);
+            let total = crate::frame::content_width(ui, egui::Id::new((id, "w")), min_w);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new(if *folded { "+" } else { "−" }).size(14.0)).frame(false))
+                    .on_hover_text(if *folded { "Expand" } else { "Collapse" })
+                    .clicked()
+                {
+                    *folded = !*folded;
+                }
+                ui.label(RichText::new(title).strong().size(12.5));
+                let width = ui.spacing().interact_size.x;
+                crate::frame::right_aligned(ui, total, width, |ui| {
+                    let close = egui::Button::new(RichText::new("×").size(14.0).color(t.text_dim)).frame(false).min_size(egui::vec2(width, 0.0));
+                    if ui.add(close).on_hover_text("Close").clicked() {
+                        keep = false;
+                    }
+                });
+            });
+            if *folded {
+                return;
+            }
+            ui.add_space(2.0);
+            let height = (dock.max_height - ui.min_rect().height() - 28.0).max(80.0);
+            // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
+            egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
+            crate::frame::remember_width(ui, egui::Id::new((id, "w")));
+        });
+    (keep, response.map(|r| r.response.rect))
+}
+
 /// What a window asks for once it has been drawn.
 #[derive(Default)]
 struct Asked {
@@ -1265,7 +1348,9 @@ const TOOL_HEADS: [&str; 7] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", 
 /// A table of tools, each row picked by clicking its name. `library`: these are the machine library's tools.
 fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picked: &mut Option<(bool, u64)>) {
     let t = Tokens::get();
-    egui::ScrollArea::both().id_salt(id).max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+    egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
+        // A table's cells are never wrapped: it scrolls sideways instead.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         egui::Grid::new(id).num_columns(TOOL_HEADS.len() + 1).spacing([18.0, 6.0]).striped(true).show(ui, |ui| {
             for head in TOOL_HEADS {
                 ui.label(RichText::new(head).color(t.text_dim));
@@ -1299,19 +1384,12 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
 
 /// The Tool Library window: the machine's tools, which every design can use. Pick a tool to
 /// change or remove it; a form appears only for New Tool and Edit.
-fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &Choices, corner: egui::Pos2, asked: &mut Asked) {
+fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &Choices, dock: Dock, asked: &mut Asked) {
     let t = Tokens::get();
-    let mut open = true;
-    crate::frame::window(ctx, RichText::new("TOOL LIBRARY").strong().size(13.0), crate::frame::Width::Wide)
-        .id(egui::Id::new("sc_cam_tools"))
-        // From the top of the viewport down, beside the Manufacture window where there is room.
-        .pivot(egui::Align2::LEFT_TOP)
-        .default_pos(corner)
-        .default_width(crate::frame::WINDOW_WIDE_MAX_W - 40.0)
-        .open(&mut open)
-        .resizable(true)
-        .show(ctx, |ui| {
-            // Everything is as wide as the window, never wider: tables scroll inside it.
+    let mut folded = cam.tools_folded;
+    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, |ui| {
+        {
+            // Everything is as wide as the panel, never wider: tables scroll inside it.
             ui.set_max_width(ui.available_width());
             if let Some(e) = cam.error.as_ref().filter(|_| !cam.open) {
                 ui.label(RichText::new(e).color(t.error));
@@ -1385,7 +1463,9 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             if matches!(cam.form, Some(Form::Tool(_))) {
                 asked.apply |= form_block(ui, cam, &[], lists);
             }
-        });
+        }
+    });
+    cam.tools_folded = folded;
     cam.tools_open = open;
 }
 
@@ -1396,19 +1476,13 @@ fn manufacture_window(
     listed: &Value,
     lists: &Choices,
     selected: &[(String, Vec3)],
-    corner: egui::Pos2,
+    dock: Dock,
     asked: &mut Asked,
 ) {
     let t = Tokens::get();
-    let mut open = true;
-    crate::frame::window(ctx, RichText::new("MANUFACTURE").strong().size(13.0), crate::frame::Width::Normal)
-        .id(egui::Id::new("sc_cam_window"))
-        // Beside the model, not over it.
-        .pivot(egui::Align2::LEFT_TOP)
-        .default_pos(corner)
-        .open(&mut open)
-        .resizable(true)
-        .show(ctx, |ui| {
+    let mut folded = cam.folded;
+    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, |ui| {
+        {
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
             }
@@ -1507,7 +1581,10 @@ fn manufacture_window(
             if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
                 asked.apply |= form_block(ui, cam, selected, lists);
             }
-        });
+        }
+    });
+    cam.folded = folded;
+    cam.panel = rect;
     cam.open = open;
 }
 
@@ -1523,19 +1600,20 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let selected = selected_faces(app);
     let library = library_listing(app, false);
     let lists = choices(app, &listed, &library);
-    let corner = app.viewport.rect.map_or(egui::pos2(16.0, 160.0), |r| r.left_top() + egui::vec2(12.0, 12.0));
+    // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
+    // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
+    let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());
+    let top = (vp.top() + crate::viewport::AXIS_VIEW_CLEARANCE).min((vp.bottom() - 360.0).max(vp.top()));
+    let right = app.viewport.dialog_rect.filter(|_| app.dialog.is_some()).map_or(vp.right(), |r| r.left() - 6.0);
+    let max_height = vp.bottom() - top - 8.0;
     let mut asked = Asked::default();
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
-        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, corner, &mut asked);
+        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height }, &mut asked);
     }
     if cam.tools_open {
-        let beside = app.viewport.rect.map_or(corner, |r| {
-            let x = r.left() + 12.0 + crate::frame::WINDOW_MAX_W + 12.0;
-            let fits = x + crate::frame::WINDOW_WIDE_MAX_W <= r.right();
-            egui::pos2(if fits { x } else { r.left() + 36.0 }, r.top() + if fits { 12.0 } else { 36.0 })
-        });
-        tools_window(ctx, &mut cam, &library, &lists, beside, &mut asked);
+        let beside = if cam.open { cam.panel.map_or(right - crate::frame::DIALOG_WIDE_MAX_W, |r| r.left()) - 6.0 } else { right };
+        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height }, &mut asked);
     }
     app.manufacture = cam;
     for (id, p) in std::mem::take(&mut asked.run) {
