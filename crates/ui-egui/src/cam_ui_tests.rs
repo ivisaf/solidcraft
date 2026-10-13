@@ -87,6 +87,32 @@ fn toolpath_follows_the_design_and_errors_stay_in_the_window() {
 }
 
 #[test]
+fn selected_faces_become_the_operation_s_geometry() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    fill(&mut h, "cam.tool.define", |_| {});
+    fill(&mut h, "cam.setup.create", |_| {});
+    let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
+    h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
+    assert_eq!(h.app.session.selection.len(), 1);
+    // Nothing is typed: the outline and both heights come from the face and its body.
+    fill(&mut h, "cam.op.contour", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        assert_eq!((op.faces.len(), op.bottom.as_str()), (1, ""));
+    });
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for p in paths(&mut h.app).iter().flatten().filter(|p| p.1) {
+        (low, high) = (low.min(p.0.z), high.max(p.0.z));
+    }
+    assert!(low.abs() < 1e-9 && high <= 10.0 + 1e-9, "{low} {high}");
+    h.frames(2);
+    // With a face selected an open form offers to cut it; a sketch can still be used instead.
+    h.app.start("cam.op.pocket");
+    h.frames(2);
+    assert!(h.widget("1 picked").is_some() && h.widget("Use a sketch").is_some());
+}
+
+#[test]
 fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();

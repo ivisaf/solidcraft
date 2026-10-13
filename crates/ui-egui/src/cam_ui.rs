@@ -56,6 +56,8 @@ pub enum Form {
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpForm {
     pub kind: OpKind,
+    /// Picked faces (body, a point on the face); when there are any they are cut, not the sketch.
+    pub faces: Vec<(String, Vec3)>,
     pub sketch: String,
     pub tool: String,
     pub spindle_rpm: String,
@@ -98,6 +100,15 @@ fn text(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+/// The faces in the selection, as an operation takes them.
+fn selected_faces(app: &SolveApp) -> Vec<(String, Vec3)> {
+    app.session
+        .selection
+        .iter()
+        .filter_map(|s| if let solidcraft_engine::Sel::Face { body, point, .. } = s { Some((body.clone(), *point)) } else { None })
+        .collect()
+}
+
 /// Whether `id` is a Manufacture command, and the window it opens if so.
 pub fn start(app: &mut SolveApp, id: &str) -> bool {
     if !id.starts_with("cam.") {
@@ -115,15 +126,17 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             .find(|f| matches!(f.kind, solidcraft_engine::doc::FeatureKind::Sketch { .. }))
             .map(|f| f.name.clone())
             .unwrap_or_default();
+        let faces = selected_faces(app);
         Form::Op(Box::new(OpForm {
             kind,
+            bottom: if faces.is_empty() { "-5 mm".into() } else { String::new() },
+            faces,
             sketch,
             tool: first_tool.clone(),
             spindle_rpm: "10000".into(),
             feed: "600".into(),
             plunge_feed: String::new(),
             top: String::new(),
-            bottom: "-5 mm".into(),
             stepdown: String::new(),
             stepover: if kind == OpKind::Face { "5 mm".into() } else { String::new() },
             side: 0,
@@ -186,7 +199,9 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             Ok(("cam.setup.create", Value::Object(p)))
         }
         Form::Op(f) => {
-            optional("sketch", &f.sketch);
+            if f.faces.is_empty() {
+                optional("sketch", &f.sketch);
+            }
             optional("top", &f.top);
             optional("bottom", &f.bottom);
             optional("stepdown", &f.stepdown);
@@ -202,6 +217,10 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     optional("ramp_angle", &f.ramp_angle);
                 }
                 OpKind::Drill => optional("peck", &f.peck),
+            }
+            if !f.faces.is_empty() {
+                let faces: Vec<Value> = f.faces.iter().map(|(body, at)| json!({"body": body, "point": [at.x, at.y, at.z]})).collect();
+                p.insert("faces".into(), json!(faces));
             }
             p.insert("tool".into(), json!(number("The tool", &f.tool)? as u64));
             p.insert("spindle_rpm".into(), json!(number("The spindle speed", &f.spindle_rpm)?));
@@ -306,7 +325,7 @@ fn choice(ui: &mut egui::Ui, id: &str, label: &str, index: &mut usize, options: 
     ui.end_row();
 }
 
-fn form_ui(ui: &mut egui::Ui, form: &mut Form) {
+fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)]) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
         Form::Tool { number, kind, diameter, flute_length, description } => {
             field(ui, "Number", number, "1");
@@ -324,13 +343,32 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form) {
             choice(ui, "sc_cam_setup_post", "Post", post, solidcraft_engine::cam::Post::BUILTIN);
         }
         Form::Op(f) => {
-            field(ui, "Sketch", &mut f.sketch, "name");
+            if f.faces.is_empty() {
+                field(ui, "Sketch", &mut f.sketch, "name");
+            } else {
+                ui.label("Faces");
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} picked", f.faces.len()));
+                    if ui.small_button("Use a sketch").clicked() {
+                        f.faces.clear();
+                    }
+                });
+                ui.end_row();
+            }
+            if !selected.is_empty() && selected != f.faces.as_slice() {
+                ui.label("");
+                if ui.small_button(format!("Cut the {} selected face(s)", selected.len())).clicked() {
+                    f.faces = selected.to_vec();
+                }
+                ui.end_row();
+            }
+            let from_faces = !f.faces.is_empty();
             field(ui, "Tool", &mut f.tool, "number");
             field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "10000");
             field(ui, "Feed (mm/min)", &mut f.feed, "600");
             field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
-            field(ui, "Top", &mut f.top, "the sketch plane");
-            field(ui, "Bottom", &mut f.bottom, "-5 mm");
+            field(ui, "Top", &mut f.top, if from_faces { "from the faces" } else { "the sketch plane" });
+            field(ui, "Bottom", &mut f.bottom, if from_faces { "from the faces" } else { "-5 mm" });
             if f.kind != OpKind::Drill {
                 field(ui, "Stepdown", &mut f.stepdown, "half the tool diameter");
             }
@@ -376,6 +414,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut run: Vec<(&'static str, Value)> = Vec::new();
     let mut apply_form = false;
     let mut post_to: Option<String> = None;
+    let selected = selected_faces(app);
     let mut cam = std::mem::take(&mut app.manufacture);
     crate::frame::window(ctx, RichText::new("MANUFACTURE").strong().size(13.0), crate::frame::Width::Normal)
         .id(egui::Id::new("sc_cam_window"))
@@ -458,7 +497,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     Form::Op(f) => f.kind.title(),
                 };
                 ui.label(RichText::new(title).strong());
-                form_ui(ui, form);
+                form_ui(ui, form, &selected);
                 ui.horizontal(|ui| {
                     apply_form = ui.button("OK").clicked();
                     if ui.button("Cancel").clicked() {

@@ -5,7 +5,8 @@
 use serde_json::{Value, json};
 use solidcraft_cam::{self as cam, ContourParams, Cut, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
 use solidcraft_doc::expr::Kind;
-use solidcraft_doc::manufacture::{CamOperation, CamOperationKind, Setup};
+use solidcraft_doc::manufacture::{CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup};
+use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 
 use super::CommandSpec;
@@ -26,9 +27,9 @@ macro_rules! op_doc {
     ($own:literal) => {
         concat!(
             $own,
-            "; sketch: id or name; profiles?: as solid.extrude (default all); tool: number; spindle_rpm; feed: mm/min; plunge_feed?: mm/min \
-             (default feed/3); bottom: expr, final depth in the setup's Z; top?: expr (default: the sketch plane's height); retract?: expr \
-             (default top + 2 mm); clearance?: expr (default top + 10 mm); stepdown?: expr (default half the tool diameter); coolant?: bool; \
+            "; sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills); tool: number; spindle_rpm; feed: mm/min; plunge_feed?: mm/min \
+             (default feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
+             retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default half the tool diameter); coolant?: bool; \
              setup?: id or name (default: the only setup); name? → operation: id, name, and its toolpath's cut_length, rapid_length, cut_minutes"
         )
     };
@@ -225,27 +226,159 @@ fn to_setup(plane: &Plane, origin: Vec3, regions: &[Region2]) -> Result<Vec<Regi
     Ok(regions.iter().map(|r| Region2 { outer: lp(&r.outer), holes: r.holes.iter().map(lp).collect() }).collect())
 }
 
+/// Closed loops out of projected face edges: the largest is the outline, the others its holes.
+fn outline(geom: &[LinkGeom]) -> std::result::Result<Region2, String> {
+    let mut loops: Vec<Loop2> = Vec::new();
+    let mut open: Vec<Seg2> = Vec::new();
+    for g in geom {
+        match *g {
+            LinkGeom::Point(_) => {}
+            LinkGeom::Line(a, b) => open.push(Seg2::Line { a, b }),
+            LinkGeom::Circle(c, r) => loops.push(Loop2::circle(c, r)),
+            LinkGeom::Arc { c, a, b } => {
+                let (start, end) = ((a - c).angle(), (b - c).angle());
+                let sweep = (end - start).rem_euclid(std::f64::consts::TAU);
+                open.push(Seg2::Arc { center: c, radius: a.dist(c), start, sweep: if sweep > 1e-12 { sweep } else { std::f64::consts::TAU } });
+            }
+            LinkGeom::Conic { a, apex, b, rho } if rho > 1e-6 && rho < 1.0 - 1e-6 => open.push(Seg2::Conic { a, apex, b, w: rho / (1.0 - rho) }),
+            _ => return Err("not supported yet: faces with elliptical or spline edges".into()),
+        }
+    }
+    if open.len() > 20_000 {
+        return Err("the face has too many edges".into());
+    }
+    // Edges come in no order and either direction: follow them end to end.
+    const JOIN: f64 = 1e-3;
+    let mut used = vec![false; open.len()];
+    for first in 0..open.len() {
+        if used.get(first).copied().unwrap_or(true) {
+            continue;
+        }
+        let Some(seed) = open.get(first).copied() else { continue };
+        if let Some(flag) = used.get_mut(first) {
+            *flag = true;
+        }
+        let mut chain = vec![seed];
+        let origin = seed.start();
+        let mut end = seed.end();
+        while end.dist(origin) > JOIN {
+            let next = open.iter().zip(&used).enumerate().filter(|(_, (_, taken))| !**taken).find_map(|(i, (seg, _))| {
+                if seg.start().dist(end) <= JOIN {
+                    Some((i, *seg))
+                } else if seg.end().dist(end) <= JOIN {
+                    Some((i, seg.reversed()))
+                } else {
+                    None
+                }
+            });
+            let Some((i, seg)) = next else { return Err("the face's edges do not form closed loops".into()) };
+            if let Some(flag) = used.get_mut(i) {
+                *flag = true;
+            }
+            end = seg.end();
+            chain.push(seg);
+        }
+        loops.push(Loop2 { segs: chain });
+    }
+    let outer = loops
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.signed_area().abs().total_cmp(&b.1.signed_area().abs()))
+        .map(|(i, _)| i)
+        .ok_or("the face has no outline")?;
+    let outer = loops.remove(outer);
+    Ok(Region2 { outer, holes: loops })
+}
+
+/// The centre of a loop that is one circle.
+fn circle_centre(lp: &Loop2) -> Option<Vec2> {
+    let Some(Seg2::Arc { center, radius, .. }) = lp.segs.first().copied() else { return None };
+    let same = |s: &Seg2| matches!(*s, Seg2::Arc { center: c, radius: r, .. } if c.dist(center) <= 1e-6 && (r - radius).abs() <= 1e-6);
+    let turned: f64 = lp.segs.iter().map(|s| if let Seg2::Arc { sweep, .. } = s { sweep.abs() } else { 0.0 }).sum();
+    (lp.segs.iter().all(same) && (turned - std::f64::consts::TAU).abs() < 1e-6).then_some(center)
+}
+
+/// Where an operation cuts, in its setup's work coordinates.
+struct Geometry {
+    regions: Vec<Region2>,
+    /// Height of the sketch plane or the picked faces.
+    z: f64,
+    /// Lowest and highest point of the picked faces' bodies.
+    body_z: Option<(f64, f64)>,
+}
+
+fn geometry(s: &Session, setup: &Setup, source: &CamGeometry) -> std::result::Result<Geometry, String> {
+    let state = s.model.state();
+    match source {
+        CamGeometry::Sketch { sketch, profiles } => {
+            let sketch =
+                state.sketches.iter().find(|k| k.feature == *sketch).ok_or("its sketch is not built (deleted, rolled back, suppressed or failed)")?;
+            let regions = solidcraft_doc::select_profiles(sketch, profiles).map_err(|e| e.to_string())?;
+            let regions = to_setup(&sketch.plane, setup.origin, &regions).map_err(|e| e.to_string())?;
+            Ok(Geometry { regions, z: sketch.plane.origin.z - setup.origin.z, body_z: None })
+        }
+        CamGeometry::Faces { faces } => {
+            let mut regions = Vec::new();
+            let mut z: Option<f64> = None;
+            let mut body_z: Option<(f64, f64)> = None;
+            for face in faces {
+                let body = state.body(&face.body).ok_or_else(|| format!("body `{}` is gone", face.body))?;
+                let (index, ..) =
+                    solidcraft_doc::naming::face_on_body(body, &face.name, face.at).ok_or_else(|| format!("its face on `{}` is gone", face.body))?;
+                let plane = body.body.planar_face(index).ok_or("a picked face is not planar")?;
+                let resolved = solidcraft_doc::project::resolve_face_indices(&state, &plane, LinkKind::Project, &face.body, &[index])
+                    .map_err(|e| e.to_string())?;
+                let region = outline(&resolved.geom)?;
+                regions.extend(to_setup(&plane, setup.origin, &[region]).map_err(|e| e.to_string())?);
+                let height = plane.origin.z - setup.origin.z;
+                if z.is_some_and(|other| (other - height).abs() > 1e-6) {
+                    return Err("the picked faces are at different heights; use one operation per height".into());
+                }
+                z = Some(height);
+                let bounds = body.mesh().bounds();
+                let (lo, hi) = (bounds.min.z - setup.origin.z, bounds.max.z - setup.origin.z);
+                body_z = Some(body_z.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi))));
+            }
+            Ok(Geometry { regions, z: z.ok_or("no face is picked")?, body_z })
+        }
+    }
+}
+
 /// The toolpath of `op` in its setup's work coordinates, from the model as it is now.
+///
+/// Heights the operation leaves out follow its geometry. A sketch gives the top (its plane).
+/// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
+/// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
+/// the face; for drilling, the top (the face) and the bottom (the bottom of its body). Retract
+/// and clearance are 2 mm and 10 mm above the top (clearance above the whole body).
 pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
     let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
     let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
     let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
+    let g = geometry(s, setup, &op.geometry).map_err(fail)?;
+    let picked = matches!(op.geometry, CamGeometry::Faces { .. });
+    let (auto_top, auto_bottom) = match (&op.kind, g.body_z) {
+        (CamOperationKind::Pocket { .. }, Some((_, hi))) if picked => (Some(hi), Some(g.z)),
+        (CamOperationKind::Contour { .. }, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
+        (CamOperationKind::Drill { .. }, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
+        (CamOperationKind::Face { .. }, _) if picked => (Some(g.z), Some(g.z)),
+        _ => (Some(g.z), None),
+    };
+    let height = |what: &str, given: &Option<String>, auto: Option<f64>| match given {
+        Some(e) => len(what, e),
+        None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
+    };
+    let top = height("top", &op.top, auto_top)?;
+    let bottom = height("bottom", &op.bottom, auto_bottom)?;
     let heights = Heights {
-        clearance: len("clearance", &op.clearance)?,
-        retract: len("retract", &op.retract)?,
-        top: len("top", &op.top)?,
-        bottom: len("bottom", &op.bottom)?,
+        clearance: height("clearance", &op.clearance, Some(g.body_z.map_or(top, |(_, hi)| hi.max(top)) + 10.0))?,
+        retract: height("retract", &op.retract, Some(top + 2.0))?,
+        top,
+        bottom,
     };
     let cut = Cut { heights, feeds: Feeds { cut: op.cut_feed, plunge: op.plunge_feed }, stepdown: len("stepdown", &op.stepdown)? };
-    let state = s.model.state();
-    let sketch = state
-        .sketches
-        .iter()
-        .find(|k| k.feature == op.sketch)
-        .ok_or_else(|| fail("its sketch is not built (deleted, rolled back, suppressed or failed)".into()))?;
-    let regions = solidcraft_doc::select_profiles(sketch, &op.profiles).map_err(|e| fail(e.to_string()))?;
-    let regions = to_setup(&sketch.plane, setup.origin, &regions).map_err(|e| fail(e.to_string()))?;
+    let regions = &g.regions;
     let path = match &op.kind {
         CamOperationKind::Face { stepover } => {
             let (mut min, mut max) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
@@ -262,7 +395,15 @@ pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Too
                 tolerance: TOLERANCE,
                 ramp_angle: angle(ramp_angle)?,
             };
-            cam::contour(&regions, tool, &params, &cut)
+            // Round a picked face means round the part: its holes are other operations' work.
+            let outer: Vec<Region2>;
+            let regions = if picked && *side == Side::Outside {
+                outer = regions.iter().map(|r| Region2 { outer: r.outer.clone(), holes: Vec::new() }).collect();
+                &outer
+            } else {
+                regions
+            };
+            cam::contour(regions, tool, &params, &cut)
         }
         CamOperationKind::Pocket { stepover, climb, stock_to_leave, ramp_angle } => {
             let params = PocketParams {
@@ -272,15 +413,44 @@ pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Too
                 tolerance: TOLERANCE,
                 ramp_angle: angle(ramp_angle)?,
             };
-            cam::pocket(&regions, tool, &params, &cut)
+            cam::pocket(regions, tool, &params, &cut)
         }
         CamOperationKind::Drill { peck, dwell } => {
             let peck = peck.as_ref().map(|e| len("peck", e)).transpose()?;
-            let points: Vec<Vec2> = regions.iter().map(|r| r.outer.centroid()).collect();
+            // A sketch's profiles are the holes; a picked face's round inner loops are.
+            let points: Vec<Vec2> = if picked {
+                regions.iter().flat_map(|r| r.holes.iter().filter_map(circle_centre)).collect()
+            } else {
+                regions.iter().map(|r| r.outer.centroid()).collect()
+            };
+            if points.is_empty() {
+                return Err(fail("the picked faces have no round holes to drill".into()));
+            }
             cam::drill(&points, tool, &DrillParams { peck, dwell: *dwell }, &cut)
         }
     };
     path.map_err(|e| fail(e.to_string()))
+}
+
+/// The faces an operation is to cut, from `faces: [{body?, point}]`: each the face holding the point.
+fn faces_param(s: &Session, v: &Value, cmd: &str) -> Result<Vec<FaceRef>> {
+    let items = v
+        .as_array()
+        .filter(|a| !a.is_empty() && a.len() <= 256)
+        .ok_or_else(|| bad(cmd, "`faces` must be a list of 1 to 256 {body?, point: [x, y, z]}"))?;
+    let state = s.model.state();
+    let mut out = Vec::new();
+    for item in items {
+        let at = item.get("point").and_then(vec3).ok_or_else(|| bad(cmd, "each face needs `point`: [x, y, z], a point on it"))?;
+        let wanted = item.get("body").and_then(Value::as_str);
+        let found = state
+            .bodies
+            .iter()
+            .filter(|b| wanted.is_none_or(|w| b.name.eq_ignore_ascii_case(w)))
+            .find_map(|b| solidcraft_doc::naming::face_name_at_body(b, at).map(|name| FaceRef { body: b.name.clone(), name, at }));
+        out.push(found.ok_or_else(|| bad(cmd, format!("no face at [{}, {}, {}]", at.x, at.y, at.z)))?);
+    }
+    Ok(out)
 }
 
 fn stats_json(path: &Toolpath) -> Value {
@@ -295,8 +465,14 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     if setup.operations.len() >= MAX_OPERATIONS {
         return Err(bad(cmd, "the setup has too many operations"));
     }
-    let sketch = super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?;
-    let profiles = super::features::profiles(p, cmd)?;
+    let geometry = match (p.get("faces"), p.get("sketch")) {
+        (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
+        (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
+        _ => CamGeometry::Sketch {
+            sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
+            profiles: super::features::profiles(p, cmd)?,
+        },
+    };
     let number = p.get("tool").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
     let tool = s
         .doc
@@ -313,20 +489,13 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
         Some(_) => positive("plunge_feed").ok_or_else(|| bad(cmd, "`plunge_feed` must be above 0 (mm/min)"))?,
         None => cut_feed / 3.0,
     };
-    let bottom = req_expr(cmd, p, "bottom")?;
-    length(s, cmd, "bottom", &bottom)?;
-    // Heights default from where the sketch is now; give an expression to make one follow the design.
-    let top = match expr(p, "top") {
-        Some(e) => e,
-        None => {
-            let state = s.model.state();
-            let plane = state.sketches.iter().find(|k| k.feature == sketch).map(|k| k.plane).ok_or_else(|| bad(cmd, "the sketch is not built"))?;
-            mm(plane.origin.z - setup.origin.z)
-        }
-    };
-    let top_z = length(s, cmd, "top", &top)?;
-    let retract = expr(p, "retract").unwrap_or_else(|| mm(top_z + 2.0));
-    let clearance = expr(p, "clearance").unwrap_or_else(|| mm(top_z + 10.0));
+    // A height left out follows the geometry (see `build`).
+    let heights = ["clearance", "retract", "top", "bottom"].map(|k| match p.get(k) {
+        Some(_) => req_expr(cmd, p, k).and_then(|e| length(s, cmd, k, &e).map(|_| Some(e))),
+        None => Ok(None),
+    });
+    let [clearance, retract, top, bottom] = heights;
+    let (clearance, retract, top, bottom) = (clearance?, retract?, top?, bottom?);
     let stepdown = expr(p, "stepdown").unwrap_or_else(|| mm(tool.diameter * 0.5));
     let name = match name_param(p, cmd)? {
         Some(n) if setup.operations.iter().any(|o| o.name.eq_ignore_ascii_case(&n)) => {
@@ -349,8 +518,7 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
         top,
         bottom,
         stepdown,
-        sketch,
-        profiles,
+        geometry,
         kind,
     };
     // An operation that cannot be cut is not added.

@@ -51,16 +51,39 @@ pub struct CamOperation {
     /// Feed rates (mm/min).
     pub cut_feed: f64,
     pub plunge_feed: f64,
-    /// Heights in the setup's Z and the depth per pass, as length expressions.
-    pub clearance: String,
-    pub retract: String,
-    pub top: String,
-    pub bottom: String,
+    /// Heights in the setup's Z, as length expressions. One left out follows the geometry:
+    /// the sketch plane or picked face, and the picked face's body (see the engine's `cam`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retract: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<String>,
+    /// Depth per pass, as a length expression.
     pub stepdown: String,
-    /// The sketch whose profiles say where to cut, and which of them.
-    pub sketch: u64,
-    pub profiles: ProfileSel,
+    /// Where to cut.
+    pub geometry: CamGeometry,
     pub kind: CamOperationKind,
+}
+
+/// What an operation's regions come from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CamGeometry {
+    /// Profiles of a sketch.
+    Sketch { sketch: u64, profiles: ProfileSel },
+    /// The outlines of planar body faces (their inner loops are islands, or holes to drill).
+    Faces { faces: Vec<FaceRef> },
+}
+
+/// A body face: the one with the persistent name `name` on `body`, else the piece of it nearest `at`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceRef {
+    pub body: String,
+    pub name: String,
+    pub at: Vec3,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

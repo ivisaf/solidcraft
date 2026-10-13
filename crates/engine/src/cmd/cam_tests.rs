@@ -44,8 +44,8 @@ fn pocket_from_a_sketch_to_gcode() {
     let listed = run(&mut s, "cam.list", json!({}));
     let first = &listed["setups"][0]["operations"][0];
     assert_eq!(first["kind"], "pocket");
-    // Heights default from the sketch plane: top 0, retract 2, clearance 10.
-    assert_eq!((first["top"].as_str(), first["retract"].as_str(), first["clearance"].as_str()), (Some("0 mm"), Some("2 mm"), Some("10 mm")));
+    // Heights left out are not stored: they follow the sketch plane (top 0, retract 2, clearance 10).
+    assert!(first.get("top").is_none() && first.get("retract").is_none() && first["bottom"] == "-5");
     assert_eq!(first["toolpath"]["cut_length"], op["cut_length"]);
 
     let posted = run(&mut s, "cam.post", json!({}));
@@ -94,8 +94,6 @@ fn toolpaths_follow_parameters_the_work_origin_and_the_sketch_height() {
     let made = run(&mut s, "cam.op.pocket", op);
     // The sketch is at world Z 10, the work origin at Z 4: the top is 6 in work coordinates.
     assert_eq!(made["lowest_z"], 3.0);
-    let listed = run(&mut s, "cam.list", json!({}));
-    assert_eq!(listed["setups"][0]["operations"][0]["top"], "6 mm");
     // World points are back at the sketch; work coordinates are shifted by the origin.
     let world = run(&mut s, "cam.toolpath", json!({"setup": "Top"}));
     let pts = world["operations"][0]["points"].as_array().unwrap();
@@ -152,6 +150,83 @@ fn contour_face_and_drill_from_sketches() {
     run(&mut s, "cam.op.remove", json!({"op": "Drill1"}));
     run(&mut s, "cam.tool.remove", json!({"number": 2}));
     assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["operations"].as_array().unwrap().len(), 2);
+}
+
+/// A 60 × 40 × 10 plate (top at Z 0) with a 40 × 20 pocket `depth` deep and a 4 mm hole through it.
+fn machined_plate() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "depth", "expression": "4 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "PocketSketch"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [50, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "PocketSketch", "distance": "depth", "direction": "negative", "operation": "cut"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "HoleSketch"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [5, 35], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "HoleSketch", "distance": 10, "direction": "negative", "operation": "cut"}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["body_count"], 1);
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "drill", "diameter": 4}));
+    run(&mut s, "cam.setup.create", json!({}));
+    s
+}
+
+#[test]
+fn operations_from_picked_faces_take_their_heights_from_the_model() {
+    let mut s = machined_plate();
+    let common = json!({"tool": 1, "spindle_rpm": 10000, "feed": 600, "plunge_feed": 200, "ramp_angle": 0});
+    let with = |extra: Value| {
+        let mut v = common.clone();
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v
+    };
+    // The pocket's floor: cut from the top of the plate (0) down to the floor (−4), 3 mm inside its walls.
+    let pocket = run(&mut s, "cam.op.pocket", with(json!({"faces": [{"point": [30, 20, -4]}]})));
+    assert_eq!(pocket["lowest_z"], -4.0);
+    let world = run(&mut s, "cam.toolpath", json!({"op": "Pocket1"}));
+    let pts: Vec<[f64; 3]> = world["operations"][0]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p[3] == true && p[2].as_f64().unwrap() < 0.0)
+        .map(|p| [p[0].as_f64().unwrap(), p[1].as_f64().unwrap(), p[2].as_f64().unwrap()])
+        .collect();
+    assert!(!pts.is_empty());
+    for p in &pts {
+        assert!(p[0] >= 13.0 - 1e-4 && p[0] <= 47.0 + 1e-4 && p[1] >= 13.0 - 1e-4 && p[1] <= 27.0 + 1e-4, "gouge at {p:?}");
+    }
+    // The plate's top: round the 60 × 40 outline (not its pocket or hole) down to the bottom
+    // of the plate in 10/3 mm passes: four laps of 200 + 6π, and 2 + 10 mm of plunging.
+    let contour = run(&mut s, "cam.op.contour", with(json!({"faces": [{"body": "Body1", "point": [5, 5, 0]}], "stepdown": 3})));
+    close(contour["lowest_z"].as_f64().unwrap(), -10.0, 1e-9);
+    close(contour["cut_length"].as_f64().unwrap(), 4.0 * (200.0 + 6.0 * std::f64::consts::PI) + 12.0, 1e-3);
+    // Its one round hole is drilled from the top through the plate: 2 → −10.
+    let drill = run(&mut s, "cam.op.drill", json!({"faces": [{"point": [5, 5, 0]}], "tool": 2, "spindle_rpm": 3000, "feed": 150}));
+    close(drill["cut_length"].as_f64().unwrap(), 12.0, 1e-9);
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("G0 X5 Y35\n"), "{gcode}");
+
+    // A deeper pocket in the design is a deeper pocket in the toolpath: the face is found again by name.
+    run(&mut s, "parameters.change", json!({"name": "depth", "expression": "7 mm"}));
+    assert_eq!(run(&mut s, "cam.toolpath", json!({"op": "Pocket1", "points": false}))["operations"][0]["lowest_z"], -7.0);
+    let saved = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(saved.manufacture, s.doc.manufacture);
+
+    // Faces the tool cannot reach from above, and points that are on no face.
+    let refused =
+        |s: &mut Session, p: Value| s.execute("cam.op.pocket", &p).err().map(|e| e.to_string()).unwrap_or_else(|| panic!("{p} was accepted"));
+    assert!(refused(&mut s, with(json!({"faces": [{"point": [0, 20, -5]}]}))).contains("not supported yet"));
+    assert!(refused(&mut s, with(json!({"faces": [{"point": [500, 500, 500]}]}))).contains("no face at"));
+    assert!(refused(&mut s, with(json!({"faces": [{"point": [30, 20, -7]}], "sketch": "Plate"}))).contains("not both"));
+    assert!(refused(&mut s, with(json!({"faces": [{"point": [30, 20, -7]}, {"point": [5, 5, 0]}]}))).contains("different heights"));
+    // A sketch gives no bottom.
+    assert!(refused(&mut s, with(json!({"sketch": "PocketSketch"}))).contains("`bottom` is required"));
 }
 
 #[test]
@@ -269,6 +344,7 @@ fn hostile_cam_params_never_panic() {
         "stepover",
         "stock_to_leave",
         "ramp_angle",
+        "faces",
         "side",
         "peck",
         "dwell",
