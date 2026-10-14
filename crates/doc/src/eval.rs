@@ -2551,6 +2551,35 @@ fn centered_extrude(plane: &Plane, region: &Region2, start: f64, end: f64, sketc
         .collect()
 }
 
+/// The regions a thin extrude's wall covers in its sketch.
+pub(crate) fn thin_regions(vals: &BTreeMap<String, Value>, ss: &SolvedSketch, thin: &crate::ThinWall) -> Result<Vec<Region2>> {
+    if thin.curves.is_empty() || thin.curves.len() > 1000 {
+        return Err(DocError::Invalid("a thin extrude needs 1…1000 sketch curves".into()));
+    }
+    let t = val(vals, &thin.thickness, Kind::Length)?;
+    let (inside, outside) = match thin.side {
+        crate::ThinSide::Center => (t / 2.0, t / 2.0),
+        crate::ThinSide::Inside => (t, 0.0),
+        crate::ThinSide::Outside => (0.0, t),
+        crate::ThinSide::TwoSides => {
+            let e = thin.thickness2.as_deref().ok_or_else(|| DocError::Invalid("a two-sided thin wall needs `thickness2`".into()))?;
+            (t, val(vals, e, Kind::Length)?)
+        }
+    };
+    if !(inside >= 0.0 && outside >= 0.0 && inside + outside > 0.0) {
+        return Err(DocError::Invalid("the wall thickness must be positive".into()));
+    }
+    let curves = thin
+        .curves
+        .iter()
+        .map(|id| {
+            let ci = ss.sketch.curve_index(id).ok_or_else(|| DocError::Unknown(format!("curve `{id}` of {}", ss.name)))?;
+            Ok(ss.sketch.exact_segs(ci).unwrap_or_else(|| ss.sketch.segs(ci)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    solidcraft_sketch::thin_wall_regions(&curves, inside, outside).map_err(|e| DocError::Invalid(format!("thin wall: {e}")))
+}
+
 /// How far apart (mm) profiles must stay for their extruded tools to be cut as one.
 const APART_GAP: f64 = 1e-3;
 
@@ -2564,13 +2593,16 @@ fn feature_tools_with_constructor(
 ) -> Result<Vec<Traced>> {
     let unnamed = |bodies: Vec<Body>| -> Vec<Traced> { bodies.into_iter().map(Traced::unnamed).collect() };
     match &f.kind {
-        FeatureKind::Extrude { sketch, profiles, extent, operation, targets } => {
+        FeatureKind::Extrude { sketch, profiles, extent, operation, targets, thin } => {
             let ss = sketch_in_feature_frame(
                 doc,
                 st.sketch(*sketch).ok_or_else(|| DocError::Unknown(format!("sketch {sketch} (it must come earlier in the timeline)")))?,
                 f.component,
             )?;
-            let regions = solidcraft_sketch::merge_regions(&select_profiles(&ss, profiles)?);
+            let regions = match thin {
+                Some(thin) => thin_regions(vals, &ss, thin)?,
+                None => solidcraft_sketch::merge_regions(&select_profiles(&ss, profiles)?),
+            };
             // From / To Object: where the face or point lies along the normal, measured over the
             // middle of the profiles. The points are in this feature's component frame, so the
             // model is seen from there: a target in another, moved component where it is shown.
@@ -3876,6 +3908,7 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
         | FeatureKind::SheetContour { .. }
         | FeatureKind::SheetFlange { .. }
         | FeatureKind::SheetHem { .. }
+        | FeatureKind::SheetPerforate { .. }
         | FeatureKind::SheetFold { .. }
         | FeatureKind::SheetUnfold { .. }
         | FeatureKind::SheetConvert { .. } => more::sheet_eval(doc, vals, f, st, warning),
@@ -4720,9 +4753,61 @@ pub fn state_in_frame_at<'a>(doc: &Document, st: &'a ModelState, comp: u64, fram
 /// occurrence of it (bodies of the first placement keep their names; further instances get the
 /// occurrence path in brackets). Without components this is the model itself.
 pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
+    world_state_reusing(doc, st, &mut PlacedBodies::default())
+}
+
+/// Bodies a [`world_state_reusing`] call placed away from their definition (a moved
+/// component's bodies), by their definition and placement: the next call reuses each one whose
+/// definition and placement are unchanged instead of transforming it again, and so keeps its
+/// display mesh. Without this every change anywhere in a design transformed and meshed every
+/// body of every moved component again.
+#[derive(Default)]
+pub struct PlacedBodies {
+    by_source: std::collections::HashMap<(usize, [u64; 16]), (ModelBody, ModelBody)>,
+}
+
+impl PlacedBodies {
+    /// The body `b` placed by `m`, from an earlier call when `b` is the same body as then.
+    fn placed(&self, b: &ModelBody, m: &crate::Mat, name: String) -> ModelBody {
+        let reused = self.by_source.get(&placed_key(b, m)).filter(|(source, _)| {
+            Arc::ptr_eq(&source.mesh, &b.mesh)
+                && source.body.same(&b.body)
+                && source.body.color() == b.body.color()
+                && source.body.paint() == b.body.paint()
+                && match (source.body.split_lines(), b.body.split_lines()) {
+                    (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+                    (None, None) => true,
+                    _ => false,
+                }
+        });
+        match reused {
+            Some((_, placed)) => {
+                let mut fresh = ModelBody::new(name, placed.body.clone(), b.feature);
+                fresh.mesh = placed.mesh.clone();
+                fresh.plan = placed.plan.clone();
+                fresh.plan_mesh = placed.plan_mesh.clone();
+                fresh
+            }
+            None => ModelBody::new(name, kernel::transform_matrix(&b.body, *m).unwrap_or_else(|_| b.body.clone()), b.feature),
+        }
+    }
+}
+
+fn placed_key(b: &ModelBody, m: &crate::Mat) -> (usize, [u64; 16]) {
+    let mut bits = [0u64; 16];
+    for (slot, v) in bits.iter_mut().zip(m.iter().flatten()) {
+        *slot = v.to_bits();
+    }
+    (Arc::as_ptr(&b.mesh) as usize, bits)
+}
+
+/// [`world_state`], reusing the bodies `placed` holds from an earlier call and leaving it holding
+/// this call's.
+pub fn world_state_reusing(doc: &Document, st: &ModelState, placed_before: &mut PlacedBodies) -> ModelState {
     if doc.occurrences.is_empty() {
         return st.clone();
     }
+    let mut placed_now = PlacedBodies::default();
     let comp_of_feature = |id: u64| doc.feature(id).map(|f| f.component).unwrap_or(0);
     let first_path = |comp: u64| -> Vec<u64> {
         let mut path = Vec::new();
@@ -4752,8 +4837,9 @@ pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
                 placed.name = name;
                 placed
             } else {
-                let body = kernel::transform_matrix(&b.body, bm).unwrap_or_else(|_| b.body.clone());
-                ModelBody::new(name, body, b.feature)
+                let placed = placed_before.placed(b, &bm, name);
+                placed_now.by_source.insert(placed_key(b, &bm), (b.clone(), placed.clone()));
+                placed
             };
             // World states keep their previous display-only evaluation-key semantics.
             placed.key = 0;
@@ -4801,6 +4887,7 @@ pub fn world_state(doc: &Document, st: &ModelState) -> ModelState {
             }
         }
     }
+    *placed_before = placed_now;
     out
 }
 

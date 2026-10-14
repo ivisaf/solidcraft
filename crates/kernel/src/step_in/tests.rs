@@ -863,6 +863,66 @@ fn glued_halves_export_as_whole_faces() {
     assert_eq!(imp.bodies[0].file_faces, 8);
 }
 
+/// A slot plate with a round on its top outline (issue #612): the extruded arc ends and the
+/// rounds along the straight edges are lone B-spline sheets, written as cylinders bounded by
+/// their faces. The rounds' sheets reach far past their edges, and a reader bounding the part by
+/// its surfaces saw a 60 mm part as 130 mm long.
+#[test]
+fn rounded_slot_exports_cylinders() {
+    use solidcraft_geom::Seg2;
+    use std::f64::consts::{FRAC_PI_2, PI};
+    let outer = Loop2 {
+        segs: vec![
+            Seg2::Line { a: Vec2::new(10.0, -10.0), b: Vec2::new(50.0, -10.0) },
+            Seg2::Arc { center: Vec2::new(50.0, 0.0), radius: 10.0, start: -FRAC_PI_2, sweep: PI },
+            Seg2::Line { a: Vec2::new(50.0, 10.0), b: Vec2::new(10.0, 10.0) },
+            Seg2::Arc { center: Vec2::new(10.0, 0.0), radius: 10.0, start: FRAC_PI_2, sweep: PI },
+        ],
+    };
+    let plate = extrude(&Plane::XY, &[Region2 { outer, holes: vec![] }], 0.0, 4.0).unwrap().pop().unwrap();
+    let edges = [Vec3::new(30.0, -10.0, 4.0), Vec3::new(30.0, 10.0, 4.0), Vec3::new(0.0, 0.0, 4.0), Vec3::new(60.0, 0.0, 4.0)];
+    let b = fillet(&plate, &edges, 1.0).unwrap();
+    let text = step_export(&[&b], "t").unwrap();
+    assert!(!text.contains("B_SPLINE_SURFACE"), "{text}");
+    assert_eq!(text.matches("CYLINDRICAL_SURFACE(").count(), 4);
+    assert_eq!(text.matches("TOROIDAL_SURFACE(").count(), 2);
+    // No point of the file (surface placements included) lies outside the part.
+    let imp = round_trip(&b);
+    for line in text.lines().filter(|l| l.contains("CARTESIAN_POINT")) {
+        let Some(xyz) = line.split("((").nth(1).and_then(|r| r.split("))").next()) else { continue };
+        let x: f64 = xyz.split(',').next().unwrap().trim().parse().unwrap();
+        assert!((-1e-6..=60.0 + 1e-6).contains(&x), "{line}");
+    }
+    // The volume analytically: the plate less the round's corner section swept along the edges
+    // (Pappus: the section's centroid runs 0.2234 r inside the edge round the arcs).
+    let section = 1.0 - PI / 4.0;
+    let centroid = (10.0 - 3.0 * PI) / (3.0 * (4.0 - PI));
+    let want = (800.0 + PI * 100.0) * 4.0 - section * (80.0 + std::f64::consts::TAU * (10.0 - centroid));
+    assert!(rel(measure(&imp.bodies[0].body).unwrap().volume, want) < 1e-3);
+}
+
+/// A countersink cut into a plate (issue #612): the cone is a tapered extrusion of a disc, a
+/// B-spline sheet per half, written as one CONICAL_SURFACE face (the sheets reached below the
+/// plate).
+#[test]
+fn countersink_exports_one_cone() {
+    use std::f64::consts::FRAC_PI_4;
+    let plate = box_solid(Vec3::new(-10.0, -10.0, 0.0), Vec3::new(10.0, 10.0, 4.0)).unwrap();
+    // A 90° countersink, radius 4 at the top face, down from 1 mm above it to radius 1.8, and the
+    // 2 mm drill through.
+    let disc = Region2 { outer: Loop2::circle(Vec2::ZERO, 5.0), holes: vec![] };
+    let cone = crate::extrude_tapered(&Plane::XY.offset(5.0), &disc, 3.2, -1.0, -FRAC_PI_4).unwrap();
+    let drill = cylinder(Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 2.0, 6.0).unwrap();
+    let b = boolean(&boolean(&plate, &cone, BoolOp::Cut).unwrap().unwrap(), &drill, BoolOp::Cut).unwrap().unwrap();
+    let text = step_export(&[&b], "t").unwrap();
+    assert!(!text.contains("B_SPLINE_SURFACE"), "{text}");
+    assert_eq!(text.matches("CONICAL_SURFACE(").count(), 1, "{text}");
+    assert_eq!(text.matches("CYLINDRICAL_SURFACE(").count(), 1, "{text}");
+    let imp = round_trip(&b);
+    // Six box faces, the countersink and the drill.
+    assert_eq!(imp.bodies[0].file_faces, 8);
+}
+
 /// Knot multiplicities are expanded into one value each before the knot count is compared with
 /// the control points, so the sum has to be checked first: 1,000,000 knots of multiplicity 64
 /// against two control points asked for a 500 MB vector (20,000,000 for 10 GB) only to reject

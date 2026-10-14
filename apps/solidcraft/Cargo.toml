@@ -27,6 +27,8 @@ egui = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 rfd = { workspace = true }
+# Checks eframe's settings file (app.ron) before eframe reads it (src/startup.rs).
+ron = "0.12"
 getrandom = "0.3"
 # The update check (docs/updates.md): HTTPS with rustls, certificates from the operating system.
 ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "platform-verifier"] }
@@ -47,6 +49,9 @@ block2 = "0.6"
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11"] }
+
+[dev-dependencies]
+pollster = { workspace = true }
 
 [build-dependencies]
 embed-resource = "3.0.11"

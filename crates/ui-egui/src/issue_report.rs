@@ -20,7 +20,7 @@ pub(crate) fn cad_input_blocked() -> bool {
     CAD_INPUT_BLOCKED.with(std::cell::Cell::get)
 }
 
-/// Draw CAD behind a report without delivering its input or focus to any model editor.
+/// Draw CAD behind a report or native picker without delivering input or focus to editors.
 /// Fresh focus history also prevents inline editors from committing on report focus loss.
 pub(crate) struct CadInput {
     ctx: egui::Context,
@@ -41,7 +41,9 @@ impl CadInput {
     }
 
     pub(crate) fn begin(app: &SolveApp, ctx: &egui::Context) -> Option<Self> {
-        app.issue_report.draft.as_ref()?;
+        if app.issue_report.draft.is_none() && app.file_picker.is_none() {
+            return None;
+        }
         let mut raw = ctx.input(|i| i.raw.clone());
         raw.events.clear();
         raw.dropped_files.clear();
@@ -553,16 +555,19 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     draft.note = "Paste the image into the GitHub draft, or save the PNG if image copying is unavailable.".into();
                 }
                 if ui.add_enabled(draft.image.is_some() && app.services.pick_save.is_some(), egui::Button::new("Save screenshot…")).clicked()
-                    && let Some(image) = draft.image.as_ref()
-                    && let Some(path) =
-                        app.services.pick_save.as_ref().and_then(|pick| pick(&format!("solidcraft-issue-{}.png", app.shot_token), &["png"]))
+                    && let Some(image) = draft.image.clone()
                 {
-                    let result = crate::control::save_screenshot(image, Some(&path));
-                    draft.note = if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-                        "Screenshot saved. Attach the PNG in the GitHub draft.".into()
-                    } else {
-                        format!("Could not save screenshot: {}", debug(&result.get("error"), 1000))
-                    };
+                    app.pick_save(&format!("solidcraft-issue-{}.png", app.shot_token), &["png"], move |app, path| {
+                        let Some(path) = path else { return };
+                        let result = crate::control::save_screenshot(&image, Some(&path));
+                        if let Some(draft) = app.issue_report.draft.as_mut() {
+                            draft.note = if result.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                                "Screenshot saved. Attach the PNG in the GitHub draft.".into()
+                            } else {
+                                format!("Could not save screenshot: {}", debug(&result.get("error"), 1000))
+                            };
+                        }
+                    });
                 }
                 if ui.add_enabled(draft.image.is_some(), egui::Button::new(crate::i18n::tr_label("Remove screenshot"))).clicked() {
                     draft.image = None;

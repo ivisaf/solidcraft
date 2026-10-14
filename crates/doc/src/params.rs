@@ -81,7 +81,28 @@ macro_rules! feature_walk {
                         }
                     }
                 },
-                FeatureKind::Extrude { extent, .. } | FeatureKind::SurfaceExtrude { extent, .. } => {
+                FeatureKind::Extrude { extent, thin, .. } => {
+                    f("Distance", & $($m)? extent.distance, L, I);
+                    if let Some(d) = & $($m)? extent.distance2 {
+                        f("Distance 2", d, L, I);
+                    }
+                    if let Some(d) = & $($m)? extent.start_offset {
+                        f("Start offset", d, L, I);
+                    }
+                    if let Some(d) = & $($m)? extent.taper {
+                        f("Taper angle", d, A, I);
+                    }
+                    if let Some(d) = & $($m)? extent.to_offset {
+                        f("To offset", d, L, I);
+                    }
+                    if let Some(thin) = thin {
+                        f("Thickness", & $($m)? thin.thickness, L, I);
+                        if let Some(t) = & $($m)? thin.thickness2 {
+                            f("Thickness 2", t, L, I);
+                        }
+                    }
+                }
+                FeatureKind::SurfaceExtrude { extent, .. } => {
                     f("Distance", & $($m)? extent.distance, L, I);
                     if let Some(d) = & $($m)? extent.distance2 {
                         f("Distance 2", d, L, I);
@@ -302,6 +323,13 @@ macro_rules! feature_walk {
                         f("Gap", g, L, I);
                     }
                 }
+                FeatureKind::SheetPerforate { diameter, pitch, margin, .. } => {
+                    f("Diameter", diameter, L, I);
+                    f("Pitch", pitch, L, I);
+                    if let Some(m) = margin {
+                        f("Margin", m, L, I);
+                    }
+                }
                 FeatureKind::Coil { diameter, pitch, turns, section_size, start_angle, base, .. } => {
                     f("Diameter", diameter, L, I);
                     f("Pitch", pitch, L, I);
@@ -386,32 +414,6 @@ impl FeatureKind {
         self.walk_exprs(&mut |_, e, _, _| v.push(e.as_str()));
         v
     }
-
-    /// A primitive's placement point (length expressions). Its coordinates are not inputs:
-    /// they get no parameter names and keep bare numbers in mm whatever the design's units, as
-    /// every other position does; renames and users still find them.
-    pub fn point_expr_mut(&mut self) -> Option<&mut crate::PointExpr> {
-        match self {
-            FeatureKind::Box { corner: p, .. }
-            | FeatureKind::Cylinder { base: p, .. }
-            | FeatureKind::Sphere { center: p, .. }
-            | FeatureKind::Torus { center: p, .. }
-            | FeatureKind::Coil { base: p, .. } => Some(p),
-            _ => None,
-        }
-    }
-
-    /// Read-only view of [`FeatureKind::point_expr_mut`].
-    pub fn point_expr(&self) -> Option<&crate::PointExpr> {
-        match self {
-            FeatureKind::Box { corner: p, .. }
-            | FeatureKind::Cylinder { base: p, .. }
-            | FeatureKind::Sphere { center: p, .. }
-            | FeatureKind::Torus { center: p, .. }
-            | FeatureKind::Coil { base: p, .. } => Some(p),
-            _ => None,
-        }
-    }
 }
 
 /// One row of the parameters table.
@@ -465,10 +467,14 @@ impl Document {
 
     /// The next free `dN` name.
     pub fn next_d_name(&self) -> String {
+        // Every taken name at once: asking `name_taken` for d1, d2, … searched the whole
+        // design once per number, quadratic in the number of named inputs.
+        let taken: std::collections::HashSet<&str> =
+            self.params.iter().map(|p| p.name.as_str()).chain(self.features.iter().flat_map(|f| f.param_names.iter().map(String::as_str))).collect();
         let mut n = 1;
         loop {
             let c = format!("d{n}");
-            if !self.name_taken(&c) {
+            if !taken.contains(c.as_str()) {
                 return c;
             }
             n += 1;
@@ -655,7 +661,15 @@ impl Document {
         let (vals, errs) = self.param_values();
         let all = self.all_param_exprs();
         let refs: BTreeMap<String, Vec<String>> = all.iter().map(|(n, e, _)| (n.clone(), expr::references(e))).collect();
-        let used_by = |n: &str| -> Vec<String> { refs.iter().filter(|(_, r)| r.iter().any(|x| x == n)).map(|(k, _)| k.clone()).collect() };
+        // Who uses each name, in name order: one pass over the references (a design an agent
+        // built names every feature input, so a search per row was quadratic).
+        let mut users: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for (k, r) in &refs {
+            for x in r {
+                users.entry(x.as_str()).or_default().push(k.clone());
+            }
+        }
+        let used_by = |n: &str| -> Vec<String> { users.get(n).cloned().unwrap_or_default() };
         let value = |n: &str, k: Kind| vals.get(n).and_then(|v| v.to_kind(k).ok()).map(|x| if k == Kind::Angle { x.to_degrees() } else { x });
         let mut rows = Vec::new();
         for p in &self.params {

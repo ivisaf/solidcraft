@@ -485,6 +485,32 @@ pub(super) fn sheet_eval(
             tag_flanges(sh, n0, f.id);
             rebuild_sheet(st, i)
         }
+        FeatureKind::SheetPerforate { diameter, pitch, margin, pattern, body } => {
+            // Without a body name the field goes on the newest sheet, as the command's own body lookup does.
+            let i = match body {
+                Some(_) => sheet_for(st, body, None)?,
+                None => st.sheets.len().checked_sub(1).ok_or_else(|| DocError::Invalid("there is no sheet metal body".into()))?,
+            };
+            let d = val(vals, diameter, Kind::Length)?;
+            let pitch = val(vals, pitch, Kind::Length)?;
+            let margin = match margin {
+                Some(e) => val(vals, e, Kind::Length)?,
+                None => d,
+            };
+            let square = match pattern.as_deref() {
+                None | Some("staggered") => false,
+                Some("square") => true,
+                Some(o) => return Err(DocError::Invalid(format!("perforation pattern {o:?}: use \"staggered\" or \"square\""))),
+            };
+            if !(d > 0.0 && pitch > d && margin >= 0.0) {
+                return Err(DocError::Invalid(format!(
+                    "perforation needs diameter > 0, pitch > diameter and margin >= 0 (diameter {d}, pitch {pitch}, margin {margin})"
+                )));
+            }
+            let sh = st.sheets.get_mut(i).ok_or_else(|| DocError::Invalid("sheet".into()))?;
+            sh.perforations.push(crate::sheet::SheetPerforation { feature: f.id, diameter: d, pitch, margin, square });
+            Ok(())
+        }
         FeatureKind::SheetHem { edges, length, gap, flip, body } => {
             let i = sheet_for(st, body, edges.first().copied())?;
             let l = val(vals, length, Kind::Length)?;

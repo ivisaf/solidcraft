@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use solidcraft_engine::Sel;
 use solidcraft_engine::Session;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
-use solidcraft_engine::doc::{AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel};
+use solidcraft_engine::doc::{AxisRef, Direction, FeatureKind, FilletStyle, HoleKind, Operation, PatternKind, PlaneRef, ProfileSel, ThinSide};
 use solidcraft_engine::geom::{Aabb3, Vec3};
 
 use crate::SolveApp;
@@ -22,6 +22,12 @@ pub(crate) const OP_LABELS: [&str; 4] = ["New Body", "Join", "Cut", "Intersect"]
 const DIRS: [&str; 4] = ["positive", "negative", "symmetric", "positive"];
 /// The "Two sides" direction (a second distance the other way).
 pub const TWO_SIDES: usize = 3;
+/// Thin Extrude wall locations, as `solid.extrude` names them, and their labels.
+const WALL_SIDES: [&str; 4] = ["center", "inside", "outside", "two_sides"];
+const WALL_LABELS: [&str; 4] = ["Center", "Inside", "Outside", "Two Sides"];
+/// What an extrude's first input picks: profiles or planar faces, or curves too when thin.
+const EXTRUDE_ACCEPT: Accept = PROFILES | PLANAR_FACES;
+const THIN_ACCEPT: Accept = PROFILES | CURVES;
 const HOLE_TYPES: [&str; 3] = ["simple", "counterbore", "countersink"];
 const HOLE_LABELS: [&str; 3] = ["Simple", "Counterbore", "Countersink"];
 
@@ -48,6 +54,14 @@ pub enum Kind {
         start: String,
         /// Extent type All (through everything) instead of a distance.
         all: bool,
+        /// Thin Extrude: a wall along the picked curves (or profiles' outlines).
+        thin: bool,
+        /// The wall thickness (inside, with Two Sides).
+        wall: String,
+        /// Wall location: an index into [`WALL_SIDES`].
+        wall_side: usize,
+        /// The thickness outside, with Two Sides.
+        wall2: String,
     },
     Revolve {
         angle: String,
@@ -376,8 +390,12 @@ impl Dialog {
                     to_offset: String::new(),
                     start: String::new(),
                     all: false,
+                    thin: false,
+                    wall: "2 mm".into(),
+                    wall_side: 0,
+                    wall2: "1 mm".into(),
                 },
-                vec![SelInput::new("Profiles", PROFILES | PLANAR_FACES, true)],
+                vec![SelInput::new("Profiles", EXTRUDE_ACCEPT, true)],
             ),
             "solid.revolve" => Dialog::new(
                 Kind::Revolve { angle: "360 deg".into(), operation: 0, axis: None },
@@ -1913,7 +1931,40 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             ui.end_row();
                         }
                     }
-                    Kind::Extrude { distance, direction, operation, auto_op, distance2, taper, taper_present, to_offset, start, all } => {
+                    Kind::Extrude {
+                        distance,
+                        direction,
+                        operation,
+                        auto_op,
+                        distance2,
+                        taper,
+                        taper_present,
+                        to_offset,
+                        start,
+                        all,
+                        thin,
+                        wall,
+                        wall_side,
+                        wall2,
+                    } => {
+                        row_label(ui, "Thin");
+                        if ui.checkbox(thin, tr("Thin Extrude")).changed() {
+                            set_thin(&mut d.inputs, *thin);
+                        }
+                        ui.end_row();
+                        if *thin {
+                            row_label(ui, "Wall Location");
+                            combo(ui, "ex_wall", &WALL_LABELS, wall_side);
+                            ui.end_row();
+                            row_label(ui, "Wall Thickness");
+                            enter |= field(ui, wall);
+                            ui.end_row();
+                            if *wall_side == 3 {
+                                row_label(ui, "Thickness Outside");
+                                enter |= field(ui, wall2);
+                                ui.end_row();
+                            }
+                        }
                         row_label(ui, "Start");
                         let old = if object_on(&d.inputs, FROM_OBJECT) { 2 } else { usize::from(!start.is_empty()) };
                         let mut st = old;
@@ -3016,7 +3067,7 @@ pub fn apply_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>
         let (cmd, mut params) = cmds.into_iter().next().ok_or("nothing to apply")?;
         if let Some(feature) = app.session.doc.feature(id) {
             let original_all = match &feature.kind {
-                FeatureKind::Extrude { sketch, profiles: ProfileSel::All, .. }
+                FeatureKind::Extrude { sketch, profiles: ProfileSel::All, thin: None, .. }
                 | FeatureKind::Revolve { sketch, profiles: ProfileSel::All, .. }
                 | FeatureKind::Emboss { sketch, profiles: ProfileSel::All, .. } => Some(*sketch),
                 _ => None,
@@ -3093,8 +3144,23 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         sels(d, i).iter().filter_map(|x| if let Sel::Face { point, .. } = x { Some(pt(*point)) } else { None }).collect()
     };
     let (cmd, params): (&str, Value) = match &d.kind {
-        Kind::Extrude { distance, direction, operation, distance2, taper, taper_present, to_offset, start, all, .. } => {
-            need(0, "profiles or a planar face")?;
+        Kind::Extrude {
+            distance,
+            direction,
+            operation,
+            distance2,
+            taper,
+            taper_present,
+            to_offset,
+            start,
+            all,
+            thin,
+            wall,
+            wall_side,
+            wall2,
+            ..
+        } => {
+            need(0, if *thin { "curves or profiles" } else { "profiles or a planar face" })?;
             let mut common = json!({"distance": distance, "direction": DIRS.get(*direction).copied().unwrap_or("positive"), "operation": OPS.get(*operation).copied().unwrap_or("new")});
             let tapered = s.doc.eval(taper, ValueKind::Angle).map(|v| v.abs() > 1e-12).unwrap_or(!taper.trim().is_empty());
             if *direction == TWO_SIDES {
@@ -3127,6 +3193,37 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 }
                 p
             };
+            if *thin {
+                // The picked curves, and the outlines (outer and holes) of picked profiles.
+                let st = s.world_state();
+                let mut curves = curve_ids(d, 0);
+                let mut sketch = None;
+                for x in sels(d, 0) {
+                    if let Sel::Profile { sketch: id, index } = x
+                        && let Some(p) = st.sketch(*id).and_then(|ss| ss.profiles.get(*index))
+                    {
+                        sketch = Some(*id);
+                        curves.extend(p.curve_ids());
+                    }
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                curves.retain(|c| seen.insert(c.clone()));
+                // A picked profile's sketch, or the edited extrude's, when it has every curve.
+                let edited = d.editing.and_then(|(id, _)| s.doc.feature(id)).and_then(|f| match f.kind {
+                    FeatureKind::Extrude { sketch, .. } => Some(sketch),
+                    _ => None,
+                });
+                let has_all = |id: u64| curves.iter().all(|c| st.sketch(id).is_some_and(|ss| ss.sketch.curve_index(c).is_some()));
+                let sketch = match sketch.or(edited) {
+                    Some(id) if has_all(id) => id,
+                    _ => curves_sketch(app, &curves, None).ok_or("the curves must be in one sketch")?,
+                };
+                let mut wall_params = json!({"sketch": sketch, "thin": true, "curves": curves, "thickness": wall, "side": WALL_SIDES.get(*wall_side).copied().unwrap_or("center")});
+                if *wall_side == 3 {
+                    wall_params["thickness2"] = json!(wall2);
+                }
+                return Ok(vec![("solid.extrude".to_string(), with(wall_params))]);
+            }
             let mut out = Vec::new();
             let (sketch, idx) = profiles();
             if !sketch.is_null() {
@@ -3660,6 +3757,21 @@ fn box_corner(s: &Session, fields: &[(&'static str, String)], p: Vec3, normal: O
     json!([coord(p.x, size("length"), Vec3::X), coord(p.y, size("width"), Vec3::Y), coord(p.z, size("height"), Vec3::Z)])
 }
 
+/// Switch an extrude's first input between profiles and faces, and (thin) profiles and curves;
+/// picks the other kind doesn't take are dropped.
+fn set_thin(inputs: &mut [SelInput], thin: bool) {
+    if let Some(input) = inputs.first_mut() {
+        input.accept = if thin { THIN_ACCEPT } else { EXTRUDE_ACCEPT };
+        input.label = if thin { "Profiles/Curves" } else { "Profiles" };
+        input.items.retain(|x| match x {
+            Sel::Profile { .. } => true,
+            Sel::SketchCurve { .. } => thin,
+            Sel::Face { .. } => !thin,
+            _ => false,
+        });
+    }
+}
+
 /// Sketch curve ids picked in an input.
 fn curve_ids(d: &Dialog, i: usize) -> Vec<String> {
     sels(d, i).iter().filter_map(|x| if let Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect()
@@ -3912,7 +4024,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
     let st = s.world_state();
     let start = |cmd: &str| Dialog::for_command(app, cmd);
     let mut d = match &f.kind {
-        FeatureKind::Extrude { sketch, profiles, extent, operation, targets } => {
+        FeatureKind::Extrude { sketch, profiles, extent, operation, targets, thin } => {
             let mut d = start("solid.extrude")?;
             d.kind = Kind::Extrude {
                 distance: extent.distance.clone(),
@@ -3930,6 +4042,10 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                 to_offset: extent.to_offset.clone().unwrap_or_default(),
                 start: extent.start_offset.clone().unwrap_or_default(),
                 all: extent.through_all,
+                thin: thin.is_some(),
+                wall: thin.as_ref().map_or_else(|| "2 mm".into(), |t| t.thickness.clone()),
+                wall_side: thin.as_ref().map_or(0, |t| WALL_SIDES.iter().position(|w| ThinSide::parse(w) == Some(t.side)).unwrap_or(0)),
+                wall2: thin.as_ref().and_then(|t| t.thickness2.clone()).unwrap_or_else(|| "1 mm".into()),
             };
             // Extent references belong to the extrude's authoring frame, including free
             // points. They are not body-local picks (a reference may be on another body).
@@ -3942,9 +4058,16 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
                     }
                 }
             }
-            let items = st.sketch(*sketch).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
-            if let Some(inp) = d.inputs.first_mut() {
-                inp.items = items.into_iter().map(|index| Sel::Profile { sketch: *sketch, index }).collect();
+            if let Some(thin) = thin {
+                set_thin(&mut d.inputs, true);
+                if let Some(inp) = d.inputs.first_mut() {
+                    inp.items = thin.curves.iter().map(|id| Sel::SketchCurve { id: id.clone() }).collect();
+                }
+            } else {
+                let items = st.sketch(*sketch).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
+                if let Some(inp) = d.inputs.first_mut() {
+                    inp.items = items.into_iter().map(|index| Sel::Profile { sketch: *sketch, index }).collect();
+                }
             }
             if !targets.is_empty() {
                 d.extra.insert("targets".into(), json!(targets));

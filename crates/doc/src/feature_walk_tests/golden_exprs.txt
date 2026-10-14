@@ -16,6 +16,16 @@ extrude
     Taper angle = extrude.taper (Angle)
     To offset = extrude.to_offset (Length)
   expressions: extrude.distance, extrude.distance2, extrude.start_offset, extrude.taper, extrude.to_offset
+extrude_thin
+  inputs:
+    Distance = thin.distance (Length)
+    Distance 2 = thin.distance2 (Length)
+    Start offset = thin.start_offset (Length)
+    Taper angle = thin.taper (Angle)
+    To offset = thin.to_offset (Length)
+    Thickness = thin.thickness (Length)
+    Thickness 2 = thin.thickness2 (Length)
+  expressions: thin.distance, thin.distance2, thin.start_offset, thin.taper, thin.to_offset, thin.thickness, thin.thickness2
 revolve
   inputs:
     Angle = revolve.angle (Angle)
@@ -234,6 +244,12 @@ sheet_hem
     Length = hem.length (Length)
     Gap = hem.gap (Length)
   expressions: hem.length, hem.gap
+sheet_perforate
+  inputs:
+    Diameter = perforate.diameter (Length)
+    Pitch = perforate.pitch (Length)
+    Margin = perforate.margin (Length)
+  expressions: perforate.diameter, perforate.pitch, perforate.margin
 sheet_fold
   inputs:
     Angle = fold.angle (Angle)

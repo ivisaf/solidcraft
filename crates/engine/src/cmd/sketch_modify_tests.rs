@@ -4,6 +4,9 @@ use solidcraft_sketch::{ConstraintKind, CurveKind};
 
 use crate::Session;
 
+#[path = "sketch_pattern_tests.rs"]
+mod pattern_tests;
+
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
     match s.execute(id, &p) {
         Ok(v) => v,
@@ -1475,7 +1478,7 @@ fn offset_driver_format18_offsets_keep_fixed_distances_on_upgrade() {
     let mut json: Value = serde_json::from_str(&doc.to_json()).unwrap();
     json["format"] = json!("solidcraft/18");
     let mut reopened = Session::new(solidcraft_doc::Document::from_json(&json.to_string()).unwrap());
-    assert_eq!(reopened.doc.format, solidcraft_doc::format::format_string(solidcraft_doc::format::FORMAT));
+    assert_eq!(reopened.doc.format, solidcraft_doc::format::format_string(solidcraft_doc::format::FORMAT), "upgraded on opening");
     run(&mut reopened, "sketch.edit", json!({"sketch":1}));
     let sk = sketch(&reopened);
     assert!((sk.offsets[0].distance - 2.0).abs() < 1e-8);

@@ -2218,7 +2218,11 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             }
         }
         // Double-click a dimension: edit its value in place.
-        let dim_edit = resp.double_clicked() && !held && app.tool.is_none() && app.dialog.is_none() && crate::dim_view::double_click(app, p);
+        let dim_edit = resp.double_clicked()
+            && !held
+            && app.tool.is_none()
+            && app.dialog.is_none()
+            && (crate::sketch_modify_ui::double_click_pattern(app, p) || crate::dim_view::double_click(app, p));
         // Double-click a text (an outline or inside a letter; the first click selected it): edit it.
         if resp.double_clicked()
             && !held
@@ -2863,13 +2867,18 @@ fn cpu_render(app: &mut SolveApp, ctx: &egui::Context, painter: &egui::Painter, 
         v.to_bits().hash(&mut h);
     }
     (rect.width() as u32, rect.height() as u32).hash(&mut h);
+    app.ui.dark.hash(&mut h);
     let key = h.finish();
     if app.viewport.cpu.as_ref().is_none_or(|(k, _)| *k != key) {
         let mut budget = solidcraft_engine::render::SamplingBudget::new(131_072, 1_048_576);
-        let scene =
-            solidcraft_engine::view::scene_with_section_and_sketch_sampler(&app.session, &proj.cam, section_plane(app), |sk, index, plane| {
-                crate::sketch_display::curve_with_budget(sk, index, plane, proj, app.viewport.pixels_per_point(), &mut budget).parts
-            });
+        let palette = scene_palette(app.ui.dark);
+        let scene = solidcraft_engine::view::scene_with_palette(
+            &app.session,
+            &proj.cam,
+            section_plane(app),
+            |sk, index, plane| crate::sketch_display::curve_with_budget(sk, index, plane, proj, app.viewport.pixels_per_point(), &mut budget).parts,
+            &palette,
+        );
         let w = (rect.width() as usize).clamp(16, 4096);
         let hh = (rect.height() as usize).clamp(16, 4096);
         let c = solidcraft_engine::render::render(&scene, &proj.cam, w, hh);
@@ -2879,6 +2888,29 @@ fn cpu_render(app: &mut SolveApp, ctx: &egui::Context, painter: &egui::Painter, 
     }
     if let Some((_, tex)) = &app.viewport.cpu {
         painter.image(tex.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+    }
+}
+
+/// The colours of a CPU picture of the model (`ui.render` and the CPU viewport) in the dark or
+/// the light theme, from the tokens the window draws with, so the picture matches the window. The
+/// light theme's are the engine's own colours, so a light render is unchanged. The sketch states
+/// and axes the window draws in the engine's colours stay so.
+pub(crate) fn scene_palette(dark: bool) -> solidcraft_engine::view::Palette {
+    let t = if dark { Tokens::dark() } else { Tokens::light() };
+    let rgb = |c: Color32| Rgb(c.r(), c.g(), c.b());
+    solidcraft_engine::view::Palette {
+        background: (rgb(t.viewport_top), rgb(t.viewport_bottom)),
+        grid: rgb(t.grid),
+        grid_major: rgb(t.grid_major),
+        edge: rgb(t.body_edge),
+        body: rgb(t.body),
+        body_selected: rgb(t.body_selected),
+        sketch: rgb(t.sketch),
+        sketch_fixed: rgb(t.sketch_fixed),
+        sketch_done: rgb(t.sketch_fixed),
+        sketch_locked: rgb(t.sketch_locked),
+        cap: rgb(t.section_cap),
+        ..solidcraft_engine::view::Palette::DEFAULT
     }
 }
 
@@ -3481,6 +3513,76 @@ mod tests {
             h.app.run("edit.undo", json!({})).unwrap();
         }
         crate::sketch_palette::set_mode(&mut h.app, 0);
+    }
+
+    /// The CPU pictures (`ui.render`, the CPU viewport) are drawn in the window's theme (#974).
+    /// The light theme's tokens are the engine's own colours, so a light picture is unchanged; in
+    /// the dark theme each part takes the token the window draws it with. Sketch states follow
+    /// what the window does with them (`sketch_color`), so the two can't drift apart.
+    #[test]
+    fn cpu_pictures_are_drawn_in_the_windows_theme() {
+        use solidcraft_engine::view::Palette;
+        assert_eq!(scene_palette(false), Palette::DEFAULT, "the light theme is the engine's colours");
+        let rgb = |c: Color32| Rgb(c.r(), c.g(), c.b());
+        let (p, t) = (scene_palette(true), Tokens::dark());
+        assert_eq!(p.background, (rgb(t.viewport_top), rgb(t.viewport_bottom)));
+        assert_eq!(
+            [p.grid, p.grid_major, p.edge, p.body, p.body_selected, p.cap],
+            [t.grid, t.grid_major, t.body_edge, t.body, t.body_selected, t.section_cap].map(rgb)
+        );
+        assert_ne!(p.background, Palette::DEFAULT.background);
+        for dark in [false, true] {
+            let (p, t) = (scene_palette(dark), if dark { Tokens::dark() } else { Tokens::light() });
+            for (tag, cpu) in [
+                (colors::SKETCH, p.sketch),
+                (colors::SKETCH_FIXED, p.sketch_fixed),
+                (colors::SKETCH_DONE, p.sketch_done),
+                (colors::SKETCH_LOCKED, p.sketch_locked),
+                (colors::SKETCH_PROJECTED, p.sketch_projected),
+                (colors::SKETCH_LOST, p.sketch_lost),
+                (colors::SKETCH_CONSTRUCTION, p.sketch_construction),
+                (colors::SKETCH_CENTERLINE, p.sketch_centerline),
+            ] {
+                let [r, g, b, _] = sketch_color(&t, tag);
+                assert_eq!(cpu, Rgb(r, g, b), "dark {dark}: the window draws {tag:?} in another colour");
+            }
+        }
+    }
+
+    /// The CPU viewport follows a theme change at once: the theme is part of its picture's key.
+    #[test]
+    fn cpu_viewport_redraws_in_the_new_theme() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(160.0, 120.0));
+        let cam = solidcraft_engine::view::home_camera(&h.app.session);
+        let proj = Proj { cam, vp: cam.view_proj(4.0 / 3.0, 100.0), rect };
+        h.app.viewport.no_pixels = false;
+        // The new picture's top row, most common colour first (the background's top); None when
+        // nothing new was drawn.
+        let top_row = |h: &mut crate::scenario::Harness| {
+            let mut out = h.ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                cpu_render(&mut h.app, ui.ctx(), ui.painter(), rect, &proj);
+            });
+            let id = h.app.viewport.cpu.as_ref().map(|(_, tex)| tex.id());
+            let top = id.and_then(|id| out.textures_delta.set.get(&id)).and_then(|d| d.iter().find(|delta| delta.pos.is_none())).map(|upload| {
+                let egui::ImageData::Color(image) = &upload.image;
+                let mut counts = std::collections::HashMap::new();
+                for px in image.pixels.iter().take(image.size[0]) {
+                    *counts.entry(*px).or_insert(0) += 1;
+                }
+                counts.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c).unwrap_or_default()
+            });
+            out.textures_delta.clear();
+            top
+        };
+        for dark in [false, true, false] {
+            h.app.ui.dark = dark;
+            let Some(px) = top_row(&mut h) else { panic!("dark {dark}: the CPU viewport kept the old picture") };
+            let want = if dark { Tokens::dark() } else { Tokens::light() }.viewport_top;
+            let near = [px.r(), px.g(), px.b()].iter().zip([want.r(), want.g(), want.b()]).all(|(a, b)| a.abs_diff(b) <= 2);
+            assert!(near, "dark {dark}: top row {px:?}, the window's background {want:?}");
+        }
     }
 
     #[test]

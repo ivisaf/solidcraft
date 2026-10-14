@@ -175,6 +175,8 @@ struct WorldCache {
     active_component: u64,
     active_occurrence_path: Option<Vec<u64>>,
     world: Arc<solidcraft_doc::ModelState>,
+    /// The moved components' bodies as placed for `world`, reused by the next world state.
+    placed: Arc<std::sync::Mutex<solidcraft_doc::PlacedBodies>>,
 }
 
 impl WorldCache {
@@ -397,17 +399,27 @@ impl Session {
         {
             return cached.world.clone();
         }
-        let mut w = if self.pending_moves.is_empty() {
-            solidcraft_doc::world_state(&self.doc, &st)
-        } else {
-            let mut d = (*self.doc).clone();
-            for o in &mut d.occurrences {
-                if let Some(m) = self.pending_moves.get(&o.id) {
-                    o.transform = *m;
+        // The bodies the last world state placed: unchanged ones are not transformed and meshed
+        // again (a design built command by command changed one body at a time).
+        let placed = self.world_cache.lock().ok().and_then(|c| c.as_ref().map(|c| c.placed.clone())).unwrap_or_default();
+        // Taken out while placing, so a scratch copy of the session sharing it never waits.
+        let mut reuse = placed.lock().map(|mut p| std::mem::take(&mut *p)).unwrap_or_default();
+        let mut w = {
+            if self.pending_moves.is_empty() {
+                solidcraft_doc::world_state_reusing(&self.doc, &st, &mut reuse)
+            } else {
+                let mut d = (*self.doc).clone();
+                for o in &mut d.occurrences {
+                    if let Some(m) = self.pending_moves.get(&o.id) {
+                        o.transform = *m;
+                    }
                 }
+                solidcraft_doc::world_state_reusing(&d, &st, &mut reuse)
             }
-            solidcraft_doc::world_state(&d, &st)
         };
+        if let Ok(mut p) = placed.lock() {
+            *p = reuse;
+        }
         // Sketch definitions are displayed once, at the placement currently being authored.
         if self.active_occurrence_path.is_some() && self.active_component != 0 {
             let first = self.occurrence_placement(&self.doc.first_path(self.active_component)).map(|p| p.world).unwrap_or(solidcraft_doc::IDENTITY);
@@ -442,6 +454,7 @@ impl Session {
                 active_component: self.active_component,
                 active_occurrence_path: self.active_occurrence_path.clone(),
                 world: w.clone(),
+                placed,
             });
         }
         w

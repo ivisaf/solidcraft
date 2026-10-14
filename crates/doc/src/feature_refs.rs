@@ -163,6 +163,7 @@ macro_rules! feature_walk {
                 | FeatureKind::DeleteFace { body, .. }
                 | FeatureKind::SheetFlange { body, .. }
                 | FeatureKind::SheetHem { body, .. }
+                | FeatureKind::SheetPerforate { body, .. }
                 | FeatureKind::SheetUnfold { body, .. }
                 | FeatureKind::Boss { body, .. }
                 | FeatureKind::Lip { body, .. }

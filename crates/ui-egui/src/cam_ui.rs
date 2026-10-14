@@ -1637,15 +1637,20 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if let Some(setup) = asked.simulate {
         simulate_setup(app, setup);
     }
-    if asked.import
-        && let Some(path) = app.services.pick_open.as_ref().and_then(|f| f())
-    {
-        app.manufacture.error = run(app, "cam.library.import", json!({ "path": path })).err();
+    // File pickers answer later; the command runs when a file is chosen.
+    if asked.import {
+        app.pick_open(|app, path| {
+            if let Some(path) = path {
+                app.manufacture.error = run(app, "cam.library.import", json!({ "path": path })).err();
+            }
+        });
     }
-    if asked.export
-        && let Some(path) = app.services.pick_save.as_ref().and_then(|f| f("tools.json", &["json"]))
-    {
-        app.manufacture.error = run(app, "cam.library.export", json!({ "path": path })).err();
+    if asked.export {
+        app.pick_save("tools.json", &["json"], |app, path| {
+            if let Some(path) = path {
+                app.manufacture.error = run(app, "cam.library.export", json!({ "path": path })).err();
+            }
+        });
     }
     if let Some((setup, op, post)) = asked.post {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());
@@ -1653,9 +1658,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         let stem: String =
             op.as_ref().map_or("program", |(_, name)| name.as_str()).chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
         let stem = if stem.trim().is_empty() { "program".to_string() } else { stem };
-        if let Some(path) = app.services.pick_save.as_ref().and_then(|f| f(&format!("{stem}.{extension}"), &[extension.as_str()])) {
-            post_to(app, setup, op.map(|(id, _)| id), &path);
-        }
+        let op = op.map(|(id, _)| id);
+        app.pick_save(&format!("{stem}.{extension}"), &[extension.as_str()], move |app, path| {
+            if let Some(path) = path {
+                post_to(app, setup, op, &path);
+            }
+        });
     }
 }
 

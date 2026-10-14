@@ -162,12 +162,12 @@ impl Document {
     pub fn face_colors(&self, b: &crate::ModelBody) -> Vec<(usize, Look)> {
         // Face colours the body was imported with, under the design's own.
         let to8 = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let names = crate::naming::face_names(b);
         let mut out: Vec<(usize, Look)> = match b.body.paint() {
             Some(p) => p.faces.iter().map(|f| (f.face, Look::custom(f.color.map(to8), f.opacity as f64))).collect(),
-            // Carried from an earlier version of the body: by face name.
+            // Carried from an earlier version of the body: by face name (worked out only here:
+            // the viewport asks every body for its face colours on every change).
             None => match &b.imported {
-                Some(imp) => names
+                Some(imp) => crate::naming::face_names(b)
                     .iter()
                     .enumerate()
                     .filter_map(|(i, n)| imp.faces.get(crate::naming::strip_piece(n)).map(|(c, o)| (i, Look::custom(c.map(to8), *o as f64))))

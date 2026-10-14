@@ -26,6 +26,14 @@ couples two joints. Contact sets stop motion where bodies would pass through eac
 **Motion Study** keys joint values along a timeline, and **Interference** shows overlapping
 volumes in red.
 
+Joints may close a loop, as in a four-bar linkage or a slider-crank. When one joint of the loop
+is driven, the other joints in the loop follow so that every joint still meets, and the
+mechanism stays in the assembly mode it started in (an open four-bar does not flip to the
+crossed one). If the motion would take a loop past the point where it can still close, for
+example driving a rocker beyond its swing, the motion stops at the last position where the loop
+closes, and the drive reports `stopped_by_loop`. A loop that cannot close at all is listed
+under `conflicts` and nothing in it moves.
+
 **Insert Design** (`component.insert_design {path, translate?}`) adds a component linked to
 another saved design, so each part can live in its own document. The part's solid bodies come
 in as they sit in that design, and they are kept in the assembly, so it opens even without the

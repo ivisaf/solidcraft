@@ -5,6 +5,7 @@
 //! solidcraft-cli eval <script.json|design.solidcraft|part.step> (alias: inspect) measurements as JSON
 //! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] loading timings as JSON lines
+//! solidcraft-cli bench-agent [--scale F] [--save F] [--script-out F] a ~1,300-body design built command by command, timed
 //! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…]
 //! solidcraft-cli exec <command> [json-params]                 run one command on an empty design
 //! solidcraft-cli commands                                     the command registry as JSON
@@ -18,6 +19,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod bench_agent;
 mod crashes;
 mod fuzz;
 mod oracle;
@@ -41,6 +43,7 @@ const USAGE: &str = "usage:
   solidcraft-cli script <design.solidcraft|script.json> [--out script.json]
       (the design's history as a command script that eval and run replay)
   solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]
+  solidcraft-cli bench-agent [--scale F] [--save design.solidcraft] [--script-out script.json]
   solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|back|top|bottom|left|right]
   solidcraft-cli exec <command> [json-params]
   solidcraft-cli commands
@@ -95,6 +98,8 @@ fn main() -> ExitCode {
         // Hidden: time recomputes after parameter edits (docs/perf.md).
         Some("bench-edit") => cmd_bench_edit(&args[1..]),
         Some("bench-open") => cmd_bench_open(&args[1..]),
+        // A ~1,300-body design built command by command, as an agent builds one over MCP.
+        Some("bench-agent") => bench_agent::run(&args[1..]),
         Some("--version" | "-V") => {
             println!("solidcraft-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -422,7 +427,7 @@ fn cmd_bench_edit(args: &[String]) -> Result<(), String> {
 }
 
 /// Separate file reading, JSON decoding/repair, timeline evaluation and display meshing.
-fn cmd_bench_open(args: &[String]) -> Result<(), String> {
+pub(crate) fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("usage: solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]")?;
     let t = std::time::Instant::now();
     let step = solidcraft_engine::io::is_step_path(path);

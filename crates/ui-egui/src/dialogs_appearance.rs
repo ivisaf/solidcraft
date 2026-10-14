@@ -93,6 +93,7 @@ pub fn hex(c: [u8; 3]) -> String {
 
 #[derive(Clone, Debug)]
 pub struct Ap {
+    pub local: crate::dialogs_library::LocalLibrary,
     /// Apply to faces instead of bodies.
     pub faces: bool,
     pub color: [u8; 3],
@@ -136,6 +137,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         });
         (
             Kind::Appearance(Ap {
+                local: Default::default(),
                 faces,
                 color: existing.as_ref().map_or([196, 199, 204], |l| l.color),
                 opacity: existing.as_ref().map_or(1.0, |l| l.opacity),
@@ -197,7 +199,7 @@ pub fn commands(k: &Ap, inputs: &[SelInput]) -> Vec<(String, Value)> {
     p.map(|p| vec![("appearance.assign".to_string(), p)]).unwrap_or_default()
 }
 
-fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
+pub(super) fn selected_params(k: &Ap, items: &[Sel]) -> Option<Value> {
     if let Some(component) = &k.component {
         Some(json!({"components": [component], "color": hex(k.color), "opacity": k.opacity, "appearance": k.look}))
     } else {
@@ -382,6 +384,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Ap, inputs: &mut [Sel
         }
     });
     ui.end_row();
+    crate::dialogs_library::rows(app, ui, k, inputs);
     // In this design.
     let used = in_design(app);
     if !used.is_empty() {

@@ -1814,6 +1814,17 @@ fn closed(b: Body) -> Result<Body> {
 /// largest that works).
 pub fn fillet(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
     body.require_brep("fillet")?;
+    // A round that would run past its faces into other geometry or another round (#1080).
+    // Checked once built, so a refusal of the build itself stands as it is.
+    let size = crate::blend_fit::Size::Round(radius);
+    match fillet_built(body, edges, radius) {
+        Ok(b) => crate::blend_fit::accept(body, b, edges, size),
+        Err(e) => Err(crate::blend_fit::explain(body, edges, size, e)),
+    }
+}
+
+/// [`fillet`], once the radius is known to fit.
+fn fillet_built(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
     // Corners the local blends refuse (an earlier round at an edge's end): radius per edge.
     blend(body, edges, radius, Shape::Round, "fillet")
         .and_then(closed)
@@ -1946,7 +1957,15 @@ pub fn fillet_each(body: &Body, edges: &[Vec3], radii: &[f64]) -> Result<Body> {
         return fillet(body, edges, *r);
     }
     let sel: Vec<(Vec3, f64)> = edges.iter().copied().zip(radii.iter().copied()).collect();
-    if let Ok(b) = crate::blend_corner::fillet_radii(body, &sel).and_then(closed) {
+    // Each round must fit beside its own edge (#1080); the edges of each radius are checked
+    // together below.
+    let fit = |b: Body| -> Result<Body> {
+        for (p, r) in &sel {
+            crate::blend_fit::check(body, std::slice::from_ref(p), crate::blend_fit::Size::Round(*r))?;
+        }
+        Ok(b)
+    };
+    if let Ok(b) = crate::blend_corner::fillet_radii(body, &sel).and_then(closed).and_then(fit) {
         return Ok(b);
     }
     let mut by_radius: Vec<(f64, Vec<Vec3>)> = Vec::new();
@@ -2019,6 +2038,17 @@ pub fn chamfer(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
     if edges.is_empty() || edges.len() > 1000 {
         return Err(KernelError::Invalid("select 1…1000 edges".into()));
     }
+    // A chamfer that would run past its faces into other geometry or another chamfer, or whose
+    // result changes more than the chamfers can (#1080).
+    let size = crate::blend_fit::Size::Chamfer(distance);
+    match chamfer_built(body, edges, distance) {
+        Ok(b) => crate::blend_fit::accept(body, b, edges, size),
+        Err(e) => Err(crate::blend_fit::explain(body, edges, size, e)),
+    }
+}
+
+/// [`chamfer`], once the size is known to fit.
+fn chamfer_built(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
     // Each step's result carries its history over `[body]`.
     let counts = record::counts(&[body]);
     // All cutters at once (their union mitres the corners), else one edge at a time.
@@ -2224,6 +2254,7 @@ pub fn chamfer_sides(body: &Body, edges: &[Vec3], d1: f64, side: ChamferSide, fl
     if edges.is_empty() || edges.len() > 1000 {
         return Err(KernelError::Invalid("select 1…1000 edges".into()));
     }
+    let size = crate::blend_fit::Size::Sides(d1, side, flip);
     let counts = record::counts(&[body]);
     let mut cur = crate::boolean_record::operand(body, 0, &counts);
     for (k, p) in edges.iter().enumerate() {
@@ -2231,7 +2262,7 @@ pub fn chamfer_sides(body: &Body, edges: &[Vec3], d1: f64, side: ChamferSide, fl
         let step = cut_one(&cur, &t)?.ok_or_else(|| KernelError::Failed("the chamfer removed everything".into()))?;
         cur = record::after(step, &cur, &counts);
     }
-    Ok(cur)
+    crate::blend_fit::accept(body, cur, edges, size)
 }
 
 /// The prism that cuts a chamfer: the body, which of its faces is the chamfer plane, and the

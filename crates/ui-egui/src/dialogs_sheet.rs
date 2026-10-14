@@ -435,17 +435,27 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
 
 fn export_flat(app: &mut SolveApp, body: &str, extension: &str) -> String {
     let name = format!("{}-{body}.{extension}", app.session.doc.name);
-    let Some(path) = app.services.pick_save.as_ref().and_then(|f| f(&name, &[extension])) else {
-        return "Export cancelled".into();
-    };
+    let body = body.to_string();
     let command = if extension == "csv" { "sheet.export_bend_table" } else { "sheet.export_dxf" };
-    match app.run(command, json!({"body": body, "path": path})) {
-        Ok(_) => {
-            app.set_status(format!("Exported {path}"), false);
-            format!("Saved {path}")
+    app.pick_save(&name, &[extension], move |app, path| {
+        let message = if let Some(path) = path {
+            match app.run(command, json!({"body": body, "path": path})) {
+                Ok(_) => {
+                    app.set_status(format!("Exported {path}"), false);
+                    format!("Saved {path}")
+                }
+                Err(e) => e,
+            }
+        } else {
+            "Export cancelled".into()
+        };
+        if let Some(d) = app.dialog.as_mut()
+            && let Kind::Sheet(Sm::FlatPattern { status, .. }) = &mut d.kind
+        {
+            *status = Some(message);
         }
-        Err(e) => e,
-    }
+    });
+    "Choose an export file…".into()
 }
 
 // ---- commands ----

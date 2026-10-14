@@ -35,8 +35,9 @@ static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env
 static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json")));
 static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/de.json")));
 static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ko.json")));
+static RUSSIAN: Catalog = Catalog::new("ru", "Русский", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ru.json")));
 static CHINESE: Catalog = Catalog::new("zh", "中文", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json")));
-pub const LOCALES: &[&Catalog] = &[&ENGLISH, &JAPANESE, &GERMAN, &KOREAN, &CHINESE];
+pub const LOCALES: &[&Catalog] = &[&ENGLISH, &JAPANESE, &GERMAN, &KOREAN, &RUSSIAN, &CHINESE];
 
 pub fn is_supported(id: &str) -> bool {
     LOCALES.iter().any(|catalog| catalog.id == id)
@@ -187,9 +188,11 @@ mod tests {
     }
 
     /// Catalogs delivered complete. English is the source catalog; Japanese was completed
-    /// upstream and Chinese lands complete here. German and Korean are still partial (they
-    /// predate the coverage guards), so their gaps are reported by `cargo xtask i18n`
-    /// without failing the build, while nothing in the two complete catalogs may regress.
+    /// upstream and Chinese lands complete here. German, Korean and Russian are partial
+    /// (German and Korean predate the coverage guards; Russian is kept partial so a new label
+    /// doesn't need a sixth translation), so their gaps fall back to English and are reported by
+    /// `cargo xtask i18n` without failing the build, while nothing in the complete catalogs may
+    /// regress.
     const COMPLETE: &[&str] = &["ja", "zh"];
 
     /// `text()` falls back to English silently, so a message a complete locale never received is
@@ -256,6 +259,7 @@ mod tests {
             ("ja", "フランジ", "ゼブラ解析", "モーション スタディ"),
             ("de", "Flansch", "Zebra-Analyse", "Bewegungsuntersuchung"),
             ("ko", "플랜지", "얼룩말줄무늬 분석", "운동 연구"),
+            ("ru", "Фланец", "Зебра-анализ", "Исследование движения"),
         ];
         for (lang, flange, zebra, motion) in cases {
             let locale = Locale::for_language(lang);
@@ -330,7 +334,9 @@ mod tests {
     /// non-empty string" would not catch that.
     #[test]
     fn id_labels_resolve_to_their_own_translation_not_an_english_fallback() {
-        for (lang, profile, points) in [("de", "Profil", "Punkte"), ("ja", "プロファイル", "点"), ("ko", "프로파일", "점")] {
+        for (lang, profile, points) in
+            [("de", "Profil", "Punkte"), ("ja", "プロファイル", "点"), ("ko", "프로파일", "점"), ("ru", "Профиль", "Точки")]
+        {
             let locale = Locale::for_language(lang);
             assert_eq!(locale.label("ui.palette_profile"), profile, "{lang}");
             assert_eq!(locale.label("ui.palette_points"), points, "{lang}");
@@ -348,7 +354,7 @@ mod tests {
     /// the row's two-word text must reach its own entry rather than that one.
     #[test]
     fn the_construction_geometries_row_reaches_its_own_entry_not_the_line_type() {
-        let rows = [("de", "Konstruktionsgeometrien"), ("ja", "構築ジオメトリ"), ("ko", "구성 형상")];
+        let rows = [("de", "Konstruktionsgeometrien"), ("ja", "構築ジオメトリ"), ("ko", "구성 형상"), ("ru", "Вспомогательная геометрия")];
         for (lang, want) in rows {
             let locale = Locale::for_language(lang);
             assert_eq!(locale.label("Construction Geometries"), want, "{lang}");
@@ -398,6 +404,27 @@ mod tests {
         assert_eq!(ko.dynamic("Parameters (5)"), "매개변수 (5)");
         assert_eq!(ko.dynamic("4 degrees of freedom"), "자유도 4개");
         assert_eq!(ko.dynamic("Sketch of bracket"), "Sketch of bracket");
+    }
+
+    #[test]
+    fn russian_catalog_translates_keys_labels_and_browser_patterns() {
+        let ru = Locale::for_language("ru");
+        assert_eq!(ru.name(), "Русский");
+        assert!(is_supported("ru"));
+        assert_eq!(ru.text("ui.preferences"), "Настройки");
+        assert_eq!(ru.label("Extrude"), "Выдавливание");
+        assert_eq!(ru.label("CREATE SKETCH"), "СОЗДАТЬ ЭСКИЗ");
+        assert_eq!(ru.label("NonExistentKey"), "NonExistentKey");
+        assert_eq!(ru.format("document.save_changes", &[("name", "My {design}")]), "Сохранить изменения в My {design}?");
+        assert_eq!(ru.format("dialog.selected_count", &[("count", "2")]), "↖ Выбрано: 2");
+        assert_eq!(ru.dynamic("Sketch1"), "Эскиз1");
+        assert_eq!(ru.dynamic("Body2"), "Тело2");
+        assert_eq!(ru.dynamic("Component12"), "Компонент12");
+        assert_eq!(ru.dynamic("Units: mm"), "Единицы: mm");
+        assert_eq!(ru.dynamic("Precision: 3"), "Точность: 3");
+        assert_eq!(ru.dynamic("Parameters (5)"), "Параметры (5)");
+        assert_eq!(ru.dynamic("4 degrees of freedom"), "Степеней свободы: 4");
+        assert_eq!(ru.dynamic("Sketch of bracket"), "Sketch of bracket");
     }
 
     #[test]

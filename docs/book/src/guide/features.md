@@ -7,7 +7,7 @@ it.
 
 | Panel | Features |
 |---|---|
-| Create | extrude (one side, two sides, symmetric, taper, start offset, to a distance or through all; new body, join, cut, intersect), revolve, sweep, loft, box, cylinder, sphere, torus, coil, pipe, rib, web, emboss, hole (simple, counterbore, countersink, tapped; on faces or at sketch points), thread, rectangular/circular/path patterns, mirror |
+| Create | extrude (one side, two sides, symmetric, taper, start offset, to a distance or through all; new body, join, cut, intersect; thin walls along curves), revolve, sweep, loft, box, cylinder, sphere, torus, coil, pipe, rib, web, emboss, hole (simple, counterbore, countersink, tapped; on faces or at sketch points), thread, rectangular/circular/path patterns, mirror |
 | Modify | press pull, fillet, chamfer, shell, draft, scale, combine, split body, offset face, replace face, move/copy, align, remove |
 | Construct | offset plane, plane at angle, plane along path |
 | Inspect | measure, section analysis, interference, curvature comb and map, zebra, draft, minimum radius, isocurves, centre of mass |
@@ -22,6 +22,19 @@ A taper slopes the sides of any profile, sketch text included: lines, arcs and s
 curves move in or out together, and a flat tip shorter than the taper closes to a point. A
 taper steeper than the profile's details (a stroke, a curve or a gap narrower than it) is
 refused with that reason; a smaller taper or distance builds.
+
+**Thin Extrude** (`thin: true` on `solid.extrude`, the Thin Extrude box in its dialog) builds a
+wall of constant thickness along sketch curves instead of filling profiles: open chains (a single
+wall) and closed loops (a ring), lines, arcs, circles, ellipses and splines. In the dialog, a
+picked profile stands for the curves around it (its outline and its holes). The wall lies on the curves' centre, inside,
+outside, or on both sides with two thicknesses (`side`: `center`, `inside`, `outside`,
+`two_sides` with `thickness2`). A closed loop's inside is the area it encloses; an open chain's
+is the side it bends toward (the inside of a U), and a straight line's is the left of its first
+curve as drawn. Curves that meet end to end are one chain whose corners are mitred; walls that
+cross or meet (a ring and a cross, a honeycomb) become one piece. Every extent, operation and target of an extrude applies, and a taper
+for walls of straight lines or of whole circles. A wall thicker than the
+radius of a curve it follows on the inside is refused. Spline walls follow the exact offset
+within 0.0001 mm.
 
 Editing an extrusion retains its signed distances, From/To Object inputs, taper expressions
 and explicit body targets. Revolve edits retain world, sketch and explicit-line axes, both
@@ -124,7 +137,7 @@ still be added through `set`. The fields of the common features:
 
 | Feature | Fields |
 |---|---|
-| Extrude | `extent`: {`distance`, `direction`: positive\|negative\|symmetric, `distance2`, `start_offset`, `through_all`, `taper`, `to`, `to_offset`, `from`}; `operation`: new_body\|join\|cut\|intersect; `targets`; `profiles`; `sketch` |
+| Extrude | `extent`: {`distance`, `direction`: positive\|negative\|symmetric, `distance2`, `start_offset`, `through_all`, `taper`, `to`, `to_offset`, `from`}; `operation`: new_body\|join\|cut\|intersect; `targets`; `profiles`; `sketch`; `thin`: {`curves`, `thickness`, `side`: center\|inside\|outside\|two_sides, `thickness2`} |
 | Revolve | `angle`, `angle2`, `symmetric`, `axis`, `to`, `operation`, `targets`, `profiles`, `sketch` |
 | Fillet | `radius`, `edges` (a point on each edge), `body`, `style` |
 | Chamfer | `distance`, `distance2` or `angle`, `flip`, `edges`, `body` |

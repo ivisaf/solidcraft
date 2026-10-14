@@ -49,13 +49,14 @@ start-up and says when the `--in` design's folder was left out; `--allow-path` a
 
 Paths are resolved before they are compared, so `..` and symlinks that lead out are refused
 (saving through a link writes the file it points to, so the link's target is what counts), and
-a new file must go into a folder that exists. On Windows a path must be on a local drive
+a new file must go into a folder that exists (a missing folder inside an allowed one is reported as missing; it is not created and does not call for a wider `--allow-path`). On Windows a path must be on a local drive
 (`C:\…` or `\\?\C:\…`): UNC, device and NT paths in any spelling (`\\server\share`,
 `//server/share`, `\\?\UNC\…`, `\??\…`, `\\.\…`), drive-relative paths (`C:file`), a `:` in a
 file name (alternate data streams), reserved device names with any extension (`NUL`, `CON`,
 `COM1.txt`, …) and short 8.3 names (`PROGRA~1`) are refused before any file system call, and the
 resolved path is checked again, so a link or junction that leads to a share is refused too. This
-includes a `sketch.text` font given as a file path; installed fonts named by family still work.
+includes a `sketch.text` font given as a file path and the font file a design's text names when
+the design is opened; installed fonts named by family still work.
 The server spells its own folders (scratch, recovery) with long names, so they work when the
 temporary folder's path has a short name (`…\NAME~1.XYZ\AppData\Local\Temp`, as Windows often
 gives when the user folder's name is long).

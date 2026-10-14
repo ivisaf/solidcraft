@@ -1,5 +1,50 @@
 # Design loading
 
+## Designs built by agents: work per command that grew with the design (2026-10-14)
+
+A design an agent builds over MCP is made of many small commands: a cylinder per spoke, a box
+per chain plate, one part built at the origin and its component moved into place. Each command
+did work over the whole design, so the 1,000th command cost far more than the first and a
+1,300-body design took minutes to build and to show. `solidcraft-cli bench-agent` builds such a
+design (a generated bicycle: about 1,260 commands, 1,280 bodies, 1,250 features, wheels built at
+the origin and moved), timing each command and then what a window needs to draw its result (the
+world state and its display meshes), and finally opens the saved design like `bench-open`. The
+script is generated, so it needs no fixture; `--scale` changes the counts and `--script-out`
+writes the commands for replaying elsewhere (`engine.execute` one by one over the control
+channel reproduces the desktop case).
+
+What grew with the design, per command:
+
+- **Moved components were placed again after every change.** `world_state` transformed every
+  body of a component whose occurrence is moved and gave it a new, empty display mesh, so every
+  command meshed all those bodies again (the two wheels: 150 bodies and two tori, 130-190 ms per
+  command). It now keeps the bodies it placed and reuses each one whose definition (same body,
+  same display cell) and placement are unchanged.
+- **A free `dN` name searched the design once per number** (`next_d_name`), quadratic in the
+  number of named inputs, for every new feature input.
+- **Every expression evaluated every parameter** (`Document::eval`), several times per
+  feature command (each coordinate, each size). Parameters are now evaluated only when the
+  expression names one.
+- **The parameter table's `used_by` searched all parameters for each one** (quadratic); it is
+  one pass now. The desktop also stops gathering expression completions (eleven parameter
+  tables) on every change while no text box has focus.
+
+`solidcraft-cli bench-agent`, release build, 16-core Linux shared with other builds (load
+average 15-20), one run each:
+
+| per command, by design size | before: command | before: display | after: command | after: display |
+|---|---:|---:|---:|---:|
+| 200 commands (227 bodies) | 6.0 ms | 129 ms | 1.8 ms | 2.7 ms |
+| 600 commands (621 bodies) | 19.9 ms | 169 ms | 4.9 ms | 2.4 ms |
+| 1,000 commands (1,021 bodies) | 45.1 ms | 187 ms | 9.8 ms | 4.5 ms |
+| 1,200 commands (1,221 bodies) | 56.8 ms | 194 ms | 12.5 ms | 5.6 ms |
+| whole build (1,260 commands) | 241 s | | 16.3 s | |
+
+The command column still grows (the timeline's fingerprints and parameter values are walked
+once per command), but slowly. `solidcraft-cli eval` output for the design corpus, the examples,
+the regression scripts, the generated bicycle and a 3,300-feature agent-built design is
+unchanged apart from the timings.
+
 ## STEP import: shells and item solids without copies (2026-10-13)
 
 A file that lists one product definition many times (a bolt used 70 times, a panel in several

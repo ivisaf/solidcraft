@@ -64,6 +64,7 @@ fn window_chrome_renders_in_the_active_language() {
         ("ja", "ブラウザ", "選択フィルター", "面"),
         ("de", "BROWSER", "Auswahlfilter", "Flächen"),
         ("ko", "브라우저", "선택 필터", "면"),
+        ("ru", "БРАУЗЕР", "Фильтр выделения", "Грани"),
     ] {
         let mut h = Harness::new();
         h.app.preferences.language = lang.into();

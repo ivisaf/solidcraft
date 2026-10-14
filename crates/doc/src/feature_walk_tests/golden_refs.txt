@@ -7,6 +7,10 @@ extrude
   sketches: [1]
   remap_refs: sketch
   remap_bodies: targets[0]
+extrude_thin
+  sketches: [1]
+  remap_refs: sketch
+  remap_bodies: targets[0]
 revolve
   sketches: [1]
   remap_refs: sketch
@@ -115,6 +119,8 @@ sheet_contour
 sheet_flange
   remap_bodies: body
 sheet_hem
+  remap_bodies: body
+sheet_perforate
   remap_bodies: body
 sheet_fold
   sketches: [7]

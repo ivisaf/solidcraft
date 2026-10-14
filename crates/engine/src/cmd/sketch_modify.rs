@@ -13,6 +13,8 @@ use super::{CommandSpec, in_sketch};
 use crate::params::{bad, bool_, expr, num, req_vec2, str_, string_list, vec2, vec2_list};
 use crate::{Result, Session};
 
+#[path = "sketch_pattern.rs"]
+mod pattern;
 #[path = "sketch_support.rs"]
 mod support;
 
@@ -86,12 +88,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CREATE")
         .icon("sketch_circ_pattern")
         .enabled(in_sketch)
-        .params(concat!("entities: [ids], center: [x,y] or point ref, count: 2…500, angle?: total deg (default 360)", created_doc!())),
+        .params(concat!("entities: [ids], center: [x,y] or point ref, count: 2…500, angle?: total deg (default 360). Adds associative pattern constraints; a coordinate center creates a constrainable point. Returns pattern and center ids. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
     CommandSpec::new("sketch.pattern.rectangular", "Rectangular Pattern", pattern_rect)
         .at("SKETCH", "CREATE")
         .icon("sketch_rect_pattern")
         .enabled(in_sketch)
-        .params(concat!("entities: [ids], dir?: [x,y] (default x), count, spacing; count2?, spacing2? (perpendicular direction)", created_doc!())),
+        .params(concat!("entities: [ids], dir?: [x,y] (default x), count, spacing; count2?, spacing2? (perpendicular direction). Adds associative pattern constraints. Returns pattern id. pattern?: existing pattern id to edit (omitted values retained; surviving instance ids retained)", created_doc!())),
 ];
 
 const TOL: f64 = 1e-7;
@@ -1495,6 +1497,9 @@ fn copy_through(
     keep: &dyn Fn(Vec2) -> bool,
     scale_r: f64,
 ) -> Result<(Vec<usize>, Vec<(usize, usize)>)> {
+    if sk.curves.len().saturating_add(cs.len()) > solidcraft_sketch::MAX_CURVES {
+        return Err(solidcraft_sketch::SketchError::TooLarge.into());
+    }
     let pts = involved_points(sk, cs, ps);
     let mut map: Vec<(usize, usize)> = Vec::new();
     for q in &pts {
@@ -1575,7 +1580,7 @@ fn mirror(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn count(p: &Value, k: &str, cmd: &str) -> Result<usize> {
     let n = num(p, k).ok_or_else(|| bad(cmd, format!("`{k}` must be a number")))?;
-    if !(1.0..=MAX_COPIES as f64).contains(&n) {
+    if !(1.0..=MAX_COPIES as f64).contains(&n) || n.fract() != 0.0 {
         return Err(bad(cmd, format!("`{k}` must be 1…{MAX_COPIES}")));
     }
     Ok(n as usize)
@@ -1598,55 +1603,11 @@ fn rotate(c: Vec2, ang: f64) -> impl Fn(Vec2) -> Vec2 {
 }
 
 fn pattern_circular(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "sketch.pattern.circular";
-    let n = count(p, "count", cmd)?;
-    let total = num(p, "angle").unwrap_or(360.0);
-    if !(total.abs() > 1e-9 && total.abs() <= 360.0) {
-        return Err(bad(cmd, "`angle` must be in (0, 360]"));
-    }
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let (cs, ps) = entities(sk, p, cmd)?;
-        let c = point_or_ref(sk, p, "center", cmd)?;
-        let full = (total.abs() - 360.0).abs() < 1e-9;
-        let step = if full { total / n as f64 } else { total / (n.max(2) - 1) as f64 };
-        let mut made = Vec::new();
-        for k in 1..n {
-            let f = rotate(c, (step * k as f64).to_radians());
-            let (m, _) = copy_through(sk, &cs, &ps, &f, false, &|_| false, 1.0)?;
-            made.extend(m);
-        }
-        Ok(ids_of(sk, &made))
-    })?;
-    Ok(json!({"curves": out, "sketch": info}))
+    pattern::run(s, p, true)
 }
 
 fn pattern_rect(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "sketch.pattern.rectangular";
-    let n1 = count(p, "count", cmd)?;
-    let s1 = num(p, "spacing").ok_or_else(|| bad(cmd, "`spacing` must be a number"))?;
-    let n2 = if p.get("count2").is_some() { count(p, "count2", cmd)? } else { 1 };
-    let s2 = num(p, "spacing2").unwrap_or(s1);
-    if n1 * n2 > MAX_COPIES {
-        return Err(bad(cmd, "too many copies"));
-    }
-    let d1 = p.get("dir").and_then(vec2).and_then(Vec2::normalized).unwrap_or(Vec2::X);
-    let d2 = d1.perp();
-    let (out, info) = edit(s, p, cmd, false, |sk, _| {
-        let (cs, ps) = entities(sk, p, cmd)?;
-        let mut made = Vec::new();
-        for i in 0..n1 {
-            for j in 0..n2 {
-                if i == 0 && j == 0 {
-                    continue;
-                }
-                let off = d1 * (s1 * i as f64) + d2 * (s2 * j as f64);
-                let (m, _) = copy_through(sk, &cs, &ps, &move |q| q + off, false, &|_| false, 1.0)?;
-                made.extend(m);
-            }
-        }
-        Ok(ids_of(sk, &made))
-    })?;
-    Ok(json!({"curves": out, "sketch": info}))
+    pattern::run(s, p, false)
 }
 
 /// Move the points of the entities (in place) through `f`; circle radii scale by `k`.
@@ -1665,6 +1626,7 @@ fn transform_in_place(sk: &mut Sketch, cs: &[usize], ps: &[usize], f: &dyn Fn(Ve
             *r *= k;
         }
     }
+    sk.follow_pattern_seeds();
     Ok(())
 }
 

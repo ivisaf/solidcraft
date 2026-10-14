@@ -1,5 +1,7 @@
 //! Contact Sets, Motion Study and Exploded views.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 use solidcraft_doc::Mat;
 use solidcraft_doc::joints::{self, JointKind};
@@ -8,7 +10,7 @@ use solidcraft_geom::Vec3;
 use solidcraft_kernel::Body;
 
 use super::CommandSpec;
-use super::joints::{joint_id, occurrence_id, resolve, value};
+use super::joints::{joint_id, occurrence_id, resolve_holding, value};
 use crate::params::{bad, bool_, str_, vec3};
 use crate::{EngineError, Result, Session};
 
@@ -254,27 +256,41 @@ fn closest(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
     a + ab * (vb / den) + ac * (vc / den)
 }
 
-/// Set joint values, stopping short where contact sets would collide: the values are moved
-/// from where they are toward `want` as far as they go without a collision.
-fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)]) -> Result<Value> {
+/// Set joint values, stopping short where contact sets would collide or a closed loop could no
+/// longer close: the values are moved from where they are toward `want` as far as they go. The
+/// `given` values (joint, index) are driven; in a closed loop the others follow.
+fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)], given: &BTreeSet<(u64, usize)>) -> Result<Value> {
     let baseline = s.doc.clone();
     let start: Vec<(u64, Vec<f64>)> =
         want.iter().map(|(id, _)| (*id, s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| j.values.clone()).unwrap_or_default())).collect();
+    // Closed loops follow the driven values from where they start.
+    let held: joints::Held = given
+        .iter()
+        .filter(|&&(id, i)| want.iter().any(|(w, q)| *w == id && i < q.len()))
+        .map(|&(id, i)| {
+            // A value the file leaves out is 0, as the solver reads it.
+            let from = start.iter().find(|(s, _)| *s == id).and_then(|(_, q)| q.get(i).copied());
+            ((id, i), from.unwrap_or(0.0))
+        })
+        .collect();
     let set = |s: &mut Session, t: f64| {
         // Trial order must not affect free anchors or linked joint placements.
         s.doc = baseline.clone();
         let doc = s.doc_mut();
         for ((id, a), (_, b)) in start.iter().zip(want) {
             if let Some(j) = doc.assembly.joints.iter_mut().find(|j| j.id == *id) {
-                let mut q: Vec<f64> = b.iter().enumerate().map(|(i, bv)| a.get(i).copied().unwrap_or(*bv) * (1.0 - t) + bv * t).collect();
+                let mut q: Vec<f64> = b.iter().enumerate().map(|(i, bv)| a.get(i).copied().unwrap_or(0.0) * (1.0 - t) + bv * t).collect();
                 joints::clamp(j, &mut q);
                 j.values = q;
             }
         }
-        resolve(s)
+        resolve_holding(s, &held)
     };
+    // Loops already open at the start stay as they are; a loop the motion opens stops it.
+    let open_at_start: BTreeSet<u64> = set(s, 0.0).conflicts.iter().map(|c| c.0).collect();
+    let opened = |sol: &joints::Solution| sol.conflicts.iter().find(|c| !open_at_start.contains(&c.0)).map(|c| c.1.clone());
     let cache = if s.doc.assembly.contact_enabled { Some(contact_sweep::ContactGeometry::new(s)?) } else { None };
-    let sol;
+    let mut sol;
     let mut stopped = None;
     if let Some(cache) = cache.filter(|cache| cache.has_pairs()) {
         let mut end = s.scratch();
@@ -313,16 +329,33 @@ fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)]) -> Result<Value
     } else {
         sol = set(s, 1.0);
     }
+    let mut stopped_by_loop = None;
+    if let Some(mut name) = opened(&sol) {
+        // The furthest the loops still close, short of where contact stopped; the joint named is
+        // the one whose loop opens first.
+        let (mut lo, mut hi) = (0.0, stopped.as_ref().and_then(|v| v["fraction"].as_f64()).unwrap_or(1.0));
+        for _ in 0..14 {
+            let mid = (lo + hi) / 2.0;
+            match opened(&set(s, mid)) {
+                None => lo = mid,
+                Some(n) => (hi, name) = (mid, n),
+            }
+        }
+        sol = set(s, lo);
+        stopped = None;
+        stopped_by_loop = Some(json!({"joint": name, "fraction": lo}));
+    }
     let values: Vec<Value> = want
         .iter()
         .map(|(id, _)| json!({"joint": id, "values": s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| j.values.clone())}))
         .collect();
-    Ok(json!({"values": values, "stopped_by_contact": stopped, "conflicts": sol.conflicts.len()}))
+    Ok(json!({"values": values, "stopped_by_contact": stopped, "stopped_by_loop": stopped_by_loop, "conflicts": sol.conflicts.len()}))
 }
 
 /// Drive one joint (joint.drive), honouring contact sets.
-pub fn drive_joint(s: &mut Session, id: u64, q: Vec<f64>) -> Result<Value> {
-    drive_with_contact(s, &[(id, q)])
+pub fn drive_joint(s: &mut Session, id: u64, q: Vec<f64>, given: usize) -> Result<Value> {
+    let given = (0..given.min(q.len())).map(|i| (id, i)).collect();
+    drive_with_contact(s, &[(id, q)], &given)
 }
 
 fn enable_sets(s: &mut Session, p: &Value) -> Result<Value> {
@@ -517,6 +550,11 @@ fn values_at(s: &Session, m: &MotionStudy, step: f64) -> Vec<(u64, Vec<f64>)> {
     out
 }
 
+/// The values a study keys: (joint, index).
+fn keyed(m: &MotionStudy) -> BTreeSet<(u64, usize)> {
+    m.keys.iter().map(|k| (k.joint, k.index)).collect()
+}
+
 /// Where each occurrence is: (name, world transform).
 fn positions(s: &Session) -> Vec<(String, Mat)> {
     s.doc.occurrences.iter().map(|o| (o.name.clone(), joints::occurrence_world(&s.doc, o.id))).collect()
@@ -532,7 +570,7 @@ fn play(s: &mut Session, p: &Value) -> Result<Value> {
     let m = s.doc.assembly.studies.get(i).cloned().ok_or_else(|| bad(cmd, "study"))?;
     let step = p.get("step").and_then(Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| bad(cmd, "`step` must be a number"))?;
     let want = values_at(s, &m, step.clamp(0.0, f64::from(m.steps)));
-    let mut out = drive_with_contact(s, &want)?;
+    let mut out = drive_with_contact(s, &want, &keyed(&m))?;
     out["positions"] = positions(s).iter().map(|(n, t)| json!({"occurrence": n, "pose": pose_json(t)})).collect();
     Ok(out)
 }
@@ -551,10 +589,11 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     for k in 0..samples {
         let step = f64::from(m.steps) * k as f64 / (samples - 1) as f64;
         let want = values_at(&t, &m, step);
-        let r = drive_with_contact(&mut t, &want)?;
+        let r = drive_with_contact(&mut t, &want, &keyed(&m))?;
         rows.push(json!({
             "step": step,
             "stopped_by_contact": r["stopped_by_contact"],
+            "stopped_by_loop": r["stopped_by_loop"],
             "positions": positions(&t).iter().map(|(n, x)| json!({"occurrence": n, "pose": pose_json(x)})).collect::<Vec<_>>(),
         }));
     }

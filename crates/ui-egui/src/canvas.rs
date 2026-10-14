@@ -59,6 +59,8 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
                     let n = if *flip && !crate::sketch_modify_ui::offset_symmetric(*mode) { -tangent.perp() } else { tangent.perp() };
                     Some(ss.plane.to_world(mid + n) - ss.plane.to_world(mid))
                 }
+                // A thin extrude's curves extrude along their sketch's normal.
+                Kind::Extrude { .. } => Some(ss.plane.normal()),
                 _ => None,
             };
             (ss.plane.to_world(mid), dir)

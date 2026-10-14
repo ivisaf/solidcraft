@@ -216,6 +216,7 @@ pub fn selection_group(app: &SolveApp, target: &Target) -> Option<Value> {
             (b.component, "bodies")
         }
         Target::Sketch { id } => (app.session.doc.feature(*id)?.component, "sketches"),
+        Target::Plane { id } => (app.session.doc.feature(*id)?.component, "construction"),
         _ => return None,
     };
     let sel = selected_keys(app, comp, folder);
@@ -1287,7 +1288,7 @@ fn entries(app: &SolveApp, comp: u64, folder: &str) -> Vec<Entry> {
                 color: None,
                 locked: false,
                 sel: Some(Sel::Plane { name: f.name.clone() }),
-                target: None,
+                target: Some(Target::Plane { id: f.id }),
                 bodies: Vec::new(),
             })
             .collect(),

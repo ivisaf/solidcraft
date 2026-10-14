@@ -120,7 +120,12 @@ pub fn open(app: &mut SolveApp) {
 
 /// Draw the dialog when it is open. Called once per frame.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
-    publish(app, ctx);
+    // Completions are offered only under a focused text box; gathering them evaluates every
+    // parameter, so a design changing command after command (an agent building over MCP)
+    // does not pay for it on every change while nobody is typing.
+    if app.params.is_some() || ctx.memory(|m| m.focused().is_some()) {
+        publish(app, ctx);
+    }
     let Some(mut d) = app.params.take() else { return };
     let t = Tokens::get();
     let mut open = true;
@@ -136,16 +141,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut d.filter).hint_text(crate::i18n::tr_label("Filter")).desired_width(180.0));
                 ui.separator();
-                if ui.button("Import…").on_hover_text(crate::i18n::tr_label("CSV or JSON: updates existing parameters, adds new ones")).clicked()
-                    && let Some(p) = app.services.pick_open.as_ref().and_then(|f| f())
-                {
-                    d.error = app.run("parameters.import", json!({ "path": p })).err();
+                if ui.button("Import…").on_hover_text(crate::i18n::tr_label("CSV or JSON: updates existing parameters, adds new ones")).clicked() {
+                    app.pick_open_command("parameters.import", json!({}));
                 }
                 for (label, ext) in [("Export CSV…", "csv"), ("Export JSON…", "json")] {
-                    if ui.button(label).clicked()
-                        && let Some(p) = app.services.pick_save.as_ref().and_then(|f| f(&format!("parameters.{ext}"), &[ext]))
-                    {
-                        d.error = app.run("parameters.export", json!({ "path": p, "format": ext })).err();
+                    if ui.button(label).clicked() {
+                        app.pick_save_command(&format!("parameters.{ext}"), &[ext], "parameters.export", json!({"format": ext}));
                     }
                 }
             });

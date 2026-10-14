@@ -1,7 +1,7 @@
 //! Solid feature commands: extrude, revolve, fillet, chamfer, primitives, combine, move.
 
 use serde_json::{Value, json};
-use solidcraft_doc::{AxisRef, Direction, Extent, FeatureKind, Operation, PointExpr, ProfileSel, expr::Kind, point_expr};
+use solidcraft_doc::{AxisRef, Direction, Extent, FeatureKind, Operation, PointExpr, ProfileSel, ThinSide, ThinWall, expr::Kind, point_expr};
 use solidcraft_geom::Vec3;
 
 use super::{CommandSpec, not_in_sketch};
@@ -13,7 +13,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SOLID", "CREATE")
         .icon("extrude")
         .key("E")
-        .params("distance: expr (or through_all: true); taper?: angle expr; sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); face?: [x,y,z] (extrude a planar body face instead of a sketch profile); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric; distance2?; start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body]; name?; body_name?"),
+        .params("distance: expr (or through_all: true); taper?: angle expr; sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); face?: [x,y,z] (extrude a planar body face instead of a sketch profile); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric; distance2?; start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body]; name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
     CommandSpec::new("solid.revolve", "Revolve", revolve)
         .at("SOLID", "CREATE")
         .icon("revolve")
@@ -119,6 +119,11 @@ fn extrude_base(s: &Session, p: &Value) -> Option<(Vec3, Vec3)> {
     let sid = feature_sketch(s, p, "Extrude").ok()?;
     let st = s.model.state();
     let ss = st.sketch(sid)?;
+    if bool_(p, "thin").unwrap_or(false) {
+        let thin = thin_param(s, p, sid, "solid.extrude").ok()?;
+        let q = thin_regions(s, ss, &thin).ok()?.first()?.interior_point();
+        return Some((ss.plane.to_world(q), ss.plane.normal()));
+    }
     let ps = &ss.profiles;
     let q = match profiles(p, "Extrude").ok()? {
         ProfileSel::All => ps.first()?.region.interior_point(),
@@ -505,10 +510,21 @@ fn extrude(s: &mut Session, p: &Value) -> Result<Value> {
         None => (feature_sketch(s, p, cmd)?, None),
     };
     let extent = extent_param(s, p, cmd)?;
+    let thin = match bool_(p, "thin") {
+        Some(true) => {
+            if face_profile.is_some() || p.get("profiles").is_some() {
+                return Err(bad(cmd, "a thin extrude follows `curves`; it takes no `profiles` or `face`"));
+            }
+            Some(thin_param(s, p, sketch, cmd)?)
+        }
+        _ if p.get("thin").is_some_and(|v| !v.is_boolean()) => return Err(bad(cmd, "`thin` must be true or false")),
+        _ => None,
+    };
     let kind = FeatureKind::Extrude {
         sketch,
         profiles: match face_profile {
             Some(f) => f,
+            None if thin.is_some() => ProfileSel::All,
             None => profiles(p, cmd)?,
         },
         extent,
@@ -517,8 +533,62 @@ fn extrude(s: &mut Session, p: &Value) -> Result<Value> {
             _ => operation(p, cmd)?,
         },
         targets: string_list(p, "targets"),
+        thin,
     };
     add_feature(s, p, kind)
+}
+
+/// A thin extrude's wall from its parameters: the sketch's curves it follows (every drawn
+/// curve when none are given), its thickness and which side of them it lies on.
+fn thin_param(s: &Session, p: &Value, sketch: u64, cmd: &str) -> Result<ThinWall> {
+    let st = s.model.state();
+    let ss = st.sketch(sketch).ok_or_else(|| bad(cmd, "the sketch is not evaluated"))?;
+    let mut curves = string_list(p, "curves");
+    if curves.is_empty() {
+        curves = ss.sketch.curves.iter().filter(|c| !c.construction && !c.centerline && c.link.is_none()).map(|c| c.id.clone()).collect();
+    }
+    if curves.is_empty() || curves.len() > 1000 {
+        return Err(bad(cmd, "a thin extrude needs 1…1000 sketch curves (`curves`)"));
+    }
+    if let Some(c) = curves.iter().find(|c| ss.sketch.curve_index(c).is_none()) {
+        return Err(bad(cmd, format!("no curve `{c}` in the sketch")));
+    }
+    let thickness = req_expr(cmd, p, "thickness")?;
+    check_expr(s, &thickness, Kind::Length, cmd, "thickness")?;
+    let side = match str_(p, "side") {
+        None => ThinSide::Center,
+        Some(o) => ThinSide::parse(o).ok_or_else(|| bad(cmd, format!("unknown side `{o}` (center, inside, outside or two_sides)")))?,
+    };
+    let thickness2 = expr(p, "thickness2");
+    match (&thickness2, side) {
+        (Some(t), ThinSide::TwoSides) => check_expr(s, t, Kind::Length, cmd, "thickness2")?,
+        (None, ThinSide::TwoSides) => return Err(bad(cmd, "`side: two_sides` needs `thickness2` (the thickness outside)")),
+        (Some(_), _) => return Err(bad(cmd, "`thickness2` goes with `side: two_sides`")),
+        (None, _) => {}
+    }
+    let thin = ThinWall { curves, thickness, side, thickness2 };
+    // Refuse a wall that can't be built now, with the reason, rather than a failed feature.
+    thin_regions(s, ss, &thin).map_err(|e| bad(cmd, e))?;
+    Ok(thin)
+}
+
+/// The regions of a thin wall in its (solved) sketch, with the current parameter values.
+fn thin_regions(s: &Session, ss: &solidcraft_doc::SolvedSketch, thin: &ThinWall) -> std::result::Result<Vec<solidcraft_geom::Region2>, String> {
+    let length = |e: &str| s.doc.eval(&s.doc.with_design_unit(e, Kind::Length), Kind::Length).map_err(|e| e.to_string());
+    let t = length(&thin.thickness)?;
+    let (inside, outside) = match thin.side {
+        ThinSide::Center => (t / 2.0, t / 2.0),
+        ThinSide::Inside => (t, 0.0),
+        ThinSide::Outside => (0.0, t),
+        ThinSide::TwoSides => (t, length(thin.thickness2.as_deref().unwrap_or("0"))?),
+    };
+    let curves: Vec<Vec<solidcraft_geom::Seg2>> = thin
+        .curves
+        .iter()
+        .filter_map(|id| ss.sketch.curve_index(id))
+        .map(|ci| ss.sketch.exact_segs(ci).unwrap_or_else(|| ss.sketch.segs(ci)))
+        .collect();
+    solidcraft_sketch::thin_wall_regions(&curves, inside, outside).map_err(|e| format!("thin wall: {e}"))
 }
 
 /// An extrude's extent from its parameters: distance (or through all, or to an object), the
@@ -1696,3 +1766,7 @@ mod solid_move_copy_tests;
 #[cfg(test)]
 #[path = "move_in_sketch_tests.rs"]
 mod move_in_sketch_tests;
+
+#[cfg(test)]
+#[path = "thin_extrude_tests.rs"]
+mod thin_extrude_tests;

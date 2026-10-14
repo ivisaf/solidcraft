@@ -181,9 +181,10 @@ impl Harness {
         // Frames are laid out, never painted.
         self.app.viewport.no_pixels = true;
         let dir = self.dir.clone();
-        self.app.services.pick_save = Some(Box::new(move |name, _| Some(dir.join(name).to_string_lossy().into_owned())));
+        self.app.services.pick_save =
+            Some(Box::new(move |name, _| Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))));
         let next = self.next_file.clone();
-        self.app.services.pick_open = Some(Box::new(move || next.borrow_mut().take()));
+        self.app.services.pick_open = Some(Box::new(move || Box::pin(std::future::ready(next.borrow_mut().take()))));
     }
 
     /// Autosave into the scenario's recovery folder (as the desktop app does into the user's).

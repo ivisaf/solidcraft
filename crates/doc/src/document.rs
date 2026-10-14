@@ -179,6 +179,51 @@ pub struct Extent {
     pub from: Option<Vec3>,
 }
 
+/// Thin Extrude: a wall of constant thickness along sketch curves instead of the profiles.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThinWall {
+    /// The sketch curves the wall follows: open chains and closed loops, joined where they
+    /// meet end to end.
+    pub curves: Vec<String>,
+    /// The wall thickness (expression); with `side: two_sides`, the thickness inside.
+    pub thickness: String,
+    #[serde(default, skip_serializing_if = "ThinSide::is_center")]
+    pub side: ThinSide,
+    /// With `side: two_sides`, the thickness outside (expression).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thickness2: Option<String>,
+}
+
+/// Where a thin wall lies against its curves. A closed loop's inside is the area it encloses;
+/// an open chain's is the side it bends toward (a straight one's, the left of its first
+/// curve as drawn).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinSide {
+    /// Half the thickness either side of the curves.
+    #[default]
+    Center,
+    Inside,
+    Outside,
+    /// `thickness` inside and `thickness2` outside.
+    TwoSides,
+}
+
+impl ThinSide {
+    pub fn is_center(&self) -> bool {
+        *self == ThinSide::Center
+    }
+    pub fn parse(s: &str) -> Option<ThinSide> {
+        match s.trim().to_ascii_lowercase().replace([' ', '-'], "_").as_str() {
+            "center" | "centre" | "centered" | "centred" | "symmetric" => Some(ThinSide::Center),
+            "inside" | "side1" | "side_1" => Some(ThinSide::Inside),
+            "outside" | "side2" | "side_2" => Some(ThinSide::Outside),
+            "two_sides" | "both" => Some(ThinSide::TwoSides),
+            _ => None,
+        }
+    }
+}
+
 /// Revolve axis.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -365,6 +410,9 @@ pub enum FeatureKind {
         /// Target body names for join/cut/intersect (empty = all bodies).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         targets: Vec<String>,
+        /// Thin: a wall along sketch curves instead of the profiles (which are then unused).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thin: Option<ThinWall>,
     },
     Revolve {
         sketch: u64,
@@ -757,6 +805,20 @@ pub enum FeatureKind {
         gap: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         flip: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+    },
+    /// A perforation field (#732): round holes of `diameter` on a staggered (60°) or square grid of `pitch` over the
+    /// whole flat sheet, kept `margin` (default: the diameter) clear of its edges, cut-outs and bend zones. Stored like
+    /// a cosmetic thread: the holes go to the flat pattern, the DXF and the measured volume, not into the B-rep, so a
+    /// panel can carry tens of thousands of them.
+    SheetPerforate {
+        diameter: String,
+        pitch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        margin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
     },
@@ -1306,6 +1368,7 @@ impl FeatureKind {
                 | FeatureKind::SheetContour { .. }
                 | FeatureKind::SheetFlange { .. }
                 | FeatureKind::SheetHem { .. }
+                | FeatureKind::SheetPerforate { .. }
                 | FeatureKind::SheetFold { .. }
                 | FeatureKind::SheetUnfold { .. }
                 | FeatureKind::SheetConvert { .. }
@@ -1359,6 +1422,7 @@ impl FeatureKind {
             FeatureKind::SheetContour { .. } => "ContourFlangeFeature",
             FeatureKind::SheetFlange { .. } => "EdgeFlangeFeature",
             FeatureKind::SheetHem { .. } => "HemFeature",
+            FeatureKind::SheetPerforate { .. } => "PerforateFeature",
             FeatureKind::SheetFold { .. } => "FoldFeature",
             FeatureKind::SheetUnfold { refold: false, .. } => "UnfoldFeature",
             FeatureKind::SheetUnfold { .. } => "RefoldFeature",
@@ -1432,6 +1496,7 @@ impl FeatureKind {
             FeatureKind::SheetContour { .. } => "ContourFlange",
             FeatureKind::SheetFlange { .. } => "EdgeFlange",
             FeatureKind::SheetHem { .. } => "Hem",
+            FeatureKind::SheetPerforate { .. } => "Perforate",
             FeatureKind::SheetFold { .. } => "Fold",
             FeatureKind::SheetUnfold { refold: false, .. } => "Unfold",
             FeatureKind::SheetUnfold { .. } => "Refold",
@@ -1457,77 +1522,6 @@ impl FeatureKind {
             FeatureKind::MeshImport { .. } => "Mesh",
             FeatureKind::MeshConvert { .. } => "ConvertMesh",
         }
-    }
-    /// Every expression the feature uses.
-    /// Points on faces the feature refers to (shell, draft, offset and replace faces, a hole's
-    /// placement), for persistent face names.
-    /// The feature's profile selections, each with its sketch.
-    pub fn profile_sels_mut(&mut self) -> Vec<(u64, &mut ProfileSel)> {
-        match self {
-            FeatureKind::Extrude { sketch, profiles, .. }
-            | FeatureKind::Revolve { sketch, profiles, .. }
-            | FeatureKind::Sweep { sketch, profiles, .. }
-            | FeatureKind::Emboss { sketch, profiles, .. }
-            | FeatureKind::SheetBase { sketch, profiles, .. } => vec![(*sketch, profiles)],
-            FeatureKind::Patch { sketch: Some(sk), profiles, .. }
-            | FeatureKind::SurfaceExtrude { sketch: sk, profiles: Some(profiles), .. }
-            | FeatureKind::SurfaceRevolve { sketch: sk, profiles: Some(profiles), .. }
-            | FeatureKind::SurfaceSweep { sketch: sk, profiles: Some(profiles), .. } => {
-                vec![(*sk, profiles)]
-            }
-            FeatureKind::Loft { sections, .. } => sections.iter_mut().filter(|s| s.point.is_none()).map(|s| (s.sketch, &mut s.profiles)).collect(),
-            FeatureKind::SurfaceLoft { sections } => sections.iter_mut().filter_map(|s| Some((s.sketch, s.profiles.as_mut()?))).collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Profile selections and their source sketches without cloning feature data.
-    pub fn profile_sels(&self) -> Vec<(u64, &ProfileSel)> {
-        match self {
-            FeatureKind::Extrude { sketch, profiles, .. }
-            | FeatureKind::Revolve { sketch, profiles, .. }
-            | FeatureKind::Sweep { sketch, profiles, .. }
-            | FeatureKind::Emboss { sketch, profiles, .. }
-            | FeatureKind::SheetBase { sketch, profiles, .. } => vec![(*sketch, profiles)],
-            FeatureKind::Patch { sketch: Some(sketch), profiles, .. }
-            | FeatureKind::SurfaceExtrude { sketch, profiles: Some(profiles), .. }
-            | FeatureKind::SurfaceRevolve { sketch, profiles: Some(profiles), .. }
-            | FeatureKind::SurfaceSweep { sketch, profiles: Some(profiles), .. } => {
-                vec![(*sketch, profiles)]
-            }
-            FeatureKind::Loft { sections, .. } => {
-                sections.iter().filter(|section| section.point.is_none()).map(|section| (section.sketch, &section.profiles)).collect()
-            }
-            FeatureKind::SurfaceLoft { sections } => sections.iter().filter_map(|s| Some((s.sketch, s.profiles.as_ref()?))).collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    pub fn face_points_mut(&mut self) -> Vec<&mut Vec3> {
-        match self {
-            FeatureKind::Shell { faces, .. }
-            | FeatureKind::Draft { faces, .. }
-            | FeatureKind::OffsetFace { faces, .. }
-            | FeatureKind::DeleteFace { faces, .. }
-            | FeatureKind::SurfaceOffset { faces, .. }
-            | FeatureKind::SplitFace { faces, .. }
-            | FeatureKind::ReplaceFace { faces, .. } => faces.iter_mut().collect(),
-            FeatureKind::Hole { position, points: None, to, .. } => std::iter::once(position).chain(to.iter_mut()).collect(),
-            FeatureKind::Hole { to: Some(t), .. } => vec![t],
-            FeatureKind::Extrude { extent, .. } => extent.to.iter_mut().chain(extent.from.iter_mut()).collect(),
-            FeatureKind::Revolve { to: Some(p), .. } => vec![p],
-            FeatureKind::Thread { face, .. } => vec![face],
-            FeatureKind::Emboss { face: Some(face), .. } => vec![&mut face.at],
-            FeatureKind::Boss { position, .. } | FeatureKind::SnapFit { position, .. } | FeatureKind::Rest { position, .. } => vec![position],
-            // With bend edges the fixed face is found by name (a plate keeps its point).
-            FeatureKind::SheetConvert { face, bends, .. } if !bends.is_empty() => vec![face],
-            _ => Vec::new(),
-        }
-    }
-
-    pub fn face_points(&self) -> Vec<Vec3> {
-        let mut k = self.clone();
-        k.face_points_mut().into_iter().map(|p| *p).collect()
     }
 }
 
@@ -2368,8 +2362,14 @@ impl Document {
 
     /// Evaluate an expression against the document's parameters.
     pub fn eval(&self, e: &str, kind: Kind) -> Result<f64> {
-        let (vals, _) = self.param_values();
-        Self::eval_in(&vals, e, kind)
+        // The parameters are evaluated only when the expression names one: most expressions an
+        // agent sends are plain values, and evaluating every parameter of a large design for
+        // each of them made every new feature cost more than the last.
+        let vals: std::cell::OnceCell<std::collections::BTreeMap<String, expr::Value>> = std::cell::OnceCell::new();
+        expr::eval_with(e, &|n| {
+            vals.get_or_init(|| self.param_values().0).get(n).copied().ok_or_else(|| DocError::Expr(format!("unknown parameter `{n}`")))
+        })?
+        .to_kind(kind)
     }
 
     pub fn eval_in(vals: &std::collections::BTreeMap<String, expr::Value>, e: &str, kind: Kind) -> Result<f64> {

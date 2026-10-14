@@ -37,11 +37,13 @@ pub struct Request {
     pub kind: Kind,
     /// A control-channel caller waiting for the command's reply.
     pub reply: Option<Sender<ControlResponse>>,
+    /// The folders that caller's agent may use: the worker reads the file inside them.
+    pub scope: Option<solidcraft_engine::io::vfs::PathScope>,
 }
 
 impl Request {
     pub fn new(path: &str, kind: Kind) -> Self {
-        Request { path: path.into(), kind, reply: None }
+        Request { path: path.into(), kind, reply: None, scope: None }
     }
     fn insert(&self) -> bool {
         self.kind == Kind::Insert
@@ -180,8 +182,28 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
         _ => return Some(req),
     };
     let Some(path) = req.params.get("params").and_then(|p| p.get("path")).and_then(Value::as_str) else { return Some(req) };
-    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()) });
+    let scope = match crate::control::request_scope(app, &req.params) {
+        Ok(scope) => scope,
+        Err(e) => {
+            let _ = req.reply.send(json!({"ok": false, "error": e}));
+            return None;
+        }
+    };
+    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope });
     None
+}
+
+/// An autosave that failed to load goes back in the recovery list, so it can be discarded (or
+/// left for later) instead of coming back unasked.
+fn reoffer(app: &mut SolveApp, id: &str, dir: Option<&str>) {
+    let dir = dir.map(std::path::PathBuf::from).or_else(|| app.autosave.as_ref().map(|a| a.dir.clone()));
+    let Some(dir) = dir else { return };
+    if app.recoverable.iter().any(|e| e.id == id) {
+        return;
+    }
+    if let Some(e) = solidcraft_engine::recovery::orphans(&dir).into_iter().find(|e| e.id == id) {
+        app.recoverable.insert(0, e);
+    }
 }
 
 /// A recovered design is ours now: autosave it under this app's entry before the old one goes.
@@ -225,6 +247,7 @@ fn start(app: &mut SolveApp) {
     let (tx, rx) = std::sync::mpsc::channel();
     let (preview_tx, preview_rx) = std::sync::mpsc::channel();
     let (command, params) = request.command();
+    let scope = request.scope.clone();
     let thumbnail = request.kind == Kind::Open;
     let spawned = std::thread::Builder::new().name("file-load".into()).spawn(move || {
         let preview_began = std::time::Instant::now();
@@ -243,9 +266,10 @@ fn start(app: &mut SolveApp) {
                 }
             }));
         }
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compute(scratch, command, &params, thumbnail, &worker_phase, &worker_progress)))
-                .unwrap_or_else(|_| Err("the file operation failed; the current design is unchanged".into()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            compute(scratch, command, &params, scope, thumbnail, &worker_phase, &worker_progress)
+        }))
+        .unwrap_or_else(|_| Err("the file operation failed; the current design is unchanged".into()));
         let _ = tx.send(result);
     });
     match spawned {
@@ -351,15 +375,26 @@ fn preview_work_fits(scene: &solidcraft_engine::render::Scene, camera: &solidcra
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn compute(mut session: Session, command: &str, params: &Value, thumbnail: bool, phase: &AtomicU8, progress: &Arc<Progress>) -> Job {
+fn compute(
+    mut session: Session,
+    command: &str,
+    params: &Value,
+    scope: Option<solidcraft_engine::io::vfs::PathScope>,
+    thumbnail: bool,
+    phase: &AtomicU8,
+    progress: &Arc<Progress>,
+) -> Job {
     let profile = solidcraft_engine::geom::env::var_os("PROFILE_OPEN").is_some();
     let began = std::time::Instant::now();
     let cancelled = || Err("file operation cancelled".to_string());
     if progress.is_cancelled() {
         return cancelled();
     }
-    // The timeline's rebuild reports each feature and stops at the next one after Cancel.
-    let result = solidcraft_engine::doc::progress::watch(progress.clone(), || session.execute(command, params)).map_err(|e| e.to_string())?;
+    // The timeline's rebuild reports each feature and stops at the next one after Cancel. An
+    // agent's scope is per thread, so it is set again here.
+    let result =
+        solidcraft_engine::io::vfs::scoped(scope, || solidcraft_engine::doc::progress::watch(progress.clone(), || session.execute(command, params)))
+            .map_err(|e| e.to_string())?;
     if progress.is_cancelled() {
         return cancelled();
     }
@@ -448,7 +483,12 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
             }
             Err(e) => {
                 request.answer(Err(e.clone()));
-                app.set_status(e, true);
+                if let Kind::Recover { id, dir } = &request.kind {
+                    reoffer(app, id, dir.as_deref());
+                    app.set_status(format!("could not recover {}: {e}. Discard it or choose Later", request.path), true);
+                } else {
+                    app.set_status(e, true);
+                }
             }
         }
     }

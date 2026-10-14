@@ -29,6 +29,7 @@ fn plate_doc() -> (Document, u64) {
     let s = doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: sk }, None).unwrap();
     doc.add_feature(
         FeatureKind::Extrude {
+            thin: None,
             sketch: s,
             profiles: ProfileSel::All,
             extent: Extent {
@@ -120,6 +121,7 @@ fn box_fillet_cut_timeline() {
     let s2 = doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: sk }, None).unwrap();
     doc.add_feature(
         FeatureKind::Extrude {
+            thin: None,
             sketch: s2,
             profiles: ProfileSel::Points { points: vec![Vec2::new(20.0, 15.0)] },
             extent: Extent {

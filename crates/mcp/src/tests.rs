@@ -524,7 +524,9 @@ fn tool_calls_stay_inside_the_agents_folders() {
     tool(&mut s, "export", json!({"path": at(&root, "part.step")}));
     tool(&mut s, "open", json!({"path": at(&root, "part.solidcraft")}));
     tool(&mut s, "screenshot", json!({"path": at(&root, "shot.png"), "width": 64, "height": 64}));
-    let mut escapes = vec![at(&out, "x.step"), at(&root, "../out/x.step")];
+    let escapes = vec![at(&out, "x.step"), at(&root, "../out/x.step")];
+    #[cfg(unix)]
+    let mut escapes = escapes;
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&out, root.join("link")).unwrap();

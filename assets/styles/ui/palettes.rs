@@ -75,6 +75,8 @@ impl Tokens {
             overlay: Color32::from_rgba_unmultiplied_const(255, 255, 255, 235),
             rubber_band: Color32::from_rgb(30, 120, 230),
             app_bar_text: Color32::from_rgb(230, 234, 242),
+            app_bar_hover: Color32::from_rgba_unmultiplied_const(255, 255, 255, 28),
+            app_bar_tab_edge: Color32::from_rgba_unmultiplied_const(255, 255, 255, 40),
             timeline_item: Color32::WHITE,
             timeline_item_error: Color32::from_rgb(250, 220, 220),
             timeline_marker: Color32::from_rgb(70, 76, 88),

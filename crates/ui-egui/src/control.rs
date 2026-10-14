@@ -20,8 +20,8 @@
 //!   pointer input in screen points; `ui.scroll {x, y, delta}`: mouse-wheel input in
 //!   points (zooms); `ui.key {key, cmd?, shift?}`, `ui.text {text}`
 //! - `ui.screenshot {path?}`: PNG of the window; `ui.render {path, width?, height?}`: headless
-//!   CPU render of the model with the current camera and the section the viewport shows (no
-//!   window needed)
+//!   CPU render of the model with the current camera, in the window's theme, with the section
+//!   the viewport shows (no window needed)
 //! - `ui.menu {x?, y?, target?, close?}`: open a context menu at a point (the viewport's marking
 //!   menu, or a browser menu with `target: {type: body|sketch|component, …}`); without a point,
 //!   the open menu and its items. `ui.menuPick {item}` runs an item by id or label;
@@ -159,20 +159,28 @@ fn batch(app: &mut SolveApp, p: &Value) -> Outcome {
     ok(json!({"completed": results.len(), "results": results, "undone": 0}))
 }
 
-pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
-    // A request from an MCP server carries the folders its agent may use; every file the
-    // request reaches must lie inside them (docs/mcp.md).
-    let Some(allowed) = req.params.get("allow_paths") else { return dispatch(app, ctx, &req.method, &req.params) };
+/// A request from an MCP server carries the folders its agent may use (`allow_paths`); every
+/// file the request reaches must lie inside them (docs/mcp.md). `None`: it names none.
+pub fn request_scope(app: &SolveApp, params: &Value) -> Result<Option<vfs::PathScope>, String> {
+    let Some(allowed) = params.get("allow_paths") else { return Ok(None) };
     let Some(roots) = allowed.as_array().and_then(|a| a.iter().map(|r| r.as_str().map(std::path::PathBuf::from)).collect::<Option<Vec<_>>>()) else {
-        return err("`allow_paths` must be a list of folders");
+        return Err("`allow_paths` must be a list of folders".into());
+    };
+    // Plus the app's own recovery folder and, when it is a safe one, the open design's folder.
+    let roots = roots.into_iter().chain(solidcraft_engine::recovery::default_dir());
+    Ok(Some(vfs::PathScope::new(roots).with_design(app.session.path.as_deref())))
+}
+
+pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
+    let scope = match request_scope(app, &req.params) {
+        Ok(Some(scope)) => scope,
+        Ok(None) => return dispatch(app, ctx, &req.method, &req.params),
+        Err(e) => return err(e),
     };
     let mut p = req.params.clone();
     if let Some(o) = p.as_object_mut() {
         o.remove("allow_paths");
     }
-    // Plus the app's own recovery folder and, when it is a safe one, the open design's folder.
-    let roots = roots.into_iter().chain(solidcraft_engine::recovery::default_dir());
-    let scope = vfs::PathScope::new(roots).with_design(app.session.path.as_deref());
     vfs::scoped(Some(scope), || dispatch(app, ctx, &req.method, &p))
 }
 
@@ -221,6 +229,7 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             "renderer": if app.viewport.gpu.is_some() { "gpu" } else { "cpu" },
             "frame_ms": app.frame_ms,
             "file_busy": app.file_load.busy(),
+            "file_picker_busy": app.file_picker_busy(),
             "build_ms": app.viewport.build_ms,
             "preview": {"active": app.preview.active, "busy": app.preview.busy, "error": app.preview.error, "ms": app.preview.ms, "replaced": app.preview.replaced},
             "home": app.home.open,
@@ -620,9 +629,15 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         "ui.render" => {
             let w = f("width").unwrap_or(1280.0).clamp(16.0, 8192.0) as usize;
             let h = f("height").unwrap_or(800.0).clamp(16.0, 8192.0) as usize;
-            // Cut by the section the viewport shows (an open Section Analysis dialog's preview,
-            // a sketch's Slice), not only the committed one.
-            let scene = solidcraft_engine::view::scene_with_section(&app.session, &app.cam, crate::viewport::section_plane(app));
+            // In the window's theme, and cut by the section the viewport shows (an open Section
+            // Analysis dialog's preview, a sketch's Slice), not only the committed one.
+            let scene = solidcraft_engine::view::scene_with_palette(
+                &app.session,
+                &app.cam,
+                crate::viewport::section_plane(app),
+                solidcraft_engine::view::world_curve_parts,
+                &crate::viewport::scene_palette(app.ui.dark),
+            );
             let Some(png) = render_png(&scene, &app.cam, w, h) else { return err("render failed") };
             match s("path") {
                 Some(path) => match vfs::check(path).and_then(|()| std::fs::write(path, &png)) {
@@ -678,6 +693,32 @@ mod tests {
             Outcome::Screenshot { .. } => panic!("ui.render took a screenshot"),
         }
         std::fs::read(path).unwrap()
+    }
+
+    /// `ui.render` draws in the window's theme (#974): its background is the viewport's, light
+    /// or dark.
+    #[test]
+    fn model_render_is_in_the_windows_theme() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        let mut app = SolveApp::new(s, Services::default());
+        let dir = std::env::temp_dir().join(format!("solidcraft-render-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for dark in [false, true, false] {
+            app.ui.dark = dark;
+            let png = render(&mut app, &dir.join(format!("dark-{dark}.png")));
+            let img = image::load_from_memory(&png).unwrap().to_rgba8();
+            // The top row is the background's top: its most common colour.
+            let mut counts = std::collections::HashMap::new();
+            for x in 0..img.width() {
+                *counts.entry(img.get_pixel(x, 0).0).or_insert(0) += 1;
+            }
+            let top = counts.into_iter().max_by_key(|(_, n)| *n).map(|(c, _)| c).unwrap();
+            let want = if dark { crate::theme::Tokens::dark() } else { crate::theme::Tokens::light() }.viewport_top;
+            let near = top.iter().zip([want.r(), want.g(), want.b()]).all(|(a, b)| a.abs_diff(b) <= 2);
+            assert!(near, "dark {dark}: the render's top row is {top:?}, the window's background {want:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A model render shows the section the window shows: the open Section Analysis dialog's
@@ -831,6 +872,33 @@ mod tests {
         assert!(v["result"]["failed"]["error"].as_str().is_some_and(|e| e.contains("outside the folders this agent may use")), "{v}");
         assert!(root.join("a.step").exists());
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written outside");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An MCP server's `doc.open` and imports load off the window thread (`file_load`), where
+    /// the agent's folders hold as they do for every other request.
+    #[test]
+    fn file_loads_stay_inside_allow_paths() {
+        let mut h = crate::scenario::Harness::new();
+        let base = vfs::temp_dir().join(format!("solidcraft-load-scope-{}", std::process::id()));
+        let (root, out) = (base.join("root"), base.join("out"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        for d in [&root, &out] {
+            std::fs::write(d.join("part.solidcraft"), solidcraft_engine::io::write_design(&s.doc)).unwrap();
+        }
+        s.execute("file.export", &json!({"path": out.join("part.step").to_string_lossy()})).unwrap();
+        let load = |command: &str, d: &std::path::Path, file: &str| json!({"command": command, "params": {"path": d.join(file).to_string_lossy()}, "allow_paths": [root.to_string_lossy()]});
+        for (command, file) in [("doc.open", "part.solidcraft"), ("file.insert_step", "part.step")] {
+            let (v, _) = h.call_queued("engine.execute", load(command, &out, file));
+            assert!(v["ok"] == false && v.to_string().contains("outside the folders this agent may use"), "{command}: {v}");
+        }
+        let (v, _) = h.call_queued("engine.execute", load("doc.open", &root, "part.solidcraft"));
+        assert_eq!(v["ok"], true, "{v}");
+        let (v, _) = h.call_queued("engine.execute", json!({"command": "doc.open", "params": {"path": "x"}, "allow_paths": "/"}));
+        assert!(v["error"].as_str().is_some_and(|e| e.contains("allow_paths")), "{v}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

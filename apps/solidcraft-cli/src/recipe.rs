@@ -296,6 +296,17 @@ pub fn to_script(recipe: &Value) -> Result<Value, String> {
             Some("sketch") => sketch_cmds(f, &mut out)?,
             Some("extrude") => {
                 let mut p = json!({"sketch": profile_sketch(f), "profiles": profiles_of(f), "operation": op(f), "name": name, "body_names": bodies});
+                // Thin: {sketch, curves, thickness, side?, thickness2?} instead of profiles.
+                if let (Some(thin), Some(params)) = (f.get("thin"), p.as_object_mut()) {
+                    params.remove("profiles");
+                    params.insert("thin".into(), json!(true));
+                    params.insert("sketch".into(), thin.get("sketch").cloned().unwrap_or(Value::Null));
+                    for key in ["curves", "thickness", "side", "thickness2"] {
+                        if let Some(v) = thin.get(key) {
+                            params.insert(key.into(), v.clone());
+                        }
+                    }
+                }
                 extent(f, &mut p);
                 out.push(json!({"command": "solid.extrude", "params": p}));
             }

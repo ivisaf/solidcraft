@@ -6,9 +6,11 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod catalog;
 mod design;
 mod design_metadata;
 mod dxf;
+mod dxf_out;
 pub use design::{
     DesignCompression, DesignContainerReader, DesignGeometry, DesignPreview, THUMBNAIL_SIZE, is_design_container, read_design_file,
     read_design_geometry, read_design_preview, read_design_thumbnail, read_design_thumbnail_file, write_design_container,
@@ -24,6 +26,7 @@ pub mod urdf;
 pub mod vfs;
 
 pub use dxf::{read_dxf, write_dxf};
+pub use dxf_out::{DxfEntity, DxfLayer, DxfShape, loop_shapes, seg_shape, write_dxf_drawing};
 pub use legacy_dir::{APP_ID, LEGACY_APP_ID, adopt_legacy_dir, legacy_flatpak_path};
 pub use safe_write::{backup_path, write_atomic};
 pub use sketch2d::{Geom2, MAX_DRAWING_BYTES};

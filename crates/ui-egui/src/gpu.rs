@@ -757,9 +757,10 @@ fn tessellation(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Qu
 }
 
 /// Create the pipelines. Call once with the app's render state and its depth/stencil/MSAA
-/// settings. Without a stencil the section cap does not hide the inside of cut bodies.
-pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) -> GpuTarget {
-    let tess = tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER);
+/// settings. Without a stencil the section cap does not hide the inside of cut bodies. Without
+/// `gpu_meshing` (safe mode) bodies are meshed on the CPU.
+pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32, gpu_meshing: bool) -> GpuTarget {
+    let tess = if gpu_meshing { tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER) } else { None };
     let t = GpuTarget { format: rs.target_format, depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits), samples, tess: tess.is_some() };
     let res = Resources::new(&rs.device, t, tess);
     rs.renderer.write().callback_resources.insert(res);

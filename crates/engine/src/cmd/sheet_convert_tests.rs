@@ -637,7 +637,9 @@ fn flat_circles(s: &mut Session) -> Vec<(f64, [f64; 2])> {
 /// How many entities of each kind the flat pattern's DXF has.
 fn dxf_entities(s: &mut Session) -> (usize, usize, usize) {
     let dxf = run(s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap_or("").replace("\r\n", "\n");
-    let n = |kind: &str| dxf.matches(&format!("\n0\n{kind}\n")).count();
+    // Group codes may be padded (`  0`): compare the code and value lines trimmed.
+    let lines: Vec<&str> = dxf.lines().map(str::trim).collect();
+    let n = |kind: &str| lines.chunks(2).filter(|pair| pair == &["0", kind]).count();
     (n("LINE"), n("ARC"), n("CIRCLE"))
 }
 

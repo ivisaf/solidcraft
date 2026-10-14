@@ -8,7 +8,7 @@ plain Python 3 (standard library only) with one function per case. Running a scr
 `expected.json` of its cases with `"source": "analytic"` and a `method` string giving the formulas:
 
 ```sh
-python3 tools/oracle-analytic/cases_basic.py        # 01-29: boxes, holes, revolves, sketches
+python3 tools/oracle-analytic/cases_basic.py        # 01-29, 82: boxes, holes, revolves, sketches, thin walls
 python3 tools/oracle-analytic/cases_features.py     # 32-66: fillets, shells, sweeps, patterns
 python3 tools/oracle-analytic/cases_sheet_metal.py  # 67-76: sheet metal
 python3 tools/oracle-analytic/cases_fillets.py      # 77-81: variable, chord-length, tapered and spline fillets

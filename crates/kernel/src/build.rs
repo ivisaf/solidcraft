@@ -1398,16 +1398,50 @@ pub(crate) fn ruled_loft_faces(wires: &[mt::Wire], edge_sources: &[Vec<Vec<usize
     Ok(sides)
 }
 
-/// Points across the sections (one per section, in order) as a smooth B-spline: cubic through
-/// four or more, quadratic through three.
-fn across(pts: &[Vec3]) -> Option<mt::BSplineCurve<mt::Point3>> {
+/// Points across the sections (one per section, in order) as a smooth B-spline through them at the
+/// parameters `u` (rising from 0 to 1, one per section): cubic through four or more, quadratic
+/// through three.
+fn across(pts: &[Vec3], u: &[f64]) -> Option<mt::BSplineCurve<mt::Point3>> {
     match pts {
         [a, b, c] => {
-            let m = *b * 2.0 - (*a + *c) * 0.5;
+            // The quadratic Bezier through `b` at t = u[1].
+            let t = *u.get(1)?;
+            if !(t > 0.0 && t < 1.0) {
+                return None;
+            }
+            let m = (*b - *a * ((1.0 - t) * (1.0 - t)) - *c * (t * t)) * (1.0 / (2.0 * t * (1.0 - t)));
             mt::BSplineCurve::try_new(mt::KnotVec::bezier_knot(2), vec![p3(*a), p3(m), p3(*c)]).ok()
         }
-        _ => interpolate_cubic(pts),
+        _ => interpolate_cubic_at(pts, u),
     }
+}
+
+/// The parameters of the sections along a loft: in proportion to the distance between them (the
+/// mean over the wires' vertices), so that unevenly spaced sections get a surface that follows
+/// them. At a uniform parameter a section close to its neighbour makes the surface overshoot
+/// between the others (by several times the section's size when the spacing differs tenfold).
+/// Evenly spaced sections give the uniform parameters.
+fn section_parameters(edges: &[Vec<mt::Edge>]) -> Vec<f64> {
+    let m = edges.len();
+    let uniform = || (0..m).map(|i| i as f64 / (m.max(2) - 1) as f64).collect::<Vec<f64>>();
+    let corners: Vec<Vec<Vec3>> = edges.iter().map(|es| es.iter().map(|e| from_p3(e.front().point())).collect()).collect();
+    let mut u = vec![0.0];
+    for w in corners.windows(2) {
+        let (Some(a), Some(b)) = (w.first(), w.get(1)) else { return uniform() };
+        let n = a.len().min(b.len());
+        if n == 0 {
+            return uniform();
+        }
+        let step = a.iter().zip(b).map(|(p, q)| p.dist(*q)).sum::<f64>() / n as f64;
+        u.push(u.last().copied().unwrap_or(0.0) + step);
+    }
+    let Some(total) = u.last().copied().filter(|t| t.is_finite() && *t > 0.0) else { return uniform() };
+    let u: Vec<f64> = u.iter().map(|x| x / total).collect();
+    // A section on top of its neighbour: no parameter for it, so the uniform ones.
+    if u.windows(2).any(|w| w.get(1).zip(w.first()).is_none_or(|(b, a)| b - a < 1e-6)) {
+        return uniform();
+    }
+    u
 }
 
 /// A loft whose side faces are B-spline surfaces through every section (smooth across the
@@ -1432,6 +1466,7 @@ pub(crate) fn smooth_loft_faces(wires: &[mt::Wire], numbers: &[Vec<Vec<usize>>],
         }
     };
     let (Some(first), Some(last)) = (edges.first(), edges.last()) else { return Err(fail("sections")) };
+    let along = section_parameters(&edges);
     // Seams: through the k-th vertex of every section (an open wire's last one at the end of
     // its last edge).
     let vertex = |e: &mt::Edge, end: bool| if end { e.back().clone() } else { e.front().clone() };
@@ -1440,7 +1475,7 @@ pub(crate) fn smooth_loft_faces(wires: &[mt::Wire], numbers: &[Vec<Vec<usize>>],
     for k in 0..seam_count {
         let (at, end) = if k < n { (k, false) } else { (n - 1, true) };
         let pts: Vec<Vec3> = edges.iter().filter_map(|es| es.get(at).map(|e| from_p3(vertex(e, end).point()))).collect();
-        let c = across(&pts).ok_or_else(|| fail("seam"))?;
+        let c = across(&pts, &along).ok_or_else(|| fail("seam"))?;
         let (Some(a), Some(b)) = (first.get(at), last.get(at)) else { return Err(fail("seam")) };
         seams.push(mt::Edge::new(&vertex(a, end), &vertex(b, end), mt::Curve::BSplineCurve(c)));
     }
@@ -1458,7 +1493,7 @@ pub(crate) fn smooth_loft_faces(wires: &[mt::Wire], numbers: &[Vec<Vec<usize>>],
         let mut vk = None;
         for j in 0..m {
             let pts: Vec<Vec3> = curves.iter().filter_map(|c| c.control_points().get(j).map(|p| from_p3(*p))).collect();
-            let c = across(&pts).ok_or_else(|| fail("surface"))?;
+            let c = across(&pts, &along).ok_or_else(|| fail("surface"))?;
             vk = Some(c.knot_vec().clone());
             ctrl.push(c.control_points().clone());
         }
