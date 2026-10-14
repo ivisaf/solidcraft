@@ -56,6 +56,9 @@ file name (alternate data streams), reserved device names with any extension (`N
 `COM1.txt`, …) and short 8.3 names (`PROGRA~1`) are refused before any file system call, and the
 resolved path is checked again, so a link or junction that leads to a share is refused too. This
 includes a `sketch.text` font given as a file path; installed fonts named by family still work.
+The server spells its own folders (scratch, recovery) with long names, so they work when the
+temporary folder's path has a short name (`…\NAME~1.XYZ\AppData\Local\Temp`, as Windows often
+gives when the user folder's name is long).
 A refused path is a tool error saying why.
 
 A hard link inside an allowed folder can't be told apart from an ordinary file, so a hard link
@@ -149,6 +152,20 @@ step: the design, the active sketch and the undo history are restored exactly as
 however long the history is. Batches that call `file.new` or `doc.open` get the design back,
 not its file path. (An older app without checkpoints falls back to undoing as many steps as
 the batch added to the undo history.)
+
+## Camera and close-up recipe
+
+The `camera` of `screenshot` (the object `view.apply` and `view.save` take too) is an orbit camera, `{target, yaw, pitch, distance, fov?}`, in millimetres and **radians**. Unlike the `angle` of `solid.move`, a bare number is not degrees here. The eye is at `target + distance * (-sin(yaw) * cos(pitch), -cos(yaw) * cos(pitch), sin(pitch))`, looking at `target` with Z up on the screen. So `yaw: 0, pitch: 0` is the front view: the eye at -Y, looking along +Y, with +X to the right. A yaw of π/2 looks from -X, π from +Y and -π/2 from +X. The pitch is the elevation angle up from the XY plane, and π/2 looks straight down with +X to the right and +Y up. `fov` is the vertical field of view in radians. `0`, or no `fov`, is an orthographic view whose visible half-height is 0.4 × `distance`; with a perspective `fov` the half-height at the target is `distance * tan(fov / 2)`. `inspect.section` removes what lies on the side its normal points to: it keeps the points `p` with `n · p < d`, where `d = n · origin` (`flip: true` keeps the other side). To look into the cut, put the eye on the removed side.
+
+To look closely at one part of a large model, such as a STEP assembly, work in a headless session. These steps change only the open design in memory:
+
+1. Open the model with `solidcraft-cli mcp --in assembly.step` (or the `open` tool). `inspect_design` lists the bodies with their names and bounding boxes.
+2. Remove what is in the way with `solid.remove`, e.g. `{"bodies": ["Cover"]}`.
+3. Cut the region out of the rest with `solid.box`, e.g. `{"corner": [40, 0, -45], "length": 20, "width": 50, "height": 45, "operation": "intersect", "targets": ["Housing", "Plate"]}`. Each listed body is trimmed to the box, and one that lies wholly outside the box is removed. The box itself is not kept.
+4. If the model lies on its back (many STEP files have +Y up), stand it Z up with `solid.move`, listing every body you keep, e.g. `{"bodies": ["Housing", "Plate"], "axis": [1, 0, 0], "angle": 90}`. It turns the bodies about the world origin, and a bare angle is in degrees. A turn of +90° about X takes +Y to +Z.
+5. Colour the parts that matter with `appearance.assign`, e.g. `{"bodies": ["Housing"], "color": "#3a7bd5"}`, and hide helper bodies or sketches with `browser.visibility`, e.g. `{"items": ["Plate"], "visible": false}`.
+6. Cut a section with `inspect.section`, e.g. `{"plane": {"origin": [50, 30, 0], "normal": [0, 1, 0]}}` or `{"plane": "XY", "at": 5}`.
+7. Take the picture with `screenshot`: a `camera` whose `target` is the centre of the region and whose eye is on the cut side, `source: "model"`, and `path`, `width` and `height` as needed. An orthographic picture is 0.8 × `distance` high, so a `distance` of about 1.5 times the region's size frames it. Look at the image, adjust `yaw`, `pitch` and `distance`, and shoot again. Headless, the picture is always a render of the model; bridged to the app, `source: "model"` asks for that render instead of the app's window.
 
 ## Compact replies
 

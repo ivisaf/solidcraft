@@ -745,3 +745,59 @@ fn a_plate_with_holes_drilled_here_converts_with_round_holes() {
     assert!(circles.len() == 9 && circles.iter().all(|(radius, _)| (radius - r).abs() < 1e-9), "{circles:?}");
     assert_eq!(dxf_entities(&mut s), (4, 0, 9));
 }
+
+/// A box `l` x `w` x `t` with round holes (centre, diameter) drilled through it, converted,
+/// picked on its top face.
+fn convert_box(l: f64, w: f64, t: f64, holes: &[([f64; 2], f64)]) -> Session {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": l, "width": w, "height": t, "body_name": "Plate"}));
+    for (c, d) in holes {
+        run(&mut s, "solid.hole", json!({"position": [c[0], c[1], t], "diameter": d}));
+    }
+    run(&mut s, "sheet.convert", json!({"body": "Plate", "face": [l * 0.4, w * 0.25, t]}));
+    s
+}
+
+/// A long thin strip converts. 1200 x 100 x 1 was refused with "no outline on that face": the
+/// outline's tolerance was a thousandth of the body's size (1.2), more than the thickness, so the
+/// far side's triangles counted as the picked face's and no boundary was left.
+#[test]
+fn a_long_thin_strip_converts() {
+    let mut s = convert_box(1200.0, 100.0, 1.0, &[]);
+    assert!((volume(&mut s) - 120_000.0).abs() < 1e-6 * 120_000.0, "{}", volume(&mut s));
+    assert!(same_size(flat_size(&mut s), (1200.0, 100.0), 1e-6), "{:?}", flat_size(&mut s));
+    let t = flat(&mut s)["flat_size_mm"][2].as_f64().unwrap_or(f64::NAN);
+    assert!((t - 1.0).abs() < 1e-9, "{t}");
+    assert_eq!(dxf_entities(&mut s), (4, 0, 0));
+}
+
+/// Plates further past that, a thousandth of their size two to six times their thickness: a
+/// full sheet, a foil, a long bar.
+#[test]
+fn plates_thousands_of_times_longer_than_thick_convert() {
+    for (l, w, t) in [(3000.0, 1500.0, 0.5), (400.0, 100.0, 0.2), (6000.0, 20.0, 1.0)] {
+        let mut s = convert_box(l, w, t, &[]);
+        let want = l * w * t;
+        assert!((volume(&mut s) - want).abs() < 1e-6 * want, "{l} x {w} x {t}: {} vs {want}", volume(&mut s));
+        assert!(same_size(flat_size(&mut s), (l, w), 1e-6), "{l} x {w} x {t}: {:?}", flat_size(&mut s));
+        assert_eq!(dxf_entities(&mut s), (4, 0, 0), "{l} x {w} x {t}");
+    }
+}
+
+/// The strip with round holes down to its thickness across keeps every one as a circle. At 1200
+/// long it was refused; just under the old limit, 990 long, it converted without the 1 mm hole:
+/// the outline's chords could sag 0.99, more than that hole's radius, and it fell out.
+#[test]
+fn a_long_thin_strip_keeps_its_small_round_holes() {
+    let d = [10.0, 4.0, 2.0, 1.0];
+    for l in [990.0, 1200.0] {
+        let holes: Vec<([f64; 2], f64)> = d.iter().enumerate().map(|(i, d)| ([l * (i as f64 + 1.0) / 5.0, 50.0], *d)).collect();
+        let mut s = convert_box(l, 100.0, 1.0, &holes);
+        let want = l * 100.0 - PI / 4.0 * d.iter().map(|d| d * d).sum::<f64>();
+        assert!((volume(&mut s) - want).abs() < 1e-5 * want, "{l}: {} vs {want}", volume(&mut s));
+        let mut radii: Vec<f64> = flat_circles(&mut s).iter().map(|c| c.0).collect();
+        radii.sort_by(f64::total_cmp);
+        assert!(radii.len() == 4 && radii.iter().zip([0.5, 1.0, 2.0, 5.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{l}: {radii:?}");
+        assert_eq!(dxf_entities(&mut s), (4, 0, 4), "{l}");
+    }
+}

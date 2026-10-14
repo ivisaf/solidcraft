@@ -693,6 +693,8 @@ fn action_matrix_worker() {
             && let Some((name, expr)) = &edit
             && stable_hash(&format!("{k} edit")).is_multiple_of(EDIT_SAMPLE)
         {
+            // Marked like an action, so a hang here is put down to the edit round (not to loading).
+            emit(json!({"start": i, "edit": true}));
             let t = Instant::now();
             let start = s.doc.features.len();
             let r = scratch
@@ -785,7 +787,9 @@ fn run_design(design: &str, out: &Path, sample: u64) -> Vec<Value> {
             .map(|f| std::io::BufReader::new(f).lines().map_while(Result::ok).filter_map(|l| serde_json::from_str(&l).ok()).collect())
             .unwrap_or_default();
         let done = lines.iter().any(|l| l.get("done").is_some());
-        let last_start = lines.iter().rev().take_while(|l| l.get("start").is_some() || l.get("design").is_none()).find_map(|l| l["start"].as_u64());
+        let last = lines.iter().rev().take_while(|l| l.get("start").is_some() || l.get("design").is_none()).find(|l| l.get("start").is_some());
+        let last_start = last.and_then(|l| l["start"].as_u64());
+        let in_edit = last.is_some_and(|l| l["edit"] == true);
         results = lines.iter().filter(|l| l.get("design").is_some()).cloned().collect();
         if done {
             break;
@@ -800,7 +804,7 @@ fn run_design(design: &str, out: &Path, sample: u64) -> Vec<Value> {
         };
         // Which action was it? The child enumerates them; ask it by running from there with a
         // marker: simplest is to record the index and let the next run name it.
-        extra.push(json!({"design": design, "index": i, "kind": if timed_out { "timeout" } else { "crash" },
+        extra.push(json!({"design": design, "index": i, "edit": in_edit, "kind": if timed_out { "timeout" } else { "crash" },
                           "message": if timed_out { format!("no result after {} s", ACTION_TIMEOUT.as_secs()) } else { format!("the process ended: {status:?}") }}));
         from = i as usize + 1;
     }
@@ -809,7 +813,10 @@ fn run_design(design: &str, out: &Path, sample: u64) -> Vec<Value> {
         let names = action_names(design);
         for e in &mut extra {
             if let Some(i) = e.get("index").and_then(Value::as_u64) {
-                let (entity, action) = names.get(i as usize).cloned().unwrap_or_else(|| (format!("action{i}"), "unknown".into()));
+                let (entity, mut action) = names.get(i as usize).cloned().unwrap_or_else(|| (format!("action{i}"), "unknown".into()));
+                if e["edit"] == true {
+                    action += "+edit";
+                }
                 *e = json!({"design": design, "entity": entity, "action": action, "ok": false, "kind": e["kind"], "message": e["message"]});
             }
         }

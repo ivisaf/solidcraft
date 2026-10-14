@@ -661,6 +661,25 @@ mod tests {
         assert_eq!(s.doc.features.len(), before, "a planned command changed the design");
     }
 
+    /// A trim keeps its construction plane when the plane is renamed.
+    #[test]
+    fn renaming_a_plane_keeps_a_surface_trim_on_it() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 20]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "surface.patch", json!({"sketch": "S", "body_name": "Sheet"}));
+        run(&mut s, "construct.plane.offset", json!({"base": "YZ", "offset": 25, "name": "Cut"}));
+        run(&mut s, "surface.trim", json!({"body": "Sheet", "plane": "Cut", "keep": [10, 10, 0], "name": "Trim"}));
+        let trimmed = area(&s, "Sheet");
+        run(&mut s, "timeline.rename", json!({"feature": "Cut", "name": "Cutter"}));
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "the trim still finds its plane");
+        let def = run(&mut s, "timeline.inspect", json!({"feature": "Trim"}));
+        assert_eq!(def["definition"]["plane"]["name"], "Cutter", "{def}");
+        assert!((area(&s, "Sheet") - trimmed).abs() < 1e-6, "{} vs {trimmed}", area(&s, "Sheet"));
+        assert!(trimmed < 40.0 * 20.0 * 0.9, "the sheet is trimmed: {trimmed}");
+    }
+
     /// A rectangle patched, trimmed by a plane and thickened; a box's open top patched; a rim
     /// that is not planar patched.
     #[test]

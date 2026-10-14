@@ -559,3 +559,18 @@ fn a_boundary_found_across_a_seam_is_not_used() {
     let r = fuzz::run(20, 8);
     assert_eq!(r.outcome.kind, "ok", "seed 20: {:?}\n{}", r.outcome, r.script());
 }
+
+/// Seed 33 ends in a fillet on its second body (#854's corner blends build it differently from
+/// before). Its display plan and its measured volume agree for every body (on main before #854,
+/// that body read 4439.42 through the display plan and 4443.51 measured).
+#[test]
+fn seed_33_display_plan_and_measure_agree() {
+    let r = fuzz::run(33, 8);
+    assert_eq!(r.outcome.kind, "ok", "seed 33: {:?}\n{}", r.outcome, r.script());
+    let s = script(r.script());
+    for b in &s.model.state().bodies {
+        let planned = b.body.display_plan(2e-4).unwrap().evaluate().measure().volume;
+        let measured = solidcraft_kernel::measure(&b.body).unwrap().volume;
+        assert!((planned - measured).abs() < 2e-5 * measured, "{}: planned {planned}, measured {measured}", b.name);
+    }
+}

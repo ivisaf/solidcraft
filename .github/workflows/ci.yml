@@ -286,9 +286,31 @@ jobs:
           name: oracle-report
           path: docs/oracle.md
 
+  # D3D12's older shader compiler (FXC, used where dxcompiler.dll is absent) is stricter than
+  # DXC, Vulkan and Metal: a shader it cannot compile once crashed the app at startup. Build the
+  # GPU tessellation pipeline with FXC on the runner's WARP software adapter and compare its
+  # results with the CPU.
+  windows-fxc:
+    name: Windows D3D12 FXC shaders
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      WGPU_BACKEND: dx12
+      WGPU_DX12_COMPILER: fxc
+      SOLIDCRAFT_REQUIRE_GPU: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-fxc
+      - run: cargo test -p solidcraft-gpu --profile ci --locked
+
   # Preserve the existing check name for branch protection, including docs-only PRs.
   ci:
-    needs: [changes, checks, clippy, build-tests, tests, doc-tests, oracle]
+    needs: [changes, checks, clippy, build-tests, tests, doc-tests, oracle, windows-fxc]
     if: always()
     runs-on: ubuntu-24.04
     steps:
@@ -302,6 +324,7 @@ jobs:
           TESTS: ${{ needs.tests.result }}
           DOCS: ${{ needs.doc-tests.result }}
           ORACLE: ${{ needs.oracle.result }}
+          WINDOWS_FXC: ${{ needs.windows-fxc.result }}
         run: |
           test "$CHANGES" = success
           test "$CHECKS" = success
@@ -311,6 +334,7 @@ jobs:
             test "$TESTS" = success
             test "$DOCS" = success
             test "$ORACLE" = success
+            test "$WINDOWS_FXC" = success
           fi
 
   wasm:

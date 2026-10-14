@@ -46,7 +46,9 @@ circle and update the outline when the inline **Sides** value changes.
 `sketch.edit_text` take a `font`, the family or full name of an installed font ("DejaVu Sans") or the path
 of a `.ttf` / `.otf` file, and the **Edit Text** dialog has a **Font** field for it. An unknown font is an
 error, and the font is kept with the text in the design, so the text stays editable in it. `SOLIDCRAFT_FONT_DIRS`
-adds folders to the ones searched for installed fonts.
+adds folders to the ones searched for installed fonts. The same two commands refuse a `text` that is not a
+string, an `at` that is not two numbers, and a `height` or `angle` that is not a number (or a `height` that is not
+positive) with a message, instead of drawing the text with a default; left out, they keep their defaults.
 
 Right-click a letter's filled interior or outline and choose **Edit Text**. You can also
 start **Edit Text** first and click the letter. All outlines belonging to that text are

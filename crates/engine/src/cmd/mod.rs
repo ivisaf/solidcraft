@@ -45,6 +45,7 @@ mod measure_sel;
 mod mesh;
 pub(crate) mod motion;
 mod parts;
+mod script;
 mod section;
 pub(crate) use measure_sel::measure_items;
 #[cfg(test)]
@@ -52,6 +53,8 @@ mod kernel_heal_tests;
 mod parameters;
 mod plastic;
 mod render;
+#[cfg(test)]
+mod script_tests;
 mod sheet;
 mod sketch;
 pub(crate) use sketch::author_path_for_rebind;
@@ -246,6 +249,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(delete::COMMANDS.iter());
     v.extend(edit::COMMANDS.iter());
     v.extend(clipboard::COMMANDS.iter());
+    v.extend(script::COMMANDS.iter());
     v.extend(parameters::COMMANDS.iter());
     v.extend(file::COMMANDS.iter());
     v.extend(inspect::COMMANDS.iter());

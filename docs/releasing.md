@@ -20,7 +20,8 @@ also attached without the version in their names, for example `solidcraft-window
 `solidcraft-linux-x86_64.AppImage`, and listed in `SHA256SUMS.txt`. The README's Download section
 links to `https://github.com/bherbruck/solidcraft/releases/latest/download/<name>`, which follows
 the release marked latest; nightlies never are. Keep these names stable: renaming one breaks the
-README links.
+README links and the in-app update check, which picks them by name (`crates/ui-egui/src/update.rs`;
+[updates and privacy](book/src/guide/updates.md)).
 
 Project Pages publishes the documentation, browser app and published-release Flatpak
 repository under `/solidcraft/`. Do not add a separate owner-site publisher or permanent
@@ -107,17 +108,7 @@ it at the draft's target commit.
 
 Items to carry into the next release's notes (step 3 below), then remove from here:
 
-- **Security (agents and the control channel, [#205](https://github.com/bherbruck/solidcraft/issues/205)).**
-  Upgrading is recommended for anyone who drives SolidCraft from an AI agent or runs it with
-  `--control` on a shared machine. MCP tool calls now reach files only in the open design's
-  folder (inside home, without its hidden files), SolidCraft's recovery folder and folders
-  given with `--allow-path`; `..`, symlinks that lead out and Windows UNC, device, stream and
-  short-name paths are refused ([#578](https://github.com/bherbruck/solidcraft/pull/578), thanks
-  @kravens). `doc.recovery_discard` deletes only real recovery entries. The control port now
-  needs a per-launch token from a file only the user can read, so other local users can't drive
-  the app; `solidcraft-cli mcp --connect` finds it by itself, other clients must send it (see
-  docs/control-protocol.md). MCP tool annotations no longer understate side effects. Reported by
-  @CalvinEthos.
+- None yet.
 
 ## Verify and publish
 
@@ -214,6 +205,47 @@ To enable the Snap Store once (owner):
 Renew the credentials before `--expires` by repeating steps 2 and 3. The snap uses strict
 confinement and only plugs that connect automatically, apart from `removable-media`, which users
 connect with `sudo snap connect solidcraft:removable-media` (getting-started.md).
+
+## Update signing
+
+The app's **Update now** (docs/book/src/guide/updates.md) only installs a package whose SHA-256
+matches the release's `SHA256SUMS.txt`, fetched over HTTPS. That protects against corrupted and
+tampered downloads in transit, but not against someone who can upload release assets. Signing
+the checksum list closes that gap: once `PUBLIC_KEY` in `crates/ui-egui/src/update/install.rs`
+is set, the app also requires `SHA256SUMS.txt.minisig`, a [minisign](https://jedisct1.github.io/minisign/)
+signature by that key whose trusted comment names the release (`SolidCraft v<version>`), and
+refuses to update in place otherwise. The release workflow signs the list when the
+`UPDATE_SIGNING_KEY` secret exists, and fails when the app expects signatures but the secret is
+missing.
+
+To turn it on once (owner):
+
+1. On a trusted machine with minisign (`sudo apt install minisign`, `brew install minisign` or
+   `winget install minisign`), make a key pair without a password (the workflow can't type one):
+
+   ```sh
+   minisign -G -W -p solidcraft-update.pub -s solidcraft-update.key
+   ```
+
+2. Store the secret key as the repository secret and keep an offline backup of it (a lost key
+   means a new key and an app release that carries it; a leaked key means the same, quickly):
+
+   ```sh
+   gh secret set UPDATE_SIGNING_KEY -R bherbruck/solidcraft < solidcraft-update.key
+   ```
+
+3. Put the public key (the second line of `solidcraft-update.pub`, starting with `RW`) into
+   `crates/ui-egui/src/update/install.rs`:
+
+   ```rust
+   pub const PUBLIC_KEY: Option<&str> = Some("RW…");
+   ```
+
+   and land that through a PR. Builds from then on refuse unsigned updates; releases built
+   from then on carry `SHA256SUMS.txt.minisig`.
+4. Delete `solidcraft-update.key` from the machine once the backup is safe.
+
+Older builds without the key keep updating with the SHA-256 check alone.
 
 ## Repository setup
 

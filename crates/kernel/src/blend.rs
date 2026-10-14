@@ -495,6 +495,18 @@ fn blend_geometry(
                 return Err(unsupported("G2 fillets require straight edges around each planar end face"));
             }
             let g = faces.get(ga).ok_or_else(|| KernelError::Failed("face".into()))?;
+            // An end face running on smoothly from a side, an earlier round of this radius (its
+            // end an arc of it): the blend ends in that round, which takes a corner of its own
+            // (`curveblend::corner_blend`), the same as rounding both together.
+            let normal = |f: &mt::Face| crate::curveblend::project(f, p, None).map(|x| x.1);
+            let of_radius = |e: &mt::Edge| crate::curveblend::circle_of(e, r * 1e-4).is_some_and(|c| (c.1 - r).abs() <= r * 1e-4);
+            if let Some(ng) = normal(g)
+                && [i1, i2].iter().filter_map(|i| faces.get(*i)).filter_map(|f| normal(f)).any(|ns| ns.dot(ng) > 1.0 - 1e-6)
+                && shape == Shape::Round
+                && (of_radius(&e1) || of_radius(&e2))
+            {
+                return Err(unsupported("a blend ending in an earlier round"));
+            }
             let surf = g.surface();
             let surf_b = faces.get(gb).ok_or_else(|| KernelError::Failed("face".into()))?.surface();
             let on_tol = (size * 1e-5).max(1e-6);
@@ -1134,8 +1146,14 @@ fn orders<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
 /// boundary leaves its surface (a blend that ran on past the end of a round's surface, which a
 /// round of a curved edge does not have) another order that has none is preferred.
 fn blend(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Result<Body> {
+    blend_with(body, edges, r, shape, what, false)
+}
+
+/// [`blend`]; `curved_ends`: also roll a ball along a straight edge between planes that ends at
+/// a curved face (the last resort, after the corner build for an earlier round there).
+fn blend_with(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, curved_ends: bool) -> Result<Body> {
     let sound = |b: &Body| crate::tess::boundaries_on_surfaces(&b.solid, (b.size() * 1e-4).max(1e-6));
-    let first = blend_in_order(body, edges, r, shape, what);
+    let first = blend_in_order(body, edges, r, shape, what, curved_ends);
     let reorder = (2..=MAX_REORDERED).contains(&edges.len())
         && match &first {
             Ok(b) => !sound(b),
@@ -1147,7 +1165,7 @@ fn blend(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Resul
     }
     let mut fallback: Option<Body> = None;
     for order in orders(edges).into_iter().skip(1) {
-        if let Ok(done) = blend_in_order(body, &order, r, shape, what) {
+        if let Ok(done) = blend_in_order(body, &order, r, shape, what, curved_ends) {
             if sound(&done) {
                 return Ok(done);
             }
@@ -1164,7 +1182,7 @@ fn blend(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Resul
     }
 }
 
-fn blend_in_order(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Result<Body> {
+fn blend_in_order(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, curved_ends: bool) -> Result<Body> {
     if !(r.is_finite() && r > 1e-6 && r < 1e6) {
         return Err(KernelError::Invalid(format!("{what} size must be positive")));
     }
@@ -1178,6 +1196,16 @@ fn blend_in_order(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str)
     let counts = record::counts(&[body]);
     // Coplanar neighbours as one face (as after a join), so corners look as they should.
     let mut cur = crate::boolean_record::healed(body)?;
+    // The last resort only for edges it treats otherwise: else it repeats the refusal.
+    if curved_ends {
+        let solid = cur.deep_copy();
+        let ids = edge_ids(&cur, &solid, edges)?;
+        let other =
+            Body::unique_edges(&solid).iter().any(|e| ids.contains(&e.id()) && !curved_case(&solid, e, false) && curved_case(&solid, e, true));
+        if !other {
+            return Err(unsupported("no edge ending at a curved face"));
+        }
+    }
     // Every edge of a convex planar body: rounded as a whole (sphere corners).
     if shape == Shape::Round && edges.len() >= 6 {
         let solid = cur.deep_copy();
@@ -1207,8 +1235,8 @@ fn blend_in_order(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str)
     {
         let _ = groups;
         let loop_pts: Vec<Vec3> = edges.iter().filter(|p| !rest.iter().any(|q| q.dist(**p) < 1e-12)).copied().collect();
-        cur = record::after(blend_in_order(&cur, &rest, r, shape, what)?, &cur, &counts);
-        return Ok(record::after(blend_in_order(&cur, &loop_pts, r, shape, what)?, &cur, &counts));
+        cur = record::after(blend_in_order(&cur, &rest, r, shape, what, curved_ends)?, &cur, &counts);
+        return Ok(record::after(blend_in_order(&cur, &loop_pts, r, shape, what, curved_ends)?, &cur, &counts));
     }
     // A loop the loop blend refuses for its shape (seams that aren't straight, walls it can't
     // trim) is blended edge by edge below instead: a ball rolls along its smooth chain.
@@ -1236,11 +1264,11 @@ fn blend_in_order(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str)
             Err(_) => {}
         }
     }
-    blend_each(cur, edges, r, shape, what, &counts)
+    blend_each(cur, edges, r, shape, what, &counts, curved_ends)
 }
 
 /// The edges blended one at a time (see [`blend`]), `cur` being the healed body.
-fn blend_each(mut cur: Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, counts: &[(usize, usize)]) -> Result<Body> {
+fn blend_each(mut cur: Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, counts: &[(usize, usize)], curved_ends: bool) -> Result<Body> {
     let counts = counts.to_vec();
     // One at a time, in whatever order works: a run along a planar face's loop (bridging arcs
     // that earlier blends left between selected edges, so corners round off), a single edge,
@@ -1251,6 +1279,30 @@ fn blend_each(mut cur: Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, c
     // refused away from every later blend would be refused the same way again: it is not tried
     // again (a refusal costs a rolling-ball attempt, seconds each on a long curved edge).
     let mut refused: Vec<(Vec3, (Vec3, Vec3), KernelError)> = Vec::new();
+    // A chain runs on along the edges smooth with a selected one in the body as given, not along
+    // a round this blend has made meanwhile (which would take in edges nobody selected, or not,
+    // by the order the edges come in).
+    let along: Vec<mt::Edge> = {
+        let solid = cur.deep_copy();
+        let all = Body::unique_edges(&solid);
+        let tol = (cur.size() * 2e-3).max(1e-3);
+        let mut list: Vec<mt::Edge> = Vec::new();
+        for p in edges {
+            if let Some((idx, _)) = cur.nearest_edge(*p, tol)?
+                && let Some(e) = all.get(idx)
+            {
+                let ids = smooth_chain(&solid, e).unwrap_or_else(|| vec![e.id()]);
+                for x in all.iter().filter(|x| ids.contains(&x.id())) {
+                    if !list.iter().any(|y| y.id() == x.id()) {
+                        list.push(x.clone());
+                    }
+                }
+            }
+        }
+        list
+    };
+    let near_chain = (cur.size() * 1e-6).max(1e-7);
+    let on_chains = |e: &mt::Edge| lies_on(e, &along, near_chain);
     for _ in 0..(2 * edges.len() + 4) {
         if todo.is_empty() {
             return Ok(cur);
@@ -1315,11 +1367,23 @@ fn blend_each(mut cur: Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, c
             };
             // A straight edge running on smoothly into curved ones (a flange into its bend, a
             // side into a rounded corner): the blend follows the whole smooth chain, as the
-            // rolling ball would.
-            let chain = smooth_chain(&solid, &edge);
-            let runs_on = !curved_case(&solid, &edge)
+            // rolling ball would. A fillet doesn't run on into an earlier round's arc of its
+            // radius: it ends in that round (as if both were rounded together).
+            let chain = smooth_chain_within(&solid, &edge, &on_chains);
+            let into_round = |ids: &[mt::EdgeID]| {
+                Body::unique_edges(&solid).iter().any(|x| {
+                    ids.contains(&x.id())
+                        && x.id() != edge.id()
+                        && [edge.front(), edge.back()].iter().any(|v| x.front() == *v || x.back() == *v)
+                        && crate::curveblend::circle_of(x, size * 1e-6).is_some_and(|c| (c.1 - r).abs() <= r * 1e-4)
+                })
+            };
+            let own = edge.id();
+            let runs_on = !curved_case(&solid, &edge, false)
                 && chain.as_ref().is_some_and(|ids| {
-                    ids.len() > 1 && Body::unique_edges(&solid).iter().any(|x| ids.contains(&x.id()) && !matches!(x.curve(), mt::Curve::Line(_)))
+                    ids.len() > 1
+                        && Body::unique_edges(&solid).iter().any(|x| ids.contains(&x.id()) && !matches!(x.curve(), mt::Curve::Line(_)))
+                        && !(shape == Shape::Round && into_round(ids))
                 });
             let local = || guard(what, || blend_one(&solid, &edge, size, r, shape));
             let attempt = match chain.as_deref().filter(|_| runs_on).map(roll) {
@@ -1333,16 +1397,24 @@ fn blend_each(mut cur: Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, c
                 None => match local() {
                     Ok(o) => Ok((o, vec![j])),
                     // A curved edge, or one between curved faces: roll a ball along its smooth chain.
-                    Err(e) if !curved_case(&solid, &edge) => Err(e),
+                    Err(e) if !curved_case(&solid, &edge, curved_ends) => Err(e),
                     Err(e) => match chain.as_deref() {
                         // The chain that cannot be rolled (it runs on into the edge an earlier round
-                        // left where it met another face): the edge alone, ending on that round.
-                        Some(ids) => roll(ids)
-                            .or_else(|first| if ids.len() > 1 { roll(&[edge.id()]).map_err(|_| first) } else { Err(first) })
-                            .map_err(|e2| match e2 {
-                                KernelError::TooLarge(m) => KernelError::TooLarge(format!("{m} ({e})")),
-                                e2 => KernelError::Failed(format!("{e2} ({e})")),
-                            }),
+                        // left where it met another face): the edge alone, ending on that round. A
+                        // straight edge into an earlier round of this radius: on its own.
+                        Some(ids) => {
+                            let ids = if shape == Shape::Round && !curved_case(&solid, &edge, false) && into_round(ids) {
+                                std::slice::from_ref(&own)
+                            } else {
+                                ids
+                            };
+                            roll(ids).or_else(|first| if ids.len() > 1 { roll(&[edge.id()]).map_err(|_| first) } else { Err(first) }).map_err(|e2| {
+                                match e2 {
+                                    KernelError::TooLarge(m) => KernelError::TooLarge(format!("{m} ({e})")),
+                                    e2 => KernelError::Failed(format!("{e2} ({e})")),
+                                }
+                            })
+                        }
                         None => Err(e),
                     },
                 },
@@ -1500,12 +1572,16 @@ fn run_on_loop(cur: &Body, solid: &Solid, pts: &[Vec3]) -> Result<Option<(Vec<mt
     Ok(best)
 }
 
-/// Is the edge curved, or does it lie between faces that aren't both planar?
-fn curved_case(solid: &Solid, edge: &mt::Edge) -> bool {
+/// Is the edge curved, or does it lie between faces that aren't both planar (or, with
+/// `curved_ends`, end at one)?
+fn curved_case(solid: &Solid, edge: &mt::Edge, curved_ends: bool) -> bool {
     if !matches!(edge.curve(), mt::Curve::Line(_)) {
         return true;
     }
-    solid.face_iter().filter(|f| f.edge_iter().any(|e| e.id() == edge.id())).any(|f| !matches!(f.oriented_surface(), mt::Surface::Plane(_)))
+    // Between curved faces, or (when asked) ending at one: a straight edge running into a wall.
+    let curved = |f: &mt::Face| !matches!(f.oriented_surface(), mt::Surface::Plane(_));
+    solid.face_iter().filter(|f| f.edge_iter().any(|e| e.id() == edge.id())).any(curved)
+        || (curved_ends && solid.face_iter().filter(|f| f.vertex_iter().any(|v| v == *edge.front() || v == *edge.back())).any(curved))
 }
 
 /// Whether the two faces of `edge` meet tangentially along it (sampled at a quarter, the
@@ -1531,6 +1607,32 @@ fn tangent_faces(solid: &Solid, edge: &mt::Edge) -> bool {
 /// The chain of edges continuing `edge` smoothly at its ends (its ids): closed, or open where
 /// the next edge turns sharply.
 fn smooth_chain(solid: &Solid, edge: &mt::Edge) -> Option<Vec<mt::EdgeID>> {
+    smooth_chain_within(solid, edge, &|_| true)
+}
+
+/// Whether edge `e` runs along one of `along` (is a piece of it): points through it lie on one.
+fn lies_on(e: &mt::Edge, along: &[mt::Edge], tol: f64) -> bool {
+    use mt::{BoundedCurve, ParametricCurve, SearchNearestParameter};
+    if along.iter().any(|a| a.id() == e.id()) {
+        return true;
+    }
+    let c = e.curve();
+    let (t0, t1) = c.range_tuple();
+    [0.25, 0.5, 0.75].iter().all(|f| {
+        let p = c.subs(t0 + (t1 - t0) * f);
+        along.iter().any(|a| {
+            let ac = a.curve();
+            let (a0, a1) = ac.range_tuple();
+            let d = |t: f64| crate::body::from_p3(ac.subs(t)).dist(crate::body::from_p3(p));
+            let Some(hint) = (0..=16).map(|i| a0 + (a1 - a0) * i as f64 / 16.0).min_by(|x, y| d(*x).total_cmp(&d(*y))) else { return false };
+            let t = ac.search_nearest_parameter(p, hint, 50).unwrap_or(hint).clamp(a0, a1);
+            d(t).min(d(hint)) <= tol
+        })
+    })
+}
+
+/// [`smooth_chain`], walking on only over edges `keep` allows.
+fn smooth_chain_within(solid: &Solid, edge: &mt::Edge, keep: &dyn Fn(&mt::Edge) -> bool) -> Option<Vec<mt::EdgeID>> {
     use mt::{BoundedCurve, ParametricCurve};
     let all = Body::unique_edges(solid);
     // Along the edge as it runs from its front to its back (an edge may run against its curve).
@@ -1550,7 +1652,7 @@ fn smooth_chain(solid: &Solid, edge: &mt::Edge) -> Option<Vec<mt::EdgeID>> {
             let next = all.iter().filter(|e| !ids.contains(&e.id()) && (*e.front() == v || *e.back() == v)).find_map(|e| {
                 let fwd = *e.front() == v;
                 let t = if fwd { dir(e, false)? } else { -dir(e, true)? };
-                (t.dot(d) > 1.0 - 1e-4 && !smooth_seam(solid, e)).then(|| (e.clone(), fwd))
+                (t.dot(d) > 1.0 - 1e-4 && !smooth_seam(solid, e) && keep(e)).then(|| (e.clone(), fwd))
             });
             let Some((e, fwd)) = next else { return Some(false) };
             ids.push(e.id());
@@ -1713,21 +1815,52 @@ fn closed(b: Body) -> Result<Body> {
 pub fn fillet(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
     body.require_brep("fillet")?;
     // Corners the local blends refuse (an earlier round at an edge's end): radius per edge.
-    blend(body, edges, radius, Shape::Round, "fillet").and_then(closed).or_else(|e| {
-        let sel: Vec<(Vec3, f64)> = edges.iter().map(|p| (*p, radius)).collect();
-        // The local blend's refusal, unless only the corner build found the radius too large.
-        crate::blend_corner::fillet_radii(body, &sel)
-            .and_then(closed)
-            .map_err(|e2| match (&e, e2) {
-                (KernelError::TooLarge(_), _) => e,
-                (_, e2 @ KernelError::TooLarge(_)) => e2,
-                _ => e,
-            })
-            // Three edges at a vertex of any faces end in a sphere.
-            .or_else(|e| {
-                if edges.len() >= 3 { crate::blend_vertex::fillet_ball_vertices(body, edges, radius).and_then(closed).map_err(|_| e) } else { Err(e) }
-            })
-    })
+    blend(body, edges, radius, Shape::Round, "fillet")
+        .and_then(closed)
+        .or_else(|e| {
+            let sel: Vec<(Vec3, f64)> = edges.iter().map(|p| (*p, radius)).collect();
+            // The local blend's refusal, unless only the corner build found the radius too large.
+            crate::blend_corner::fillet_radii(body, &sel)
+                .and_then(closed)
+                .map_err(|e2| keep_size(e, e2))
+                // Three edges at a vertex of any faces end in a sphere.
+                .or_else(|e| {
+                    if edges.len() >= 3 {
+                        crate::blend_vertex::fillet_ball_vertices(body, edges, radius).and_then(closed).map_err(|_| e)
+                    } else {
+                        Err(e)
+                    }
+                })
+        })
+        // Straight edges ending at a curved face that isn't an earlier round's: a rolling ball
+        // trimmed by the face. Refused, the refusal above stands.
+        .or_else(|e| blend_with(body, edges, radius, Shape::Round, "fillet", true).and_then(closed).map_err(|_| e))
+        // Blends meeting at corners on curved faces: all at once.
+        .or_else(|e| corners(body, edges, radius, Shape::Round, "fillet").and_then(closed).map_err(|e2| keep_size(e, e2)))
+}
+
+/// The first refusal, unless only the second found the blend too large (a smaller one may fit).
+fn keep_size(e: KernelError, e2: KernelError) -> KernelError {
+    match (&e, e2) {
+        (KernelError::TooLarge(_), _) => e,
+        (_, e2 @ KernelError::TooLarge(_)) => e2,
+        _ => e,
+    }
+}
+
+/// Blend the edges together, rebuilding the corners where they meet on faces of any surface
+/// (see [`crate::curveblend::corner_blend`]).
+fn corners(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Result<Body> {
+    let counts = record::counts(&[body]);
+    let cur = crate::boolean_record::healed(body)?;
+    let size = cur.size();
+    let solid = cur.deep_copy();
+    let ids = edge_ids(&cur, &solid, edges)?;
+    if ids.len() != edges.len() {
+        return Err(KernelError::Invalid("no edge near a selected point".into()));
+    }
+    let (made, rec) = guard(what, || crate::curveblend::corner_blend(&solid, &ids, size, r, shape == Shape::Round))?;
+    Ok(record::after(record::rebuilt(made, &[&solid], &rec)?, &cur, &counts))
 }
 
 /// The step of the radius search: three significant digits of the requested radius.
@@ -1889,12 +2022,14 @@ pub fn chamfer(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
     // Each step's result carries its history over `[body]`.
     let counts = record::counts(&[body]);
     // All cutters at once (their union mitres the corners), else one edge at a time.
+    // A hole corner's mitre extension runs into the wall, and the union of those cutters
+    // notches it. Those edges take the local blend below, which is one bevel (#814).
     let tools: Result<Vec<Cutter>> = edges.iter().enumerate().map(|(i, p)| chamfer_tool(body, *p, distance, i)).collect();
-    if let Ok(tools) = tools {
-        // The union so far, with its history over the cutters it joined.
+    let notch = tools.as_ref().ok().is_some_and(|ts| ts.iter().any(|t| t.extension_inside));
+    // The union of the cutters, cut from the body they were built on.
+    let batch = |tools: &[Cutter]| -> Option<Body> {
         let mut acc: Option<(Body, Option<History>)> = None;
-        let mut ok = true;
-        for t in &tools {
+        for t in tools {
             let next = match &acc {
                 None => Some((t.body.clone(), Some(History::identity(&t.body)))),
                 Some((a, h)) => crate::ops::boolean(a, &t.body, crate::BoolOp::Union).ok().flatten().map(|u| {
@@ -1902,30 +2037,31 @@ pub fn chamfer(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
                     (u, h)
                 }),
             };
-            if next.is_none() {
-                ok = false;
-                break;
-            }
+            next.as_ref()?;
             acc = next;
         }
-        if ok
-            && let Some((tool, h)) = acc
-            && let Ok(Some(r)) = crate::ops::boolean(body, &tool, crate::BoolOp::Cut)
-        {
-            let h = cut_history(crate::boolean_record::through(&r, 1, h.as_ref()), body, &tools);
-            return Ok(r.with_checked_history(h, &counts));
-        }
+        let (tool, h) = acc?;
+        let r = crate::ops::boolean(body, &tool, crate::BoolOp::Cut).ok().flatten()?;
+        let h = cut_history(crate::boolean_record::through(&r, 1, h.as_ref()), body, tools);
+        Some(r.with_checked_history(h, &counts))
+    };
+    if !notch
+        && let Ok(tools) = &tools
+        && let Some(r) = batch(tools)
+    {
+        return Ok(r);
     }
     // At a pocket rim the cutters cannot extend beyond the selected edges. Rebuild
     // the corners locally, allowing adjacent chamfers to reach different depths
     // on their common wall seam.
-    if edges.len() > 1
+    if !notch
+        && edges.len() > 1
         && let Ok(result) = crate::blend_corner::chamfer(body, edges, distance)
     {
         return Ok(result);
     }
     // Coplanar neighbours as one face (as after a join), so corners look as they should.
-    let mut cur = crate::boolean_record::healed(body)?;
+    let cur = crate::boolean_record::healed(body)?;
     if let Some(groups) = loop_groups(&cur, edges)? {
         let whole = || -> Result<Body> {
             let mut lc = cur.clone();
@@ -1951,14 +2087,54 @@ pub fn chamfer(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
             Err(_) => {}
         }
     }
-    for p in edges {
-        let step = match chamfer_tool(&cur, *p, distance, 0).and_then(|t| cut_one(&cur, &t)) {
-            Ok(Some(b)) => b,
-            _ => blend(&cur, std::slice::from_ref(p), distance, Shape::Flat, "chamfer")?,
+    let start = cur.clone();
+    let one_by_one = || -> Result<Body> {
+        let mut cur = start.clone();
+        // Set once a step has changed the body, so a later miss cannot restart from the cutters.
+        let mut progressed = false;
+        // A chain running on into curved faces, or an edge ending at one: as for fillets.
+        let blend_or_curved = |cur: &Body, p: &Vec3| -> Result<Body> {
+            blend(cur, std::slice::from_ref(p), distance, Shape::Flat, "chamfer")
+                .or_else(|e| blend_with(cur, std::slice::from_ref(p), distance, Shape::Flat, "chamfer", true).map_err(|_| e))
         };
-        cur = record::after(step, &cur, &counts);
-    }
-    Ok(cur)
+        for p in edges {
+            let tool = chamfer_tool(&cur, *p, distance, 0);
+            // The extension is inside the wall. The local blend is one bevel on a hole corner.
+            // Where that blend cannot build the edge, the cutter is what used to succeed (#814).
+            let inside = tool.as_ref().ok().is_some_and(|t| t.extension_inside);
+            let step = if inside {
+                match blend(&cur, std::slice::from_ref(p), distance, Shape::Flat, "chamfer") {
+                    Ok(b) => b,
+                    Err(miss) => match tool.and_then(|t| cut_one(&cur, &t)) {
+                        Ok(Some(b)) => b,
+                        // Healing can leave an edge the blend cannot end, and a cutter rebuilt on
+                        // the healed body cannot cut it. Nothing has been applied yet, so the
+                        // cutters built on the original body are what used to succeed
+                        // (oracle/69-sm-tray). A hole corner does not get here: its bevel builds.
+                        _ if !progressed => {
+                            if let Ok(tools) = &tools
+                                && let Some(r) = batch(tools)
+                            {
+                                return Ok(r);
+                            }
+                            blend_or_curved(&cur, p).map_err(|_| miss)?
+                        }
+                        _ => blend_or_curved(&cur, p).map_err(|_| miss)?,
+                    },
+                }
+            } else {
+                match tool.and_then(|t| cut_one(&cur, &t)) {
+                    Ok(Some(b)) => b,
+                    _ => blend_or_curved(&cur, p)?,
+                }
+            };
+            progressed = true;
+            cur = record::after(step, &cur, &counts);
+        }
+        Ok(cur)
+    };
+    // Chamfers meeting at corners on curved faces: all at once.
+    one_by_one().or_else(|e| corners(body, edges, distance, Shape::Flat, "chamfer").map_err(|e2| keep_size(e, e2)))
 }
 
 /// `cur` cut by one cutter, with its history over `[cur]` (`None`: nothing left).
@@ -2064,6 +2240,9 @@ pub(crate) struct Cutter {
     body: Body,
     face: Option<usize>,
     edge: usize,
+    /// The mitre extension at mid-edge lies in the body. On a convex edge it stays outside.
+    /// On a hole corner it runs into the walls, and the cutter bites them (#814).
+    extension_inside: bool,
 }
 
 impl Cutter {
@@ -2124,6 +2303,10 @@ fn chamfer_tool_sides(cur: &Body, p: Vec3, s: f64, sides: Option<(ChamferSide, b
     let a_ext = a + ab * (s * 0.5 + reach * 0.05);
     let b_ext = b - ab * (s * 0.5 + reach * 0.07);
     let e_far = base + out * reach;
+    // The cross-section sits past the edge ends, so test the offset at mid-edge. The cutter
+    // is still built: a caller that cannot blend the edge keeps it (#814).
+    let mid_edge = (f.p0 + f.p1) * 0.5;
+    let extension_inside = cur.contains(mid_edge + (a_ext - base)) || cur.contains(mid_edge + (b_ext - base));
     // The material beyond both ends must be empty (the cutter runs past them).
     let mid = (a + b + base) / 3.0;
     for probe in [mid + f.d * (ext * 0.5), mid + f.d * (len + ext * 1.5)] {
@@ -2142,7 +2325,7 @@ fn chamfer_tool_sides(cur: &Body, p: Vec3, s: f64, sides: Option<(ChamferSide, b
     let region = solidcraft_geom::Region2 { outer: lp, holes: vec![] };
     let body = crate::build::extrude(&plane, &[region], 0.0, len + 2.0 * ext)?.pop().ok_or_else(|| KernelError::Failed("chamfer tool".into()))?;
     let face = body.history().and_then(|h| h.faces.iter().position(|f| f.origins == [FaceOrigin::Profile { segment: chamfer_segment }]));
-    Ok(Cutter { body, face, edge })
+    Ok(Cutter { body, face, edge, extension_inside })
 }
 
 #[cfg(test)]
@@ -2338,6 +2521,28 @@ mod tests {
             let removed = v0 - vol(&out);
             assert!(removed > area * 14.0 && removed < area * 15.2, "{removed}");
         }
+    }
+
+    #[test]
+    fn a_chamfer_of_a_hole_corner_is_one_bevel() {
+        let plate = crate::build::box_solid(Vec3::ZERO, Vec3::new(40.0, 40.0, 10.0)).unwrap();
+        let pocket = crate::build::box_solid(Vec3::new(10.0, 10.0, -1.0), Vec3::new(30.0, 30.0, 12.0)).unwrap();
+        let body = crate::ops::boolean(&plate, &pocket, crate::BoolOp::Cut).unwrap().unwrap();
+        let vol = |b: &Body| b.tessellate(1e-4).unwrap().measure().volume;
+        let v0 = vol(&body);
+        let one = chamfer(&body, &[Vec3::new(10.0, 10.0, 5.0)], 2.0).unwrap();
+        assert!(one.validity().is_empty(), "{:?}", one.validity());
+        assert_eq!(one.unmeshed_faces(), 0);
+        let added = vol(&one) - v0;
+        // The bevel fills the hole corner: a right triangle of legs 2 mm, times the 10 mm edge.
+        assert!(added > 19.0 && added < 21.0, "added {added}, want 20");
+        assert_eq!(one.face_count(), body.face_count() + 1, "one bevel face");
+        let corners = [Vec3::new(10.0, 10.0, 5.0), Vec3::new(30.0, 10.0, 5.0), Vec3::new(30.0, 30.0, 5.0), Vec3::new(10.0, 30.0, 5.0)];
+        let all = chamfer(&body, &corners, 2.0).unwrap();
+        assert!(all.validity().is_empty(), "{:?}", all.validity());
+        let added = vol(&all) - v0;
+        assert!(added > 76.0 && added < 84.0, "added {added}, want 80");
+        assert_eq!(all.face_count(), body.face_count() + 4, "one bevel face per corner");
     }
 
     #[test]

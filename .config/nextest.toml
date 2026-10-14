@@ -28,3 +28,11 @@ slow-timeout = { period = "60s" }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The action matrix sample runs its designs in parallel worker processes, one per CPU. Run with
+# other tests beside it (the heavy ones on main), a pi-case hole that takes 8 s alone (#952 makes
+# it a real hole) went past the matrix's 90 s action limit. It runs on its own.
+[[profile.ci.overrides]]
+filter = "binary(action_matrix) & test(=action_matrix_sample)"
+threads-required = "num-cpus"
+

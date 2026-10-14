@@ -15,6 +15,68 @@ fn orthotropic(e: [f64; 3], nu: [f64; 3]) -> Value {
 }
 
 #[test]
+fn directional_isotropy_and_principal_axes_match_analytic_values() {
+    let iso = admit_card(&card(isotropic(12e9, 0.25))).unwrap();
+    let mut equivalent = orthotropic([12e9; 3], [0.25; 3]);
+    equivalent["model"]["shear_moduli_pa"] = json!([4.8e9, 4.8e9, 4.8e9]);
+    let equivalent = admit_card(&card(equivalent)).unwrap();
+    for direction in [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 2., 3.], [-1., 2., -3.], [f64::MAX; 3], [1e-320; 3]] {
+        let a = iso.directional_modulus(direction).unwrap();
+        let b = equivalent.directional_modulus(direction).unwrap();
+        assert_eq!(a.young_modulus_pa, 12e9);
+        assert!((b.young_modulus_pa / 12e9 - 1.).abs() < 1e-14);
+        assert_eq!(a.axes, None);
+        assert_eq!(b.axes, Some(MaterialAxes::WoodLrt));
+        assert!((a.direction.iter().map(|x| x * x).sum::<f64>() - 1.).abs() < 1e-14);
+    }
+    let ortho = admit_card(&card(orthotropic([12e9, 3e9, 1e9], [0.2, 0.1, 0.02]))).unwrap();
+    for (direction, e) in [([1., 0., 0.], 12e9), ([0., 1., 0.], 3e9), ([0., 0., 1.], 1e9)] {
+        assert!((ortho.directional_modulus(direction).unwrap().young_modulus_pa / e - 1.).abs() < 1e-14);
+    }
+}
+
+#[test]
+fn directional_orthotropy_includes_shear_and_reciprocal_coupling() {
+    let mut data = orthotropic([12e9, 3e9, 1e9], [0.2, 0.1, 0.02]);
+    data["model"]["shear_moduli_pa"] = json!([2e9, 1e9, 0.5e9]);
+    let material = admit_card(&card(data)).unwrap();
+    // For n=(1,1,0)/sqrt(2), 1/E(n)=(S11+S22+2S12+1/G12)/4.
+    let expected = 4. / (1. / 12e9 + 1. / 3e9 - 2. * 0.2 / 12e9 + 1. / 2e9);
+    for d in [[1., 1., 0.], [-2., 2., 0.], [1e200, 1e200, 0.]] {
+        let r = material.directional_modulus(d).unwrap();
+        assert!((r.young_modulus_pa / expected - 1.).abs() < 1e-14);
+        assert_eq!(r.validation.source_review_required, vec!["test"]);
+        assert!(!r.validation.analysis_solver_available);
+    }
+    // Independent direct tensor contraction in a general non-principal direction.
+    let [x, y, z] = [2. / 3., -1. / 3., 2. / 3.];
+    let inverse = x * x * x * x / 12e9
+        + y * y * y * y / 3e9
+        + z * z * z * z / 1e9
+        + x * x * y * y * (1. / 2e9 - 2. * 0.2 / 12e9)
+        + y * y * z * z * (1. / 1e9 - 2. * 0.1 / 3e9)
+        + z * z * x * x * (1. / 0.5e9 - 2. * 0.02 / 1e9);
+    let actual = material.directional_modulus([2., -1., 2.]).unwrap();
+    assert!((actual.young_modulus_pa * inverse - 1.).abs() < 1e-14);
+}
+
+#[test]
+fn directional_queries_refuse_unknown_unstable_and_nonfinite_inputs() {
+    let mut material = admit_card(&card(isotropic(12e9, 0.25))).unwrap();
+    for d in [[0.; 3], [f64::NAN, 0., 1.], [0., f64::INFINITY, 0.]] {
+        assert!(material.directional_modulus(d).is_err());
+    }
+    material.properties.clear();
+    assert!(material.directional_modulus([1., 0., 0.]).is_err());
+    material.properties.push(Property {
+        data: PropertyData::Elasticity { model: Elasticity::Isotropic { young_modulus_pa: 12e9, poisson_ratio: 0.6 } },
+        source_id: "test".into(),
+        conditions: Conditions::default(),
+    });
+    assert!(material.directional_modulus([1., 0., 0.]).is_err());
+}
+
+#[test]
 fn isotropic_moduli_match_closed_form_and_auxetic_values_are_valid() {
     let r = validate_card(&card(isotropic(12e9, 0.25))).unwrap();
     assert_eq!(r.isotropic_moduli, Some(IsotropicModuli { shear_pa: 4.8e9, bulk_pa: 8e9 }));

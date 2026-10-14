@@ -293,7 +293,7 @@ pub fn windows_refusal(path: &str) -> Option<&'static str> {
         // A short (8.3) name such as `PROGRA~1` or `SSH~1` is another spelling of a folder whose
         // real name could be anything; canonicalising expands existing ones, and a new file's
         // name must not be one.
-        if name.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
+        if short_name(name) {
             return Some("short (8.3) names such as `PROGRA~1`");
         }
         let stem = name.split('.').next().unwrap_or("").trim_end_matches([' ', '.']).to_uppercase();
@@ -304,6 +304,45 @@ pub fn windows_refusal(path: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Whether a file or folder name looks like a short (8.3) name: a `~` and a digit (`PROGRA~1`).
+fn short_name(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit())
+}
+
+/// `path` spelled with long names, for the folders SolidCraft derives from the environment
+/// itself (the temporary folder, the recovery folder). On Windows those may hold a short (8.3)
+/// name: the temporary folder is often `…\NAME~1.XYZ\AppData\Local\Temp`, with the user folder's
+/// short name, when that folder's name is long, and [`windows_refusal`] refuses short names in
+/// every path an agent's commands reach, the server's own folders included. A path with a short
+/// name is resolved as far as it exists (the rest is appended as given) and loses the `\\?\`
+/// prefix resolving adds. It stays as it is when it has no short name, can't be resolved or
+/// doesn't resolve to a local drive, and off Windows.
+pub fn long_names(path: &std::path::Path) -> std::path::PathBuf {
+    if !cfg!(windows) || !path.iter().any(|n| short_name(&n.to_string_lossy())) {
+        return path.to_path_buf();
+    }
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(full) = std::fs::canonicalize(at) {
+            let local = full
+                .to_str()
+                .and_then(|f| f.strip_prefix(r"\\?\"))
+                .filter(|f| matches!(f.as_bytes(), [d, b':', b'\\', ..] if d.is_ascii_alphabetic()));
+            return local.map_or_else(|| path.to_path_buf(), |f| rest.iter().rev().fold(std::path::PathBuf::from(f), |p, n| p.join(n)));
+        }
+        let (Some(parent), Some(name)) = (at.parent(), at.file_name()) else { return path.to_path_buf() };
+        rest.push(name);
+        at = parent;
+    }
+}
+
+/// The temporary folder spelled with long names ([`long_names`]), for the folders SolidCraft
+/// makes in it.
+pub fn temp_dir() -> std::path::PathBuf {
+    long_names(&std::env::temp_dir())
 }
 
 /// `path` with symlinks and `..` resolved. A file that doesn't exist yet resolves through its
@@ -536,7 +575,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_unc_verbatim_drive_relative_and_device_paths_are_refused() {
-        let root = std::env::temp_dir().join(format!("solidcraft-vfs-win-{}", std::process::id()));
+        let root = super::temp_dir().join(format!("solidcraft-vfs-win-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let scope = super::PathScope::new([root.clone()]);
         let inside = |f: &str| root.join(f).to_string_lossy().to_string();
@@ -556,6 +595,45 @@ mod tests {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{bad}: {e}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The short (8.3) spelling of an existing `path` as `cmd` gives it (`NAME~1.XYZ`), or `None`
+    /// when it has no short name (the volume makes none).
+    #[cfg(windows)]
+    fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("cmd").raw_arg(format!("/d /c for %I in (\"{}\") do @echo %~sI", path.display())).output().ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| s.split('\\').any(super::short_name)).map(Into::into)
+    }
+
+    /// The folders SolidCraft derives from the environment are spelled with long names: on Windows
+    /// the temporary folder's path often has a short (8.3) name (the user folder's `NAME~1.XYZ`
+    /// when its name is long), and the server's own folders in it were refused like an agent's
+    /// short names. An agent's own short spelling of a folder it may use stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn derived_folders_are_spelled_with_long_names_and_short_names_from_agents_stay_refused() {
+        use super::{PathScope, long_names, short_name, temp_dir};
+        assert!(!temp_dir().iter().any(|n| short_name(&n.to_string_lossy())), "{}", temp_dir().display());
+        let long = temp_dir().join(format!("solidcraft-vfs-long-names-{}", std::process::id()));
+        std::fs::create_dir_all(&long).unwrap();
+        let Some(short) = short_spelling(&long) else {
+            eprintln!("skipped: {} has no short (8.3) name on this volume", long.display());
+            let _ = std::fs::remove_dir_all(&long);
+            return;
+        };
+        let expanded = long_names(&short);
+        assert_eq!(std::fs::canonicalize(&expanded).unwrap(), std::fs::canonicalize(&long).unwrap());
+        assert!(super::windows_refusal(&expanded.to_string_lossy()).is_none(), "{}", expanded.display());
+        // What doesn't exist yet is kept as given; a path without a short name is left alone.
+        assert_eq!(long_names(&short.join("new folder").join("part.step")), expanded.join("new folder").join("part.step"));
+        assert_eq!(long_names(&long), long);
+        // The folder through a scope: its long spelling is in reach, an agent's short one is not.
+        let scope = PathScope::new([long.clone()]);
+        assert!(scope.check(&expanded.join("part.step").to_string_lossy()).is_ok());
+        let e = scope.check(&short.join("part.step").to_string_lossy()).unwrap_err();
+        assert!(e.to_string().contains("short (8.3) names"), "{e}");
+        let _ = std::fs::remove_dir_all(&long);
     }
 
     /// The open design's folder counts only when it is safe (#205): strictly inside home (or the

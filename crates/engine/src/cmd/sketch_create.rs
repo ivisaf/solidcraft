@@ -145,21 +145,40 @@ fn text_style(p: &Value, cmd: &str, old: TextStyle) -> Result<TextStyle> {
     Ok(style)
 }
 
+/// What a text's `at` must be.
+const AT_MUST: &str = "`at` must be the baseline start [x, y]";
+
+/// The number given for `key`: `None` when it is left out or null, and an error when it is
+/// anything but a number (not read as left out).
+fn given_num(p: &Value, cmd: &str, key: &str, what: &str) -> Result<Option<f64>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => num(p, key).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` must be {what}"))),
+    }
+}
+
 fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option<String>, TextStyle)>) -> Result<LinkSource> {
     let (t0, at0, h0, a0, f0, s0) = old.unwrap_or((String::new(), Vec2::ZERO, 5.0, 0.0, None, TextStyle::default()));
-    let text = str_(p, "text").map(str::to_string).unwrap_or(t0);
+    let text = match p.get("text") {
+        None | Some(Value::Null) => t0,
+        Some(Value::String(t)) => t.clone(),
+        Some(_) => return Err(bad(cmd, "`text` must be a string")),
+    };
     if text.trim().is_empty() {
         return Err(bad(cmd, "`text` must not be empty"));
     }
     if text.chars().count() > solidcraft_sketch::MAX_TEXT_CHARS {
         return Err(bad(cmd, "text too long"));
     }
-    let at = p.get("at").and_then(crate::params::vec2).unwrap_or(at0);
-    let height = num(p, "height").unwrap_or(h0);
+    let at = match p.get("at") {
+        None | Some(Value::Null) => at0,
+        Some(v) => crate::params::vec2(v).ok_or_else(|| bad(cmd, AT_MUST))?,
+    };
+    let height = given_num(p, cmd, "height", "a length in mm")?.unwrap_or(h0);
     if !(height > 1e-6 && height < 1e5) {
         return Err(bad(cmd, "`height` must be positive"));
     }
-    let angle = num(p, "angle").map(f64::to_radians).unwrap_or(a0);
+    let angle = given_num(p, cmd, "angle", "an angle in degrees")?.map_or(a0, f64::to_radians);
     let font = match p.get("font") {
         None | Some(Value::Null) => f0,
         Some(Value::String(f)) if f.trim().is_empty() => None,
@@ -178,8 +197,8 @@ fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option
 
 fn text(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.text";
-    if p.get("at").is_none() {
-        return Err(bad(cmd, "`at` must be the baseline start [x, y]"));
+    if p.get("at").is_none_or(Value::is_null) {
+        return Err(bad(cmd, AT_MUST));
     }
     let src = text_source(p, cmd, None)?;
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;

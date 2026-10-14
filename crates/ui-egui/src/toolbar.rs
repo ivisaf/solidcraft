@@ -252,7 +252,9 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         let captions = if app.custom_titlebar { crate::titlebar::WIDTH } else { 0.0 };
         let tabs_start = x + 16.0;
         let (report, report_label) = report_rect(r, captions, tabs_start);
-        let tabs_end = report.left() - 8.0;
+        // A newer release: its Update button, left of Report a bug (`update`).
+        let update = crate::update::button(app, ui, report.left() - 6.0, report.top(), report_label);
+        let tabs_end = update.map_or(report.left(), |u| u.left()) - 8.0;
         // Narrow title bars can fit only part of the tab strip. Its hit regions must not
         // extend into the persistent report and window controls.
         let tabs_rect = Rect::from_min_max(pos2(tabs_start.min(tabs_end), r.top()), pos2(tabs_end, r.bottom()));
@@ -298,7 +300,7 @@ pub fn app_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
         ui.painter().text(
             pos2(r.right() - 12.0 - captions, r.center().y),
             Align2::RIGHT_CENTER,
-            format!("v{}", env!("CARGO_PKG_VERSION")),
+            format!("v{}", crate::update::current_version()),
             FontId::proportional(11.0),
             Color32::from_rgb(160, 168, 182),
         );

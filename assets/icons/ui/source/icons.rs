@@ -266,6 +266,12 @@ pub fn paint(p: &Painter, r: Rect, name: &str, ink: Color32, fill: Color32, acce
                 pen.line(&[(17.0, y), (21.0, y)], ink);
             }
         }
+        // Update: an arrow down onto a tray (a newer release can be downloaded).
+        "update" => {
+            pen.line(&[(12.0, 3.5), (12.0, 14.5)], ink);
+            pen.line(&[(7.5, 10.0), (12.0, 14.5), (16.5, 10.0)], ink);
+            pen.line(&[(4.0, 15.0), (4.0, 20.0), (20.0, 20.0), (20.0, 15.0)], ink);
+        }
         // Help: a question mark in a ring.
         "help" => {
             pen.circle(12.0, 12.0, 9.0, Color32::TRANSPARENT, ink);

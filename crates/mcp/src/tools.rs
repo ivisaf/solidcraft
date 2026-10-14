@@ -589,7 +589,7 @@ fn capture(b: &mut dyn Backend, a: &Map<String, Value>) -> Result<(Vec<u8>, Valu
     let keep = str_arg(a, "path").filter(|p| !p.trim().is_empty()).map(str::to_string);
     let path = keep.clone().unwrap_or_else(|| {
         let n = SHOT.fetch_add(1, Ordering::Relaxed);
-        let dir = crate::scratch_dir().unwrap_or_else(std::env::temp_dir);
+        let dir = crate::scratch_dir().unwrap_or_else(vfs::temp_dir);
         dir.join(format!("shot-{n}.png")).to_string_lossy().to_string()
     });
     let window = match str_arg(a, "source") {

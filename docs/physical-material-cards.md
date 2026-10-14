@@ -125,3 +125,37 @@ specimen properties and graded design values. No handbook data/table is bundled.
 The [Khronos PBR material model](https://www.khronos.org/gltf/pbr) is a reference for
 the separate optical track. No third-party code, engineering dataset or asset is
 added by this implementation.
+
+## Directional elasticity query
+
+`material.properties.directional {card, direction: [x,y,z]}` reports Young's modulus
+in Pa for a uniaxial, small-strain constitutive test along a material-local direction.
+It returns the safely normalized direction, declared axes (`null` for isotropy), and
+the full validation/source/condition report. It neither assigns axes to a body nor
+predicts a part's displacement, failure, strength or safety factor. No solver or
+render capability is enabled. Missing elasticity refuses instead of inventing data.
+
+For orthotropy, let n=(x,y,z) be the unit direction. With engineering shear
+compliance 1/G and the reciprocal Poisson convention above:
+
+```
+1/E(n) = x^4/E1 + y^4/E2 + z^4/E3
+       + x²y²(1/G12 - 2 nu12/E1)
+       + y²z²(1/G23 - 2 nu23/E2)
+       + z²x²(1/G31 - 2 nu31/E3).
+```
+
+This follows by applying stress sigma = n tensor n, computing strain with the
+symmetric compliance, then contracting n with strain and n. The implementation
+uses a Cholesky sum of squares for the normal contribution, avoiding cancellation
+between the positive diagonal and negative coupling terms. Shear contributions
+are also nonnegative. Isotropy returns E directly, independent of orientation.
+
+Input directions must contain exactly three finite numbers and be nonzero; arbitrary
+magnitude is allowed. Max-component scaling avoids overflow or underflow while
+normalizing very large or tiny vectors. Unrepresentable compliance/modulus refuses;
+this finite-precision check does not establish a condition-number certificate.
+The card's test conditions still apply; changing direction does not extrapolate
+temperature, moisture, process, rate, damage or nonlinear behavior. Synthetic analytic
+tests cover principal axes, the isotropic limit and off-axis shear/coupling terms.
+No physical dataset or external implementation is included.

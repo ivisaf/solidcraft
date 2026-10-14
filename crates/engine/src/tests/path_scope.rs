@@ -8,7 +8,7 @@ use crate::*;
 
 #[test]
 fn file_commands_stay_inside_the_agents_folders() {
-    let base = std::env::temp_dir().join(format!("solidcraft-path-scope-{}", std::process::id()));
+    let base = solidcraft_io::vfs::temp_dir().join(format!("solidcraft-path-scope-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (root, out) = (base.join("root"), base.join("out"));
     std::fs::create_dir_all(&root).unwrap();

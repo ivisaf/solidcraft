@@ -590,11 +590,22 @@ pub(super) fn sheet_eval(
         FeatureKind::SheetConvert { body, face, rule, .. } => {
             let mb = st.body(body).cloned().ok_or_else(|| DocError::Unknown(format!("body `{body}`")))?;
             let n = planar_normal_at(&mb.body, *face).ok_or_else(|| DocError::Invalid("pick a planar face of the plate".into()))?;
-            let tol = (mb.body.size() * 1e-3).max(1e-3);
-            let mesh = mb.body.tessellate(tol)?;
             // Thickness: the body's extent along the face normal.
-            let ds: Vec<f64> = mesh.positions.iter().map(|p| (*p - *face).dot(n)).collect();
-            let (lo, hi) = (ds.iter().cloned().fold(f64::MAX, f64::min), ds.iter().cloned().fold(f64::MIN, f64::max));
+            let extent = |mesh: &solidcraft_geom::Mesh| {
+                mesh.positions.iter().map(|p| (*p - *face).dot(n)).fold((f64::MAX, f64::MIN), |(lo, hi), d| (lo.min(d), hi.max(d)))
+            };
+            // The tolerance (the mesh's chords, and how far off the face's plane a point of it may
+            // be) is at most a tenth of the thickness, not only a thousandth of the size. On a long
+            // thin plate that thousandth passes the thickness: the far side's triangles counted as
+            // this face's (no outline was left), and a hole of a smaller radius than that fell out.
+            let mut tol = (mb.body.size() * 1e-3).max(1e-3);
+            let mut mesh = mb.body.tessellate(tol)?;
+            let (mut lo, mut hi) = extent(&mesh);
+            if hi - lo > 0.0 && tol > (hi - lo) * 0.1 {
+                tol = ((hi - lo) * 0.1).max(1e-6);
+                mesh = mb.body.tessellate(tol)?;
+                (lo, hi) = extent(&mesh);
+            }
             let t = hi - lo;
             // The face outline: boundary edges of the triangles on that face's plane, where it runs
             // along a round wall an arc of the wall's circle (not chords: the plate check below

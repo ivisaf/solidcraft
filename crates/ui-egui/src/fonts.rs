@@ -3,7 +3,8 @@
 //! The UI's Latin font always comes first; a CJK font (then a Hangul font) is only ever appended as
 //! a fallback, so English text renders exactly as before and only glyphs the Latin font lacks use
 //! the CJK face. The Hangul fallback covers Korean where the CJK font found (Meiryo, Hiragino)
-//! lacks Hangul.
+//! lacks Hangul. The order of the CJK and Chinese faces follows the UI language
+//! (see [`fallback_order`]): one face drawing a whole word keeps its glyphs on one baseline.
 
 use std::sync::Arc;
 
@@ -428,31 +429,50 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
     None
 }
 
-/// Configure font definitions with system CJK, Chinese and Hangul fallbacks where available.
+/// The fallback entries in the order they join each family for a UI language.
+///
+/// Chinese goes first for `zh`: a Japanese font (Meiryo, Yu Gothic) lacks the simplified
+/// characters, so the rest of the word falls through to the Chinese font per glyph — and
+/// epaint centres each face's own line height in the row, so glyphs from two faces of very
+/// different height (Meiryo ≈ 2.0 em, Microsoft YaHei ≈ 1.4 em) sit at different heights
+/// inside one word. One face for the whole word keeps them on one baseline.
+pub fn fallback_order(language: &str) -> [&'static str; 3] {
+    if language == "zh" { [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK] } else { [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK] }
+}
+
+/// Configure font definitions with system CJK, Chinese and Hangul fallbacks where available,
+/// ordered for the UI language (see [`fallback_order`]).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn setup_fonts(ctx: &egui::Context) {
+pub fn setup_fonts_for(ctx: &egui::Context, language: &str) {
+    let cjk = find_system_cjk_font();
+    let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
+    let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
     let mut fonts = egui::FontDefinitions::default();
     let mut found = false;
-    let cjk = find_system_cjk_font();
-    if let Some(bytes) = cjk.clone().and_then(|bytes| with_cjk_fallback(fonts.clone(), bytes)) {
-        fonts = bytes;
-        found = true;
-    }
-    // Chinese after the CJK fallback: a Japanese-only CJK font lacks simplified characters,
-    // so Chinese falls through to this one per glyph.
-    let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
-    if let Some(with_chinese) = chinese.and_then(|bytes| with_fallback(fonts.clone(), CHINESE_FALLBACK, bytes)) {
-        fonts = with_chinese;
-        found = true;
-    }
-    let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
-    if let Some(with_hangul) = hangul.and_then(|bytes| with_fallback(fonts.clone(), HANGUL_FALLBACK, bytes)) {
-        fonts = with_hangul;
-        found = true;
+    for name in fallback_order(language) {
+        let bytes = match name {
+            CJK_FALLBACK => cjk.clone(),
+            CHINESE_FALLBACK => chinese.clone(),
+            _ => hangul.clone(),
+        };
+        if let Some(bytes) = bytes
+            && let Some(with_fallback) = with_fallback(fonts.clone(), name, bytes)
+        {
+            fonts = with_fallback;
+            found = true;
+        }
     }
     if found {
         ctx.set_fonts(fonts);
     }
+}
+
+/// Configure font definitions with system fallbacks for an English UI (all fallbacks are
+/// installed whatever the language, so CJK text in a design still renders; only their order
+/// follows the language, see [`setup_fonts_for`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn setup_fonts(ctx: &egui::Context) {
+    setup_fonts_for(ctx, "en");
 }
 
 /// Find a font covering simplified Chinese in the known candidate paths or by scanning the
@@ -478,6 +498,9 @@ fn find_system_chinese_font() -> Option<Vec<u8>> {
 
 /// On web, setup_fonts does not perform synchronous disk reads.
 /// Use asynchronous loading through [`solidcraft_web`] or host scripts.
+#[cfg(target_arch = "wasm32")]
+pub fn setup_fonts_for(_ctx: &egui::Context, _language: &str) {}
+
 #[cfg(target_arch = "wasm32")]
 pub fn setup_fonts(_ctx: &egui::Context) {}
 
@@ -507,6 +530,24 @@ mod tests {
             assert_eq!(list.last().map(String::as_str), Some(CJK_FALLBACK), "CJK is the last fallback");
         }
         assert!(with_cjk_fallback(defaults, b"not a font".to_vec()).is_none());
+    }
+
+    #[test]
+    fn a_chinese_ui_puts_the_chinese_face_before_the_japanese_one() {
+        assert_eq!(fallback_order("zh"), [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK]);
+        for lang in ["en", "ja", "ko", "de"] {
+            assert_eq!(fallback_order(lang), [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK], "{lang} keeps the Japanese font first");
+        }
+        let defaults = egui::FontDefinitions::default();
+        let mut fonts = defaults.clone();
+        for name in fallback_order("zh") {
+            fonts = with_fallback(fonts, name, latin_font_bytes()).unwrap();
+        }
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let list = &fonts.families[&family];
+            assert_eq!(list.first(), defaults.families[&family].first(), "the Latin UI font stays first");
+            assert_eq!(&list[list.len() - 3..], [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK]);
+        }
     }
 
     #[test]

@@ -245,6 +245,10 @@ pub struct Prefs {
     pub offer_stand_up: bool,
     /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
     pub middle_double_click: String,
+    /// Check for updates at start and once a day (docs/updates.md).
+    pub check_updates: bool,
+    /// When the last update check ran, and the versions skipped or put off (`update::Memo`).
+    pub update: crate::update::Memo,
 }
 
 /// What a middle-button double-click in the view does.
@@ -303,6 +307,8 @@ impl Default for Prefs {
             up_axis: "z".into(),
             offer_stand_up: true,
             middle_double_click: "home".into(),
+            check_updates: true,
+            update: crate::update::Memo::default(),
         }
     }
 }
@@ -359,7 +365,10 @@ impl Snapshot {
     }
     fn restore(self, app: &mut SolveApp) {
         let msaa = app.preferences.msaa;
+        // Update bookkeeping isn't a setting: a check that finished while the dialog was open stays.
+        let update = std::mem::take(&mut app.preferences.update);
         app.preferences = self.prefs;
+        app.preferences.update = update;
         app.ui.dark = self.dark;
         app.ui.show_grid = self.grid;
         app.ui.ground_shadow = self.shadow;
@@ -392,6 +401,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
             p.default_units = d.default_units;
             p.length_decimals = d.length_decimals;
             p.angle_decimals = d.angle_decimals;
+            p.check_updates = d.check_updates;
             app.ui.dark = true;
             app.ui.agent_cursor = Default::default();
             app.autosave_minutes = 5.0;
@@ -901,6 +911,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.label("");
             ui.add_enabled(s.show, egui::Checkbox::new(&mut s.follow_camera, crate::i18n::tr_label("Follow the camera (Look At sketches)")));
             ui.end_row();
+            crate::update::prefs_rows(app, ui, t);
         }
         1 => {
             ui.label(app.tr_label("Pan, zoom, orbit"));

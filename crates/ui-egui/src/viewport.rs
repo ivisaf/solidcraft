@@ -306,6 +306,51 @@ fn sketch_color(t: &Tokens, c: Rgb) -> [u8; 4] {
     }
 }
 
+/// With a component active, bodies outside it are drawn faded.
+fn body_faded(app: &SolveApp, b: &solidcraft_engine::doc::ModelBody, active_bodies: &Option<Vec<String>>) -> bool {
+    let s = &app.session;
+    if let Some(names) = active_bodies {
+        !names.contains(&b.name)
+    } else {
+        s.active_component != 0 && !s.doc.component_within(b.component, s.active_component)
+    }
+}
+
+/// The display plan the model scene draws `b` from on the GPU, or `None` when its faces are built
+/// here from the reference mesh. Opaque shaded bodies (`opaque`: not faded, and no see-through
+/// body or face) are drawn from their plans where the device evaluates them; faded and
+/// see-through ones (sorted and blended per triangle) are built here.
+fn drawn_plan(
+    app: &SolveApp,
+    b: &solidcraft_engine::doc::ModelBody,
+    opaque: bool,
+) -> Option<std::sync::Arc<solidcraft_engine::geom::tess::TessPlan>> {
+    let shaded = app.ui.visual_style != 2;
+    (shaded && opaque && app.viewport.gpu.is_some_and(|g| g.tess))
+        .then(|| b.display_plan())
+        .flatten()
+        .filter(|plan| plan.vertex_count() <= solidcraft_gpu::MAX_BATCH)
+}
+
+/// The mesh whose triangles the model scene shows for `b`'s faces: the plan's (evaluated on the
+/// CPU, the same triangles the GPU draws) or the reference mesh. A face highlighted over the model
+/// must use the same triangles: another triangulation of the same face fights it at equal depth
+/// and shimmers.
+fn shown_mesh(
+    app: &SolveApp,
+    b: &solidcraft_engine::doc::ModelBody,
+    active_bodies: &Option<Vec<String>>,
+) -> std::sync::Arc<solidcraft_engine::geom::Mesh> {
+    let doc = &app.session.doc;
+    let opaque =
+        || !body_faded(app, b, active_bodies) && doc.model_body_opacity(b) >= 0.999 && doc.face_colors(b).iter().all(|(_, l)| l.opacity >= 0.999);
+    (app.viewport.gpu.is_some_and(|g| g.tess) && opaque())
+        .then(|| drawn_plan(app, b, true))
+        .flatten()
+        .and_then(|_| b.plan_mesh())
+        .unwrap_or_else(|| b.mesh())
+}
+
 fn build_scene(app: &SolveApp) -> GpuScene {
     let tk = Tokens::get();
     let mut sc = GpuScene::default();
@@ -320,12 +365,7 @@ fn build_scene(app: &SolveApp) -> GpuScene {
         if stock || !app.session.body_visible(&b.name) || app.preview.replaced.contains(&b.name) {
             continue;
         }
-        // With a component active, bodies outside it are drawn faded.
-        let faded = if let Some(names) = &active_bodies {
-            !names.contains(&b.name)
-        } else {
-            s.active_component != 0 && !s.doc.component_within(b.component, s.active_component)
-        };
+        let faded = body_faded(app, b, &active_bodies);
         let base = body_color(&s.doc, b).unwrap_or(tk.body);
         let col = if faded { c4(base.gamma_multiply(0.35)) } else { c4(base) };
         let m = b.mesh();
@@ -342,13 +382,8 @@ fn build_scene(app: &SolveApp) -> GpuScene {
         let opacity = s.doc.model_body_opacity(b);
         let face_looks: std::collections::HashMap<usize, solidcraft_engine::doc::appearance::Look> =
             if shaded { s.doc.face_colors(b).into_iter().collect() } else { Default::default() };
-        // Opaque bodies are drawn from their display plans on the GPU where the device evaluates
-        // them; faded and see-through ones (sorted and blended per triangle) are built here.
         let opaque = !faded && opacity >= 0.999 && face_looks.values().all(|l| l.opacity >= 0.999);
-        let planned = (shaded && opaque && app.viewport.gpu.is_some_and(|g| g.tess))
-            .then(|| b.display_plan())
-            .flatten()
-            .filter(|plan| plan.vertex_count() <= solidcraft_gpu::MAX_BATCH);
+        let planned = drawn_plan(app, b, opaque);
         let on_gpu = planned.is_some();
         if let Some(plan) = planned {
             let face_colors = (0..b.body.face_count())
@@ -1404,6 +1439,10 @@ fn highlight_key(app: &SolveApp) -> u64 {
     format!("{:?}", app.viewport.hover).hash(&mut h);
     app.viewport.hover_feature.hash(&mut h);
     app.viewport.hover_bodies.hash(&mut h);
+    // Which mesh lights a face follows how the model draws its body (see `shown_mesh`).
+    app.session.active_component.hash(&mut h);
+    app.session.active_occurrence_path.hash(&mut h);
+    app.ui.visual_style.hash(&mut h);
     app.ui.pick_bodies.hash(&mut h);
     crate::theme::is_dark().hash(&mut h);
     app.preview.replaced.hash(&mut h);
@@ -1422,6 +1461,10 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
     let t = Tokens::get();
     let mut sc = GpuScene::default();
     let st = app.session.world_state();
+    let s = &app.session;
+    let active_bodies = s.active_occurrence_path.as_ref().and_then(|p| s.occurrence_bodies(p, true).ok());
+    // Faces lit over the model use the triangles the model shows them with.
+    let shown = |b: &solidcraft_engine::doc::ModelBody| shown_mesh(app, b, &active_bodies);
     let mut sel = Vec::new();
     for item in app.highlighted() {
         for piece in displayed_selection(app, &item) {
@@ -1495,7 +1538,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
             Sel::Face { body, index, .. } => {
                 // A live preview stands in for the body: its old faces would fight with it.
                 if let Some(b) = st.body(body).filter(|_| app.session.body_visible(body) && !app.preview.replaced.contains(body)) {
-                    face_tris(&mut sc, &b.mesh(), *index, c4(t.sel_face), false);
+                    face_tris(&mut sc, &shown(b), *index, c4(t.sel_face), false);
                     hidden_face_outline(&mut sc, &b.mesh(), *index, t.sel_edge);
                 }
             }
@@ -1503,7 +1546,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
                 if let Some(b) = st.body(name)
                     && app.session.body_visible(name)
                 {
-                    let m = b.mesh();
+                    let m = shown(b);
                     for f in 0..b.body.face_count() {
                         face_tris(&mut sc, &m, f, c4(t.body_selected), true);
                     }
@@ -1577,11 +1620,12 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
         let k = t.hover_face_lift;
         let c = body_rgb(app, &b.name);
         let m = b.mesh();
+        let lit = shown(b);
         for &f in &faces {
             if !sel.iter().any(|x| {
                 matches!(x, Sel::Face { body, index, .. } if body == &b.name && *index == f) || matches!(x, Sel::Body { name } if name == &b.name)
             }) {
-                face_tris(&mut sc, &m, f, [c.0.saturating_add(k), c.1.saturating_add(k), c.2.saturating_add(k), 255], true);
+                face_tris(&mut sc, &lit, f, [c.0.saturating_add(k), c.1.saturating_add(k), c.2.saturating_add(k), 255], true);
             }
         }
         for (ei, e) in m.edges.iter().enumerate() {
@@ -1597,7 +1641,7 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
             if let Some(b) = st.body(body) {
                 let k = t.hover_face_lift;
                 let c = body_rgb(app, body);
-                let m = b.mesh();
+                let m = shown(b);
                 for f in 0..b.body.face_count() {
                     face_tris(&mut sc, &m, f, [c.0.saturating_add(k), c.1.saturating_add(k), c.2.saturating_add(k), 255], true);
                 }
@@ -1612,8 +1656,9 @@ fn build_highlight(app: &SolveApp) -> GpuScene {
                 let c = body_rgb(app, body);
                 let m = b.mesh();
                 let patch = m.surface_patch(*index);
+                let lit = shown(b);
                 for &f in &patch {
-                    face_tris(&mut sc, &m, f, [c.0.saturating_add(k), c.1.saturating_add(k), c.2.saturating_add(k), 255], true);
+                    face_tris(&mut sc, &lit, f, [c.0.saturating_add(k), c.1.saturating_add(k), c.2.saturating_add(k), 255], true);
                 }
                 for (e, _) in m.edge_faces.iter().enumerate().filter(|(_, fs)| fs.iter().any(|f| patch.contains(&(*f as usize)))) {
                     if let Some(p) = m.edges.get(e)
@@ -3276,8 +3321,8 @@ mod tests {
             let proj = projection(&app, rect);
             let e = proj.cam.eye().to_f32();
             let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
-            let planned = scene.planned.len();
-            (planned, scene.tris.len(), crate::gpu::render_offscreen(scene, proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, tess))
+            let (planned, shader) = (scene.planned.len(), tess.then_some(solidcraft_gpu::SHADER));
+            (planned, scene.tris.len(), crate::gpu::render_offscreen(scene, None, proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, shader))
         };
         let (planned, gpu_tris, gpu) = render(true);
         let (none, cpu_tris, cpu) = render(false);
@@ -3293,6 +3338,102 @@ mod tests {
         assert!(drawn > n / 20, "the model covers the view: {drawn} pixels");
         let differ = (0..n).filter(|&i| px(&gpu, i).iter().zip(px(&cpu, i)).any(|(a, b)| a.abs_diff(b) > 24)).count();
         assert!(differ * 100 < drawn, "{differ} of {drawn} model pixels differ");
+    }
+
+    /// A device that cannot build the tessellation pipeline (D3D12's FXC rejected the shader
+    /// at startup and the app panicked) still shows the model: the failure is caught, logged,
+    /// and bodies are built on the CPU and drawn. A shader the device rejects stands in for FXC.
+    /// Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn bodies_are_built_on_the_cpu_when_the_tessellation_pipeline_fails() {
+        const REJECTED: &str = "
+            @group(0) @binding(1) var<storage, read_write> surfaces: array<u32>;
+            @compute @workgroup_size(64)
+            fn main(@builtin(global_invocation_id) gid: vec3<u32>) { surfaces[gid.x] = 1u; }
+        ";
+        let Some(tess) = crate::gpu::offscreen_tessellates(REJECTED) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        assert!(!tess, "the rejected shader built a pipeline");
+        let mut s = solidcraft_engine::Session::default();
+        s.run_script(&solidcraft_engine::sample::script()).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.viewport.no_pixels = true;
+        app.fit_view();
+        app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+        const SIZE: u32 = 256;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let scene = build_scene(&app);
+        assert!(scene.planned.is_empty(), "no body waits for the GPU evaluation");
+        assert!(!scene.tris.is_empty(), "the bodies are meshed on the CPU");
+        let proj = projection(&app, rect);
+        let e = proj.cam.eye().to_f32();
+        let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+        let Some(img) = crate::gpu::render_offscreen(scene, None, proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, Some(REJECTED)) else {
+            return;
+        };
+        let n = (SIZE * SIZE) as usize;
+        let drawn = img.chunks(4).filter(|p| p[..3] != [255, 255, 255]).count();
+        assert!(drawn > n / 20, "the model is drawn: {drawn} pixels");
+    }
+
+    /// A hovered face lights solidly over a body drawn from its display plan on the GPU: the
+    /// highlight uses the plan's triangles, not the reference mesh's other triangulation of the
+    /// same face, which fought the model at equal depth and shimmered in wedges. Every face of a
+    /// box with a pocket and a round boss, hovered, changes the same pixels as on the CPU path (where model and
+    /// highlight share the reference mesh). Skipped without a GPU adapter.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_hovered_face_lights_whole_over_a_body_drawn_from_its_plan() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 40, "height": 40, "corner": [0, 0, 0], "operation": "new"})).unwrap();
+        s.execute("solid.box", &json!({"length": 16, "width": 16, "height": 20, "corner": [12, 12, 20], "operation": "cut"})).unwrap();
+        s.execute("solid.cylinder", &json!({"base": [33, 33, 40], "diameter": 10, "height": 10, "operation": "join"})).unwrap();
+        let mut app = SolveApp::new(s, crate::Services::default());
+        app.viewport.no_pixels = true;
+        app.fit_view();
+        const SIZE: u32 = 256;
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(SIZE as f32, SIZE as f32));
+        let body = app.session.world_state().bodies[0].clone();
+        let faces = body.body.face_count();
+        let mut render = |tess: bool, hover: Option<usize>| {
+            app.viewport.gpu = Some(GpuTarget { format: egui_wgpu::wgpu::TextureFormat::Rgba8Unorm, depth: None, samples: 1, tess });
+            app.viewport.hover = hover.map(|index| Hit::Face { body: body.name.clone(), index, point: Vec3::ZERO });
+            let (scene, highlight) = (build_scene(&app), build_highlight(&app));
+            assert_eq!(!scene.planned.is_empty(), tess, "the box is drawn from its plan exactly on the GPU path");
+            let proj = projection(&app, rect);
+            let e = proj.cam.eye().to_f32();
+            let eye = [e[0], e[1], e[2], if proj.cam.fov > 0.0 { 1.0 } else { 0.0 }];
+            let shader = tess.then_some(solidcraft_gpu::SHADER);
+            crate::gpu::render_offscreen(scene, Some(highlight), proj.vp.to_f32(), proj.cam.back().to_f32(), eye, SIZE, shader)
+        };
+        let lit = |plain: &[u8], hovered: &[u8]| -> Vec<bool> { plain.chunks(4).zip(hovered.chunks(4)).map(|(a, b)| a != b).collect() };
+        let (Some(gpu_plain), Some(cpu_plain)) = (render(true, None), render(false, None)) else {
+            eprintln!("skipping: no GPU adapter");
+            return;
+        };
+        let mut checked = 0;
+        for f in 0..faces {
+            let (Some(gpu), Some(cpu)) = (render(true, Some(f)), render(false, Some(f))) else { return };
+            let (on_gpu, on_cpu) = (lit(&gpu_plain, &gpu), lit(&cpu_plain, &cpu));
+            let area = on_cpu.iter().filter(|x| **x).count();
+            if area < 400 {
+                continue; // facing away or hidden
+            }
+            // Inside the face, two pixels in from its outline: a curved face's outline follows
+            // its own facets, which the plan and the reference mesh cut differently.
+            let n = SIZE as i32;
+            let inside = |i: usize| {
+                let (x, y) = (i as i32 % n, i as i32 / n);
+                (-2..=2).all(|dy| (-2..=2).all(|dx| on_cpu.get(((y + dy).clamp(0, n - 1) * n + (x + dx).clamp(0, n - 1)) as usize) == Some(&true)))
+            };
+            let missed = (0..on_cpu.len()).filter(|&i| inside(i) && !on_gpu[i]).count();
+            assert!(missed * 200 < area, "face {f}: {missed} of its {area} hovered pixels do not light (the highlight fights the model)");
+            checked += 1;
+        }
+        assert!(checked >= 3, "{checked} faces seen lit");
     }
 
     #[test]

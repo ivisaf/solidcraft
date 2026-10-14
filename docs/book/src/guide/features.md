@@ -18,6 +18,11 @@ Extruding into existing material selects **Cut**. In an empty component it selec
 choose **New Body** explicitly to keep an addition separate. Changing the default does not alter
 operations already saved in a design.
 
+A taper slopes the sides of any profile, sketch text included: lines, arcs and spline or conic
+curves move in or out together, and a flat tip shorter than the taper closes to a point. A
+taper steeper than the profile's details (a stroke, a curve or a gap narrower than it) is
+refused with that reason; a smaller taper or distance builds.
+
 Editing an extrusion retains its signed distances, From/To Object inputs, taper expressions
 and explicit body targets. Revolve edits retain world, sketch and explicit-line axes, both
 angle expressions and To Object targets. An unchanged **All profiles** selection continues

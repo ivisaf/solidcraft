@@ -459,6 +459,12 @@ pub fn read(s: &str) -> Result<Document> {
             return Err(DocError::Invalid(format!("damaged design: occurrence `{}` has an invalid placement", o.name)));
         }
     }
+    if !all_unique(d.features.iter().map(|f| f.id))
+        || !all_unique(d.components.iter().map(|c| c.id))
+        || !all_unique(d.occurrences.iter().map(|o| o.id))
+    {
+        return Err(DocError::Invalid("damaged design: duplicate feature, component or occurrence id".into()));
+    }
     let component_ids: std::collections::BTreeSet<_> = d.components.iter().map(|component| component.id).chain(std::iter::once(0)).collect();
     for feature in &d.features {
         if let crate::FeatureKind::Sketch { sketch, .. } = &feature.kind {
@@ -480,8 +486,19 @@ pub fn read(s: &str) -> Result<Document> {
     // Fill in what older designs (and hand-edited files) may lack; a no-op otherwise.
     crate::format_offsets::validate_typed(&d)?;
     normalise(&mut d)?;
+    // `next_id` is trusted by nothing: a hand-edited or generated file may omit it or leave it stale,
+    // and the next feature, component or occurrence would then reuse an id that is already taken.
+    let largest =
+        d.features.iter().map(|f| f.id).chain(d.components.iter().map(|c| c.id)).chain(d.occurrences.iter().map(|o| o.id)).max().unwrap_or(0);
+    let floor = largest.checked_add(1).ok_or_else(|| DocError::Invalid("damaged design: the id space is exhausted".into()))?;
+    d.next_id = d.next_id.max(floor).max(1);
     d.format = format_string(FORMAT);
     Ok(d)
+}
+
+fn all_unique(ids: impl Iterator<Item = u64>) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    ids.into_iter().all(|id| seen.insert(id))
 }
 
 /// The caps interactive editing enforces, applied to the raw JSON so an oversized sketch is
@@ -1597,5 +1614,64 @@ mod tests {
             let error = read(&value.to_string()).unwrap_err().to_string();
             assert!(error.contains("sketch too large"), "{key}: {error}");
         }
+    }
+
+    fn two_components_one_occurrence() -> Document {
+        let mut d = Document::new("ids");
+        let a = d.add_component(None, 0).unwrap();
+        d.add_component(None, 0).unwrap();
+        d.add_occurrence(a, 0, crate::IDENTITY).unwrap();
+        d
+    }
+
+    fn edited(d: &Document, f: impl FnOnce(&mut Value)) -> String {
+        let mut v: Value = serde_json::from_str(&d.to_json()).unwrap();
+        f(&mut v);
+        v.to_string()
+    }
+
+    #[test]
+    fn missing_or_stale_next_id_does_not_reuse_existing_ids() {
+        let d = two_components_one_occurrence();
+        let largest = d.components.iter().map(|c| c.id).chain(d.occurrences.iter().map(|o| o.id)).max().unwrap();
+        for stale in [None, Some(0), Some(1)] {
+            let json = edited(&d, |v| {
+                let o = v.as_object_mut().unwrap();
+                match stale {
+                    Some(n) => o.insert("next_id".into(), n.into()),
+                    None => o.remove("next_id"),
+                };
+            });
+            let mut back = read(&json).unwrap();
+            assert!(back.next_id > largest, "next_id {} after load with {stale:?}", back.next_id);
+            let fresh = back.add_component(None, 0).unwrap();
+            assert!(fresh > largest, "new component reused id {fresh}");
+        }
+    }
+
+    #[test]
+    fn duplicate_component_or_occurrence_ids_are_a_damaged_design() {
+        let d = two_components_one_occurrence();
+        let dup_component = edited(&d, |v| v["components"][1]["id"] = v["components"][0]["id"].clone());
+        let dup_occurrence = edited(&d, |v| {
+            let first = v["occurrences"][0].clone();
+            v["occurrences"].as_array_mut().unwrap().push(first);
+        });
+        for json in [dup_component, dup_occurrence] {
+            let error = read(&json).unwrap_err().to_string();
+            assert!(error.contains("damaged design"), "{error}");
+        }
+    }
+
+    #[test]
+    fn exhausted_id_space_is_an_error_not_a_panic() {
+        let d = two_components_one_occurrence();
+        let json = edited(&d, |v| v["next_id"] = u64::MAX.into());
+        let mut back = read(&json).unwrap();
+        let before = back.components.len();
+        assert!(back.add_component(None, 0).is_err());
+        assert_eq!(back.components.len(), before);
+        let json = edited(&d, |v| v["components"][1]["id"] = u64::MAX.into());
+        assert!(read(&json).unwrap_err().to_string().contains("damaged design"));
     }
 }

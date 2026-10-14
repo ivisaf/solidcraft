@@ -217,10 +217,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
     // one sets it. The triad is the manipulator here, so the box comes without the drag arrow
     // every other dialog's value gets (`dir` is None below).
     if matches!(d.kind, Kind::Move { .. }) {
+        let mut dragging = false;
         if let Some(t) = crate::dialogs_move::triad(app, &d)
             && let Some(g) = crate::gizmo::show(ui, painter, proj, egui::Id::new("sc_move_triad"), &t, snap_step(app.cam.half_height()))
         {
             crate::dialogs_move::drag(app, &mut d, g);
+            dragging = true;
         }
         // Read the triad again after the drag, so the box follows it in the same frame. Move
         // types with no triad (Rotate, Point to Point, Point to Position) put the box on the
@@ -234,7 +236,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
             // Clear of the triad: its arrows reach LEN_PX and its rings RING of that, so a box
             // beside the centre would cover the handles the user is reaching for.
             let off = if triad.is_some() { vec2(crate::gizmo::LEN_PX as f32 + 16.0, -12.0) } else { vec2(16.0, -30.0) };
-            value_box(ui, label, value, bs + off, focus);
+            value_box(ui, label, value, bs + off, focus || dragging);
         }
         app.dialog = Some(d);
         return;
@@ -418,7 +420,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             box_at = ts + vec2(14.0, -12.0);
         }
     }
-    value_box(ui, label, value, box_at, focus);
+    value_box(ui, label, value, box_at, focus || *value != before);
     if *value != before
         && let Kind::Extrude { all, .. } = &mut d.kind
     {
@@ -428,8 +430,11 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
 
 /// The command's main value in the viewport, next to the geometry: the keyboard goes here while
 /// the window is open, so a number typed straight after a pick sets the value. `at` is its
-/// top-left corner.
-fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, focus: bool) {
+/// top-left corner. `select_all` re-selects the whole field, both right after a pick and on every
+/// frame a drag is changing the value underneath it: without the latter, a drag that grows the
+/// text (e.g. "4 mm" -> "15 mm") would leave the stale, shorter selection from the pick in place,
+/// covering only part of the new text.
+fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool) {
     let t = Tokens::get();
     let id = egui::Id::new("sc_canvas_value");
     crate::frame::area(egui::Id::new("sc_canvas_area")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
@@ -438,7 +443,7 @@ fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, focus
                 ui.label(egui::RichText::new(label).color(t.text_dim).size(11.5));
                 let r = ui.add(egui::TextEdit::singleline(value).id(id).desired_width(72.0));
                 crate::params_dialog::complete(ui, &r, value);
-                if focus {
+                if select_all {
                     r.request_focus();
                     let n = value.chars().count();
                     let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
@@ -806,6 +811,7 @@ fn draw_revolve(
         curved_to: false,
     });
     let mut box_at = bs + vec2(16.0, -30.0);
+    let angle_before = if let Kind::Revolve { angle, .. } = &d.kind { angle.clone() } else { String::new() };
     if !extent.curved_to && extent.sweep.is_finite() {
         let (origin, direction) = axis;
         let centre = origin + direction * (base - origin).dot(direction);
@@ -898,9 +904,9 @@ fn draw_revolve(
             }
         }
     }
-    crate::frame::area(egui::Id::new("sc_canvas_area")).fixed_pos(box_at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
-            if to_mode {
+    if to_mode {
+        crate::frame::area(egui::Id::new("sc_canvas_area")).fixed_pos(box_at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                 let text = if extent.curved_to {
                     "To surface".into()
                 } else if extent.sweep.is_finite() {
@@ -909,25 +915,12 @@ fn draw_revolve(
                     "Choose target".into()
                 };
                 ui.label(text).on_hover_text(crate::i18n::tr_label("Determined by To Object. Choose Angle to edit the angular extent."));
-            } else if let Kind::Revolve { angle, .. } = &mut d.kind {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(crate::i18n::tr_label("Angle")).color(Tokens::get().text_dim).size(11.5));
-                    let id = egui::Id::new("sc_canvas_value");
-                    let response = ui.add(egui::TextEdit::singleline(angle).id(id).desired_width(72.0));
-                    crate::params_dialog::complete(ui, &response, angle);
-                    if focus {
-                        response.request_focus();
-                        let n = angle.chars().count();
-                        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-                        state
-                            .cursor
-                            .set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
-                        state.store(ui.ctx(), id);
-                    }
-                });
-            }
+            });
         });
-    });
+    } else if let Kind::Revolve { angle, .. } = &mut d.kind {
+        let dragging = *angle != angle_before;
+        value_box(ui, crate::i18n::tr_label("Angle"), angle, box_at, focus || dragging);
+    }
 }
 
 fn revolve_convention(d: &Dialog) -> solidcraft_engine::doc::RevolveConvention {

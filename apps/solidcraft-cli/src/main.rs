@@ -3,6 +3,7 @@
 //! ```text
 //! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--allow-errors]
 //! solidcraft-cli eval <script.json|design.solidcraft|part.step> (alias: inspect) measurements as JSON
+//! solidcraft-cli script <design.solidcraft> [--out script.json]     the design's history as a command script
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] loading timings as JSON lines
 //! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…]
 //! solidcraft-cli exec <command> [json-params]                 run one command on an empty design
@@ -37,6 +38,8 @@ const USAGE: &str = "usage:
   solidcraft-cli run --in <design.solidcraft|part.step> [--out FILE]...
       (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway)
   solidcraft-cli eval <script.json|design.solidcraft|part.step>     (alias: inspect; or --in FILE)
+  solidcraft-cli script <design.solidcraft|script.json> [--out script.json]
+      (the design's history as a command script that eval and run replay)
   solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]
   solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|back|top|bottom|left|right]
   solidcraft-cli exec <command> [json-params]
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
     let r = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("eval" | "inspect") => cmd_eval(&args[1..]),
+        Some("script") => cmd_script(&args[1..]),
         Some("snapshot") => cmd_snapshot(&args[1..]),
         Some("exec") => cmd_exec(&args[1..]),
         Some("commands") => {
@@ -239,6 +243,23 @@ fn cmd_eval(args: &[String]) -> Result<(), String> {
         "sketches": d["sketches"],
     });
     println!("{}", pretty(&out));
+    Ok(())
+}
+
+/// A design's history as a command script (`timeline.export_script`): printed, or written to
+/// `--out`; what the script leaves out goes to stderr.
+fn cmd_script(args: &[String]) -> Result<(), String> {
+    let path = positional(args).ok_or_else(|| USAGE.to_string())?;
+    let s = &mut load(path)?;
+    let out = flag(args, "--out");
+    let r = s.execute("timeline.export_script", &json!({"path": out})).map_err(|e| e.to_string())?;
+    for what in r["omitted"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        eprintln!("note: the script leaves out {what}");
+    }
+    match out {
+        Some(out) => eprintln!("{out}: {} steps", r["steps"]),
+        None => println!("{}", pretty(&r["script"])),
+    }
     Ok(())
 }
 

@@ -642,7 +642,7 @@ impl Resources {
             access_bgl,
             access_bind,
             access_version: 0,
-            tri_hl: pipeline("sc_tris_hl", "vs_tri", "fs_tri", tri_layout(), depth(wgpu::CompareFunction::LessEqual, false), alpha),
+            tri_hl: pipeline("sc_tris_hl", "vs_tri", "fs_tri", tri_layout(), highlight_depth(t.depth), alpha),
             trans: pipeline("sc_trans", "vs_tri", "fs_tri", tri_layout(), depth(wgpu::CompareFunction::LessEqual, false), alpha),
             glass_far: glass("sc_glass_far", wgpu::Face::Front),
             glass_near: glass("sc_glass_near", wgpu::Face::Back),
@@ -661,6 +661,24 @@ impl Resources {
         }
     }
 }
+
+/// Depth state of faces lit over the model (hover, selection): tested, not written, and pulled a
+/// little toward the eye. They lie on the model's own faces, but the GPU evaluates a body's plan
+/// in f32 while the highlight's copy of the same triangles is evaluated on the CPU, so the two
+/// depths differ by rounding and an unbiased equal test lights the face in speckles and wedges.
+/// The bias is a few depth steps plus the face's own slope: far less than any real gap.
+fn highlight_depth(format: Option<wgpu::TextureFormat>) -> Option<wgpu::DepthStencilState> {
+    format.map(|format| wgpu::DepthStencilState {
+        format,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+        stencil: Default::default(),
+        bias: HIGHLIGHT_BIAS,
+    })
+}
+
+/// See [`highlight_depth`]. Negative: toward the eye (depth grows away from it).
+const HIGHLIGHT_BIAS: wgpu::DepthBiasState = wgpu::DepthBiasState { constant: -8, slope_scale: -1.0, clamp: 0.0 };
 
 fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize) -> Option<Batch> {
     upload_with(device, label, bytes, stride, wgpu::BufferUsages::VERTEX)
@@ -718,14 +736,30 @@ impl Batches {
     }
 }
 
+/// The tessellation pipeline (`shader`: its source), where display plans are evaluated: on a
+/// device that runs compute shaders with the storage buffers the evaluation binds (not WebGL2)
+/// and builds the pipeline. Elsewhere `None`, and bodies are built on the CPU: a device whose
+/// shader compiler rejects the shader (D3D12's FXC once did) only loses GPU evaluation.
+fn tessellation(adapter: &wgpu::Adapter, device: &wgpu::Device, queue: &wgpu::Queue, shader: &str) -> Option<solidcraft_gpu::TessGpu> {
+    let compute = adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
+        && device.limits().max_storage_buffers_per_shader_stage >= 4;
+    if !compute {
+        return None;
+    }
+    let info = adapter.get_info();
+    match solidcraft_gpu::TessGpu::with_shader(info.name.clone(), device.clone(), queue.clone(), shader) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            log::warn!("bodies are built on the CPU on {} ({:?}): {e}", info.name, info.backend);
+            None
+        }
+    }
+}
+
 /// Create the pipelines. Call once with the app's render state and its depth/stencil/MSAA
 /// settings. Without a stencil the section cap does not hide the inside of cut bodies.
 pub fn install(rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) -> GpuTarget {
-    // Display plans are evaluated where the device runs compute shaders with the storage
-    // buffers the evaluation binds (not WebGL2): elsewhere bodies are built on the CPU.
-    let compute = rs.adapter.get_downlevel_capabilities().flags.contains(wgpu::DownlevelFlags::COMPUTE_SHADERS)
-        && rs.device.limits().max_storage_buffers_per_shader_stage >= 4;
-    let tess = compute.then(|| solidcraft_gpu::TessGpu::new(rs.adapter.get_info().name, rs.device.clone(), rs.queue.clone()));
+    let tess = tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER);
     let t = GpuTarget { format: rs.target_format, depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits), samples, tess: tess.is_some() };
     let res = Resources::new(&rs.device, t, tess);
     rs.renderer.write().callback_resources.insert(res);
@@ -894,19 +928,43 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
 
 /// Render `scene` offscreen on a device of its own, through the viewport's real resources and
 /// frame callback (`prepare`, then `paint`), and read the pixels back: straight RGBA, `size` ×
-/// `size`. `None` without a GPU adapter. With `tess`, planned bodies are evaluated on the GPU.
+/// `size`. `None` without a GPU adapter. With `tess` (the tessellation shader), planned bodies
+/// are evaluated on the GPU where the device builds that pipeline, as [`install`] sets it up.
+/// `highlight` is drawn as the viewport's highlight scene (hover and selection).
 #[cfg(all(test, not(target_arch = "wasm32")))]
-pub(crate) fn render_offscreen(scene: GpuScene, view_proj: [[f32; 4]; 4], back: [f32; 3], eye: [f32; 4], size: u32, tess: bool) -> Option<Vec<u8>> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+fn offscreen_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
         ..Default::default()
     }))
     .ok()?;
+    Some((adapter, device, queue))
+}
+
+/// Whether [`install`] would evaluate plans on the GPU with `shader`, on an offscreen device
+/// (`None` without a GPU adapter).
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn offscreen_tessellates(shader: &str) -> Option<bool> {
+    let (adapter, device, queue) = offscreen_device()?;
+    Some(tessellation(&adapter, &device, &queue, shader).is_some())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn render_offscreen(
+    scene: GpuScene,
+    highlight: Option<GpuScene>,
+    view_proj: [[f32; 4]; 4],
+    back: [f32; 3],
+    eye: [f32; 4],
+    size: u32,
+    tess: Option<&str>,
+) -> Option<Vec<u8>> {
+    let (adapter, device, queue) = offscreen_device()?;
     let (format, depth) = (wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth24PlusStencil8);
-    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess };
-    let compute = tess.then(|| solidcraft_gpu::TessGpu::new(adapter.get_info().name, device.clone(), queue.clone()));
+    let compute = tess.and_then(|shader| tessellation(&adapter, &device, &queue, shader));
+    let target = GpuTarget { format, depth: Some(depth), samples: 1, tess: compute.is_some() };
     let mut resources = egui_wgpu::CallbackResources::default();
     resources.insert(Resources::new(&device, target, compute));
     let none = || Arc::new(Mutex::new(None));
@@ -915,8 +973,8 @@ pub(crate) fn render_offscreen(scene: GpuScene, view_proj: [[f32; 4]; 4], back: 
         slot: Arc::new(Mutex::new(Some(scene))),
         sketch_key: 0,
         sketch_slot: none(),
-        hl_key: 0,
-        hl_slot: none(),
+        hl_key: u64::from(highlight.is_some()),
+        hl_slot: Arc::new(Mutex::new(highlight)),
         pv_key: 0,
         pv_slot: none(),
         view_proj,

@@ -17,6 +17,37 @@ use solidcraft_geom::Vec3;
 use solidcraft_geom::tess::{EvalCurve, EvalSurface, TessPlan};
 use wgpu::util::DeviceExt;
 
+/// The tessellation compute shader (WGSL).
+pub const SHADER: &str = include_str!("tess.wgsl");
+
+/// The error a popped error scope caught. Native devices answer at once; a browser's answer
+/// comes later, and is not waited for (no error is assumed).
+fn popped(f: impl std::future::Future<Output = Option<wgpu::Error>>) -> Option<wgpu::Error> {
+    let mut f = std::pin::pin!(f);
+    match f.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+        std::task::Poll::Ready(e) => e,
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// An adapter and device without a window (native only). The environment may pick the backend
+/// and the D3D12 shader compiler (`WGPU_BACKEND`, `WGPU_DX12_COMPILER`).
+#[cfg(not(target_arch = "wasm32"))]
+fn open_headless() -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(
+        instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
+    )
+    .map_err(|_| GpuError::NoAdapter)?;
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("solidcraft compute"),
+        required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+        ..Default::default()
+    }))
+    .map_err(|e| GpuError::Device(e.to_string()))?;
+    Ok((adapter, device, queue))
+}
+
 /// Most vertices evaluated in one dispatch (bounds the buffers; larger plans go in batches).
 pub const MAX_BATCH: usize = 1 << 20;
 const WORKGROUP: u32 = 64;
@@ -29,6 +60,8 @@ pub enum GpuError {
     Device(String),
     #[error("the GPU evaluation failed: {0}")]
     Failed(String),
+    #[error("the GPU tessellation pipeline could not be created: {0}")]
+    Pipeline(String),
     #[error("not supported yet: {0}")]
     Unsupported(String),
 }
@@ -78,11 +111,47 @@ pub struct TessGpu {
 }
 
 impl TessGpu {
-    /// The pipeline on an existing device (`adapter`: its name, for reports).
-    pub fn new(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue) -> Self {
+    /// The pipeline on an existing device (`adapter`: its name, for reports). An error (never
+    /// a panic) when the device cannot build it, for example where the D3D12 driver's older shader
+    /// compiler (FXC) rejects the shader: the caller then builds bodies on the CPU.
+    pub fn new(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue) -> Result<Self> {
+        Self::with_shader(adapter, device, queue, SHADER)
+    }
+
+    /// [`TessGpu::new`] with another shader source: tests use it to make pipeline creation fail
+    /// as it does on a device whose compiler rejects the real shader.
+    #[doc(hidden)]
+    pub fn with_shader(adapter: impl Into<String>, device: wgpu::Device, queue: wgpu::Queue, shader: &str) -> Result<Self> {
+        // Errors here would go to the device's uncaptured-error handler, which panics by default:
+        // capture them, so a device that cannot run the shader only loses GPU tessellation.
+        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f));
+        let (pipeline, layout) = Self::build(&device, shader);
+        let mut failed = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(e) = popped(scope.pop()) {
+                failed.get_or_insert(e.to_string());
+            }
+        }
+        if let Some(e) = failed {
+            return Err(GpuError::Pipeline(e));
+        }
+        // A viewport records the evaluation into its own frame (see `TessGpu::record`).
+        #[cfg(target_arch = "wasm32")]
+        let _ = queue;
+        Ok(TessGpu {
+            adapter: adapter.into(),
+            device,
+            #[cfg(not(target_arch = "wasm32"))]
+            queue,
+            pipeline,
+            layout,
+        })
+    }
+
+    fn build(device: &wgpu::Device, shader: &str) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("solidcraft tessellation"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("tess.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(shader.into()),
         });
         let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
             binding,
@@ -114,34 +183,14 @@ impl TessGpu {
             compilation_options: Default::default(),
             cache: None,
         });
-        // A viewport records the evaluation into its own frame (see `TessGpu::record`).
-        #[cfg(target_arch = "wasm32")]
-        let _ = queue;
-        TessGpu {
-            adapter: adapter.into(),
-            device,
-            #[cfg(not(target_arch = "wasm32"))]
-            queue,
-            pipeline,
-            layout,
-        }
+        (pipeline, layout)
     }
 
     /// A device of its own, without a window (native only).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() }),
-        )
-        .map_err(|_| GpuError::NoAdapter)?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("solidcraft compute"),
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
-            ..Default::default()
-        }))
-        .map_err(|e| GpuError::Device(e.to_string()))?;
-        Ok(Self::new(adapter.get_info().name, device, queue))
+        let (adapter, device, queue) = open_headless()?;
+        Self::new(adapter.get_info().name, device, queue)
     }
 
     /// The adapter's name, for reports.

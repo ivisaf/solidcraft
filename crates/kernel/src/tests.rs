@@ -490,6 +490,99 @@ fn tapered_extrude_of_lines_and_arcs() {
     assert!(e.to_string().contains("arc meets another edge at a corner"), "{e}");
 }
 
+/// A circle drawn as four conics (the way free curves come, as in text) tapered inward: each
+/// conic's control polygon moves in by d, which for a circle is the exact smaller circle, so
+/// the solid is a cone frustum.
+#[test]
+fn tapered_extrude_of_conics() {
+    let (r, h, a) = (10.0, 12.0, 8f64.to_radians());
+    let w = std::f64::consts::FRAC_1_SQRT_2;
+    let p = |x: f64, y: f64| Vec2::new(x, y);
+    let disc = Loop2 {
+        segs: vec![
+            Seg2::Conic { a: p(r, 0.0), apex: p(r, r), b: p(0.0, r), w },
+            Seg2::Conic { a: p(0.0, r), apex: p(-r, r), b: p(-r, 0.0), w },
+            Seg2::Conic { a: p(-r, 0.0), apex: p(-r, -r), b: p(0.0, -r), w },
+            Seg2::Conic { a: p(0.0, -r), apex: p(r, -r), b: p(r, 0.0), w },
+        ],
+    };
+    let b = extrude_tapered(&Plane::XY, &Region2 { outer: disc, holes: vec![] }, h, 1.0, -a).unwrap();
+    let r1 = r - h * a.tan();
+    let v = PI * h / 3.0 * (r * r + r1 * r1 + r * r1);
+    let m = measure(&b).unwrap();
+    assert!(rel(m.volume, v) < 1e-3, "{} vs {v}", m.volume);
+    assert!((m.bbox.max.x - r).abs() < 1e-6 && (m.bbox.max.z - h).abs() < 1e-6, "{:?}", m.bbox);
+}
+
+/// A wedge whose tip is a flat line far shorter than the taper moves its sides in: the tip line
+/// goes, the two long sides meet, and its side is the flat triangle up to there. The solid is a
+/// prismatoid, its volume h/6 · (A₀ + 4·A_mid + A₁).
+#[test]
+fn tapered_extrude_swallows_a_short_tip() {
+    let (h, a) = (2.0, 5f64.to_radians());
+    let d = h * a.tan();
+    let pts = [Vec2::new(0.0, -2.0), Vec2::new(20.0, -0.01), Vec2::new(20.0, 0.01), Vec2::new(0.0, 2.0)];
+    let b = extrude_tapered(&Plane::XY, &Region2 { outer: Loop2::polygon(&pts), holes: vec![] }, h, 1.0, -a).unwrap();
+    // The top: the three long lines moved in by d (to their left, the loop running
+    // counter-clockwise), meeting each other.
+    let moved = |p: Vec2, q: Vec2| {
+        let t = (q - p).normalized().unwrap();
+        (p + t.perp() * d, t)
+    };
+    let meet = |(p0, t0): (Vec2, Vec2), (p1, t1): (Vec2, Vec2)| p0 + t0 * ((p1 - p0).cross(t1) / t0.cross(t1));
+    let (low, high, left) = (moved(pts[0], pts[1]), moved(pts[2], pts[3]), moved(pts[3], pts[0]));
+    let top = [meet(left, low), meet(low, high), meet(high, left)];
+    let area = |q: &[Vec2]| 0.5 * q.iter().zip(q.iter().cycle().skip(1)).map(|(a, b)| a.cross(*b)).sum::<f64>();
+    // Halfway up, each side edge's midpoint (the two tip corners both run to the top's tip).
+    let mid = [pts[0].lerp(top[0], 0.5), pts[1].lerp(top[1], 0.5), pts[2].lerp(top[1], 0.5), pts[3].lerp(top[2], 0.5)];
+    let v = h / 6.0 * (area(&pts) + 4.0 * area(&mid) + area(&top));
+    let m = measure(&b).unwrap();
+    assert!(rel(m.volume, v) < 1e-6, "{} vs {v}", m.volume);
+    assert_eq!(m.merged.faces, 6, "bottom, top, three sides and the tip's triangle");
+}
+
+/// A taper from below the profile, with a foot: the sides stand straight for the foot's height,
+/// then slope on to the top, and the section at the profile's plane is the profile.
+#[test]
+fn tapered_extrude_between_with_a_foot() {
+    let a = 10f64.to_radians();
+    let sq = Region2 {
+        outer: Loop2::polygon(&[Vec2::new(-20.0, -20.0), Vec2::new(20.0, -20.0), Vec2::new(20.0, 20.0), Vec2::new(-20.0, 20.0)]),
+        holes: vec![],
+    };
+    let (from, to, foot) = (-2.0, 10.0, 0.5);
+    let b = extrude_tapered_between(&Plane::XY, &sq, from, to, foot, 1.0, a).unwrap();
+    let side = |z: f64| 40.0 + 2.0 * z * a.tan();
+    let (s0, s1, rise) = (side(from), side(to), to - from - foot);
+    let v = foot * s0 * s0 + rise / 3.0 * (s0 * s0 + s1 * s1 + s0 * s1);
+    let m = measure(&b).unwrap();
+    assert!(rel(m.volume, v) < 1e-6, "{} vs {v}", m.volume);
+    assert!((m.bbox.min.z - from).abs() < 1e-6 && (m.bbox.max.z - to).abs() < 1e-6, "{:?}", m.bbox);
+    assert_eq!(m.merged.faces, 10);
+    assert!(extrude_tapered_between(&Plane::XY, &sq, from, to, 7.0, 1.0, a).is_err(), "a foot taller than half the solid");
+}
+
+/// A taper steeper than a profile's details is refused, and says why: a slot narrower than the
+/// taper closes; a ring's hole smaller than it closes.
+#[test]
+fn tapered_extrude_refuses_a_taper_steeper_than_the_details() {
+    let slot = Loop2::polygon(&[
+        Vec2::new(0.0, 0.0),
+        Vec2::new(10.0, 0.0),
+        Vec2::new(10.0, 10.0),
+        Vec2::new(5.1, 10.0),
+        Vec2::new(5.1, 2.0),
+        Vec2::new(4.9, 2.0),
+        Vec2::new(4.9, 10.0),
+        Vec2::new(0.0, 10.0),
+    ]);
+    let e = extrude_tapered(&Plane::XY, &Region2 { outer: slot, holes: vec![] }, 2.0, 1.0, 10f64.to_radians()).unwrap_err();
+    assert!(e.to_string().contains("the taper closes the profile"), "{e}");
+    let ring = Region2 { outer: Loop2::circle(Vec2::ZERO, 5.0), holes: vec![Loop2::circle(Vec2::ZERO, 0.3).reversed()] };
+    let e = extrude_tapered(&Plane::XY, &ring, 2.0, 1.0, 10f64.to_radians()).unwrap_err();
+    assert!(e.to_string().contains("the taper closes the profile"), "{e}");
+}
+
 #[test]
 fn polyhedra_shell_and_draft() {
     let b = box_solid(Vec3::ZERO, Vec3::new(50.0, 40.0, 30.0)).unwrap();

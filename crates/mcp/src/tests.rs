@@ -462,7 +462,7 @@ fn legacy_design_files_and_resource_uris() {
 /// design is open there, without its hidden files. The working folder doesn't count at all.
 #[test]
 fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folder() {
-    let base = std::env::temp_dir().join(format!("solidcraft-mcp-defaults-{}", std::process::id()));
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-defaults-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (proj, other, recovery) = (base.join("proj"), base.join("other"), base.join("recovery"));
     std::fs::create_dir_all(&proj).unwrap();
@@ -508,7 +508,7 @@ fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folde
 #[test]
 fn tool_calls_stay_inside_the_agents_folders() {
     use solidcraft_engine::io::vfs::PathScope;
-    let base = std::env::temp_dir().join(format!("solidcraft-mcp-scope-{}", std::process::id()));
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-scope-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (root, out) = (base.join("root"), base.join("out"));
     std::fs::create_dir_all(&root).unwrap();
@@ -546,6 +546,70 @@ fn tool_calls_stay_inside_the_agents_folders() {
     }
     assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written outside");
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The short (8.3) spelling of an existing `path` as `cmd` gives it (`NAME~1.XYZ`), or `None`
+/// when it has no short name (the volume makes none).
+#[cfg(windows)]
+fn short_spelling(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("cmd").raw_arg(format!("/d /c for %I in (\"{}\") do @echo %~sI", path.display())).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| solidcraft_engine::io::vfs::windows_refusal(s).is_some_and(|why| why.contains("8.3")))
+        .map(Into::into)
+}
+
+/// On Windows the temporary folder's path often has a short (8.3) name (the user folder's
+/// `NAME~1.XYZ` when its name is long). The server's own folders are spelled with long names
+/// there, so `screenshot` without a `path` (the scratch folder) and `doc.recovery_list` (the
+/// recovery folder) work; on such a machine both were refused as short names. Run in a child
+/// process whose `TMP`, `TEMP` and `SOLIDCRAFT_RECOVERY_DIR` are short spellings.
+#[cfg(windows)]
+#[test]
+fn the_servers_own_folders_work_when_the_temporary_folder_has_a_short_name() {
+    let base = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-mcp-short-names-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (temp, recovery) = (base.join("temporary"), base.join("recovery folder"));
+    std::fs::create_dir_all(&temp).unwrap();
+    std::fs::create_dir_all(&recovery).unwrap();
+    let (Some(short_temp), Some(short_recovery)) = (short_spelling(&temp), short_spelling(&recovery)) else {
+        eprintln!("skipped: {} has no short (8.3) name on this volume", base.display());
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    };
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "tests::short_names_child", "--test-threads=1", "--nocapture"])
+        .env("TMP", &short_temp)
+        .env("TEMP", &short_temp)
+        .env("SOLIDCRAFT_RECOVERY_DIR", &short_recovery)
+        .env("SOLIDCRAFT_MCP_SHORT_NAMES_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("short names: ok"), "{text}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The child process of the test above; does nothing on its own.
+#[cfg(windows)]
+#[test]
+fn short_names_child() {
+    if std::env::var_os("SOLIDCRAFT_MCP_SHORT_NAMES_CHILD").is_none() {
+        return;
+    }
+    use solidcraft_engine::io::vfs::windows_refusal;
+    let temp = std::env::temp_dir();
+    assert!(windows_refusal(&temp.to_string_lossy()).is_some_and(|why| why.contains("8.3")), "{}", temp.display());
+    let mut s = Server::new(Box::new(Headless::default())).with_path_scope(Some(crate::agent_scope([])));
+    tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}}));
+    tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    tool(&mut s, "execute", json!({"command": "doc.recovery_list", "params": {}}));
+    // An agent's own short spelling of the scratch folder stays refused.
+    let scratch = crate::scratch_dir().unwrap();
+    let short = std::env::temp_dir().join(scratch.file_name().unwrap()).join("shot.png");
+    let r = raw_tool(&mut s, "screenshot", json!({"path": short.to_string_lossy(), "width": 32, "height": 32}));
+    assert!(r.to_string().contains("short (8.3) names"), "{r}");
+    println!("short names: ok");
 }
 
 /// A bridged server sends the agent's folders with every request, so the app confines the

@@ -252,6 +252,28 @@ fn join_of_two_overlapping_rings_is_not_refused() {
     assert!(rel(got, want) < 1e-3, "{got} vs {want}");
 }
 
+/// A disc with a lobe on its rim, patterned six times about its centre: every copy shares the
+/// whole disc with the target, and joining them was refused as too much contact work (#1029).
+#[test]
+fn join_of_a_lobed_disc_pattern_is_not_refused() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "diameter": 15}));
+    run(&mut s, "sketch.circle.center", json!({"center": [0, 7.5], "diameter": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 10, "profiles": "all", "operation": "new", "body_name": "Disc"}));
+    run(&mut s, "solid.pattern.circular", json!({"bodies": ["Disc"], "axis": "Z", "count": 6}));
+    let tools: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).filter(|n| n != "Disc").collect();
+    assert_eq!(tools.len(), 5);
+    run(&mut s, "solid.combine", json!({"target": "Disc", "tools": tools, "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // The disc plus six lobes, each less the part inside the disc; neighbouring lobes stay apart.
+    let (disc, lobe) = (7.5, 2.5);
+    let want = (PI * disc * disc + 6.0 * (PI * lobe * lobe - disc_overlap(disc, lobe, disc))) * 10.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
 mod boolean_diagnostics;
 mod component_frames;
 mod large_step_import;
@@ -729,8 +751,8 @@ fn hostile_params_never_panic() {
                     while let Some(&id) = ids.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                         for v in hostile_values() {
                             for k in keys {
-                                if k == "path" && id.starts_with("parameters.") {
-                                    continue; // parameter files: covered by their own tests (no stray files)
+                                if k == "path" && (id.starts_with("parameters.") || id == "timeline.export_script") {
+                                    continue; // parameter and script files: covered by their own tests (no stray files)
                                 }
                                 let mut s = Session::default();
                                 // A model with a sketch, a body and an active sketch, so most commands get far.
@@ -2878,6 +2900,67 @@ fn renaming_a_pattern_copy_keeps_the_other_copies_names() {
     run(&mut s, "body.rename", json!({"body": "X (3)", "name": "Third"}));
     let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
     assert_eq!(names, ["X", "Second", "Third"]);
+}
+
+/// Three solids in one STEP file that carry the same label: the file written for three boxes, each
+/// named `X`.
+fn step_three_solids_labelled_x(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Session::default();
+    for (i, label) in ["Aa", "Bb", "Cc"].iter().enumerate() {
+        let corner = [30.0 * i as f64, 0.0, 0.0];
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": corner, "operation": "new_body", "body_name": label}));
+    }
+    let p = dir.join("Three.step");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut text = std::fs::read_to_string(&p).unwrap();
+    for label in ["Aa", "Bb", "Cc"] {
+        assert!(text.contains(&format!("MANIFOLD_SOLID_BREP('{label}'")), "the file names its solids: {label}");
+        text = text.replace(&format!("MANIFOLD_SOLID_BREP('{label}'"), "MANIFOLD_SOLID_BREP('X'");
+    }
+    std::fs::write(&p, text).unwrap();
+    p
+}
+
+/// Renaming one of several imported bodies that share a label leaves the names of the others alone:
+/// the model lists them as `X`, `X (2)`, `X (3)`, and `X (3)` is still there after `X (2)` is renamed.
+#[test]
+fn renaming_an_imported_body_keeps_the_names_of_its_duplicates() {
+    let p = step_three_solids_labelled_x("duplicate-labels");
+    let mut s = Session::default();
+    run(&mut s, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&s), ["X", "X (2)", "X (3)"]);
+    let x_of =
+        |s: &mut Session, body: &str| run(s, "inspect.measure", json!({"bodies": [body]}))["bodies"][0]["bbox"]["min"][0].as_f64().map(f64::round);
+    assert_eq!(x_of(&mut s, "X (3)"), Some(60.0));
+    run(&mut s, "body.rename", json!({"body": "X (2)", "name": "Second"}));
+    assert_eq!(names(&s), ["X", "Second", "X (3)"]);
+    assert_eq!(x_of(&mut s, "X (3)"), Some(60.0), "X (3) is still the solid at x = 60");
+    run(&mut s, "body.rename", json!({"body": "X (3)", "name": "Third"}));
+    assert_eq!(names(&s), ["X", "Second", "Third"]);
+    assert_eq!(x_of(&mut s, "Third"), Some(60.0));
+    // The names survive a rebuild and a reopen of the saved design.
+    let design = p.with_file_name("Three.solidcraft");
+    run(&mut s, "file.save_as", json!({"path": design.to_string_lossy()}));
+    let mut r = Session::default();
+    run(&mut r, "doc.open", json!({"path": design.to_string_lossy()}));
+    assert_eq!(names(&r), ["X", "Second", "Third"]);
+}
+
+/// The same when the first of the three is renamed: `X (2)` and `X (3)` do not slide down to `X` and
+/// `X (2)`, and what is set on one of them (a material) stays with it.
+#[test]
+fn renaming_the_first_imported_duplicate_keeps_the_numbers_of_the_others() {
+    let p = step_three_solids_labelled_x("duplicate-labels-first");
+    let mut s = Session::default();
+    run(&mut s, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    run(&mut s, "material.assign", json!({"bodies": ["X (3)"], "material": "Steel"}));
+    run(&mut s, "body.rename", json!({"body": "X", "name": "First"}));
+    let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+    assert_eq!(names, ["First", "X (2)", "X (3)"]);
+    assert!(s.doc.materials.contains_key("X (3)"), "the material is still on X (3): {:?}", s.doc.materials.keys().collect::<Vec<_>>());
 }
 
 /// Parameters that work are listed in the command's params doc, which is all agents see (#271).

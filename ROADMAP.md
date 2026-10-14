@@ -67,6 +67,10 @@ PCB / Package, Render, Animation, Simulation, Manufacture/CAM, Drawings.
   persist properties, provide a solver or enable rendering; see
   [the contract and staged follow-ups](docs/physical-material-cards.md).
 
+- Directional elasticity (#994) queries the validated card in material-local axes
+  through read-only `material.properties.directional`, with source/condition review.
+  It does not assign body frames, predict structural behavior or enable a solver.
+
 ## Library foundations (#785, #786, #787)
 
 - Proposed phases cover offline bundled/project/user packs, physical materials and
@@ -78,6 +82,11 @@ PCB / Package, Render, Animation, Simulation, Manufacture/CAM, Drawings.
   texture rendering and expanded component families are not implemented by this entry.
 
 ## Render foundation
+
+- The initial opaque surface numerical contract for #1004 provides bounded linear
+  color/metallic/roughness/IOR admission and an original tested direct-light BRDF.
+  It does not enable PBR rendering or change stored appearances. See
+  [the model, evidence and remaining consumer gates](docs/render-surface.md).
 
 - A bounded cooperative Radiance RGBE input utility is available in L1 render;
   it does not yet enable HDRI/PBR rendering or a document import command. See
@@ -155,6 +164,13 @@ PCB / Package, Render, Animation, Simulation, Manufacture/CAM, Drawings.
   Crash Reports…) with a reviewed issue draft; agents read them through
   `diagnostics.crash_reports`, the MCP `crash_reports` tool or the CLI. Nothing is sent
   anywhere. See [crash reports](docs/crash-reports.md).
+- Command scripts from designs (#886): `timeline.export_script` (CLI `solidcraft-cli script`)
+  writes a design's history as a script that `eval` and `run` replay into the same design —
+  user parameters, units, sheet metal and plastic rules and materials as their own commands,
+  then each feature through `timeline.add` with its ids, names and dimension parameters kept,
+  so every feature kind replays exactly and a failing feature fails the same way. Trimming the
+  script after a step gives the design at that step. Appearances, folders, views and
+  configurations are listed as left out; components and joints are not supported yet.
 
 ## 0.2.0 release batch
 

@@ -21,3 +21,5 @@ wgpu = { workspace = true, features = ["metal", "vulkan", "dx12", "gles"] }
 
 [dev-dependencies]
 solidcraft-kernel = { workspace = true }
+# The HLSL the D3D12 backend compiles (tests check it suits FXC).
+naga = { workspace = true, features = ["wgsl-in", "hlsl-out"] }

@@ -305,6 +305,12 @@ impl MaterialCard {
 /// Bound JSON traversal before cloning/deserializing it. Metadata and numeric
 /// bounds are admission limits, not claims about a real material's valid range.
 pub fn validate_card(value: &Value) -> Result<Validation> {
+    admit_card(value)?.validate()
+}
+
+/// Bound and deserialize a candidate before cloning it. Semantic checks belong
+/// to `validate` or the derived query; this alone does not validate the numbers.
+pub fn admit_card(value: &Value) -> Result<MaterialCard> {
     let mut pending = vec![(value, 0usize)];
     let (mut nodes, mut bytes) = (0usize, 0usize);
     while let Some((value, depth)) = pending.pop() {
@@ -345,7 +351,69 @@ pub fn validate_card(value: &Value) -> Result<Validation> {
         }
     }
     let card: MaterialCard = serde_json::from_value(value.clone()).map_err(|e| invalid(format!("material card: {e}")))?;
-    card.validate()
+    Ok(card)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DirectionalModulus {
+    pub direction: [f64; 3],
+    pub axes: Option<MaterialAxes>,
+    pub young_modulus_pa: f64,
+    pub validation: Validation,
+}
+
+impl MaterialCard {
+    /// Uniaxial small-strain modulus in the supplied material-local direction.
+    /// This is a constitutive query, not a body load case or structural solver.
+    pub fn directional_modulus(&self, direction: [f64; 3]) -> Result<DirectionalModulus> {
+        let validation = self.validate()?;
+        if !direction.iter().all(|x| x.is_finite()) {
+            return Err(invalid("direction: expected three finite components"));
+        }
+        let scale = direction.iter().fold(0.0_f64, |a, x| a.max(x.abs()));
+        if scale == 0. {
+            return Err(invalid("direction: must be nonzero"));
+        }
+        let scaled = direction.map(|x| x / scale);
+        let length = scaled.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let direction = scaled.map(|x| x / length);
+        let model = self
+            .properties
+            .iter()
+            .find_map(|p| match &p.data {
+                PropertyData::Elasticity { model } => Some(model),
+                _ => None,
+            })
+            .ok_or_else(|| invalid("elasticity is unspecified"))?;
+        let (axes, modulus) = match model {
+            Elasticity::Isotropic { young_modulus_pa, .. } => (None, *young_modulus_pa),
+            Elasticity::Orthotropic { axes, young_moduli_pa, shear_moduli_pa, poisson_ratios } => {
+                let [x, y, z] = direction;
+                let [e1, e2, e3] = *young_moduli_pa;
+                let [g12, g23, g31] = *shear_moduli_pa;
+                let [n12, n23, n31] = *poisson_ratios;
+                let [a, b, c] = [-n12 * (e2.sqrt() / e1.sqrt()), -n23 * (e3.sqrt() / e2.sqrt()), -n31 * (e1.sqrt() / e3.sqrt())];
+                let minor = 1. - a * a;
+                let determinant = 1. + 2. * a * b * c - a * a - b * b - c * c;
+                // Cholesky of the scaled normal compliance: evaluate the energy
+                // as sums of squares instead of cancelling positive/negative terms.
+                let l22 = minor.sqrt();
+                let l32 = (b - a * c) / l22;
+                let l33 = (determinant / minor).sqrt();
+                let [u, v, w] = [x * x / e1.sqrt(), y * y / e2.sqrt(), z * z / e3.sqrt()];
+                let terms = [u + a * v + c * w, l22 * v + l32 * w, l33 * w];
+                let compliance = terms.iter().map(|t| t * t).sum::<f64>() + (x * y).powi(2) / g12 + (y * z).powi(2) / g23 + (z * x).powi(2) / g31;
+                if !compliance.is_finite() || compliance <= 0. {
+                    return Err(invalid("directional compliance is unrepresentable"));
+                }
+                (Some(*axes), compliance.recip())
+            }
+        };
+        if !modulus.is_finite() || modulus <= 0. {
+            return Err(invalid("directional modulus is unrepresentable"));
+        }
+        Ok(DirectionalModulus { direction, axes, young_modulus_pa: modulus, validation })
+    }
 }
 
 #[cfg(test)]

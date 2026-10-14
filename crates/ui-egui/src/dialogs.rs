@@ -2981,6 +2981,8 @@ fn sels(d: &Dialog, i: usize) -> &[Sel] {
 
 fn run_dialog(app: &mut SolveApp, d: &Dialog) -> Result<(), String> {
     let commands = apply_commands(app, d)?;
+    // The live preview may be computing these very commands: OK takes its result.
+    crate::preview::settle(app, &commands);
     if let Some((_, marker)) = d.editing {
         // Record the actual pre-edit timeline state in the command's undo snapshot.
         roll_marker(app, marker)?;

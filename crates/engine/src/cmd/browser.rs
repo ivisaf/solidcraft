@@ -489,7 +489,10 @@ fn rename_body(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, format!("another body is called `{name}`")));
     }
     // The body is the k-th new body of its feature; its siblings keep the names they have now
-    // (unpinned pattern copies would otherwise be renumbered into the freed name, #265).
+    // (unpinned pattern copies would otherwise be renumbered into the freed name, #265). That
+    // includes the siblings whose stored name is shared: the solids of a STEP file with one label
+    // are stored as `X`, `X`, `X` and built as `X`, `X (2)`, `X (3)`, so the stored names are set
+    // to the numbered ones, or `X (3)` would turn into `X (2)` once the second solid is renamed.
     let fid = b.feature;
     let siblings: Vec<String> = st.bodies.iter().filter(|x| x.feature == fid).map(|x| x.name.clone()).collect();
     let k = siblings.iter().position(|n| *n == old).unwrap_or(0);
@@ -498,6 +501,9 @@ fn rename_body(s: &mut Session, p: &Value) -> Result<Value> {
     while f.body_names.len() < siblings.len().max(k + 1) {
         let i = f.body_names.len();
         f.body_names.push(siblings.get(i).cloned().unwrap_or_default());
+    }
+    for (slot, current) in f.body_names.iter_mut().zip(&siblings) {
+        slot.clone_from(current);
     }
     if let Some(slot) = f.body_names.get_mut(k) {
         *slot = name.to_string();

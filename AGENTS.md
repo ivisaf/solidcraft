@@ -27,7 +27,9 @@ new uses of it anywhere else. Public docs/web/Flatpak deployments use project Pa
 ## Never crash
 People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
 - **No panics in non-test code:** no `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`,
-  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`).
+  `unimplemented!`; no `unsafe` (`unsafe_code = "forbid"`). The one exception is two functions in
+  `apps/solidcraft/src/open_documents.rs` (that crate denies it instead): macOS hands Finder files
+  only to an Objective-C method.
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
   returns an error ("not supported yet: …"); it never panics.
 - **Input-derived numbers are hostile** (command parameters, design files, control-channel

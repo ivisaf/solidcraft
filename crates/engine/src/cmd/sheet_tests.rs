@@ -962,6 +962,42 @@ fn tray_shrunk_by_a_parameter_unfolds_like_one_built_at_that_size() {
     }
 }
 
+/// A 55 x 30 plate whose bottom edge bends up by 1 in 100 over its last 5 mm, with a flange on
+/// the straight 50 mm, unfolds at any turn. The flange keeps its start rounded to the
+/// nanometre, so its bend zone meets the plate a fraction of a nanometre off the corner, and
+/// the bent piece of edge, a hair from the zone's edge, crosses it a few hundredths of a
+/// micrometre before the corner. Split there, the piece left a sliver shorter than the
+/// tolerance, which the flat pattern's union took for a second way out of the corner and
+/// closed as a loop of its own: "planar region arrangement failed" at 46 of these 90 turns.
+#[test]
+fn a_flange_beside_a_slightly_bent_edge_unfolds_at_any_turn() {
+    // Base 55 x 30 less the 5 x 0.05 triangle under the bent piece; bend π and leg 17 along 50.
+    let area = 55.0 * 30.0 - 5.0 * 0.05 / 2.0 + 50.0 * (PI + 17.0);
+    let mut failed = Vec::new();
+    for k in 0..90 {
+        let turn = (k as f64).to_radians();
+        let at = |x: f64, y: f64| [x * turn.cos() - y * turn.sin(), x * turn.sin() + y * turn.cos()];
+        let mut s = Session::default();
+        run(&mut s, "sheet.manage_rules", json!({"name": "R", "thickness": "2 mm", "k_factor": "0.5", "bend_radius": "1 mm", "active": true}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Outline"}));
+        let outline = [(95.0, 50.05), (100.0, 50.0), (150.0, 50.0), (150.0, 80.0), (95.0, 80.0)].map(|(x, y)| at(x, y));
+        run(&mut s, "sketch.line", json!({"points": outline, "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "sheet.flange", json!({"sketch": "Outline"}));
+        let [x, y] = at(125.0, 50.0);
+        run(&mut s, "sheet.flange", json!({"edges": [[x, y, 2]], "height": 20, "angle": 90, "radius": 1, "position": "outside"}));
+        if let Err(e) = s.execute("sheet.unfold", &json!({})) {
+            failed.push(format!("{k}°: {e}"));
+            continue;
+        }
+        let f = flat(&mut s);
+        assert_eq!(f["outline"].as_array().map(Vec::len), Some(1), "{k}°: {f}");
+        assert!((flat_area(&f) - area).abs() < 1e-6, "{k}°: {} vs {area}", flat_area(&f));
+        assert!(rel(volume(&mut s), area * 2.0) < 1e-4, "{k}°: {} vs {}", volume(&mut s), area * 2.0);
+    }
+    assert!(failed.is_empty(), "{} of 90 turns: {failed:?}", failed.len());
+}
+
 #[test]
 fn the_bend_table_and_the_dxf_follow_what_flat_cuts_leave_of_a_bend() {
     // A 200 x 100 plate with a 40 mm flange along y = 0: the bend's centre line runs at y = -pi/2

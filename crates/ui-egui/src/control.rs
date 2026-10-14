@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn engine_batch_stays_inside_allow_paths() {
         let mut h = crate::scenario::Harness::new();
-        let base = std::env::temp_dir().join(format!("solidcraft-batch-scope-{}", std::process::id()));
+        let base = vfs::temp_dir().join(format!("solidcraft-batch-scope-{}", std::process::id()));
         let (root, out) = (base.join("root"), base.join("out"));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&out).unwrap();
@@ -859,7 +859,7 @@ mod tests {
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
         let mut app = SolveApp::new(s, Services::default());
-        let base = std::env::temp_dir().join(format!("solidcraft-control-scope-{}", std::process::id()));
+        let base = vfs::temp_dir().join(format!("solidcraft-control-scope-{}", std::process::id()));
         let (root, out) = (base.join("root"), base.join("out"));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&out).unwrap();

@@ -14,6 +14,7 @@
 - [Plastic parts](guide/plastic.md)
 - [Import and export](guide/files.md)
 - [Keyboard shortcuts](guide/shortcuts.md)
+- [Updates and privacy](guide/updates.md)
 - [Driving SolidCraft with an AI agent (MCP)](guide/mcp.md)
 
 # Developer guide

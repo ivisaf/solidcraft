@@ -10,12 +10,14 @@
 //! See `solidcraft_ui_egui::control` and docs/control-protocol.md.
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 #[cfg(not(target_os = "macos"))]
 #[path = "../../../assets/icons/app/shared/source/app_icon.rs"]
 mod app_icon;
 mod control_server;
+#[cfg(target_os = "macos")]
+mod open_documents;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod space_mouse;
 
@@ -38,6 +40,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             solidcraft_ui_egui::documents::request_quit(&mut self.solve);
         }
+        #[cfg(target_os = "macos")]
+        for f in open_documents::take() {
+            self.solve.open_path_async(&f);
+        }
         self.solve.logic(ctx);
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         self.space_mouse.tick(&mut self.solve, ctx);
@@ -57,6 +63,12 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         solidcraft_ui_egui::recovery_ui::close(&mut self.solve);
         solidcraft_engine::crash::end_session();
+        // An update asked to restart into the new version or to run its installer.
+        if let Some((program, args)) = solidcraft_ui_egui::update::take_launch(&mut self.solve)
+            && let Err(e) = std::process::Command::new(&program).args(&args).spawn()
+        {
+            log::error!("update: starting {}: {e}", program.display());
+        }
     }
 }
 
@@ -107,6 +119,8 @@ fn services() -> Services {
             dialog.save_file().map(|p| p.to_string_lossy().to_string())
         })),
         graphics_path: graphics_path().map(|p| p.to_string_lossy().to_string()),
+        http_get: Some(std::sync::Arc::new(http_get)),
+        http_download: Some(std::sync::Arc::new(http_download)),
         show_in_folder: Some(Box::new(|path| {
             let folder = std::path::Path::new(path).parent().unwrap_or_else(|| std::path::Path::new("."));
             let mut command = std::process::Command::new(if cfg!(target_os = "windows") {
@@ -125,6 +139,79 @@ fn services() -> Services {
             let _ = command.spawn();
         })),
     }
+}
+
+/// HTTPS GET for the update check (docs/updates.md): certificates from the operating system, a
+/// 15 s limit, at most 1 MB, and no headers beyond what GitHub requires (a User-Agent without
+/// the version or anything about this machine, and the API's media type).
+fn http_get(url: &str) -> Result<Vec<u8>, solidcraft_ui_egui::update::FetchError> {
+    use solidcraft_ui_egui::update::FetchError;
+    let mut response = http_call(url, std::time::Duration::from_secs(15))?;
+    response.body_mut().with_config().limit(1 << 20).read_to_vec().map_err(|e| FetchError::Failed(e.to_string()))
+}
+
+/// HTTPS download of an update package to `to` (docs/updates.md), reporting progress; stops when
+/// `progress` returns false. The caller verifies the file.
+fn http_download(url: &str, to: &std::path::Path, progress: &dyn Fn(u64, Option<u64>) -> bool) -> Result<(), solidcraft_ui_egui::update::FetchError> {
+    use solidcraft_ui_egui::update::FetchError;
+    use std::io::{Read, Write};
+    let fail = |e: String| FetchError::Failed(e);
+    let mut response = http_call(url, std::time::Duration::from_secs(30 * 60))?;
+    let total = response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
+    let mut body = response.body_mut().with_config().limit(solidcraft_ui_egui::update::install::MAX_PACKAGE).reader();
+    let mut file = std::fs::File::create(to).map_err(|e| fail(format!("{}: {e}", to.display())))?;
+    let mut buf = vec![0u8; 1 << 16];
+    let mut done = 0u64;
+    loop {
+        let n = body.read(&mut buf).map_err(|e| fail(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(buf.get(..n).unwrap_or_default()).map_err(|e| fail(format!("{}: {e}", to.display())))?;
+        done += n as u64;
+        if !progress(done, total) {
+            return Err(fail("cancelled".into()));
+        }
+    }
+    file.sync_all().map_err(|e| fail(format!("{}: {e}", to.display())))?;
+    Ok(())
+}
+
+/// One GET to GitHub: a 200 answer, or why not (rate limits included).
+fn http_call(url: &str, timeout: std::time::Duration) -> Result<ureq::http::Response<ureq::Body>, solidcraft_ui_egui::update::FetchError> {
+    use solidcraft_ui_egui::update::FetchError;
+    use std::time::Duration;
+    let tls = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .unversioned_rustls_crypto_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .https_only(true)
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(Duration::from_secs(5)))
+        .user_agent("SolidCraft-update-check")
+        .max_redirects(3)
+        .build()
+        .into();
+    let response = agent
+        .get(url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .call()
+        .map_err(|e| FetchError::Failed(e.to_string()))?;
+    let status = response.status().as_u16();
+    let header = |k: &str| response.headers().get(k).and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
+    if status == 429 || (status == 403 && (header("x-ratelimit-remaining") == Some(0) || header("retry-after").is_some())) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let retry_after_s = header("retry-after").or_else(|| header("x-ratelimit-reset").map(|reset| reset.saturating_sub(now))).unwrap_or(3600);
+        return Err(FetchError::RateLimited { retry_after_s });
+    }
+    if status != 200 {
+        return Err(FetchError::Failed(format!("GitHub answered HTTP {status}")));
+    }
+    Ok(response)
 }
 
 /// The per-user settings folder: eframe's storage (`app.ron`) and the anti-aliasing preference.
@@ -286,6 +373,9 @@ fn main() -> eframe::Result {
             b.with_x11();
         }));
     }
+    // Files opened from Finder and the Dock arrive as events, not arguments.
+    #[cfg(target_os = "macos")]
+    open_documents::install();
     let result = eframe::run_native(
         "SolidCraft",
         options,
@@ -320,6 +410,12 @@ fn main() -> eframe::Result {
                 app.session.mark_saved();
                 app.session.undo.clear();
             }
+            // A launch from Finder: its files arrived before the window.
+            #[cfg(target_os = "macos")]
+            let files = {
+                open_documents::set_ui(&cc.egui_ctx);
+                [files, open_documents::take()].concat()
+            };
             for f in &files {
                 app.open_path_async(f);
             }
