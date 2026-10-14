@@ -74,12 +74,21 @@ doesn't update automatically.
 
 The same app runs in the browser: [open SolidCraft on the web](../app/) (`?sample` opens the sample
 part, `?webgl` forces WebGL2 where WebGPU is missing). Designs are saved in the browser's private
-file storage, which needs HTTPS or localhost. To build it yourself:
+file storage, which needs HTTPS or localhost.
+
+After the first visit the web app works offline: the browser keeps a copy of it. Online, each
+launch gets the latest published build (the browser downloads it once when it changes); offline,
+when the network doesn't answer within a few seconds, or when a new build can't be downloaded
+whole, the kept copy starts (and the download carries on for the next launch). To build it
+yourself:
 
 ```sh
 rustup target add wasm32-unknown-unknown
-cd apps/solidcraft-web && trunk serve --release
+cd apps/solidcraft-web && trunk serve --release --no-autoreload
 ```
+
+Offline use needs `--no-autoreload`: Trunk's live reload changes the page as it serves it, so it
+no longer matches the build the browser would keep. Debug builds (`trunk serve`) never keep a copy.
 
 ## CLI
 

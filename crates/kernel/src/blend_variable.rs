@@ -819,3 +819,7 @@ mod tests {
         assert!(rel(measure(&f).unwrap().volume, measure(&k).unwrap().volume) < 1e-9);
     }
 }
+
+#[cfg(test)]
+#[path = "taper_mesh_tests.rs"]
+mod taper_mesh_tests;

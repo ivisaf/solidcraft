@@ -10,6 +10,7 @@
 #[path = "occurrence_ui_tests.rs"]
 mod occurrence_ui_tests;
 
+use crate::icons::glyphs::badge;
 use std::collections::BTreeSet;
 
 use egui::{Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, pos2, vec2};
@@ -62,6 +63,9 @@ pub struct TreeState {
     pub timeline_anchor: Option<String>,
     /// The Edit Canvas / Calibrate panel.
     pub canvas_panel: Option<CanvasPanel>,
+    /// A Section Analysis hidden with its eye in the Analysis folder: its plane (origin,
+    /// normal), so the eye can bring it back (#822).
+    pub hidden_section: Option<(solidcraft_engine::geom::Vec3, solidcraft_engine::geom::Vec3)>,
     /// What waits for the Capture Position question: a command id, or [`SAVE`].
     pub capture_prompt: Option<String>,
     /// The last row clicked (for Shift ranges).
@@ -335,13 +339,8 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     // Fold arrow.
     if let Some(open) = row.fold {
         let ar = Rect::from_center_size(pos2(x + 6.0, cy), vec2(12.0, 12.0));
-        let pts = if open {
-            vec![pos2(ar.left() + 2.0, ar.top() + 4.0), pos2(ar.right() - 2.0, ar.top() + 4.0), pos2(ar.center().x, ar.bottom() - 3.0)]
-        } else {
-            vec![pos2(ar.left() + 4.0, ar.top() + 2.0), pos2(ar.right() - 3.0, ar.center().y), pos2(ar.left() + 4.0, ar.bottom() - 2.0)]
-        };
         let ink = if hover_on == 1 { t.text } else { t.text_dim };
-        ui.painter().add(egui::Shape::convex_polygon(pts, ink, Stroke::NONE));
+        crate::icons::glyphs::disclosure(ui.painter(), ar, open, ink);
         out.fold = resp.clicked() && click_on == 1;
         crate::scenario::publish_handle(&format!("fold:{}", row.label), fold_r.center());
     }
@@ -354,6 +353,7 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
             ui.painter().line_segment([er.left_bottom() + vec2(2.0, -2.0), er.right_top() + vec2(-2.0, 2.0)], Stroke::new(1.4, t.text_dim));
         }
         out.eye = resp.clicked() && click_on == 2;
+        crate::scenario::publish_handle(&format!("eye:{}", row.label), er.center());
     }
     x += 18.0;
     // Activation radio (components).
@@ -401,35 +401,6 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         out.secondary = resp.interact_pointer_pos().or(Some(r.left_bottom()));
     }
     out
-}
-
-/// Small glyphs after a row's label: a padlock, a pin (grounded).
-fn badge(p: &egui::Painter, r: Rect, name: &str, c: Color32) {
-    let s = Stroke::new(1.3, c);
-    match name {
-        "lock" => {
-            let body = Rect::from_min_max(pos2(r.left() + 1.5, r.center().y - 0.5), pos2(r.right() - 1.5, r.bottom() - 0.5));
-            p.rect_filled(body, 1.5, c);
-            let top = pos2(r.center().x, r.top() + 4.0);
-            p.add(egui::Shape::line(
-                (0..=8)
-                    .map(|k| {
-                        let a = std::f32::consts::PI * (k as f32 / 8.0);
-                        pos2(top.x - 3.2 * a.cos(), top.y - 3.2 * a.sin() + 1.0)
-                    })
-                    .chain([pos2(top.x + 3.2, body.top())])
-                    .collect(),
-                s,
-            ));
-            p.line_segment([pos2(top.x - 3.2, top.y + 1.0), pos2(top.x - 3.2, body.top())], s);
-        }
-        "pin" => {
-            let head = pos2(r.center().x + 2.0, r.top() + 4.0);
-            p.circle_filled(head, 3.2, c);
-            p.line_segment([head, pos2(r.left() + 1.5, r.bottom() - 1.0)], Stroke::new(1.6, c));
-        }
-        _ => {}
-    }
 }
 
 /// A Ctrl/Shift-aware click on a selectable row.
@@ -680,6 +651,7 @@ fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, 
         named_view_rows(app, ui, d, acts);
         origin_rows(app, ui, d);
         canvas_rows(app, ui, d, acts);
+        analysis_rows(app, ui, d, acts);
     }
     let _ = t;
     for folder in ["bodies", "sketches", "construction"] {
@@ -949,6 +921,77 @@ pub fn view_items(app: &SolveApp, name: &str) -> Vec<Item> {
         Item::sep(),
         Item::action("ui.rename", "Rename", "").with(json!({ "view": name })).on_if(saved),
         Item::action("view.delete", "Delete", "delete").with(json!({ "view": name })).on_if(saved),
+    ]
+}
+
+/// The Analysis folder: the Section Analysis, while there is one (shown or hidden), with an eye
+/// to hide and show it, a double-click to edit it and a menu to delete it (#822).
+fn analysis_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &mut Actions) {
+    if app.session.section.is_some() {
+        // A section made (or remade) while an older one was hidden replaces it.
+        app.tree.hidden_section = None;
+    }
+    let visible = app.session.section.is_some();
+    if !visible && app.tree.hidden_section.is_none() {
+        return;
+    }
+    let key = "analysis";
+    let open = is_open(app, key, true);
+    let r = draw_row(
+        ui,
+        ui.id().with(key),
+        &Row { depth, fold: Some(open), eye: Some(visible), icon: "folder", label: "Analysis", ..Default::default() },
+    );
+    if r.fold || r.clicked {
+        toggle(app, key, true);
+    }
+    if r.eye {
+        set_section_visible(app, !visible);
+    }
+    if !open {
+        return;
+    }
+    let r = draw_row(
+        ui,
+        ui.id().with("section_analysis"),
+        &Row { depth: depth + 1, eye: Some(visible), icon: "section", label: "Section Analysis", dim: !visible, ..Default::default() },
+    );
+    if r.eye {
+        set_section_visible(app, !visible);
+    }
+    if r.double {
+        app.start("inspect.section");
+    }
+    if let Some(p) = r.secondary {
+        acts.menu = Some((p, Target::Section));
+    }
+}
+
+/// Hide the Section Analysis (keeping its plane to show it again) or show the hidden one.
+pub fn set_section_visible(app: &mut SolveApp, visible: bool) {
+    if visible {
+        if let Some((origin, normal)) = app.tree.hidden_section {
+            let plane = json!({"origin": [origin.x, origin.y, origin.z], "normal": [normal.x, normal.y, normal.z]});
+            if app.run("inspect.section", json!({ "plane": plane })).is_ok() {
+                app.tree.hidden_section = None;
+            }
+        }
+    } else if let Some(section) = app.session.section
+        && app.run("inspect.section", json!({"clear": true})).is_ok()
+    {
+        app.tree.hidden_section = Some(section);
+    }
+}
+
+/// The menu of the Section Analysis row.
+pub fn section_items(app: &SolveApp) -> Vec<Item> {
+    let visible = app.session.section.is_some();
+    vec![
+        Item::action("ui.editSection", "Edit Section Analysis", "section"),
+        Item::sep(),
+        Item::action("ui.unsection", "Delete", "delete"),
+        Item::sep(),
+        Item::action("ui.sectionVisible", "Show/Hide", "eye").key("V").with(json!({ "visible": !visible })),
     ]
 }
 
@@ -1784,9 +1827,7 @@ pub fn dims_overlay(app: &SolveApp, ctx: &egui::Context) {
             }
             for (tip, dir) in &lay.arrows {
                 if let (Some(t), Some(back)) = (to(*tip), to(*tip - *dir * px)) {
-                    let d = (t - back).normalized();
-                    let n = vec2(-d.y, d.x);
-                    painter.add(egui::Shape::convex_polygon(vec![t, t - d * 9.0 + n * 3.0, t - d * 9.0 - n * 3.0], col, Stroke::NONE));
+                    crate::icons::markers::dimension_arrow(&painter, t, back, col);
                 }
             }
             let Some(tc) = to(lay.text) else { continue };
@@ -1883,3 +1924,7 @@ fn occurrence_origin(app: &SolveApp, occurrence: u64) -> Option<solidcraft_engin
     let own = app.session.pending_moves.get(&occurrence).copied().unwrap_or(o.transform);
     Some(solidcraft_engine::doc::apply_point(&solidcraft_engine::doc::mat_mul(&parent, &own), solidcraft_engine::geom::Vec3::ZERO))
 }
+
+#[cfg(test)]
+#[path = "section_browser_tests.rs"]
+mod section_browser_tests;

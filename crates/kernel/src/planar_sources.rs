@@ -18,6 +18,18 @@ pub(super) fn actual_plane(face: &mt::Face) -> Option<Plane> {
     Plane::new(from_p3(p.origin()), u, v)
 }
 
+/// How far apart the normals' x components of two planes `same_support` accepts can be, with
+/// room to spare: their unit normals are within about 1e-12 of each other.
+const NORMAL_WINDOW: f64 = 1e-9;
+
+/// The entries of `sorted` (ordered by their plane's normal x) whose normal x is within
+/// [`NORMAL_WINDOW`] of `nx`: the only ones `same_support` can accept for a plane with that normal.
+fn normal_window<T>(sorted: &[T], plane: impl Fn(&T) -> &Plane, nx: f64) -> &[T] {
+    let first = sorted.partition_point(|t| plane(t).normal().x < nx - NORMAL_WINDOW);
+    let last = sorted.partition_point(|t| plane(t).normal().x <= nx + NORMAL_WINDOW);
+    sorted.get(first..last.max(first)).unwrap_or_default()
+}
+
 pub(super) fn same_support(a: &Plane, b: &Plane) -> bool {
     let error = 4096. * f64::EPSILON * (1. + a.origin.len() + b.origin.len());
     a.normal().cross(b.normal()).len() <= 4096. * f64::EPSILON
@@ -162,7 +174,13 @@ impl Body {
         }
         let opening_tolerance = if shell.is_some() { inputs.iter().map(|input| input.size()).fold(0., f64::max) * 1e-4 + 1e-6 } else { 0. };
         let mapped = guard("exact planar support lineage", || {
-            let competing: Vec<_> = blocker.into_iter().flat_map(|b| b.solid.face_iter()).filter_map(actual_plane).collect();
+            let mut competing = Vec::new();
+            for plane in blocker.into_iter().flat_map(|b| b.solid.face_iter()).filter_map(actual_plane) {
+                // A tool face blocks a face on its plane facing either way.
+                let opposing = Plane::new(plane.origin, plane.x, -plane.y).ok_or_else(|| KernelError::Invalid("invalid opposing plane".into()))?;
+                competing.extend([plane, opposing]);
+            }
+            competing.sort_by(|a, b| a.normal().x.total_cmp(&b.normal().x));
             let mut candidates = Vec::new();
             let mut unknown_supports = Vec::new();
             let faces = inputs.iter().flat_map(|input| {
@@ -198,6 +216,10 @@ impl Body {
                     candidates.push((inner, source, true, cost));
                 }
             }
+            // Planes that match must have (nearly) the same unit normal (`same_support`), so the
+            // lists are sorted by the normal's x and each face looks only at its window of them.
+            unknown_supports.sort_by(|a, b| a.normal().x.total_cmp(&b.normal().x));
+            candidates.sort_by(|a, b| a.0.normal().x.total_cmp(&b.0.normal().x));
             let mut work = 2_000_000usize;
             let mut metadata = 2_000_000usize;
             let mut identity_bytes = 16_000_000usize;
@@ -206,21 +228,17 @@ impl Body {
                 let mut found = None;
                 if let Some(actual) = actual_plane(face) {
                     let mut blocked = false;
-                    for plane in &unknown_supports {
+                    let nx = actual.normal().x;
+                    for plane in normal_window(&unknown_supports, |p| p, nx) {
                         work = work.checked_sub(1).ok_or_else(|| KernelError::Invalid("unknown planar source comparison budget exceeded".into()))?;
                         if same_support(plane, &actual) {
                             blocked = true;
                             break;
                         }
                     }
-                    for plane in &competing {
+                    for plane in normal_window(&competing, |p| p, nx) {
                         work = work.checked_sub(1).ok_or_else(|| KernelError::Invalid("planar tool comparison budget exceeded".into()))?;
-                        if same_support(plane, &actual)
-                            || same_support(
-                                &Plane::new(plane.origin, plane.x, -plane.y).ok_or_else(|| KernelError::Invalid("invalid opposing plane".into()))?,
-                                &actual,
-                            )
-                        {
+                        if same_support(plane, &actual) {
                             blocked = true;
                             break;
                         }
@@ -243,7 +261,7 @@ impl Body {
                         continue;
                     }
                     let mut chosen: Option<(Plane, &FaceSource, bool, usize)> = None;
-                    for (plane, source, inner, cost) in &candidates {
+                    for (plane, source, inner, cost) in normal_window(&candidates, |c| &c.0, nx) {
                         work = work.checked_sub(1).ok_or_else(|| KernelError::Invalid("planar source comparison budget exceeded".into()))?;
                         if same_support(plane, &actual) {
                             if let Some((previous_plane, previous_source, previous_inner, _)) = chosen {

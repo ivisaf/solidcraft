@@ -19,8 +19,67 @@ solidcraft --control 7878 &
 solidcraft-cli mcp --connect 127.0.0.1:7878
 ```
 
+Bridged, the server finds the app's control token in the token file the app wrote for that port
+([control-protocol.md](control-protocol.md#token)); `--token T` or `SOLIDCRAFT_CONTROL_TOKEN` give
+it explicitly when the app runs in a sandbox whose data folder the server can't see (prefer the
+variable: command-line arguments are visible to other users in the process list).
+
 stdout carries only protocol messages; errors go to stderr. Bridged screenshots are written to a
 temporary file by the app and read back by the server, so both must run on the same machine.
+
+### Which files the agent can reach
+
+Tool calls read, write and delete files only inside the server's folders:
+
+- the folder of the open design (the `--in` design, or whatever the agent last opened or saved),
+  but only when it lies strictly inside your home folder (or the temporary folder) and not in a
+  hidden folder. Home itself, a folder above it (`/`, `/home`, `/Users`, a drive's root),
+  hidden folders such as `~/.config` and folders elsewhere don't count. Hidden files and folders
+  inside the design's folder (`.env`, `.git`) are out of reach too;
+- SolidCraft's own recovery folder, so `doc.recovery_list`, `doc.recover` and
+  `doc.recovery_discard` work out of the box (discarding deletes only real recovery entries);
+- the server's own scratch folder (a new private `solidcraft-mcp-*` folder in the temporary
+  folder), where `screenshot` without a `path` goes;
+- every `--allow-path DIR` (repeat it for more). A folder named here is reached in full,
+  hidden files included.
+
+The working folder the server was started in does not count by itself, so `~/.ssh`, `~/.aws`,
+`~/.bashrc` and other dotfiles are never in reach by default. stderr lists the folders at
+start-up and says when the `--in` design's folder was left out; `--allow-path` adds it back.
+
+Paths are resolved before they are compared, so `..` and symlinks that lead out are refused
+(saving through a link writes the file it points to, so the link's target is what counts), and
+a new file must go into a folder that exists. On Windows a path must be on a local drive
+(`C:\…` or `\\?\C:\…`): UNC, device and NT paths in any spelling (`\\server\share`,
+`//server/share`, `\\?\UNC\…`, `\??\…`, `\\.\…`), drive-relative paths (`C:file`), a `:` in a
+file name (alternate data streams), reserved device names with any extension (`NUL`, `CON`,
+`COM1.txt`, …) and short 8.3 names (`PROGRA~1`) are refused before any file system call, and the
+resolved path is checked again, so a link or junction that leads to a share is refused too. This
+includes a `sketch.text` font given as a file path; installed fonts named by family still work.
+A refused path is a tool error saying why.
+
+A hard link inside an allowed folder can't be told apart from an ordinary file, so a hard link
+to a file elsewhere is reachable through it; don't keep such links in a folder you allow.
+
+```sh
+solidcraft-cli mcp --allow-path ~/designs --allow-path ~/exports
+solidcraft-cli mcp --allow-any-path   # no limit (the behaviour before this option existed)
+```
+
+Bridged, the server sends its folders with every request (`allow_paths`, see
+[control-protocol.md](control-protocol.md)) and the app adds its own recovery folder and the
+folder of the design open in it, under the same rules, so give absolute paths: a relative one
+resolves against the app's working folder, not the server's. The app's own
+file dialogs are never limited.
+
+### Tool annotations
+
+Each tool says what it may do, for clients that ask before running tools (or auto-approve on
+these hints). `list_commands`, `inspect_design`, `measure`, `body_topology` and `crash_reports`
+are read-only. `set_parameter`, `undo` and `redo` change the design undoably. `new_design`
+replaces it (destructive). `execute`, `batch`, `open`, `save`, `export` and `screenshot` (whose
+`path` writes a file) can read, write, overwrite or delete files: they are not read-only,
+`destructiveHint` and `openWorldHint` are true.
 
 ### Client configuration
 
@@ -47,11 +106,12 @@ Claude Desktop (`claude_desktop_config.json`), bridged to a running app:
 
 ### Agent skills
 
-[`skills/`](https://github.com/bherbruck/solidcraft/tree/main/skills) holds two [Agent Skills](https://agentskills.io) for agents that model through this server:
+[`skills/`](https://github.com/bherbruck/solidcraft/tree/main/skills) holds three [Agent Skills](https://agentskills.io) for agents that model through this server:
 - `solidcraft-modeling` covers building a new part.
 - `solidcraft-editing` covers changing an existing design.
+- `solidcraft-checking` adds checks for errors SolidCraft does not report, regression tests and porting, next to the other two.
 
-They cover the workflow, the command shapes, how to verify with `measure`, and the known traps. With them an agent builds a part in a few `batch` calls and reads far less output. To install them for Claude Code, copy both folders into `~/.claude/skills/`; [skills/README.md](https://github.com/bherbruck/solidcraft/blob/main/skills/README.md) has the details.
+They cover the workflow, the command shapes, how to verify with `measure`, and the known traps. With them an agent builds a part in a few `batch` calls and reads far less output. To install them for Claude Code, copy the folders into `~/.claude/skills/`; [skills/README.md](https://github.com/bherbruck/solidcraft/blob/main/skills/README.md) has the details.
 
 ## Tools
 
@@ -59,13 +119,13 @@ They cover the workflow, the command shapes, how to verify with `measure`, and t
 |---|---|---|
 | `list_commands` | `filter?` | The command catalog: id, label, tab/panel, shortcut, parameter docs, enabled now. `filter` matches id, label, tab and panel. |
 | `execute` | `command`, `params?`, `verbose?` (default true) | Run any command with JSON parameters (`list_commands` shows them). Failures leave the design unchanged. A feature command replies with the feature (`feature`, `name`), every body (`bodies`) and the bodies it created, changed and removed (`created_bodies`, `changed_bodies`, `removed_bodies`). `verbose: false` uses the same compact reply as `batch`. |
-| `batch` | `commands: [{command, params}]`, `rollback?` (default true), `verbose?` (default true) | Run steps in order, stop at the first error and undo the completed steps. The reply names the failing step (`failed.index`, `failed.command`, `failed.error`) and every result before it. `verbose: false` keeps the reply small in large designs: feature steps leave out the full body list (`created_bodies`, `changed_bodies`, `removed_bodies` stay) and sketch steps the ids they repeat outside `created`. |
+| `batch` | `commands: [{command, params}]`, `rollback?` (default true), `verbose?` (default true) | Run steps in order, stop at the first error and undo the completed steps. The reply names the failing step (`failed.index`, `failed.command`, `failed.error`) and every result before it. `verbose: false` keeps the reply small in large designs: feature steps leave out the full body list (`created_bodies`, `changed_bodies`, `removed_bodies` stay) and sketch steps the ids they repeat outside `created`. Bridged to an app that has `engine.batch`, the whole batch is one control request (one frame of the app). Older apps, and apps showing the agent cursor, get the steps one by one. |
 | `inspect_design` | `measure?` (default true), `sketches?` (default true) | Parameters, timeline (type, suppressed, rolled back, error, warning, timing), bodies (volume, area, centre of mass, bbox, face/edge/vertex counts, visible), sketches (curves, points, constraints, profiles, DOF, solve status, visible), selection, undo depth. Hide helper sketches, bodies or construction planes with `execute` `browser.visibility` (`{items, visible}` or `{folder, visible}`). |
 | `measure` | `body?` | Volume (mm³), area (mm²), centre of mass, bbox and topology counts per body, with totals. |
 | `body_topology` | `body` | Edges (index, midpoint, length, ends) and faces (index, area, centroid, normal). An edge midpoint is the `[x,y,z]` that picks that edge for fillet and chamfer. |
 | `set_parameter` | `name`, `value` (number or expression), `unit?`, `comment?` | Create or change a user parameter and recompute; reports `recomputed` (features rebuilt), `restored` (features whose earlier result for the same inputs was reused, e.g. a value set back) and features that now fail. |
 | `screenshot` | `view?` (iso, top, front, back, bottom, left, right, home, fit, or a named view saved with `view.save`), `camera?` (`{target, yaw, pitch, distance, fov?}`, as `view.apply`), `path?`, `width?`, `height?`, `source?` (window, model) | A PNG image content block. Headless: CPU render fitted to the model, or from the named view or camera. Bridged: the app window (default) or a model render with the app's camera; a named view or camera moves the app's viewport there first (`execute` `view.apply` does the same without a screenshot). |
-| `export` | `path`, `format?` (step, 3mf, 3mf-tagged, stl, stla, obj), `bodies?` | STEP, 3MF or mesh export. |
+| `export` | `path`, `format?` (step, 3mf, 3mf-tagged, stl, stla, obj, urdf), `bodies?`, `mesh_prefix?`, `effort?`, `velocity?` | STEP, 3MF or mesh export; URDF writes the whole assembly with its meshes next to it (`docs/urdf.md`). |
 | `undo`, `redo` | — | Undo / redo one change. |
 | `crash_reports` | `id?`, `limit?` | The crash reports on this computer, newest first; with `id`, the whole report (backtrace, command, recent commands, `design_path`/`replay_path`). See [crash-reports.md](crash-reports.md). |
 | `new_design` | `name?` | Start an empty design. |

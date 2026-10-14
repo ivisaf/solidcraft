@@ -3,6 +3,8 @@
 //! tools for free-form curves and slots, text placement, and constraint glyphs. Like `tools`,
 //! these are UI state only: every action runs a command.
 
+use crate::icons::markers::glyph_icon;
+use crate::icons::markers::glyph_letter;
 use std::cell::{Cell, RefCell};
 
 use egui::{Pos2, Stroke};
@@ -1023,24 +1025,6 @@ fn glyphs(app: &SolveApp, painter: &egui::Painter, proj: &Proj, hover: Option<Po
     GLYPHS.with(|g| *g.borrow_mut() = drawn);
 }
 
-/// Toolbar icons used as glyphs (H and V stay letters, which tell them apart).
-fn glyph_icon(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Coincident" => "c_coincident",
-        "Parallel" => "c_parallel",
-        "Perpendicular" => "c_perpendicular",
-        "Collinear" => "c_collinear",
-        "Tangent" => "c_tangent",
-        "Smooth" => "c_smooth",
-        "Equal" => "c_equal",
-        "Concentric" => "c_concentric",
-        "MidPoint" => "c_midpoint",
-        "Symmetry" => "c_symmetry",
-        "Fix" => "c_fix",
-        _ => return None,
-    })
-}
-
 /// The curves and points a constraint ties together.
 fn constraint_entities(k: &solidcraft_engine::sketch::ConstraintKind) -> (Vec<usize>, Vec<usize>) {
     use solidcraft_engine::sketch::ConstraintKind::*;
@@ -1059,14 +1043,6 @@ fn constraint_entities(k: &solidcraft_engine::sketch::ConstraintKind) -> (Vec<us
         | Tangent { a, b }
         | Smooth { a, b } => (vec![a, b], vec![]),
         _ => (vec![], vec![]),
-    }
-}
-
-fn glyph_letter(name: &str) -> &'static str {
-    match name {
-        "Horizontal" => "H",
-        "Vertical" => "V",
-        _ => "?",
     }
 }
 

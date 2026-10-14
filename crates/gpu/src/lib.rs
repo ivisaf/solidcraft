@@ -50,11 +50,20 @@ pub struct GpuMesh {
     pub indices: wgpu::Buffer,
     pub index_count: u32,
     pub vertex_count: u32,
-    /// Each vertex's face (the plan's face numbering), for colouring by face.
+    /// Each vertex's face (its plan's face numbering), for colouring by face.
     pub vertex_face: Vec<u32>,
+    /// Per plan (in the order given), its vertices and indices.
+    pub parts: Vec<Part>,
     bind: wgpu::BindGroup,
     // The inputs, kept until the evaluation has run.
     _inputs: [wgpu::Buffer; 4],
+}
+
+/// One plan's share of a [`GpuMesh`]: its vertices and its entries in the index buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Part {
+    pub vertices: std::ops::Range<u32>,
+    pub indices: std::ops::Range<u32>,
 }
 
 /// The compute pipeline, ready to evaluate plans on one device.
@@ -144,7 +153,7 @@ impl TessGpu {
     /// and normals in f32, fixed edge nodes exact). Blocks until the GPU is done (native).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn evaluate(&self, plan: &TessPlan) -> Result<Mesh> {
-        let packed = pack(plan)?;
+        let packed = pack(&[plan])?;
         let mut mesh = Mesh::default();
         let mut base = 0usize;
         for chunk in packed.vertices.chunks(MAX_BATCH * VERTEX_WORDS) {
@@ -186,9 +195,16 @@ impl TessGpu {
     /// [`TessGpu::record`]. Refused (so the caller draws its CPU mesh) for a plan with more than
     /// [`MAX_BATCH`] vertices or a face without an evaluable surface.
     pub fn prepare(&self, plan: &TessPlan) -> Result<GpuMesh> {
-        let packed = pack(plan)?;
+        self.prepare_many(&[plan])
+    }
+
+    /// Like [`TessGpu::prepare`] for several plans at once: one upload, one buffer and one
+    /// dispatch for all of them (a viewport's whole scene), each plan's vertices and triangles in
+    /// [`GpuMesh::parts`]. Refused past [`MAX_BATCH`] vertices in all.
+    pub fn prepare_many(&self, plans: &[&TessPlan]) -> Result<GpuMesh> {
+        let packed = pack(plans)?;
         if packed.count > MAX_BATCH {
-            return Err(GpuError::Unsupported(format!("a plan of {} vertices on the GPU", packed.count)));
+            return Err(GpuError::Unsupported(format!("{} vertices in one dispatch", packed.count)));
         }
         let d = &self.device;
         let count = word(packed.count)?;
@@ -211,14 +227,19 @@ impl TessGpu {
         });
         let mut tri: Vec<u32> = Vec::new();
         let mut vertex_face = Vec::with_capacity(packed.count);
+        let mut parts = Vec::with_capacity(plans.len());
         let mut offset = 0u32;
-        for f in &plan.faces {
-            let n = word(f.uv.len())?;
-            for t in f.triangles.iter().filter(|t| t.iter().all(|&i| i < n)) {
-                tri.extend([offset + t[0], offset + t[1], offset + t[2]]);
+        for plan in plans {
+            let (v0, i0) = (offset, word(tri.len())?);
+            for f in &plan.faces {
+                let n = word(f.uv.len())?;
+                for t in f.triangles.iter().filter(|t| t.iter().all(|&i| i < n)) {
+                    tri.extend([offset + t[0], offset + t[1], offset + t[2]]);
+                }
+                vertex_face.extend(std::iter::repeat_n(f.face, f.uv.len()));
+                offset += n;
             }
-            vertex_face.extend(std::iter::repeat_n(f.face, f.uv.len()));
-            offset += n;
+            parts.push(Part { vertices: v0..offset, indices: i0..word(tri.len())? });
         }
         let indices = init("tess mesh indices", &words(&tri), wgpu::BufferUsages::INDEX);
         let bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -238,6 +259,7 @@ impl TessGpu {
             index_count: word(tri.len())?,
             vertex_count: count,
             vertex_face,
+            parts,
             bind,
             _inputs: [params, surfaces, data, verts],
         })
@@ -348,10 +370,12 @@ fn push_curve(data: &mut Vec<f32>, c: &EvalCurve) -> Result<(u32, u32)> {
     Ok((knots, ctrl))
 }
 
-fn pack(plan: &TessPlan) -> Result<Packed> {
-    let mut surfaces = Vec::with_capacity(plan.surfaces.len() * SURFACE_WORDS);
+/// Several plans as one: their surfaces one after another, each face's surface index offset by
+/// the surfaces of the plans before it.
+fn pack(plans: &[&TessPlan]) -> Result<Packed> {
+    let mut surfaces = Vec::with_capacity(plans.iter().map(|p| p.surfaces.len()).sum::<usize>() * SURFACE_WORDS);
     let mut data: Vec<f32> = Vec::new();
-    for s in &plan.surfaces {
+    for s in plans.iter().flat_map(|p| &p.surfaces) {
         let mut head = [0u32; SURFACE_WORDS];
         match s {
             EvalSurface::Plane { origin, du, dv } => {
@@ -394,39 +418,44 @@ fn pack(plan: &TessPlan) -> Result<Packed> {
         }
         surfaces.extend(head);
     }
-    let mut vertices = Vec::with_capacity(plan.vertex_count() * VERTEX_WORDS);
+    let mut vertices = Vec::with_capacity(plans.iter().map(|p| p.vertex_count()).sum::<usize>() * VERTEX_WORDS);
     #[cfg(not(target_arch = "wasm32"))]
     let mut fixed = Vec::new();
     let mut count = 0usize;
-    for f in &plan.faces {
-        let Some(surface) = f.surface else {
-            return Err(GpuError::Unsupported("a face without an evaluable surface".into()));
-        };
-        if surface as usize >= plan.surfaces.len() {
-            return Err(GpuError::Failed("surface index out of range".into()));
-        }
-        for (k, uv) in f.uv.iter().enumerate() {
-            let pinned = f.fixed.get(k).copied();
-            let flags = u32::from(f.flip) | if pinned.is_some() { 2 } else { 0 };
-            let p = pinned.unwrap_or(Vec3::ZERO);
-            vertices.extend([
-                (uv[0] as f32).to_bits(),
-                (uv[1] as f32).to_bits(),
-                surface,
-                flags,
-                (p.x as f32).to_bits(),
-                (p.y as f32).to_bits(),
-                (p.z as f32).to_bits(),
-                0,
-            ]);
-            if let Some(p) = pinned {
-                #[cfg(not(target_arch = "wasm32"))]
-                fixed.push((count, p));
-                #[cfg(target_arch = "wasm32")]
-                let _ = p;
+    let mut base = 0u32;
+    for plan in plans {
+        for f in &plan.faces {
+            let Some(surface) = f.surface else {
+                return Err(GpuError::Unsupported("a face without an evaluable surface".into()));
+            };
+            if surface as usize >= plan.surfaces.len() {
+                return Err(GpuError::Failed("surface index out of range".into()));
             }
-            count += 1;
+            let surface = base + surface;
+            for (k, uv) in f.uv.iter().enumerate() {
+                let pinned = f.fixed.get(k).copied();
+                let flags = u32::from(f.flip) | if pinned.is_some() { 2 } else { 0 };
+                let p = pinned.unwrap_or(Vec3::ZERO);
+                vertices.extend([
+                    (uv[0] as f32).to_bits(),
+                    (uv[1] as f32).to_bits(),
+                    surface,
+                    flags,
+                    (p.x as f32).to_bits(),
+                    (p.y as f32).to_bits(),
+                    (p.z as f32).to_bits(),
+                    0,
+                ]);
+                if let Some(p) = pinned {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    fixed.push((count, p));
+                    #[cfg(target_arch = "wasm32")]
+                    let _ = p;
+                }
+                count += 1;
+            }
         }
+        base += word(plan.surfaces.len())?;
     }
     Ok(Packed {
         surfaces,

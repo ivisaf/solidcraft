@@ -31,7 +31,7 @@ use solidcraft_engine::geom::{Vec2, Vec3};
 
 use crate::SolveApp;
 use crate::dialogs::{CHAMFER_TYPES, Dialog, Kind, check, field, icon_choice, row_label};
-use crate::selection::{AXES, CURVES, POINTS, SelInput};
+use crate::selection::{AXES, CURVES, SKETCH_POINTS, SelInput};
 use crate::viewport::{Hit, Proj};
 
 /// The three chamfer types, drawn as the cut each one makes, in `CHAMFER_TYPES` order.
@@ -91,6 +91,10 @@ pub enum Mod {
 }
 
 impl Mod {
+    pub fn previews(&self) -> bool {
+        matches!(self, Self::Mirror | Self::PatternRect { .. } | Self::PatternCirc { .. } | Self::Offset { .. })
+    }
+
     pub fn title(&self) -> &'static str {
         match self {
             Mod::Scale { .. } => "SKETCH SCALE",
@@ -121,20 +125,20 @@ impl Mod {
 
 fn inputs(k: &Mod) -> Vec<SelInput> {
     match k {
-        Mod::Scale { .. } => vec![SelInput::new("Entities", CURVES | POINTS, true), SelInput::new("Base point", POINTS, false)],
+        Mod::Scale { .. } => vec![SelInput::new("Entities", CURVES | SKETCH_POINTS, true), SelInput::new("Base point", SKETCH_POINTS, false)],
         Mod::Offset { .. } => vec![SelInput::new("Curves", CURVES, true)],
         // AXES is the mask that takes a straight sketch curve (`selection::SelInput::accepts`).
-        Mod::Mirror => vec![SelInput::new("Entities", CURVES | POINTS, true), SelInput::new("Mirror line", AXES, false)],
-        Mod::Move { .. } => vec![SelInput::new("Entities", CURVES | POINTS, true), SelInput::new("Center", POINTS, false)],
+        Mod::Mirror => vec![SelInput::new("Entities", CURVES | SKETCH_POINTS, true), SelInput::new("Mirror line", AXES, false)],
+        Mod::Move { .. } => vec![SelInput::new("Entities", CURVES | SKETCH_POINTS, true), SelInput::new("Center", SKETCH_POINTS, false)],
         // The direction is optional: `sketch.pattern.rectangular` documents sketch x as its
         // default, the way the engine reads it.
-        Mod::PatternRect { .. } => vec![SelInput::new("Entities", CURVES | POINTS, true), SelInput::new("Direction", AXES, false)],
+        Mod::PatternRect { .. } => vec![SelInput::new("Entities", CURVES | SKETCH_POINTS, true), SelInput::new("Direction", AXES, false)],
         // The centre is required: `sketch.pattern.circular` has no default for it.
-        Mod::PatternCirc { .. } => vec![SelInput::new("Entities", CURVES | POINTS, true), SelInput::new("Center", POINTS, false)],
+        Mod::PatternCirc { .. } => vec![SelInput::new("Entities", CURVES | SKETCH_POINTS, true), SelInput::new("Center", SKETCH_POINTS, false)],
         // A fillet rounds any number of corners to one radius (`points`). Each chamfer command
         // cuts one corner, so its input holds one.
-        Mod::Corner { chamfer: false, .. } => vec![SelInput::new("Corners", POINTS, true)],
-        Mod::Corner { .. } => vec![SelInput::new("Corner", POINTS, false)],
+        Mod::Corner { chamfer: false, .. } => vec![SelInput::new("Corners", SKETCH_POINTS, true)],
+        Mod::Corner { .. } => vec![SelInput::new("Corner", SKETCH_POINTS, false)],
     }
 }
 
@@ -163,6 +167,25 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     };
     let i = inputs(&k);
     Some((Kind::SketchModify(k), i))
+}
+
+/// Sketch modify inputs accept only the sketch being edited. Origin axes remain valid
+/// rectangular-pattern directions, while Hole continues using its separate POINTS mask.
+pub fn candidate(d: &Dialog, session: &solidcraft_engine::Session, hit: &Hit) -> Option<Sel> {
+    let active = session.active_sketch?;
+    match hit {
+        Hit::SketchCurve { sketch, .. } | Hit::SketchPoint { sketch, .. } if *sketch != active => None,
+        _ => d.active_input()?.accepts(hit, |_, _| false),
+    }
+}
+
+/// Place a circular pattern centre in empty sketch space without creating a document point.
+pub fn pick_position(d: &mut Dialog, session: &solidcraft_engine::Session, point: Vec3) -> bool {
+    if !matches!(d.kind, Kind::SketchModify(Mod::PatternCirc { .. })) || d.active != 1 {
+        return false;
+    }
+    d.pick(session, Sel::Vertex { body: String::new(), point });
+    true
 }
 
 /// The rows after the inputs; true when Enter was pressed in a field.
@@ -311,7 +334,7 @@ pub(crate) fn corner_hit(app: &SolveApp, proj: &Proj, pos: Pos2) -> Option<(Hit,
     let Some(Kind::SketchModify(Mod::Corner { chamfer, .. })) = app.dialog.as_ref().map(|d| &d.kind) else { return None };
     let sketch = app.session.active_sketch?;
     let (at, id) = crate::sketch_tools::corner_point(app, proj, pos, !*chamfer)?;
-    let sel = Sel::SketchPoint { id: format!("{sketch}:{id}") };
+    let sel = Sel::SketchPoint { id: id.clone() };
     Some((Hit::SketchPoint { sketch, id, at }, sel))
 }
 
@@ -320,23 +343,28 @@ fn items(inputs: &[SelInput], i: usize) -> &[Sel] {
     inputs.get(i).map(|x| x.items.as_slice()).unwrap_or(&[])
 }
 
-/// A picked sketch point as the id its own sketch knows it by. Picking prefixes the sketch
-/// ("`<sketch>:<point>`") so points of any visible sketch stay distinct; a sketch command
-/// names the point alone.
-fn point_id(sel: &Sel) -> Option<&str> {
-    match sel {
-        Sel::SketchPoint { id } => Some(id.split_once(':').map(|(_, p)| p).unwrap_or(id)),
-        _ => None,
+/// A local point id. Qualified ids supplied by scripts or older selections are also accepted;
+/// commands check that their sketch prefix identifies the sketch being edited.
+pub(crate) fn point_id<'a>(session: &solidcraft_engine::Session, sel: &'a Sel) -> Option<&'a str> {
+    let Sel::SketchPoint { id } = sel else { return None };
+    let Some((owner, point)) = id.split_once(':') else { return Some(id) };
+    let active = session.active_sketch?;
+    // Custom local ids may themselves contain ':'. Preserve them before interpreting a
+    // legacy qualified selection, whose owner must match the sketch being edited.
+    if session.world_state().sketch(active).is_some_and(|sk| sk.sketch.point_index(id).is_some()) {
+        Some(id)
+    } else {
+        (owner.parse::<u64>().ok() == Some(active)).then_some(point)
     }
 }
 
 /// The curves and lone points picked in input `i`, as the engine's `entities` list.
-fn entity_ids(inputs: &[SelInput], i: usize) -> Vec<String> {
+fn entity_ids(session: &solidcraft_engine::Session, inputs: &[SelInput], i: usize) -> Vec<String> {
     items(inputs, i)
         .iter()
         .filter_map(|x| match x {
             Sel::SketchCurve { id } => Some(id.clone()),
-            _ => point_id(x).map(str::to_string),
+            _ => point_id(session, x).map(str::to_string),
         })
         .collect()
 }
@@ -412,20 +440,9 @@ fn length(app: &SolveApp, label: &str, text: &str) -> Result<f64, String> {
     }
     Ok(v)
 }
-/// Corner point ids picked in input `i`, within the active sketch. A `POINTS` pick is stored as
-/// "<sketch id>:<point id>"; a point selected without the window carries the bare id.
+/// Corner point ids within the active sketch, including qualified script selections.
 fn corner_ids(app: &SolveApp, inputs: &[SelInput], i: usize) -> Vec<String> {
-    let active = app.session.active_sketch;
-    items(inputs, i)
-        .iter()
-        .filter_map(|x| match x {
-            Sel::SketchPoint { id } => match id.split_once(':') {
-                Some((sketch, point)) => (sketch.parse::<u64>().ok() == active).then(|| point.to_string()),
-                None => Some(id.clone()),
-            },
-            _ => None,
-        })
-        .collect()
+    items(inputs, i).iter().filter_map(|sel| point_id(&app.session, sel).map(str::to_string)).collect()
 }
 
 /// A corner size evaluated against the document's parameters, which every corner command needs
@@ -472,23 +489,25 @@ fn total_angle(app: &SolveApp, label: &str, text: &str) -> Result<f64, String> {
 
 /// The bare sketch point id of a single point pick, as a command's `center` or `base` reads it.
 /// `point_id` above takes one `Sel`; this one takes the first pick of an input.
-fn picked_point(inputs: &[SelInput], i: usize) -> Option<String> {
-    items(inputs, i).first().and_then(point_id).map(str::to_string)
+fn picked_point(session: &solidcraft_engine::Session, inputs: &[SelInput], i: usize) -> Option<String> {
+    items(inputs, i).first().and_then(|sel| point_id(session, sel)).map(str::to_string)
 }
 
-/// The command a sketch modify dialog makes. `sketch.scale` takes a plain evaluated number for
-/// its factor, `sketch.offset` one for its distance and `sketch.move` its distances and angle,
-/// not expression strings: none has a model parameter to carry one, unlike `sketch.fillet`'s radius.
+/// The command a sketch modify dialog makes. Scale, Move, and patterns send evaluated
+/// numbers. Offset and Fillet retain expressions in persistent driving dimensions.
 pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String, Value>) -> Result<Vec<(String, Value)>, String> {
+    if inputs.iter().flat_map(|input| &input.items).any(|sel| matches!(sel, Sel::SketchPoint { .. }) && point_id(&app.session, sel).is_none()) {
+        return Err("Select points of the sketch being edited".into());
+    }
     let (cmd, mut params) = match k {
         Mod::Scale { factor: text } => {
-            let entities = entity_ids(inputs, 0);
+            let entities = entity_ids(&app.session, inputs, 0);
             if entities.is_empty() {
                 return Err("Select the sketch curves or points to scale first".into());
             }
             let f = factor(app, text)?;
             let mut p = json!({"entities": entities, "factor": f});
-            if let Some(base) = items(inputs, 1).first().and_then(point_id) {
+            if let Some(base) = items(inputs, 1).first().and_then(|sel| point_id(&app.session, sel)) {
                 p["base"] = json!(base);
             }
             ("sketch.scale", p)
@@ -499,20 +518,21 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 return Err("Select the curves to offset first".into());
             }
             // Symmetric hides Flip, so a flip left over from another mode does not travel with it.
-            let d = signed_length(app, "Distance", distance, *flip && *mode != SYMMETRIC)?;
-            let mut params = json!({"curves": curves, "distance": d, "chain": chain});
+            signed_length(app, "Distance", distance, *flip && *mode != SYMMETRIC)?;
+            let mut params = json!({"curves": curves, "distance": distance.trim(), "flip": *flip && *mode != SYMMETRIC, "chain": chain});
             if let Value::Object(m) = &mut params {
                 if *mode == SYMMETRIC {
                     m.insert("symmetric".into(), json!(true));
                 }
                 if *mode == TWO_SIDES {
-                    m.insert("distance2".into(), json!(signed_length(app, "Distance 2", distance2, false)?.abs()));
+                    let d2 = signed_length(app, "Distance 2", distance2, false)?;
+                    m.insert("distance2".into(), json!(if d2 > 0.0 { distance2.trim().to_string() } else { format!("-({})", distance2.trim()) }));
                 }
             }
             ("sketch.offset", params)
         }
         Mod::Mirror => {
-            let entities = entity_ids(inputs, 0);
+            let entities = entity_ids(&app.session, inputs, 0);
             if entities.is_empty() {
                 return Err("Select the sketch curves or points to mirror first".into());
             }
@@ -529,7 +549,7 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             ("sketch.mirror", json!({"entities": entities, "line": line}))
         }
         Mod::Move { x, y, angle, copy } => {
-            let entities = entity_ids(inputs, 0);
+            let entities = entity_ids(&app.session, inputs, 0);
             if entities.is_empty() {
                 return Err("Select the sketch curves or points to move first".into());
             }
@@ -540,13 +560,13 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
                 return Err("Type a distance or an angle to move by".into());
             }
             let mut p = json!({"entities": entities, "translate": [dx, dy], "angle": deg, "copy": copy});
-            if let Some(center) = items(inputs, 1).first().and_then(point_id) {
+            if let Some(center) = items(inputs, 1).first().and_then(|sel| point_id(&app.session, sel)) {
                 p["center"] = json!(center);
             }
             ("sketch.move", p)
         }
         Mod::PatternRect { count, spacing, count2, spacing2 } => {
-            let entities = entity_ids(inputs, 0);
+            let entities = entity_ids(&app.session, inputs, 0);
             if entities.is_empty() {
                 return Err("Select the sketch curves or points to pattern first".into());
             }
@@ -573,11 +593,19 @@ pub fn commands(app: &SolveApp, k: &Mod, inputs: &[SelInput], extra: &Map<String
             ("sketch.pattern.rectangular", p)
         }
         Mod::PatternCirc { count, angle } => {
-            let entities = entity_ids(inputs, 0);
+            let entities = entity_ids(&app.session, inputs, 0);
             if entities.is_empty() {
                 return Err("Select the sketch curves or points to pattern first".into());
             }
-            let center = picked_point(inputs, 1).ok_or("Select the centre the pattern turns around first")?;
+            let center = match items(inputs, 1).first() {
+                Some(Sel::Vertex { body, point }) if body.is_empty() => {
+                    let plane =
+                        app.session.world_state().sketch(app.session.active_sketch.ok_or("open a sketch first")?).ok_or("sketch is missing")?.plane;
+                    let p = plane.to_local(*point);
+                    json!([p.x, p.y])
+                }
+                _ => json!(picked_point(&app.session, inputs, 1).ok_or("Select the centre the pattern turns around first")?),
+            };
             let n = whole(app, "Quantity", count)?;
             if n < 2 {
                 return Err("Quantity must be at least 2".into());

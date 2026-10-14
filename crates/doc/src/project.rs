@@ -255,7 +255,11 @@ fn resolve_uncached(
         LinkSource::SketchAxis { name } => {
             vec![solidcraft_sketch::sketch_axis_geom(name).ok_or_else(|| DocError::Unknown(format!("sketch axis `{name}`")))?]
         }
-        LinkSource::Text { text, at, height, angle, font } => solidcraft_sketch::text_geometry_in(font.as_deref(), text, *at, *height, *angle)?,
+        LinkSource::Text { text, at, height, angle, font, style } if style.path.is_none() => {
+            solidcraft_sketch::text_geometry_styled(font.as_deref(), text, *at, *height, *angle, style, None)?
+        }
+        // Its path is a curve of its own sketch: set with the sketch (`Sketch::text_source_geometry`).
+        LinkSource::Text { .. } => return Err(DocError::Invalid("a text on a path is set with its sketch".into())),
         LinkSource::Plane { name } => {
             let pr =
                 if Plane::named(name).is_some() { PlaneRef::Origin { name: name.clone() } } else { PlaneRef::Construction { name: name.clone() } };
@@ -586,7 +590,15 @@ fn refresh_links_in(
                 }
             }
         }
-        let resolved = if l.auto_face {
+        let resolved = if matches!(source, LinkSource::Text { .. }) {
+            // A text needs nothing outside its sketch; one on a path follows a curve of it.
+            sk.text_source_geometry(&source).map_err(DocError::from).and_then(|geom| {
+                if geom.is_empty() {
+                    return Err(DocError::Invalid(format!("the {} makes no outline", source.describe())));
+                }
+                Ok(Resolved { geom, wires: Vec::new(), source: source.clone(), moved: false, face_index: None, edge_index: None })
+            })
+        } else if l.auto_face {
             anchor
                 .filter(|anchor| {
                     l.face_name.as_ref() == Some(&anchor.target.name) && matches!(&l.source,LinkSource::Face {body,..} if *body==anchor.target.body)

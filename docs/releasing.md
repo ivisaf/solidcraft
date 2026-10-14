@@ -27,6 +27,11 @@ repository under `/solidcraft/`. Do not add a separate owner-site publisher or p
 old-name Pages/Flatpak aliases. GitHub repository redirects are separate from Pages hosting;
 verify the new project URLs after deployment.
 
+The browser app keeps itself for offline use (`apps/solidcraft-web/sw.js`). Browsers keep that
+service worker after the code that registered it is gone, so to switch it off deploy
+`apps/solidcraft-web/sw.js` unbuilt (as `trunk serve` builds do): it deletes what it kept and
+unregisters. A site without `build.json` is also safe: launches then go to the network.
+
 ## Nightly prereleases
 
 `release.yml` also runs at midnight in `America/New_York` (Eastern time, following daylight
@@ -97,6 +102,22 @@ asset set. Existing release notes are preserved on rebuild; refresh their change
 new commits were added. An existing tag or published release is never overwritten. Use a new
 version after publication. Do not push the version tag yourself: publishing the draft creates
 it at the draft's target commit.
+
+## Notes for the next release
+
+Items to carry into the next release's notes (step 3 below), then remove from here:
+
+- **Security (agents and the control channel, [#205](https://github.com/bherbruck/solidcraft/issues/205)).**
+  Upgrading is recommended for anyone who drives SolidCraft from an AI agent or runs it with
+  `--control` on a shared machine. MCP tool calls now reach files only in the open design's
+  folder (inside home, without its hidden files), SolidCraft's recovery folder and folders
+  given with `--allow-path`; `..`, symlinks that lead out and Windows UNC, device, stream and
+  short-name paths are refused ([#578](https://github.com/bherbruck/solidcraft/pull/578), thanks
+  @kravens). `doc.recovery_discard` deletes only real recovery entries. The control port now
+  needs a per-launch token from a file only the user can read, so other local users can't drive
+  the app; `solidcraft-cli mcp --connect` finds it by itself, other clients must send it (see
+  docs/control-protocol.md). MCP tool annotations no longer understate side effects. Reported by
+  @CalvinEthos.
 
 ## Verify and publish
 

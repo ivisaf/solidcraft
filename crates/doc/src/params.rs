@@ -69,7 +69,7 @@ impl FeatureKind {
                     v.push(("To offset", d, L));
                 }
             }
-            FeatureKind::Revolve { angle, angle2, .. } => {
+            FeatureKind::Revolve { angle, angle2, .. } | FeatureKind::SurfaceRevolve { angle, angle2, .. } => {
                 v.push(("Angle", angle, A));
                 if let Some(a) = angle2 {
                     v.push(("Angle 2", a, A));
@@ -77,6 +77,7 @@ impl FeatureKind {
             }
             FeatureKind::Fillet { radius, style, .. } => match style {
                 crate::FilletStyle::Constant => v.push(("Radius", radius, L)),
+                crate::FilletStyle::Curvature => v.push(("Equivalent radius", radius, L)),
                 crate::FilletStyle::Chord => v.push(("Chord length", radius, L)),
                 crate::FilletStyle::Variable { radius2, mid, .. } => {
                     v.push(("Start radius", radius, L));
@@ -278,6 +279,12 @@ impl FeatureKind {
             FeatureKind::SurfaceTrim { plane, .. } => plane_inputs_mut(plane, &mut v),
             FeatureKind::SurfaceExtend { distance, .. } => v.push(("Distance", distance, L)),
             FeatureKind::Unstitch { .. } | FeatureKind::ReverseNormal { .. } => {}
+            FeatureKind::SurfaceOffset { distance, tolerance, .. } => {
+                v.push(("Distance", distance, L));
+                if let Some(t) = tolerance {
+                    v.push(("Tolerance", t, L));
+                }
+            }
             FeatureKind::Patch { .. } => {}
             FeatureKind::Combine { .. }
             | FeatureKind::SheetBase { .. }
@@ -289,6 +296,8 @@ impl FeatureKind {
             | FeatureKind::BoundaryFill { .. }
             | FeatureKind::Loft { .. }
             | FeatureKind::Sweep { .. }
+            | FeatureKind::SurfaceSweep { .. }
+            | FeatureKind::SurfaceLoft { .. }
             | FeatureKind::Import { .. }
             | FeatureKind::MeshImport { .. }
             | FeatureKind::BodyTransfer { .. } => {}

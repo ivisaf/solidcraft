@@ -436,9 +436,17 @@ fn flat_json(sh: &SheetBody) -> Result<Value> {
             "side": side, "depth_mm": p.z1-p.z0, "z0_mm": p.z0, "z1_mm": p.z1})
         })
         .collect();
-    Ok(
-        json!({"body": sh.body, "rule": sh.rule, "thickness": sh.t, "k_factor": sh.k, "flat_size_mm": [w, h, sh.t], "outline": outline, "cutouts": holes, "cutout_shapes": hole_shapes, "pockets": pockets, "bends": bends, "unfolded": sh.flat}),
-    )
+    // Holes drilled along a panel into its rim: drilled after cutting, not in the outline.
+    let bores: Vec<Value> = sh
+        .bores
+        .iter()
+        .map(|b| json!({"start": [b.base.x, b.base.y, b.base.z], "axis": [b.axis.x, b.axis.y, b.axis.z], "diameter": b.radius * 2.0, "length": b.height.abs()}))
+        .collect();
+    let mut out = json!({"body": sh.body, "rule": sh.rule, "thickness": sh.t, "k_factor": sh.k, "flat_size_mm": [w, h, sh.t], "outline": outline, "cutouts": holes, "cutout_shapes": hole_shapes, "pockets": pockets, "bends": bends, "unfolded": sh.flat});
+    if !bores.is_empty() {
+        out["bores"] = Value::Array(bores);
+    }
+    Ok(out)
 }
 
 fn flat_pattern(s: &mut Session, p: &Value) -> Result<Value> {

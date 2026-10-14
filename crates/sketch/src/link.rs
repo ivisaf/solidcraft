@@ -81,6 +81,9 @@ pub enum LinkSource {
         angle: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         font: Option<String>,
+        /// Bold or italic, alignment, spacing and the curve the text follows.
+        #[serde(default, skip_serializing_if = "crate::text::TextStyle::is_plain")]
+        style: crate::text::TextStyle,
     },
 }
 

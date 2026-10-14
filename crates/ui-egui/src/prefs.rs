@@ -860,13 +860,15 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             );
             crate::scenario::publish_rect("prefs:scale", scale.rect);
             ui.end_row();
-            ui.label("Feature history");
+            ui.label(app.tr("ui.feature_history"));
+            let timeline_bottom = app.tr("ui.timeline_bottom").to_string();
+            let timeline_left = app.tr("ui.timeline_left_sidebar").to_string();
             ui.horizontal(|ui| {
-                ui.radio_value(&mut app.preferences.timeline_left, false, "Bottom timeline");
-                ui.radio_value(&mut app.preferences.timeline_left, true, "Left sidebar");
+                ui.radio_value(&mut app.preferences.timeline_left, false, timeline_bottom);
+                ui.radio_value(&mut app.preferences.timeline_left, true, timeline_left);
             });
             ui.end_row();
-            note(ui, "The left layout shows the rollback bar above the parts and scene browser.");
+            note(ui, app.tr("ui.timeline_left_note"));
             ui.label(app.tr("ui.units_of_new_designs"));
             egui::ComboBox::from_id_salt("pref_units").selected_text(app.preferences.default_units.clone()).show_ui(ui, |ui| {
                 for u in UNITS {

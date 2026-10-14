@@ -31,11 +31,12 @@ impl Catalog {
     }
 }
 
-static ENGLISH: Catalog = Catalog::new("en", "English", include_str!("locales/en.json"));
-static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!("locales/ja.json"));
-static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!("locales/de.json"));
-static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!("locales/ko.json"));
-pub const LOCALES: &[&Catalog] = &[&ENGLISH, &JAPANESE, &GERMAN, &KOREAN];
+static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/en.json")));
+static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json")));
+static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/de.json")));
+static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ko.json")));
+static CHINESE: Catalog = Catalog::new("zh", "中文", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json")));
+pub const LOCALES: &[&Catalog] = &[&ENGLISH, &JAPANESE, &GERMAN, &KOREAN, &CHINESE];
 
 pub fn is_supported(id: &str) -> bool {
     LOCALES.iter().any(|catalog| catalog.id == id)
@@ -178,6 +179,90 @@ mod tests {
             rest = remaining;
         }
         result
+    }
+
+    /// Every English text `label()` can be asked to translate, read straight from the catalogs.
+    fn english_texts() -> BTreeSet<&'static str> {
+        ENGLISH.messages().values().map(String::as_str).collect()
+    }
+
+    /// Catalogs delivered complete. English is the source catalog; Japanese was completed
+    /// upstream and Chinese lands complete here. German and Korean are still partial (they
+    /// predate the coverage guards), so their gaps are reported by `cargo xtask i18n`
+    /// without failing the build, while nothing in the two complete catalogs may regress.
+    const COMPLETE: &[&str] = &["ja", "zh"];
+
+    /// `text()` falls back to English silently, so a message a complete locale never received is
+    /// shown in English inside an otherwise translated UI, with nothing in the build to say so.
+    /// This is the guard against that: adding a key to `en.json` and forgetting a complete
+    /// catalog fails here.
+    #[test]
+    fn every_complete_catalog_carries_every_english_message() {
+        let english: Messages = serde_json::from_str(ENGLISH.source).unwrap();
+        for catalog in LOCALES.iter().filter(|c| COMPLETE.contains(&c.id)) {
+            let messages: Messages = serde_json::from_str(catalog.source).unwrap();
+            let missing: Vec<&str> = english.keys().filter(|id| !messages.contains_key(*id)).map(String::as_str).collect();
+            assert!(missing.is_empty(), "{} is missing {} English message(s): {}", catalog.id, missing.len(), missing.join(", "));
+        }
+    }
+
+    /// A toolbar tab or panel reaches the UI as a bare source string (`toolbar::TABS`,
+    /// `CommandSpec::tab` / `.panel`) and is resolved only by `label()`'s English-text lookup, so
+    /// a heading missing from `en.json` can never translate in any locale. There are a dozen of
+    /// them, so all of them are required rather than ratcheted.
+    #[test]
+    fn every_toolbar_tab_and_panel_is_in_the_english_catalog() {
+        let texts = english_texts();
+        let mut wanted: Vec<&str> = crate::toolbar::TABS.to_vec();
+        wanted.push(crate::toolbar_custom::WORKSPACE);
+        for spec in solidcraft_engine::command_specs() {
+            wanted.push(spec.tab);
+            wanted.push(spec.panel);
+        }
+        let mut missing: Vec<&str> = wanted.into_iter().filter(|t| !t.is_empty() && !texts.contains(t)).collect();
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(missing.is_empty(), "toolbar tabs/panels absent from en.json: {missing:?}");
+    }
+
+    /// Every command label the engine can show must exist as an English catalog message.
+    ///
+    /// `label()` resolves source text coming from the engine by looking that exact English string
+    /// up in `en.json`, so a label the catalog does not carry stays English in *every* locale —
+    /// nothing fails, the row just looks untranslated. The whole registry now has entries (their
+    /// ids are `cmd.<command id>`), so this is a hard requirement rather than a budget: a new
+    /// command added without a catalog entry fails here.
+    #[test]
+    fn every_command_label_is_in_the_english_catalog() {
+        let texts = english_texts();
+        let mut untranslated: Vec<&str> = solidcraft_engine::command_specs().iter().map(|c| c.label).filter(|label| !texts.contains(label)).collect();
+        untranslated.sort_unstable();
+        untranslated.dedup();
+        assert!(
+            untranslated.is_empty(),
+            "{} command label(s) have no English catalog entry, so they would stay English in every locale: {untranslated:?}",
+            untranslated.len()
+        );
+    }
+
+    /// The whole engine registry now reaches the catalogs. Sample command labels from areas that
+    /// had no entry at all before (sheet metal, inspect, joints, motion) must resolve to their
+    /// translation rather than echo the English source text — `label()` returns its argument when
+    /// it finds no English message, so a dropped entry looks like a working English UI.
+    #[test]
+    fn newly_catalogued_command_labels_translate() {
+        let cases = [
+            ("zh", "法兰", "斑马纹分析", "运动研究"),
+            ("ja", "フランジ", "ゼブラ解析", "モーション スタディ"),
+            ("de", "Flansch", "Zebra-Analyse", "Bewegungsuntersuchung"),
+            ("ko", "플랜지", "얼룩말줄무늬 분석", "운동 연구"),
+        ];
+        for (lang, flange, zebra, motion) in cases {
+            let locale = Locale::for_language(lang);
+            for (source, expected) in [("Flange", flange), ("Zebra Analysis", zebra), ("Motion Study", motion)] {
+                assert_eq!(locale.label(source), expected, "{lang}: {source}");
+            }
+        }
     }
 
     #[test]

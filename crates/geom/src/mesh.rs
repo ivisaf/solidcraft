@@ -90,14 +90,32 @@ const MAX_CELLS_PER_TRIANGLE: usize = 64;
 /// `gap` of each other (each such pair once), until it returns true, and says whether it did.
 /// The cost follows the number of close pairs, not `a.len() * b.len()`: `b` is filed in a sparse
 /// grid of cells about its typical triangle's size, and each triangle of `a` meets only those in
-/// its cells. Every call of `test` takes one from `budget`; `None` when the budget runs out.
+/// its cells. The work counts against `budget`, one unit each: a grid cell a triangle of `b` is
+/// filed under, a cell a triangle of `a` visits, and a call of `test`. `None` when the budget runs out.
 pub fn find_close_pair(
     a: &[BoxedTriangle],
     b: &[BoxedTriangle],
     gap: f64,
     budget: &mut usize,
+    test: impl FnMut(&BoxedTriangle, &BoxedTriangle) -> bool,
+) -> Option<bool> {
+    let work = std::cell::Cell::new(*budget);
+    let found = find_close_pair_within(a, b, gap, &work, test);
+    *budget = work.get();
+    found
+}
+
+fn find_close_pair_within(
+    a: &[BoxedTriangle],
+    b: &[BoxedTriangle],
+    gap: f64,
+    work: &std::cell::Cell<usize>,
     mut test: impl FnMut(&BoxedTriangle, &BoxedTriangle) -> bool,
 ) -> Option<bool> {
+    let spend = |n: usize| -> Option<()> {
+        work.set(work.get().checked_sub(n)?);
+        Some(())
+    };
     let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
     let close = |x: &Aabb3, y: &Aabb3| {
         x.min.x <= y.max.x + gap
@@ -108,7 +126,7 @@ pub fn find_close_pair(
             && y.min.z <= x.max.z + gap
     };
     let mut call = |t: &BoxedTriangle, u: &BoxedTriangle| -> Option<bool> {
-        *budget = budget.checked_sub(1)?;
+        spend(1)?;
         Some(test(t, u))
     };
     let (Some(first), true) = (b.first(), !a.is_empty()) else { return Some(false) };
@@ -146,6 +164,7 @@ pub fn find_close_pair(
                 for ix in x.0..=x.1 {
                     for iy in y.0..=y.1 {
                         for iz in z.0..=z.1 {
+                            spend(1)?;
                             cells.entry((ix, iy, iz)).or_default().push(j as u32);
                         }
                     }
@@ -177,6 +196,7 @@ pub fn find_close_pair(
         for ix in x.0..=x.1 {
             for iy in y.0..=y.1 {
                 for iz in z.0..=z.1 {
+                    spend(1)?;
                     for &j in cells.get(&(ix, iy, iz)).into_iter().flatten() {
                         let (Some(mark), Some(u)) = (seen.get_mut(j as usize), b.get(j as usize)) else { continue };
                         if *mark == i + 1 {
@@ -230,6 +250,72 @@ pub struct MeshMeasure {
     pub volume: f64,
     pub area: f64,
     pub centroid: Vec3,
+}
+
+/// Volume, centroid and inertia tensor of a closed mesh at unit density: the inertia is about
+/// the centroid, in the mesh's axes (times a density, mass and inertia in that density's units).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MassProperties {
+    pub volume: f64,
+    pub centroid: Vec3,
+    pub inertia: [[f64; 3]; 3],
+}
+
+impl Mesh {
+    /// [`MassProperties`] of a closed mesh, by the divergence theorem over the tetrahedra its
+    /// triangles make with the origin. `None` unless every edge (by vertex index: weld first) is
+    /// shared by exactly two triangles that cross it in opposite directions (closed, consistently
+    /// oriented), or for a mesh without volume or with non-finite values.
+    pub fn mass_properties(&self) -> Option<MassProperties> {
+        // Closed and consistently oriented: each edge is crossed once in each direction.
+        let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for t in &self.triangles {
+            for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+        if edges.is_empty() || edges.iter().any(|(&(a, b), n)| *n != 1 || edges.get(&(b, a)) != Some(&1)) {
+            return None;
+        }
+        let xyz = |v: Vec3| [v.x, v.y, v.z];
+        let (mut v6, mut first, mut second) = (0.0, Vec3::ZERO, [[0.0f64; 3]; 3]);
+        for t in &self.triangles {
+            let [a, b, c] = self.tri(t)?;
+            let det = a.dot(b.cross(c));
+            v6 += det;
+            first += (a + b + c) * det;
+            // ∫ x xᵀ over the tetrahedron (0, a, b, c) = det/120 · (Σ p pᵀ + s sᵀ), s = a + b + c.
+            let (p, s) = ([xyz(a), xyz(b), xyz(c)], xyz(a + b + c));
+            for (i, row) in second.iter_mut().enumerate() {
+                for (j, cell) in row.iter_mut().enumerate() {
+                    *cell += det / 120.0 * (p.iter().map(|q| q[i] * q[j]).sum::<f64>() + s[i] * s[j]);
+                }
+            }
+        }
+        if !(v6.abs() / 6.0 > 1e-12) {
+            return None;
+        }
+        // Inward-facing: every sum changes sign together.
+        let sign = v6.signum();
+        let volume = v6.abs() / 6.0;
+        let centroid = first / (4.0 * v6);
+        let c = xyz(centroid);
+        let mut about = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                about[i][j] = sign * second[i][j] - volume * c[i] * c[j];
+            }
+        }
+        let trace = about[0][0] + about[1][1] + about[2][2];
+        let mut inertia = [[0.0f64; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                inertia[i][j] = if i == j { trace } else { 0.0 } - about[i][j];
+            }
+        }
+        let finite = volume.is_finite() && c.iter().all(|x| x.is_finite()) && inertia.iter().flatten().all(|x| x.is_finite());
+        finite.then_some(MassProperties { volume, centroid, inertia })
+    }
 }
 
 impl Mesh {

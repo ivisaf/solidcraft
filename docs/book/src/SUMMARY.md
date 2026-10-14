@@ -20,6 +20,7 @@
 
 - [Contributing](dev/contributing.md)
 - [Architecture](dev/architecture.md)
+- [Extensible library proposal](dev/libraries.md)
 - [The command engine](dev/commands.md)
 - [The kernel boundary and truck](dev/kernel.md)
 - [Persistent naming](dev/naming.md)

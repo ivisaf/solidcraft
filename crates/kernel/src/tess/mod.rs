@@ -21,6 +21,7 @@ pub(crate) mod coons;
 pub(crate) mod edges;
 pub(crate) mod grid;
 pub(crate) mod size;
+pub(crate) mod ssi;
 pub(crate) mod surface;
 pub(crate) mod uv;
 
@@ -83,13 +84,13 @@ pub(crate) fn plan(solid: &Solid, tol: f64, turn: Option<size::Turn>) -> Result<
     let sampled = crate::par::map("edge nodes", &jobs, solved >= PARALLEL_CURVES || edges.len() >= PARALLEL_EDGES, |(e, h)| {
         Ok(edges::sample_edge(e, &rules, *h))
     });
-    let mut nodes: HashMap<_, Vec<Vec3>> = HashMap::with_capacity(edges.len());
-    for (e, pts) in edges.iter().zip(sampled) {
-        nodes.insert(e.id(), pts?);
+    let mut nodes: HashMap<_, edges::Nodes> = HashMap::with_capacity(edges.len());
+    for (e, n) in edges.iter().zip(sampled) {
+        nodes.insert(e.id(), n?);
     }
     relax_crowded_faces(&faces, &jobs, &rules, &mut nodes);
     let oriented = |e: &mt::Edge| -> Option<Vec<Vec3>> {
-        let mut pts = nodes.get(&e.id())?.clone();
+        let mut pts = nodes.get(&e.id())?.points.clone();
         if !e.orientation() {
             pts.reverse();
         }
@@ -102,21 +103,32 @@ pub(crate) fn plan(solid: &Solid, tol: f64, turn: Option<size::Turn>) -> Result<
             Some((Some(eval), Some(size))) => (eval.clone(), *size),
             _ => return Err(unsupported(format!("face {fi}: surface not evaluable"))),
         };
-        // Boundary nodes, loop by loop (each edge's last node is the next edge's first).
+        // Boundary nodes, loop by loop (each edge's last node is the next edge's first), with
+        // their parameters on this face where the edge knows them (an intersection edge on
+        // this face's surface).
         let mut loops3: Vec<Vec<Vec3>> = Vec::new();
+        let mut known: Vec<Vec<Option<[f64; 2]>>> = Vec::new();
         for wire in face.absolute_boundaries() {
-            let mut pts = Vec::new();
+            let (mut pts, mut uvs) = (Vec::new(), Vec::new());
             for e in wire.edge_iter() {
-                let mut ep = oriented(e).ok_or_else(|| unsupported("edge without nodes"))?;
+                let n = nodes.get(&e.id()).ok_or_else(|| unsupported("edge without nodes"))?;
+                let (mut ep, mut eq) = (n.points.clone(), n.params_on(&eval).unwrap_or_else(|| vec![None; n.points.len()]));
+                if !e.orientation() {
+                    ep.reverse();
+                    eq.reverse();
+                }
                 ep.pop();
+                eq.pop();
                 pts.extend(ep);
+                uvs.extend(eq);
             }
             if pts.len() >= 2 {
                 loops3.push(pts);
+                known.push(uvs);
             }
         }
         let mut stats = PlanStats::default();
-        let fp = plan_face(fi, &eval, &loops3, &rules, size, &mut stats)?;
+        let fp = plan_face(fi, &eval, &loops3, &known, &rules, size, &mut stats)?;
         let fp = FacePlan {
             flip: !face.orientation(),
             triangles: if face.orientation() { fp.triangles } else { fp.triangles.into_iter().map(|[a, b, c]| [a, c, b]).collect() },
@@ -140,13 +152,40 @@ pub(crate) fn plan(solid: &Solid, tol: f64, turn: Option<size::Turn>) -> Result<
     Ok((plan, stats))
 }
 
+/// Whether every curved face's boundary lies on the face's surface, within `accept`: a point
+/// off the surface's own parameter range is off it. The planner needs this of every face; a
+/// blend that runs on past the end of a neighbouring round's surface does not have it.
+pub(crate) fn boundaries_on_surfaces(solid: &Solid, accept: f64) -> bool {
+    use mt::{BoundedCurve, ParametricCurve};
+    for face in solid.face_iter() {
+        let Some(eval) = surface::eval_surface(&face.surface()) else { continue };
+        if matches!(eval, EvalSurface::Plane { .. }) {
+            continue;
+        }
+        let dom = uv::domain(&eval);
+        let mut prev: Option<[f64; 2]> = None;
+        for e in face.edge_iter() {
+            let c = e.oriented_curve();
+            let (lo, hi) = c.range_tuple();
+            for k in 0..=32 {
+                let p = crate::body::from_p3(c.subs(lo + (hi - lo) * f64::from(k) / 32.0));
+                match uv::project(&eval, &dom, p, prev, accept) {
+                    Some(uv) => prev = Some(uv),
+                    None => return false,
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Bounded work for the facet angle, as the reference mesher bounds it: a face whose boundary
 /// would get more than `MAX_ANGLE_BOUNDARY` segments has its curved edges sampled again at twice
 /// the angle, as often as it takes, down to the tolerance alone (a plate with a thousand small
 /// holes is not worth a hundred times the work to draw each hole round). An edge keeps one set
 /// of nodes for both its faces, at the coarser of their levels, so every rim of a crowded face
 /// gets the same share whatever the order of the faces.
-fn relax_crowded_faces(faces: &[&mt::Face], jobs: &[(&mt::Edge, f64)], rules: &size::Rules, nodes: &mut HashMap<mt::EdgeID, Vec<Vec3>>) {
+fn relax_crowded_faces(faces: &[&mt::Face], jobs: &[(&mt::Edge, f64)], rules: &size::Rules, nodes: &mut HashMap<mt::EdgeID, edges::Nodes>) {
     use truck_meshalgo::tessellation::Deflection;
     let Some(turn) = rules.turn else { return };
     let h_of: HashMap<mt::EdgeID, (&mt::Edge, f64)> = jobs.iter().map(|(e, h)| (e.id(), (*e, *h))).collect();
@@ -154,7 +193,7 @@ fn relax_crowded_faces(faces: &[&mt::Face], jobs: &[(&mt::Edge, f64)], rules: &s
         faces.iter().map(|f| f.absolute_boundaries().iter().flat_map(|w| w.edge_iter().map(|e| e.id())).collect()).collect();
     let mut level: HashMap<mt::EdgeID, u8> = HashMap::new();
     for l in 1..=Deflection::MAX_RELAX {
-        let segments = |id: &mt::EdgeID| nodes.get(id).map_or(0, |n| n.len().saturating_sub(1));
+        let segments = |id: &mt::EdgeID| nodes.get(id).map_or(0, |n| n.points.len().saturating_sub(1));
         let mut crowded: Vec<mt::EdgeID> = boundaries
             .iter()
             .filter(|ids| ids.iter().map(segments).sum::<usize>() > Deflection::MAX_ANGLE_BOUNDARY)
@@ -184,6 +223,7 @@ fn plan_face(
     fi: usize,
     s: &EvalSurface,
     loops3: &[Vec<Vec3>],
+    known: &[Vec<Option<[f64; 2]>>],
     rules: &size::Rules,
     size: (f64, [f64; 2]),
     stats: &mut PlanStats,
@@ -197,11 +237,17 @@ fn plan_face(
     let mut fixed: Vec<Vec3> = Vec::new();
     let mut uvs: Vec<[f64; 2]> = Vec::new();
     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
-    for pts in loops3 {
+    for (li, pts) in loops3.iter().enumerate() {
         let mut luv: Vec<[f64; 2]> = Vec::with_capacity(pts.len());
         let mut prev: Option<[f64; 2]> = None;
-        for p in pts {
-            let mut q = uv::project(s, &dom, *p, prev, accept).ok_or_else(|| fail("boundary does not lie on the surface"))?;
+        for (k, p) in pts.iter().enumerate() {
+            // Known parameters (an intersection edge's), else a projection seeded by the
+            // previous node.
+            let given = known.get(li).and_then(|l| l.get(k)).copied().flatten();
+            let mut q = match given {
+                Some(q) => q,
+                None => uv::project(s, &dom, *p, prev, accept).ok_or_else(|| fail("boundary does not lie on the surface"))?,
+            };
             if let Some(pr) = prev {
                 for d in 0..2 {
                     q[d] = uv::unwrap(q[d], pr[d], dom.period[d]);

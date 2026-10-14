@@ -195,12 +195,73 @@ fn join_meeting_nothing_keeps_the_first_body() {
     assert!(rel(volume(&mut s), 1064.0) < 1e-6);
 }
 
+/// Two spheres of one size: the join's contact test tried every pair of their finely meshed
+/// triangles and refused the join as too much work (#232).
+#[test]
+fn join_of_two_overlapping_equal_spheres_is_not_refused() {
+    let mut s = Session::default();
+    run(&mut s, "solid.sphere", json!({"radius": 10, "center": [0, 0, 0], "body_name": "A"}));
+    run(&mut s, "solid.sphere", json!({"radius": 10, "center": [12, 0, 0], "body_name": "B"}));
+    run(&mut s, "solid.combine", json!({"target": "A", "tools": ["B"], "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // Two spheres less the lens they share: 2 * 4/3 pi r^3 - pi (4r + d) (2r - d)^2 / 12.
+    let (r, d) = (10.0, 12.0);
+    let want = 2.0 * 4.0 / 3.0 * PI * r * r * r - PI * (4.0 * r + d) * (2.0 * r - d) * (2.0 * r - d) / 12.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
+/// Area two discs of radii `r1`, `r2` with centres `d` apart have in common.
+fn disc_overlap(r1: f64, r2: f64, d: f64) -> f64 {
+    if d >= r1 + r2 {
+        return 0.0;
+    }
+    if d <= (r1 - r2).abs() {
+        return PI * r1.min(r2) * r1.min(r2);
+    }
+    let a = ((d * d + r1 * r1 - r2 * r2) / (2.0 * d * r1)).acos();
+    let b = ((d * d + r2 * r2 - r1 * r1) / (2.0 * d * r2)).acos();
+    r1 * r1 * a + r2 * r2 * b - 0.5 * ((-d + r1 + r2) * (d + r1 - r2) * (d - r1 + r2) * (d + r1 + r2)).sqrt()
+}
+
+/// Two thick rings 11 mm apart: their walls cross, and the join was refused as too much work (#232).
+#[test]
+fn join_of_two_overlapping_rings_is_not_refused() {
+    let mut s = Session::default();
+    for (name, x) in [("RingA", 0.0), ("RingB", 11.0)] {
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"diameter": 120, "height": 60, "base": [x, 0, 0], "operation": "new", "name": format!("{name}Outer"), "body_name": name}),
+        );
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"diameter": 96, "height": 60, "base": [x, 0, 0], "operation": "cut", "targets": [name], "name": format!("{name}Bore")}),
+        );
+    }
+    run(&mut s, "solid.combine", json!({"target": "RingA", "tools": ["RingB"], "operation": "join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    // Union of the two rings' plan areas: both less what they share, which is the overlap of the
+    // two outer discs less the two bores (each inside the other's outer disc) plus the bores' own overlap.
+    let (outer, bore, d) = (60.0, 48.0, 11.0);
+    let ring = PI * (outer * outer - bore * bore);
+    let shared = disc_overlap(outer, outer, d) - 2.0 * disc_overlap(bore, outer, d) + disc_overlap(bore, bore, d);
+    let want = (2.0 * ring - shared) * 60.0;
+    let got = volume(&mut s);
+    assert!(rel(got, want) < 1e-3, "{got} vs {want}");
+}
+
 mod boolean_diagnostics;
 mod component_frames;
+mod large_step_import;
+mod loft_cut;
 mod mirror_planes;
+mod path_scope;
 mod primitive_points;
 mod robustness;
 mod robustness_goldens;
+mod spiral_join;
 mod xz_plane;
 
 /// Plan area a round of radius `r` fills at the concave corner `x` where circles (c1, r1) and
@@ -899,6 +960,36 @@ fn step_open_then_model_on_it() {
     let mut s2 = Session::default();
     run(&mut s2, "doc.open", json!({"path": design.to_string_lossy()}));
     assert!(rel(volume(&mut s2), before) < 1e-6);
+}
+
+/// A join onto an imported body of thousands of planar faces (a converted mesh, say): each face of
+/// the result was compared with every planar face of the inputs whose source is unknown, and the
+/// join was refused past the comparison budget.
+#[test]
+fn join_onto_a_finely_faceted_import() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-faceted-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = 4000;
+    let mut pts: Vec<[f64; 2]> =
+        (0..n).map(|i| std::f64::consts::TAU * f64::from(i) / f64::from(n)).map(|a| [20.0 * a.cos(), 20.0 * a.sin()]).collect();
+    pts.push(pts[0]);
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "P"}));
+    run(&mut s, "sketch.line", json!({"points": pts}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "P", "distance": 10}));
+    let p = dir.join("Faceted.step");
+    run(&mut s, "file.export", json!({"path": p.to_string_lossy()}));
+    let prism = volume(&mut s);
+
+    let mut d = Session::default();
+    run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    run(&mut d, "sketch.create", json!({"plane": "XY", "name": "Pin"}));
+    run(&mut d, "sketch.rectangle.two_point", json!({"p0": [-5, -5], "p1": [5, 5]}));
+    run(&mut d, "sketch.finish", json!({}));
+    run(&mut d, "solid.extrude", json!({"sketch": "Pin", "distance": 25, "operation": "join"}));
+    assert_eq!(d.model.state().bodies.len(), 1);
+    assert!(rel(volume(&mut d), prism + 10.0 * 10.0 * 15.0) < 1e-6, "{}", volume(&mut d));
 }
 
 /// Shell an imported body; insert STEP into an existing design; extension case; bad files.

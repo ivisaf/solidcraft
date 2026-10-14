@@ -68,6 +68,8 @@ pub enum Target {
     Canvas {
         id: u64,
     },
+    /// The Section Analysis in the browser's Analysis folder.
+    Section,
     /// A component's Bodies, Sketches or Construction folder.
     Folder {
         component: u64,
@@ -261,7 +263,8 @@ pub fn target_bodies(app: &SolveApp, target: &Target) -> Vec<String> {
         | Target::Toolbar
         | Target::Workspace
         | Target::NamedViews
-        | Target::NamedView { .. } => Vec::new(),
+        | Target::NamedView { .. }
+        | Target::Section => Vec::new(),
     }
 }
 
@@ -315,6 +318,7 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::Canvas { id } => crate::browser::canvas_items(app, *id),
         Target::Origin => crate::browser::origin_items(app),
         Target::NamedViews => vec![act("ui.newView", "New Named View", "perspective")],
+        Target::Section => crate::browser::section_items(app),
         Target::Joint { id } => joint_items(app, *id),
         Target::ToolbarCommand { id } => crate::toolbar_custom::command_items(app, id),
         Target::Toolbar => crate::toolbar_custom::toolbar_items(app),
@@ -858,7 +862,12 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.tangentChain" => tangent_chain(app),
         "ui.origin" => app.ui.show_origin = !app.ui.show_origin,
         "ui.clear" => drop(app.run("select.clear", json!({}))),
-        "ui.unsection" => drop(app.run("inspect.section", json!({"clear": true}))),
+        "ui.unsection" => {
+            app.tree.hidden_section = None;
+            drop(app.run("inspect.section", json!({"clear": true})));
+        }
+        "ui.editSection" => app.start("inspect.section"),
+        "ui.sectionVisible" => crate::browser::set_section_visible(app, p.get("visible").and_then(Value::as_bool).unwrap_or(true)),
         "ui.fit" => app.animate_view("fit"),
         "ui.home" => app.animate_view("home"),
         // One command for the whole selection: all fixed unless all already are.
@@ -1430,16 +1439,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             let painter = ui.painter_at(r.expand(4.0));
             let font = FontId::proportional(13.0);
             // Centre: a ring with a pointer toward the hot direction.
-            painter.circle(c, 15.0, t.panel.gamma_multiply(0.92), Stroke::new(1.0, t.border));
-            if let (Some(k), Some(p)) = (hot, pointer) {
-                let d = (p - c).normalized();
-                painter.line_segment(
-                    [c + d * 6.0, c + d * 15.0],
-                    Stroke::new(3.0, if radial.get(k).is_some_and(|i| i.enabled) { t.accent } else { t.border }),
-                );
-            } else {
-                painter.circle_filled(c, 3.0, t.text_dim);
-            }
+            let direction = hot.zip(pointer).map(|(k, p)| ((p - c).normalized(), radial.get(k).is_some_and(|i| i.enabled)));
+            crate::icons::glyphs::radial_centre(&painter, c, direction, t);
             for (k, item) in radial.iter().enumerate() {
                 let display_label = crate::i18n::tr_label(&item.label);
                 let galley = painter.layout_no_wrap(display_label.to_string(), font.clone(), if item.enabled { t.text } else { t.text_dim });

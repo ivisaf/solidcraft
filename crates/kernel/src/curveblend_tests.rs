@@ -4,6 +4,7 @@
 use mt::{BoundedCurve, ParametricCurve, ParametricSurface, ParametricSurface3D, SearchNearestParameter};
 
 use super::*;
+use crate::blend::plane_normal;
 use crate::{Body, BoolOp, boolean, cylinder, fillet};
 
 fn tee(scale: f64, origin: Vec3) -> Body {
@@ -350,4 +351,60 @@ fn a_refused_edge_is_not_rolled_again_after_blends_far_from_it() {
     assert_eq!(rolls, 1, "the seam was rolled {rolls} times");
     // The far edges alone still round.
     assert!(fillet(&body, &ends, 3.0).is_ok());
+}
+
+/// At a knife edge (the plane and the wall's normals opposite) the ball's centre is the same
+/// whichever face is side 1: `r` inside the plane and `r` outside the wall's cylinder.
+#[test]
+fn knife_edge_ball_centre_does_not_depend_on_the_side_order() {
+    const R: f64 = 21.0;
+    let tip = Vec3::new(62.0 + 1.0 / 6.0, 0.0, 5.0);
+    let slab = crate::box_solid(Vec3::new(0.0, -R, 0.0), Vec3::new(tip.x, 0.0, 10.0)).unwrap();
+    let disc = cylinder(Vec3::new(tip.x, -R, 0.0), Vec3::Z, R, 10.0).unwrap();
+    let body = boolean(&slab, &disc, BoolOp::Cut).unwrap().unwrap();
+    let faces: Vec<&mt::Face> = body.solid.face_iter().collect();
+    let plane = faces.iter().copied().find(|f| plane_normal(f).is_some_and(|n| n.y > 0.99)).unwrap();
+    let wall = faces.iter().copied().find(|f| plane_normal(f).is_none()).unwrap();
+    for r in [0.5, 2.0, 5.0] {
+        let centre = Vec3::new(tip.x - (4.0 * R * r).sqrt(), -r, tip.z);
+        // `cusp` is +1 when n1 × t points into the cusp: the wall's normal is −y, the plane's +y.
+        for (f1, f2, cusp) in [(wall, plane, 1.0), (plane, wall, -1.0)] {
+            let s = solve(&[f1], &[f2], tip, Vec3::Z, r, -1.0, cusp, None, 1e-6).unwrap();
+            assert!(s.c.dist(centre) < 1e-6, "r={r} cusp={cusp}: centre {:?}, expected {centre:?}", s.c);
+        }
+    }
+}
+
+/// #896: the seams where rounds run into the faces beside them are picked to be rounded again.
+/// The faces meet tangentially there, so there is nothing to round: the refusal says so, rather
+/// than that blending such an edge isn't supported yet.
+#[test]
+fn a_smooth_seam_is_refused_as_having_no_corner() {
+    let b = crate::box_solid(Vec3::ZERO, Vec3::new(150.0, 200.0, 70.0)).unwrap();
+    let mut edges = Vec::new();
+    for (x, y) in [(0.0, 0.0), (150.0, 0.0), (0.0, 200.0), (150.0, 200.0)] {
+        edges.push(Vec3::new(x, y, 35.0));
+    }
+    for (a, z) in [(0.0, 0.0), (150.0, 0.0), (0.0, 70.0), (150.0, 70.0)] {
+        edges.push(Vec3::new(a, 100.0, z));
+    }
+    for (y, z) in [(0.0, 0.0), (200.0, 0.0), (0.0, 70.0), (200.0, 70.0)] {
+        edges.push(Vec3::new(75.0, y, z));
+    }
+    let rounded = fillet(&b, &edges, 10.0).unwrap();
+    // The seam on the top face beside the round of the edge along y at x = 0, and the seam
+    // with the end face x = 0 beside the round of the top edge along y.
+    for seam in [Vec3::new(10.0, 100.0, 70.0), Vec3::new(0.0, 100.0, 60.0)] {
+        for chamfer in [false, true] {
+            let r = if chamfer { crate::chamfer(&rounded, &[seam], 1.0) } else { fillet(&rounded, &[seam], 1.0) };
+            match r {
+                Err(KernelError::Invalid(m)) => assert!(m.contains("smooth") && m.contains("no corner"), "{m}"),
+                other => panic!("{seam:?}: {:?}", other.map(|_| "a body")),
+            }
+        }
+    }
+    // A sharp edge of a box with one round still takes a fillet beside the round's seams.
+    let one = fillet(&crate::box_solid(Vec3::ZERO, Vec3::new(40.0, 30.0, 20.0)).unwrap(), &[Vec3::new(40.0, 30.0, 10.0)], 5.0).unwrap();
+    assert!(fillet(&one, &[Vec3::new(20.0, 0.0, 20.0)], 1.0).is_ok());
+    assert!(matches!(fillet(&one, &[Vec3::new(35.0, 30.0, 10.0)], 1.0), Err(KernelError::Invalid(_))));
 }

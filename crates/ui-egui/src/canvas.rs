@@ -90,7 +90,30 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             let offset = if start.trim().is_empty() { 0.0 } else { app.session.doc.eval(start, ValueKind::Length).ok()? };
             (at + n * (from + offset), Some(n))
         }
-        Kind::Section { .. } | Kind::Hole { .. } | Kind::OffsetPlane { .. } | Kind::OffsetFaces { .. } => (at, normal),
+        // A hole on a curved face drills against the face's normal where it was picked.
+        Kind::Hole { .. } if matches!(first, Sel::Face { .. }) => {
+            (at, normal.or_else(|| solidcraft_engine::doc::hole_direction_at(&st, at).map(|d| -d)))
+        }
+        // Holes at sketch points go into the part the sketch touches (or away, flipped): the
+        // arrow shows which way.
+        Kind::Hole { .. } => {
+            let mut by_sketch: Vec<(u64, Vec<String>)> = Vec::new();
+            for x in &d.inputs.first()?.items {
+                if let Sel::SketchPoint { id } = x
+                    && let Some((sk, pid)) = id.split_once(':')
+                    && let Ok(sk) = sk.parse::<u64>()
+                {
+                    match by_sketch.iter_mut().find(|(s, _)| *s == sk) {
+                        Some((_, v)) => v.push(pid.to_string()),
+                        None => by_sketch.push((sk, vec![pid.to_string()])),
+                    }
+                }
+            }
+            let flip = d.extra.get("flip").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let dir = by_sketch.first().and_then(|(sk, ids)| solidcraft_engine::doc::sketch_hole_direction(&st, *sk, ids, flip));
+            (at, normal.or(dir.map(|d| -d)))
+        }
+        Kind::Section { .. } | Kind::OffsetPlane { .. } | Kind::OffsetFaces { .. } => (at, normal),
         // Fillet radii, chamfer distances and shell thickness grow into the body.
         Kind::Fillet { .. } | Kind::Shell { .. } => (at, normal.map(|n| -n)),
         Kind::Sheet(_) => (at, crate::dialogs_sheet::arrow(app, d).or(normal)),

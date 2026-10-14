@@ -1,6 +1,7 @@
 //! The timeline (bottom): features in order, the rollback marker, errors and warnings.
 
-use egui::{Color32, Rect, Sense, Stroke, UiBuilder, pos2, vec2};
+pub(crate) use crate::icons::glyphs::transport_glyph;
+use egui::{Rect, Sense, Stroke, UiBuilder, pos2, vec2};
 use serde_json::json;
 use solidcraft_engine::doc::FeatureKind;
 
@@ -14,6 +15,10 @@ pub(crate) fn icon_of(k: &FeatureKind) -> &'static str {
         FeatureKind::SurfaceExtrude { .. } => "surface_extrude",
         FeatureKind::Unstitch { .. } => "unstitch",
         FeatureKind::ReverseNormal { .. } => "reverse_normal",
+        FeatureKind::SurfaceRevolve { .. } => "surface_revolve",
+        FeatureKind::SurfaceSweep { .. } => "surface_sweep",
+        FeatureKind::SurfaceLoft { .. } => "surface_loft",
+        FeatureKind::SurfaceOffset { .. } => "surface_offset",
         FeatureKind::Revolve { .. } => "revolve",
         FeatureKind::Fillet { .. } => "fillet",
         FeatureKind::Chamfer { .. } => "chamfer",
@@ -341,25 +346,4 @@ fn find_in_browser(app: &mut SolveApp, id: u64) {
     let bodies: Vec<serde_json::Value> = st.bodies.iter().filter(|b| b.feature == id).map(|b| json!({"type": "body", "name": b.name})).collect();
     let items = if bodies.is_empty() { vec![json!({"type": "feature", "id": id})] } else { bodies };
     let _ = app.run("select.set", json!({ "items": items }));
-}
-
-/// Transport buttons drawn as shapes (the UI font has no media glyphs).
-pub(crate) fn transport_glyph(p: &egui::Painter, c: egui::Pos2, what: &str, col: Color32) {
-    let tri = |dir: f32, dx: f32| {
-        let pts = vec![pos2(c.x + dx - 4.0 * dir, c.y - 5.0), pos2(c.x + dx + 4.0 * dir, c.y), pos2(c.x + dx - 4.0 * dir, c.y + 5.0)];
-        p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
-    };
-    let bar = |dx: f32| p.line_segment([pos2(c.x + dx, c.y - 5.0), pos2(c.x + dx, c.y + 5.0)], Stroke::new(1.6, col));
-    match what {
-        "first" => {
-            bar(-5.0);
-            tri(-1.0, 1.0);
-        }
-        "back" => tri(-1.0, 0.0),
-        "forward" => tri(1.0, 0.0),
-        _ => {
-            tri(1.0, -1.0);
-            bar(5.0);
-        }
-    }
 }

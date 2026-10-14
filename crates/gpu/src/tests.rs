@@ -112,6 +112,43 @@ fn a_resident_mesh_matches_the_cpu() {
     }
 }
 
+/// Several bodies in one buffer and one dispatch (a viewport's scene): each plan's part holds
+/// exactly its own vertices and triangles, evaluated as the CPU evaluates that plan alone.
+#[test]
+fn a_scene_in_one_dispatch_matches_each_body_on_the_cpu() {
+    let Some(gpu) = gpu() else { return };
+    let plans: Vec<TessPlan> = bodies().iter().map(|(_, b)| ok(b.display_plan_angular(0.01, std::f64::consts::PI / 9.0))).collect();
+    let refs: Vec<&TessPlan> = plans.iter().collect();
+    let mesh = ok(gpu.prepare_many(&refs));
+    assert_eq!(mesh.parts.len(), plans.len());
+    let d = &gpu.device;
+    let size = u64::from(mesh.vertex_count) * VERTEX_STRIDE;
+    let dst = d.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("test read"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = d.create_command_encoder(&Default::default());
+    gpu.record(&mut enc, &mesh);
+    enc.copy_buffer_to_buffer(&mesh.vertices, 0, &dst, 0, size);
+    gpu.queue.submit([enc.finish()]);
+    let slice = dst.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    ok(d.poll(wgpu::PollType::wait_indefinitely()));
+    let out: Vec<f32> = ok(slice.get_mapped_range()).as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    for ((plan, part), (name, _)) in plans.iter().zip(&mesh.parts).zip(bodies()) {
+        let cpu = plan.evaluate();
+        assert_eq!((part.vertices.end - part.vertices.start) as usize, cpu.positions.len(), "{name}");
+        assert_eq!((part.indices.end - part.indices.start) as usize, cpu.triangles.len() * 3, "{name}");
+        for (k, p) in cpu.positions.iter().enumerate() {
+            let i = part.vertices.start as usize + k;
+            let q = Vec3::new(f64::from(out[8 * i]), f64::from(out[8 * i + 1]), f64::from(out[8 * i + 2]));
+            assert!(q.dist(*p) < 20.0 * 1e-5, "{name}: vertex {k}");
+        }
+    }
+}
+
 /// Display meshing of a 400-hole plate (#303's benchmark): reference mesher, plan, CPU and GPU
 /// evaluation. `cargo test --release -p solidcraft-gpu bench_plate -- --ignored --nocapture`.
 #[test]

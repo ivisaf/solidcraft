@@ -19,7 +19,7 @@ pub const MAX_EVAL_KNOTS: usize = 1 << 12;
 /// Most control points in one evaluable surface.
 pub const MAX_EVAL_POINTS: usize = 1 << 18;
 /// Basis slots for the highest evaluable degree.
-const W: usize = MAX_SPLINE_DEGREE + 1;
+pub(crate) const W: usize = MAX_SPLINE_DEGREE + 1;
 
 /// A rational B-spline curve: homogeneous control points `[x·w, y·w, z·w, w]`. Outside its
 /// domain it continues as the polynomial of the end span (a line extends for ever).
@@ -241,7 +241,7 @@ fn nurbs_derivs(degree: [usize; 2], knots: &[Vec<f64>; 2], count: [usize; 2], ct
 
 /// The knot span used at `t`: the last non-empty span starting at or before `t`, clamped to
 /// the valid spans `p ≤ k < n` so parameters just outside the domain extend the end spans.
-fn span_of(knots: &[f64], p: usize, n: usize, t: f64) -> usize {
+pub(crate) fn span_of(knots: &[f64], p: usize, n: usize, t: f64) -> usize {
     let mut k = p;
     for i in p..n {
         if let (Some(&a), Some(&b)) = (knots.get(i), knots.get(i + 1))
@@ -259,7 +259,7 @@ fn span_of(knots: &[f64], p: usize, n: usize, t: f64) -> usize {
 
 /// Non-zero basis functions of degree `p` on span `span` and their first derivatives
 /// (NURBS Book A2.3 with n = 1). `ders[0][j]` is `N_{span−p+j}`, `ders[1][j]` its derivative.
-fn basis_ders(knots: &[f64], span: usize, p: usize, t: f64) -> Option<[[f64; W]; 2]> {
+pub(crate) fn basis_ders(knots: &[f64], span: usize, p: usize, t: f64) -> Option<[[f64; W]; 2]> {
     if p == 0 || p >= W {
         return None;
     }

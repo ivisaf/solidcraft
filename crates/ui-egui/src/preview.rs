@@ -33,9 +33,16 @@ impl Colors {
     }
 }
 
+pub struct SketchPreview {
+    pub sketch: std::sync::Arc<solidcraft_engine::doc::SolvedSketch>,
+    pub curves: Vec<usize>,
+    pub points: Vec<usize>,
+}
+
 /// A computed preview: the scene to draw and the bodies it stands in for.
 pub struct Built {
     pub scene: GpuScene,
+    pub sketches: Vec<SketchPreview>,
     pub replaced: Vec<String>,
     /// Why the feature failed, when the scene only shows its tool body.
     pub error: Option<String>,
@@ -64,6 +71,7 @@ pub struct PreviewState {
     pub key: u64,
     /// Is a preview scene up?
     pub active: bool,
+    pub sketches: Vec<SketchPreview>,
     /// Why the current inputs don't make a feature (the last good preview stays up).
     pub error: Option<String>,
     /// A preview is being computed.
@@ -87,6 +95,7 @@ impl PreviewState {
         self.error = None;
         self.applied = None;
         self.tapered.clear();
+        self.sketches.clear();
         self.busy = false;
         if self.active || !self.replaced.is_empty() {
             self.active = false;
@@ -108,6 +117,7 @@ impl PreviewState {
         self.ms = crate::now_ms() - self.started;
         match job {
             Ok(b) => {
+                self.sketches = b.sketches;
                 self.replaced = b.replaced;
                 self.bounds = b.bounds;
                 self.active = true;
@@ -117,6 +127,7 @@ impl PreviewState {
                 self.set_scene(b.scene);
             }
             Err(e) => {
+                self.sketches.clear();
                 self.error = Some(e);
                 self.applied = None;
                 self.tapered.clear();
@@ -128,6 +139,7 @@ impl PreviewState {
     /// computing new inputs, but never let an obsolete result block their Apply.
     fn poll(&mut self, key: u64, motion_key: Option<u64>) {
         if self.shown_key != Some(key) {
+            self.sketches.clear();
             self.error = None;
         }
         if let Some((k, rx)) = &self.running {
@@ -241,7 +253,7 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if cmds.iter().any(|(command, params)| {
-        command == "sketch.redefine"
+        matches!(command.as_str(), "sketch.redefine" | "sketch.mirror" | "sketch.pattern.rectangular" | "sketch.pattern.circular" | "sketch.offset")
             || command == "construct.plane.along_path"
             || params.get("command").and_then(Value::as_str) == Some("construct.plane.along_path")
     }) {
@@ -315,7 +327,7 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
             }
         }
     }
-    Built { scene: sc, replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+    Built { scene: sc, sketches: Vec::new(), replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
 }
 
 /// The same commands making a new body instead of joining, cutting or intersecting, and the
@@ -425,7 +437,34 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             replaced.push(b.name.clone());
         }
     }
-    Built { scene: sc, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+    let sketches = after
+        .sketches
+        .iter()
+        .filter_map(|sketch| {
+            let old = before.sketch(sketch.feature);
+            let old_curves = old.into_iter().flat_map(|s| s.sketch.curves.iter().map(|c| c.id.as_str())).collect::<std::collections::HashSet<_>>();
+            let old_points = old.into_iter().flat_map(|s| s.sketch.points.iter().map(|p| p.id.as_str())).collect::<std::collections::HashSet<_>>();
+            let indices = sketch
+                .sketch
+                .curves
+                .iter()
+                .enumerate()
+                .filter_map(|(index, curve)| {
+                    let unchanged = old_curves.contains(curve.id.as_str());
+                    if unchanged { None } else { Some(index) }
+                })
+                .collect::<Vec<_>>();
+            let points = sketch
+                .sketch
+                .points
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| if old_points.contains(p.id.as_str()) { None } else { Some(i) })
+                .collect::<Vec<_>>();
+            if indices.is_empty() && points.is_empty() { None } else { Some(SketchPreview { sketch: sketch.clone(), curves: indices, points }) }
+        })
+        .collect();
+    Built { scene: sc, sketches, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
 }
 
 /// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
@@ -544,6 +583,29 @@ pub fn point_triangle_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
     if inside { h.abs() } else { [(a, b), (b, c), (c, a)].iter().map(|(u, v)| p.dist_to_segment(*u, *v)).fold(f64::INFINITY, f64::min) }
 }
 
+/// The same computed sketch preview is drawn over both native GPU and CPU viewports.
+pub fn paint_sketches(app: &SolveApp, painter: &egui::Painter, proj: &crate::viewport::Proj) {
+    if !app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::SketchModify(_)) && d.previews()) {
+        return;
+    }
+    let stroke = egui::Stroke::new(2.5, Tokens::get().preview_sketch);
+    let mut budget = solidcraft_engine::render::SamplingBudget::new(32_768, 65_536);
+    let mut curves = 0;
+    for preview in &app.preview.sketches {
+        let sketch = &preview.sketch;
+        for index in &preview.curves {
+            crate::tools::paint_curve(&sketch.sketch, *index, &sketch.plane, painter, proj, stroke, &mut budget);
+            curves += 1;
+        }
+        for index in &preview.points {
+            if let Some(point) = sketch.sketch.point(*index).and_then(|p| proj.to_screen(sketch.plane.to_world(p))) {
+                painter.circle_filled(point, 3.0, stroke.color);
+            }
+        }
+    }
+    crate::scenario::publish_count("sketch_preview_curves", curves as f64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,7 +651,15 @@ mod tests {
     }
 
     fn pose() -> Built {
-        Built { scene: GpuScene::default(), replaced: vec!["Lid".into()], error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+        Built {
+            scene: GpuScene::default(),
+            sketches: Vec::new(),
+            replaced: vec!["Lid".into()],
+            error: None,
+            bounds: Aabb3::EMPTY,
+            applied: None,
+            tapered: Vec::new(),
+        }
     }
 
     /// The worker completes while the slider is still held or Play keeps advancing.

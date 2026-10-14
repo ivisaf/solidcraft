@@ -1,6 +1,6 @@
 //! File formats. Designs use JSON or versioned containers (`.solidcraft`); the authoritative
 //! document rebuilds on load and optional display caches remain provisional. Bodies export
-//! as STL (binary or ASCII), OBJ, STEP and 3MF; STEP
+//! as STL (binary or ASCII), OBJ, STEP and 3MF, and assemblies as URDF ([`urdf()`]); STEP
 //! files import as a base feature (see [`step_import_feature`]), 3MF and STL files as mesh bodies
 //! (see [`mesh_import_feature`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
@@ -20,6 +20,7 @@ pub mod safe_write;
 mod sketch2d;
 mod svg;
 mod threemf;
+pub mod urdf;
 pub mod vfs;
 
 pub use dxf::{read_dxf, write_dxf};
@@ -30,6 +31,7 @@ pub use svg::read_svg;
 mod obj;
 pub use obj::read_obj;
 pub use threemf::{MAX_3MF_BYTES, MeshObject, model_xml, read_3mf, weld, write_3mf};
+pub use urdf::{UrdfOptions, UrdfPackage, urdf};
 
 use solidcraft_doc::{Document, ModelState};
 use solidcraft_geom::{Mesh, Vec3};
@@ -54,7 +56,7 @@ pub const MAX_DESIGN_BYTES: usize = 256 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
-    #[error("unsupported format `{0}` (use stl, obj, step, 3mf or solidcraft)")]
+    #[error("unsupported format `{0}` (use stl, obj, step, 3mf, urdf or solidcraft)")]
     Format(String),
     #[error("nothing to export: the design has no bodies")]
     Empty,
@@ -93,6 +95,9 @@ pub struct StepFeature {
     /// Body names from the file (solid names, else product names).
     pub body_names: Vec<String>,
     pub warnings: Vec<String>,
+    /// The file as read. Hold it until the feature has been evaluated: the timeline then reuses
+    /// it instead of reading the file again (it is freed with the last holder).
+    pub import: std::sync::Arc<solidcraft_kernel::StepImport>,
 }
 
 /// Read STEP bytes (`file` is the source file name) into an Import base feature. The file is
@@ -123,8 +128,9 @@ pub fn step_import_feature(bytes: &[u8], file: &str) -> Result<StepFeature> {
     Ok(StepFeature {
         name,
         body_names: imp.bodies.iter().map(|b| b.name.clone()).collect(),
-        kind: solidcraft_doc::FeatureKind::Import { file: file_name, step: text, components: imp.tree.clone() },
+        kind: solidcraft_doc::FeatureKind::Import { file: file_name, step: text.into(), components: imp.tree.clone() },
         warnings: iges_warnings.into_iter().chain(imp.warnings.iter().cloned()).collect(),
+        import: imp,
     })
 }
 
@@ -202,6 +208,9 @@ pub enum Format {
     /// `.3mf` path alone means [`Format::ThreeMf`].
     ThreeMfTagged,
     Design,
+    /// A robot description of the assembly with its mesh files ([`urdf()`]); written by the
+    /// engine, since it is several files.
+    Urdf,
 }
 
 impl Format {
@@ -216,6 +225,7 @@ impl Format {
             "igs" | "iges" => Format::Iges,
             "3mf" => Format::ThreeMf,
             "3mf-tagged" => Format::ThreeMfTagged,
+            "urdf" => Format::Urdf,
             "solidcraft" | "solvecraft" | "json" => Format::Design,
             _ => return Err(IoError::Format(ext)),
         })
@@ -336,6 +346,7 @@ pub fn export(state: &ModelState, bodies: &[String], format: Format, name: &str)
             write_3mf(&objs)?
         }
         Format::Design => return Err(IoError::Format("solidcraft (save the document instead)".into())),
+        Format::Urdf => return Err(IoError::Format("urdf (an assembly package; use file.export)".into())),
     })
 }
 

@@ -546,12 +546,41 @@ fn same_surface(x: &Option<crate::FaceSurface>, y: &Option<crate::FaceSurface>, 
     }
 }
 
-/// The box around faces `faces` of `body` (by their boundaries), grown by `gap`.
+/// A box around face `f` from its edges' control points (a B-spline or NURBS curve with positive
+/// weights lies in their hull; an edge's curve may run past the edge, which only grows the box).
+/// No dividing: for choosing faces it need only contain the face, and dividing a split face's
+/// curved edges down to a tolerance ran away on the sensor enclosure's lid (gigabytes, minutes).
+/// `None` for an edge on an intersection curve or with weights that don't bound it.
+fn hull_box(f: &mt::Face) -> Option<Aabb3> {
+    let mut bb = Aabb3::EMPTY;
+    for e in f.edge_iter() {
+        match e.curve() {
+            mt::Curve::Line(_) => {
+                bb.add(from_p3(e.front().point()));
+                bb.add(from_p3(e.back().point()));
+            }
+            mt::Curve::BSplineCurve(c) => c.control_points().iter().for_each(|p| bb.add(from_p3(*p))),
+            mt::Curve::NurbsCurve(c) => {
+                for p in c.control_points() {
+                    if !(p.w > 0.0 && p.w.is_finite()) {
+                        return None;
+                    }
+                    bb.add(Vec3::new(p.x / p.w, p.y / p.w, p.z / p.w));
+                }
+            }
+            mt::Curve::IntersectionCurve(_) => return None,
+        }
+    }
+    (!bb.is_empty() && bb.min.is_finite() && bb.max.is_finite()).then_some(bb)
+}
+
+/// The box around faces `faces` of `body` ([`hull_box`]), grown by `gap`. `None` when a face's
+/// extent can't be found.
 fn faces_box(body: &Body, faces: &[usize], gap: f64) -> Option<Aabb3> {
     let fs: Vec<&mt::Face> = body.solid.face_iter().collect();
     let mut bb = Aabb3::EMPTY;
     for f in faces {
-        let b = face_box(fs.get(*f)?, gap)?;
+        let b = hull_box(fs.get(*f)?)?;
         bb.add(b.min);
         bb.add(b.max);
     }
@@ -565,10 +594,12 @@ fn faces_box(body: &Body, faces: &[usize], gap: f64) -> Option<Aabb3> {
 fn imprinted(body: Body, mut h: Option<History>, n: Vec3, d: f64, tool: &Body, tol: f64) -> Result<(Body, Option<History>)> {
     let contact = faces_in(tool, -n, -d, tol);
     let gap = tol * 10.0;
-    let Some(region) = faces_box(tool, &contact, gap) else { return Ok((body, h)) };
+    // A face whose extent can't be found counts as near.
+    let region = faces_box(tool, &contact, gap);
     let near = |b: &Body, faces: Vec<usize>| -> Vec<usize> {
+        let Some(region) = region else { return faces };
         let fs: Vec<&mt::Face> = b.solid.face_iter().collect();
-        faces.into_iter().filter(|f| fs.get(*f).and_then(|x| face_box(x, gap)).is_some_and(|bx| !boxes_separate(bx, region, gap))).collect()
+        faces.into_iter().filter(|f| fs.get(*f).and_then(|x| hull_box(x)).is_none_or(|bx| !boxes_separate(bx, region, gap))).collect()
     };
     let bounds = crate::history::edge_faces(&tool.solid);
     let mut beside: Vec<usize> = bounds

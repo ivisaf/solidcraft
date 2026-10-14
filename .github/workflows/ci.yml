@@ -21,8 +21,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  # Every push to main gets its full run; a new PR push replaces the old run.
+  # A new PR push replaces the old run. Only one run per group may wait, so a busy main would
+  # cancel the waiting nightly (or a Run workflow) before it starts: they get groups of their own.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -99,6 +100,8 @@ jobs:
         run: cargo xtask licences --check
       - name: Dependency layers
         run: cargo xtask layers
+      - name: Web app offline use and updates (headless Chrome)
+        run: cargo xtask web-offline-test
 
   clippy:
     name: Native Linux Clippy

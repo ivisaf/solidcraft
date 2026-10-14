@@ -694,3 +694,38 @@ fn blind_bore_into_a_joined_boss_meshes() {
     let m = measure(&mut s);
     assert_eq!(m["bodies"].as_array().map(Vec::len), Some(1), "{m}");
 }
+
+#[test]
+fn cutting_a_text_removes_each_letter_whether_its_letters_stand_apart_or_touch() {
+    // Letters apart (cut at once by all of them), and two touching blocks (cut one after the other).
+    for (text, touching) in [("SOLIDCRAFT", false), ("", true)] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane":"XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[200,40]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance":10}));
+        run(&mut s, "sketch.create", json!({"plane":"XY"}));
+        if touching {
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0":[10,10],"p1":[20,20]}));
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0":[20,12],"p1":[30,18]}));
+        } else {
+            run(&mut s, "sketch.text", json!({"text":text,"at":[5,12],"height":14}));
+        }
+        let state = s.world_state();
+        let ss = state.sketch(s.active_sketch.unwrap()).unwrap();
+        // The profiles cut: the letters, not their counters (the inside of an O, whose outline
+        // is a hole of its letter).
+        let sorted = |ids: &[String]| {
+            let mut ids = ids.to_vec();
+            ids.sort();
+            ids
+        };
+        let counter = |p: &solidcraft_sketch::Profile| ss.profiles.iter().any(|q| q.hole_curves.iter().any(|h| sorted(h) == sorted(&p.outer_curves)));
+        let area: f64 = ss.profiles.iter().filter(|p| !counter(p)).map(|p| p.area).sum();
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance":2,"operation":"cut"}));
+        let volume = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+        assert!((volume - (200.0 * 40.0 * 10.0 - 2.0 * area)).abs() < 1e-3 * area, "{text:?}: {volume} for {area} mm² cut 2 mm deep");
+        assert_eq!(s.world_state().bodies.len(), 1);
+    }
+}

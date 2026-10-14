@@ -857,8 +857,9 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
     for ss in point_sketches.iter().filter_map(|sid| st.sketch(*sid)) {
         let sid = ss.feature;
         let shown = snapping.then(|| crate::dialogs::SnapPoints::of(&ss.sketch));
+        let visible = solidcraft_engine::view::SketchPointVisibility::new(&ss.sketch);
         for p in &ss.sketch.points {
-            if shown.as_ref().is_some_and(|f| !f.takes(p)) {
+            if !visible.takes(p) || shown.as_ref().is_some_and(|f| !f.takes(p)) {
                 continue;
             }
             if let Some(sp) = proj.to_screen(ss.plane.to_world(p.pos)) {
@@ -2133,6 +2134,15 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             } else if app.dialog.as_ref().is_some_and(|d| d.wants_picks()) {
                 if let Some((hit, Some(sel))) = cand {
                     dialog_pick(app, &hit, sel);
+                } else if let Some(mut dialog) = app.dialog.take() {
+                    let state = app.session.world_state();
+                    if let Some(sketch) = app.session.active_sketch.and_then(|id| state.sketch(id)) {
+                        let (origin, direction) = proj.ray(p);
+                        if let Some(point) = sketch.plane.intersect_ray(origin, direction) {
+                            crate::sketch_modify_ui::pick_position(&mut dialog, &app.session, point);
+                        }
+                    }
+                    app.dialog = Some(dialog);
                 }
             } else {
                 // Dimensions and constraint glyphs sit on top of the geometry.
@@ -2386,6 +2396,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     } else {
         app.viewport.boxsel = None;
     }
+    crate::preview::paint_sketches(app, &painter, &proj);
     crate::ref_images::show(app, ui, &painter, &proj);
     crate::dialogs_assembly::origins(app, &painter, &proj);
     overlays(app, &painter, &proj);
@@ -2547,12 +2558,19 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
     let st = app.session.world_state();
     let mut out: Vec<Sel> = Vec::new();
     let to2 = |pts: &[Vec3]| -> Vec<Pos2> { pts.iter().filter_map(|p| proj.to_screen(*p)).collect() };
-    if app.dialog.is_none()
+    let sketch_dialog = app.dialog.as_ref().is_some_and(|d| matches!(d.kind, crate::dialogs::Kind::SketchModify(_)));
+    let accepts = app.dialog.as_ref().and_then(|d| d.active_input()).map(|i| i.accept);
+    if (app.dialog.is_none() || sketch_dialog)
         && let Some(ss) = app.session.active_sketch.and_then(|sid| st.sketch(sid))
     {
         // What the selection filter lets through (window: wholly inside; crossing: touching).
         let off = |k: &str| app.ui.pick_off.iter().any(|x| x == k);
         for (i, c) in ss.sketch.curves.iter().enumerate().filter(|_| !off("sketch") && !off("sketch_curves")) {
+            if accepts
+                .is_some_and(|a| a & crate::selection::CURVES == 0 && (a & crate::selection::AXES == 0 || !matches!(c.kind, CurveKind::Line { .. })))
+            {
+                continue;
+            }
             if !solidcraft_engine::view::sketch_curve_visible(&ss.sketch, i) {
                 continue;
             }
@@ -2573,19 +2591,24 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
                 out.push(Sel::SketchCurve { id: c.id.clone() });
             }
         }
+        let visible = solidcraft_engine::view::SketchPointVisibility::new(&ss.sketch);
         for (i, p) in ss.sketch.points.iter().enumerate().filter(|_| !off("sketch") && !off("sketch_points")) {
-            if i != 0 && solidcraft_engine::view::sketch_point_visible(&ss.sketch, i) && bx.takes(&to2(&[ss.plane.to_world(p.pos)])) {
+            if accepts.is_none_or(|a| a & crate::selection::SKETCH_POINTS != 0)
+                && i != 0
+                && visible.takes(p)
+                && bx.takes(&to2(&[ss.plane.to_world(p.pos)]))
+            {
                 out.push(Sel::SketchPoint { id: p.id.clone() });
             }
         }
-        if !off("dimensions") {
+        if !sketch_dialog && !off("dimensions") {
             for (id, r) in crate::dim_view::text_rects() {
                 if bx.takes(&[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]) {
                     out.push(Sel::SketchConstraint { id });
                 }
             }
         }
-        if !off("constraints") {
+        if !sketch_dialog && !off("constraints") {
             for (id, c) in crate::sketch_tools::glyph_positions() {
                 if bx.takes(&[c]) {
                     out.push(Sel::SketchConstraint { id });
@@ -2747,8 +2770,9 @@ fn overlays(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let sk = &ss.sketch;
     let locked = sk.locked_points();
     let virtual_corners: Vec<usize> = sk.virtual_corners().into_iter().map(|(i, _)| i).collect();
+    let visible = solidcraft_engine::view::SketchPointVisibility::new(sk);
     for (i, p) in sk.points.iter().enumerate() {
-        if !solidcraft_engine::view::sketch_point_visible(sk, i) {
+        if !visible.takes(p) {
             continue;
         }
         let hidden = (sk.view.hide_points && i != 0) || (sk.view.hide_projected && p.link.is_some());
@@ -2837,7 +2861,7 @@ fn axis_rect(app: &SolveApp, rect: Rect) -> Rect {
 }
 
 const AXIS_LENGTH: f64 = 38.0;
-const AXIS_RADIUS: f32 = 11.0;
+use crate::icons::navigation::AXIS_RADIUS;
 
 /// Six signed world axes, sorted back to front so overlapping tips have one owner.
 fn axis_tips(cam: &Camera, c: Pos2) -> Vec<(&'static str, Vec3, Pos2, f64)> {
@@ -3004,24 +3028,7 @@ fn signed_axis_view(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
         painter.circle_filled(c, 55.0, t.overlay);
     }
     for (i, (name, d, at, depth)) in tips.iter().enumerate() {
-        let col = if d.x != 0.0 {
-            colors::AXIS_X
-        } else if d.y != 0.0 {
-            colors::AXIS_Y
-        } else {
-            colors::AXIS_Z
-        };
-        let col = Color32::from_rgb(col.0, col.1, col.2);
-        let positive = !name.starts_with('-');
-        let ink = if *depth < -0.01 { col.gamma_multiply(0.55) } else { col };
-        painter.line_segment([c, *at], Stroke::new(if positive { 2.0 } else { 1.0 }, ink));
-        painter.circle_filled(*at, AXIS_RADIUS, if hovered == Some(i) { t.accent_soft } else { t.overlay });
-        painter.circle_stroke(
-            *at,
-            AXIS_RADIUS,
-            Stroke::new(if hovered == Some(i) { 2.0 } else { 1.0 }, if hovered == Some(i) { t.accent } else { ink }),
-        );
-        painter.text(*at, Align2::CENTER_CENTER, name.to_uppercase(), FontId::proportional(11.0), ink);
+        crate::icons::navigation::axis_tip(&painter, c, name, d, *at, *depth, hovered == Some(i), t);
         crate::scenario::publish_handle(&format!("axis_view:{name}"), *at);
     }
     crate::scenario::publish_count("axis_view_highlights", f64::from(u8::from(hovered.is_some())));

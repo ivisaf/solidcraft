@@ -1,4 +1,4 @@
-# SolidCraft 英語・日本語 ローカライズ対照リスト (全 844 件)
+# SolidCraft 英語・日本語 ローカライズ対照リスト (全 847 件)
 
 | 英語 (English) | 日本語 (Japanese) | キー名 (Key) |
 | :--- | :--- | :--- |
@@ -50,6 +50,7 @@
 | All Sketch Points | すべてのスケッチ点 | `All Sketch Points` |
 | Allowed expressions, separated by semicolons | 使用可能な式（セミコロンで区切る） | `Allowed expressions, separated by semicolons` |
 | Also deletes | 同時に削除される要素: | `Also deletes` |
+| Analysis | 解析 | `ui.analysis` |
 | Angle | 角度 | `ui.angle` |
 | Angle 2 | 角度 2 | `Angle 2` |
 | Angle decimals | 角度の小数点以下の桁数 | `ui.angle_decimals` |
@@ -290,6 +291,7 @@
 | Edit Joint | ジョイントを編集 | `cmd.joint_edit` |
 | Edit Physical Material | 物理マテリアルを編集 | `cmd.material_edit` |
 | Edit Profile Sketch | プロファイルスケッチを編集 | `Edit Profile Sketch` |
+| Edit Section Analysis | 断面解析を編集 | `ui.edit_section_analysis` |
 | Edit Sketch | スケッチを編集 | `cmd.sketch_edit` |
 | Edit Text | テキストを編集 | `cmd.sketch_edit_text` |
 | Ellipse | 楕円 | `ui.ellipse` |
@@ -668,6 +670,7 @@
 | Rim Edge | リムエッジ | `Rim Edge` |
 | Roll History Marker | 履歴マーカーを移動 | `cmd.timeline_roll_to` |
 | Roll History Marker Here | 履歴マーカーをここに移動 | `Roll History Marker Here` |
+| Rounded Rectangle | 角丸長方形 | `cmd.sketch_rectangle_rounded` |
 | Rule | ルール | `Rule` |
 | Save | 保存 | `ui.save` |
 | Save As | 名前を付けて保存 | `ui.save_as` |

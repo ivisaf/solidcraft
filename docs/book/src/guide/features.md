@@ -63,6 +63,21 @@ Fillets and chamfers handle straight edges between planar faces, whole smooth lo
 neighbouring edges with mitred or spherical corners, and closed chains of curved edges (a rolling
 ball). See the roadmap's known limitations for the rest.
 
+**Curvature (G2)** in the Fillet dialog's **Radius Type** blends straight edges between two
+planar faces with an exact quintic section. The tangent plane and curvature match each side
+face: curvature goes to zero at both contact rails, unlike a circular G1 fillet. Each end
+must meet one planar face perpendicular to the edge. Curved edges/faces, sloped or multi-face
+ends, and intersecting corner blends are not supported; they return an error, not a G1 fallback.
+**Equivalent Radius** sets the same contact setback as a circular fillet (for a right angle,
+setback equals the entered value); it is not a constant curvature radius. Reduce/Taper to Fit
+are unavailable for this type.
+
+Scripts and MCP use the same command, for example on a 20 mm box:
+```json
+{"command": "solid.fillet", "params": {"edges": [[20, 0, 10]], "radius": 2, "type": "curvature"}}
+```
+`type: "g2"` is an alias. Existing fillets still default to circular, constant-radius G1 blends.
+
 Feature references to faces and edges are stored by name, so an upstream edit that moves geometry
 keeps them on the right face (see [Persistent naming](../dev/naming.md)). When a reference can't
 be found, the feature warns instead of silently picking another face.

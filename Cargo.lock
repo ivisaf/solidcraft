@@ -3281,11 +3281,12 @@ dependencies = [
 
 [[package]]
 name = "solidcraft"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "egui",
  "embed-resource",
+ "getrandom 0.3.4",
  "hidapi",
  "log",
  "quick-xml",
@@ -3298,7 +3299,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-cam"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3308,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde_json",
  "solidcraft-engine",
@@ -3317,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-doc"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "serde",
@@ -3333,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-engine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "serde",
@@ -3350,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-geom"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3359,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-gpu"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "pollster 0.4.0",
@@ -3371,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-io"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "quick-xml",
  "serde",
@@ -3386,7 +3387,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-kernel"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "log",
  "rayon",
@@ -3404,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-mcp"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde_json",
  "solidcraft-engine",
@@ -3412,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-render"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "image",
  "serde",
@@ -3422,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-sketch"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3433,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-ui-egui"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "egui",
  "egui-wgpu",
@@ -3450,7 +3451,7 @@ dependencies = [
 
 [[package]]
 name = "solidcraft-web"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "eframe",
  "egui",
@@ -4873,9 +4874,10 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

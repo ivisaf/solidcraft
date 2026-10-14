@@ -921,57 +921,7 @@ pub fn overlay(app: &SolveApp, painter: &egui::Painter, proj: &Proj, d: &mut Dia
 fn glyph(painter: &egui::Painter, proj: &Proj, s: &SnapPt, col: Color32, half_height: f64, tag: Option<&str>) {
     let Some(c) = proj.to_screen(s.at) else { return };
     let len = half_height * 2.0 * 0.06;
-    // A dark halo under every stroke keeps the glyph readable on light and dark faces alike.
-    let halo = Stroke::new(4.5, Color32::from_black_alpha(150));
-    let white = Stroke::new(1.5, Color32::WHITE);
-    if let Some(tip) = proj.to_screen(s.at + s.z * len) {
-        let d = (tip - c).normalized();
-        let n = vec2(-d.y, d.x);
-        let head = vec![tip + d * 2.0, tip - d * 9.0 + n * 5.0, tip - d * 9.0 - n * 5.0];
-        painter.line_segment([c, tip], halo);
-        painter.add(egui::Shape::convex_polygon(head.clone(), Color32::TRANSPARENT, halo));
-        painter.line_segment([c, tip], Stroke::new(2.0, col));
-        painter.add(egui::Shape::convex_polygon(head, col, Stroke::NONE));
-    }
-    let shape = |fill: Color32, stroke: Stroke, grow: f32| -> egui::Shape {
-        match s.kind {
-            SnapKind::FaceCenter => egui::Shape::rect_filled(egui::Rect::from_center_size(c, vec2(12.0 + grow, 12.0 + grow)), 1.5, fill),
-            SnapKind::CircleCenter => egui::Shape::circle_filled(c, 7.0 + grow / 2.0, fill),
-            SnapKind::EdgeMid => {
-                let r = 8.0 + grow / 2.0;
-                egui::Shape::convex_polygon(vec![c + vec2(0.0, -r), c + vec2(r * 0.93, r * 0.7), c + vec2(-r * 0.93, r * 0.7)], fill, stroke)
-            }
-            SnapKind::Vertex => {
-                let r = 7.5 + grow / 2.0;
-                egui::Shape::convex_polygon(vec![c + vec2(0.0, -r), c + vec2(r, 0.0), c + vec2(0.0, r), c + vec2(-r, 0.0)], fill, stroke)
-            }
-        }
-    };
-    painter.add(shape(Color32::from_black_alpha(150), Stroke::NONE, 4.0));
-    painter.add(shape(col, Stroke::NONE, 0.0));
-    match s.kind {
-        SnapKind::FaceCenter => {
-            painter.rect_stroke(egui::Rect::from_center_size(c, vec2(12.0, 12.0)), 1.5, white, egui::StrokeKind::Middle);
-        }
-        SnapKind::CircleCenter => {
-            painter.circle_stroke(c, 7.0, white);
-            painter.line_segment([c - vec2(4.5, 0.0), c + vec2(4.5, 0.0)], Stroke::new(1.2, Color32::WHITE));
-            painter.line_segment([c - vec2(0.0, 4.5), c + vec2(0.0, 4.5)], Stroke::new(1.2, Color32::WHITE));
-        }
-        SnapKind::EdgeMid | SnapKind::Vertex => {
-            painter.add(shape(Color32::TRANSPARENT, white, 0.0));
-        }
-    }
-    // What it snaps to (hovered), or which component it is (picked): a small label.
-    if let Some(tag) = tag {
-        let t = Tokens::get();
-        let font = egui::FontId::proportional(11.5);
-        let g = painter.layout_no_wrap(tag.to_string(), font, t.text);
-        let at = c + vec2(12.0, 10.0);
-        let r = egui::Rect::from_min_size(at, g.size()).expand2(vec2(5.0, 2.0));
-        painter.rect(r, 3.0, t.panel.gamma_multiply(0.92), Stroke::new(1.0, col), egui::StrokeKind::Inside);
-        painter.galley(at, g, t.text);
-    }
+    crate::icons::markers::snap(painter, c, proj.to_screen(s.at + s.z * len), s.kind, col, tag);
 }
 
 /// What a snap is called (the hover label).

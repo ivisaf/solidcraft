@@ -60,16 +60,19 @@ impl NameCell {
     pub fn known(names: Arc<Vec<String>>) -> Self {
         let legacy = OnceLock::new();
         let _ = legacy.set(names.clone());
-        NameCell { legacy: Arc::new(legacy), ..Self::shared(Arc::new(Names::given(names)), None) }
+        NameCell { legacy: Arc::new(legacy), ..Self::shared(Arc::new(Names::given(names))) }
     }
     /// The names of `body` (a moved copy of a body keeps its faces' names, and how sure they are).
+    ///
+    /// Worked out on first request, from the source: moving a body (a transfer into a
+    /// component, a placed instance) does not name every face of every moved body up front.
     pub fn same(body: &ModelBody) -> Self {
-        Self::shared(names(body), Some(Arc::new(body.clone())))
+        NameCell { copy_of: Some(Arc::new(body.clone())), ..NameCell::default() }
     }
-    fn shared(names: Arc<Names>, copy_of: Option<Arc<ModelBody>>) -> Self {
+    fn shared(names: Arc<Names>) -> Self {
         let cell = OnceLock::new();
         let _ = cell.set(names);
-        NameCell { names: Arc::new(cell), copy_of, ..NameCell::default() }
+        NameCell { names: Arc::new(cell), ..NameCell::default() }
     }
 }
 
@@ -206,6 +209,10 @@ pub fn face_name_exact(b: &ModelBody, index: usize) -> bool {
 /// A body's names, with what finding them again needs: from the history of the feature that
 /// made it where it reports one, else from geometry (unverified).
 pub(crate) fn names(b: &ModelBody) -> Arc<Names> {
+    // A moved copy has its source's names (the source's cell keeps them for both).
+    if let Some(source) = &b.names.copy_of {
+        return b.names.names.get_or_init(|| names(source)).clone();
+    }
     b.names
         .names
         .get_or_init(|| {

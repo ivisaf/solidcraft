@@ -179,12 +179,16 @@ pub struct AccessMap {
     pub scale: f32,
 }
 
+/// Vertices (or line instances) on the GPU, in as many buffers as the device's buffer size
+/// limit needs: a large import's triangles can exceed one buffer (#883).
 struct Batch {
-    buffer: wgpu::Buffer,
-    count: u32,
+    /// Each buffer and its vertex (instance) count.
+    parts: Vec<(wgpu::Buffer, u32)>,
+    /// Bytes per buffer (all but the last are full).
+    chunk: usize,
 }
 
-/// A planned body on the GPU: its evaluated mesh and a colour per vertex.
+/// A chunk of planned bodies on the GPU: their evaluated mesh and a colour per vertex.
 struct PlannedDraw {
     mesh: Arc<solidcraft_gpu::GpuMesh>,
     colors: wgpu::Buffer,
@@ -206,9 +210,9 @@ struct Batches {
     xray: Option<Batch>,
     under: Option<Batch>,
     planned: Vec<PlannedDraw>,
-    /// Evaluated plans by the plan's address, holding the plan so the address stays its own:
-    /// a body whose plan is unchanged is not evaluated again when the scene is rebuilt.
-    resident: std::collections::HashMap<usize, (Arc<solidcraft_engine::geom::tess::TessPlan>, Arc<solidcraft_gpu::GpuMesh>)>,
+    /// Evaluated chunks by their plans' addresses, holding the plans so the addresses stay
+    /// theirs: a chunk whose plans are unchanged is not evaluated again when the scene is rebuilt.
+    resident: std::collections::HashMap<Vec<usize>, (Vec<Arc<solidcraft_engine::geom::tess::TessPlan>>, Arc<solidcraft_gpu::GpuMesh>)>,
 }
 
 impl Batches {
@@ -238,6 +242,9 @@ impl Batches {
         }
     }
 
+    /// The planned bodies on the GPU: in chunks of at most `MAX_BATCH` vertices (one for any
+    /// ordinary scene), each uploaded and evaluated in one dispatch and drawn in one call. A
+    /// chunk whose plans are unchanged is not evaluated again; colours are rebuilt each time.
     fn planned(
         &mut self,
         device: &wgpu::Device,
@@ -245,29 +252,49 @@ impl Batches {
         encoder: &mut wgpu::CommandEncoder,
         bodies: &[PlannedBody],
     ) -> Vec<PlannedDraw> {
-        let ptr = |b: &PlannedBody| Arc::as_ptr(&b.plan) as usize;
-        self.resident.retain(|k, _| bodies.iter().any(|b| ptr(b) == *k));
-        let mut out = Vec::with_capacity(bodies.len());
+        let mut chunks: Vec<Vec<&PlannedBody>> = Vec::new();
+        let mut filled = 0usize;
         for b in bodies {
-            let mesh = match self.resident.get(&ptr(b)) {
+            let n = b.plan.vertex_count();
+            match chunks.last_mut() {
+                Some(c) if filled + n <= solidcraft_gpu::MAX_BATCH => c.push(b),
+                _ => {
+                    chunks.push(vec![b]);
+                    filled = 0;
+                }
+            }
+            filled += n;
+        }
+        let key = |c: &[&PlannedBody]| c.iter().map(|b| Arc::as_ptr(&b.plan) as usize).collect::<Vec<usize>>();
+        self.resident.retain(|k, _| chunks.iter().any(|c| key(c) == *k));
+        let mut out = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let mesh = match self.resident.get(&key(chunk)) {
                 Some((_, m)) => m.clone(),
-                None => match tess.prepare(&b.plan) {
-                    Ok(m) => {
-                        tess.record(encoder, &m);
-                        let m = Arc::new(m);
-                        self.resident.insert(ptr(b), (b.plan.clone(), m.clone()));
-                        m
+                None => {
+                    let plans: Vec<&solidcraft_engine::geom::tess::TessPlan> = chunk.iter().map(|b| &*b.plan).collect();
+                    match tess.prepare_many(&plans) {
+                        Ok(m) => {
+                            tess.record(encoder, &m);
+                            let m = Arc::new(m);
+                            self.resident.insert(key(chunk), (chunk.iter().map(|b| b.plan.clone()).collect(), m.clone()));
+                            m
+                        }
+                        Err(e) => {
+                            log::warn!("bodies are not drawn on the GPU: {e}");
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("a body is not drawn on the GPU: {e}");
-                        continue;
-                    }
-                },
+                }
             };
-            let last = b.face_colors.last().copied().unwrap_or([200, 200, 200, 255]);
-            let bytes: Vec<u8> = mesh.vertex_face.iter().flat_map(|f| b.face_colors.get(*f as usize).copied().unwrap_or(last)).collect();
-            if let Some(colors) = upload(device, "sc_planned_colors", &bytes, 4) {
-                out.push(PlannedDraw { mesh, colors: colors.buffer });
+            let mut bytes = Vec::with_capacity(mesh.vertex_face.len() * 4);
+            for (part, b) in mesh.parts.iter().zip(chunk) {
+                let last = b.face_colors.last().copied().unwrap_or([200, 200, 200, 255]);
+                let faces = mesh.vertex_face.get(part.vertices.start as usize..part.vertices.end as usize).unwrap_or_default();
+                bytes.extend(faces.iter().flat_map(|f| b.face_colors.get(*f as usize).copied().unwrap_or(last)));
+            }
+            if let Some((colors, _)) = upload(device, "sc_planned_colors", &bytes, 4).and_then(|c| c.parts.into_iter().next()) {
+                out.push(PlannedDraw { mesh, colors });
             }
         }
         out
@@ -348,323 +375,7 @@ fn access_texture(device: &wgpu::Device, queue: Option<&wgpu::Queue>, bgl: &wgpu
     })
 }
 
-const SHADER: &str = r#"
-struct U {
-    vp: mat4x4<f32>,
-    back: vec4<f32>,   // xyz = toward the eye, w = 1 for linear output
-    screen: vec4<f32>, // viewport width, height (px), depth bias (see `biased_z`), silhouettes on (1)
-    clip: vec4<f32>,   // section plane: normal, d (zero normal: no section)
-    cap: vec4<f32>,    // colour of the inside of cut bodies
-    ana: vec4<f32>,    // surface analysis: mode (1 zebra, 2 draft, 3 curvature), parameter
-    pull: vec4<f32>,   // draft pull direction
-    acc_u: vec4<f32>,  // accessibility map axes (xyz, offset)
-    acc_v: vec4<f32>,
-    eye: vec4<f32>,    // eye position, w = 1 for perspective (0: orthographic, looking along -back)
-};
-
-@group(1) @binding(2) var acc_t: texture_2d<f32>;
-
-fn clipped(p: vec3<f32>) -> bool {
-    return length(u.clip.xyz) > 0.5 && dot(u.clip.xyz, p) > u.clip.w;
-}
-@group(0) @binding(0) var<uniform> u: U;
-
-fn to_linear(c: vec3<f32>) -> vec3<f32> {
-    return select(c, pow((c + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4)), c > vec3<f32>(0.04045));
-}
-
-fn out_color(c: vec4<f32>) -> vec4<f32> {
-    if (u.back.w > 0.5) {
-        return vec4<f32>(to_linear(c.rgb), c.a);
-    }
-    return c;
-}
-
-struct TOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) n: vec3<f32>,
-    @location(1) c: vec4<f32>,
-    @location(2) wp: vec3<f32>,
-};
-
-@vertex
-fn vs_tri(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>) -> TOut {
-    var o: TOut;
-    o.pos = u.vp * vec4<f32>(p, 1.0);
-    o.n = n;
-    o.c = c;
-    o.wp = p;
-    return o;
-}
-
-/// Opaque model surfaces: cut by the section plane, the inside shows as a flat cap colour.
-@fragment
-fn fs_solid(i: TOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let c = solid(i, front);
-    return c;
-}
-
-struct CutOut {
-    @location(0) c: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-};
-
-/// The section cap (the inside seen through the cut, drawn on the far walls' back faces where
-/// they are the visible surface) again, at the depth of the section plane rather than of the
-/// far wall, so the cut face hides what lies inside the body instead of showing it like a
-/// pane of glass.
-@fragment
-fn fs_solid_cut(i: TOut, @builtin(front_facing) front: bool) -> CutOut {
-    var o: CutOut;
-    o.c = solid(i, front);
-    o.depth = cap_depth(i.wp, i.pos.z);
-    return o;
-}
-
-/// Depth of the section plane on the view ray through `wp` (a far wall seen through the cut),
-/// never behind the wall itself (`z`).
-fn cap_depth(wp: vec3<f32>, z: f32) -> f32 {
-    var dir = -u.back.xyz;
-    if (u.eye.w > 0.5) { dir = wp - u.eye.xyz; }
-    let dn = dot(u.clip.xyz, dir);
-    if (abs(dn) < 1e-9) { return z; }
-    let p = wp + dir * ((u.clip.w - dot(u.clip.xyz, wp)) / dn);
-    let c = u.vp * vec4<f32>(p, 1.0);
-    if (c.w <= 0.0) { return z; }
-    return clamp(c.z / c.w, 0.0, z);
-}
-
-fn solid(i: TOut, front: bool) -> vec4<f32> {
-    // Derivatives first, in uniform control flow (browsers' WGSL compilers reject them after
-    // a branch that returns; the whole shader module then fails and nothing is drawn).
-    let k = curvature(i);
-    let ndv = dot(normalize(i.n), normalize(u.back.xyz));
-    let fw = fwidth(ndv);
-    if (clipped(i.wp)) { discard; }
-    if (!front && length(u.clip.xyz) > 0.5) {
-        // The cut face in its body's colour (as Fusion's "from component"), tinted toward the
-        // cap colour so it reads as a cut, hatched at 45 degrees on screen.
-        let base = mix(i.c.rgb, u.cap.rgb, 0.35);
-        let h = fract((i.pos.x + i.pos.y) / 9.0);
-        return out_color(vec4<f32>(select(base, base * 0.6, h < 0.22), 1.0));
-    }
-    if (u.ana.x > 0.5 && length(i.n) > 0.5) {
-        return analysis(i, k);
-    }
-    let c = shade(i);
-    // Silhouettes (styles with edges): where a curved surface turns away from the eye, a line
-    // about 1.5 px wide, on the visible surface only (depth-correct).
-    if (u.screen.w > 0.5 && length(i.n) > 0.5 && fw > 1e-6) {
-        let a = 1.0 - smoothstep(fw * 0.8, fw * 2.0, abs(ndv));
-        return vec4<f32>(mix(c.rgb, out_color(vec4<f32>(0.07, 0.08, 0.10, 1.0)).rgb, a), c.a);
-    }
-    return c;
-}
-
-/// How fast the normal turns across the pixel (per mm).
-fn curvature(i: TOut) -> f32 {
-    let nn = normalize(i.n);
-    let kx = length(dpdx(nn)) / max(length(dpdx(i.wp)), 1e-6);
-    let ky = length(dpdy(nn)) / max(length(dpdy(i.wp)), 1e-6);
-    return max(kx, ky);
-}
-
-/// Surface analysis colours: zebra stripes, draft angle bands, curvature map (`k`: the
-/// surface's curvature here, worked out by the caller).
-fn analysis(i: TOut, k: f32) -> vec4<f32> {
-    let v = normalize(u.back.xyz);
-    var n = normalize(i.n);
-    if (dot(n, v) < 0.0) { n = -n; }
-    let lit = 0.55 + 0.45 * max(dot(n, v), 0.0);
-    if (u.ana.x < 1.5) {
-        // Reflections of upright light bars standing around the viewer: the stripe follows
-        // the reflected ray's sideways direction (horizontal on screen).
-        let r = reflect(-v, n);
-        var side = cross(v, vec3<f32>(0.0, 0.0, 1.0));
-        if (length(side) < 1e-3) { side = vec3<f32>(1.0, 0.0, 0.0); }
-        let s = sin(dot(r, normalize(side)) * u.ana.y * 3.14159265);
-        let c = select(0.08, 0.95, s > 0.0);
-        return out_color(vec4<f32>(vec3<f32>(c), 1.0));
-    }
-    if (u.ana.x > 4.5) {
-        // Reachable from the access direction: facing it and nothing above.
-        let d = normalize(u.pull.xyz);
-        let size = i32(u.ana.w);
-        let px = vec2<i32>(floor(vec2<f32>(dot(i.wp, u.acc_u.xyz) + u.acc_u.w, dot(i.wp, u.acc_v.xyz) + u.acc_v.w) * u.ana.z));
-        var top = -1e30;
-        if (px.x >= 0 && px.y >= 0 && px.x < size && px.y < size) {
-            top = textureLoad(acc_t, px, 0).x;
-        }
-        let cn = dot(normalize(i.n), d);
-        let facing = cn > 0.02;
-        // Slack of a pixel and a half, more on slopes (the map holds the pixel's highest point).
-        let slack = u.ana.y * (1.0 + sqrt(max(1.0 - cn * cn, 0.0)) / max(cn, 0.05));
-        let clear = dot(i.wp, d) >= top - slack;
-        var c = vec3<f32>(0.85, 0.22, 0.20);
-        if (facing && clear) { c = vec3<f32>(0.20, 0.75, 0.30); }
-        return out_color(vec4<f32>(c * lit, 1.0));
-    }
-    if (u.ana.x > 3.5) {
-        // A studio around the model: sky above, a dark floor below, a bright horizon band and
-        // two soft light panels, seen in a mirror.
-        let r = reflect(-v, n);
-        var c = mix(vec3<f32>(0.32, 0.34, 0.38), vec3<f32>(0.80, 0.86, 0.95), smoothstep(-0.05, 0.6, r.z));
-        c = c + vec3<f32>(0.6) * exp(-abs(r.z) * 40.0);
-        let side = atan2(r.y, r.x);
-        c = c + vec3<f32>(0.9) * smoothstep(0.92, 0.98, cos(side * 2.0)) * smoothstep(0.1, 0.3, r.z) * smoothstep(0.8, 0.6, r.z);
-        if (r.z < -0.02) {
-            // The floor: lighter toward the horizon, with light-panel streaks along it.
-            c = mix(vec3<f32>(0.55, 0.56, 0.60), vec3<f32>(0.20, 0.20, 0.22), clamp(-r.z * 1.6, 0.0, 1.0));
-            c = c + vec3<f32>(0.35) * smoothstep(0.95, 0.99, cos(side * 3.0));
-        }
-        return out_color(vec4<f32>(min(c, vec3<f32>(1.0)), 1.0));
-    }
-    if (u.ana.x < 2.5) {
-        let a = degrees(asin(clamp(dot(normalize(i.n), normalize(u.pull.xyz)), -1.0, 1.0)));
-        var c = vec3<f32>(0.95, 0.80, 0.15);
-        if (a >= u.ana.y) { c = vec3<f32>(0.20, 0.75, 0.30); }
-        if (a <= -u.ana.y) { c = vec3<f32>(0.85, 0.22, 0.20); }
-        return out_color(vec4<f32>(c * lit, 1.0));
-    }
-    // Curvature from how fast the normal turns across the pixel.
-    let t = clamp(k * u.ana.y, 0.0, 1.0);
-    let c = select(mix(vec3<f32>(0.10, 0.80, 0.25), vec3<f32>(0.90, 0.15, 0.10), t * 2.0 - 1.0),
-                   mix(vec3<f32>(0.15, 0.35, 0.95), vec3<f32>(0.10, 0.80, 0.25), t * 2.0), t < 0.5);
-    return out_color(vec4<f32>(c * lit, 1.0));
-}
-
-@fragment
-fn fs_tri(i: TOut) -> @location(0) vec4<f32> {
-    if (clipped(i.wp)) { discard; }
-    return shade(i);
-}
-
-fn shade(i: TOut) -> vec4<f32> {
-    // A zero normal marks flat colour (selection fills, translucent planes).
-    if (length(i.n) < 0.5) {
-        return out_color(i.c);
-    }
-    let v = normalize(u.back.xyz);
-    var n = normalize(i.n);
-    if (dot(n, v) < 0.0) { n = -n; }
-    let key = normalize(v * 0.8 + vec3<f32>(-0.3, 0.2, 0.6));
-    let diff = max(dot(n, key), 0.0);
-    let fill = max(dot(n, v), 0.0);
-    let h = normalize(key + v);
-    let spec = pow(max(dot(n, h), 0.0), 40.0) * 0.25;
-    let k = 0.42 + 0.38 * diff + 0.25 * fill;
-    return out_color(vec4<f32>(min(i.c.rgb * k + vec3<f32>(spec), vec3<f32>(1.0)), i.c.a));
-}
-
-/// Clip-space z of `p` (clipped to `c`) pulled `s` depth biases toward the eye (pushed away
-/// when negative). Orthographic depth is linear in distance, so the bias is a fixed step of it.
-/// Perspective depth is not: near the far plane a fixed step spans tens of millimetres (edges
-/// showed through walls), so the point moves toward the eye by a fraction of its distance.
-fn biased_z(p: vec3<f32>, c: vec4<f32>, s: f32) -> f32 {
-    if (u.eye.w > 0.5) {
-        let q = u.vp * vec4<f32>(mix(p, u.eye.xyz, u.screen.z * 8.0 * s), 1.0);
-        return q.z / max(q.w, 1e-6) * c.w;
-    }
-    return c.z - u.screen.z * s * c.w;
-}
-
-@vertex
-fn vs_ghost(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>) -> TOut {
-    var o: TOut;
-    o.pos = u.vp * vec4<f32>(p, 1.0);
-    o.pos.z = biased_z(p, o.pos, -4.0);
-    o.n = n;
-    o.c = c;
-    o.wp = p;
-    return o;
-}
-
-struct LOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) c: vec4<f32>,
-    @location(1) wp: vec3<f32>,
-};
-
-@vertex
-fn vs_line(@builtin(vertex_index) vi: u32, @location(0) a: vec3<f32>, @location(1) b: vec3<f32>, @location(2) c: vec4<f32>, @location(3) w: f32) -> LOut {
-    var pa = a;
-    var pb = b;
-    var ca = u.vp * vec4<f32>(a, 1.0);
-    var cb = u.vp * vec4<f32>(b, 1.0);
-    // An end behind the near plane (clip z < 0) has no screen point: its divide flips the
-    // line or drops it whole (ground grid lines running past the eye at a low angle). Cut
-    // the segment at the plane instead; clip space is linear in the world point.
-    if (ca.z < 0.0 && cb.z > 0.0) {
-        let k = ca.z / (ca.z - cb.z);
-        ca = mix(ca, cb, k);
-        pa = mix(a, b, k);
-    } else if (cb.z < 0.0 && ca.z > 0.0) {
-        let k = cb.z / (cb.z - ca.z);
-        cb = mix(cb, ca, k);
-        pb = mix(b, a, k);
-    }
-    let half = u.screen.xy * 0.5;
-    let sa = ca.xy / max(ca.w, 1e-6) * half;
-    let sb = cb.xy / max(cb.w, 1e-6) * half;
-    var dir = sb - sa;
-    let len = length(dir);
-    if (len < 1e-6) { dir = vec2<f32>(1.0, 0.0); } else { dir = dir / len; }
-    let nrm = vec2<f32>(-dir.y, dir.x);
-    // Two triangles: corners (t, side).
-    var ts = array<f32, 6>(0.0, 1.0, 1.0, 0.0, 1.0, 0.0);
-    var ss = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
-    let t = ts[vi];
-    let s = ss[vi];
-    let base = select(ca, cb, t > 0.5);
-    let off = nrm * s * w * 0.5 + dir * (t * 2.0 - 1.0) * w * 0.5;
-    var o: LOut;
-    o.pos = vec4<f32>(base.xy + off / half * base.w, biased_z(select(pa, pb, t > 0.5), base, 1.0), base.w);
-    o.c = c;
-    o.wp = select(pa, pb, t > 0.5);
-    return o;
-}
-
-@fragment
-fn fs_line(i: LOut) -> @location(0) vec4<f32> {
-    if (clipped(i.wp)) { discard; }
-    return out_color(i.c);
-}
-
-struct IOut {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) a: f32,
-    @location(2) wp: vec3<f32>,
-};
-
-@group(1) @binding(0) var img_t: texture_2d<f32>;
-@group(1) @binding(1) var img_s: sampler;
-
-@vertex
-fn vs_img(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) a: f32) -> IOut {
-    var o: IOut;
-    o.pos = u.vp * vec4<f32>(p, 1.0);
-    // Pulled toward the eye like lines, so a decal on a face is not lost in it.
-    o.pos.z = biased_z(p, o.pos, 1.0);
-    o.uv = uv;
-    o.a = a;
-    o.wp = p;
-    return o;
-}
-
-@fragment
-fn fs_img(i: IOut) -> @location(0) vec4<f32> {
-    let c = textureSample(img_t, img_s, i.uv);
-    if (clipped(i.wp)) { discard; }
-    return out_color(vec4<f32>(c.rgb, c.a * i.a));
-}
-
-/// Lines the section never cuts (the grid, highlights drawn on top).
-@fragment
-fn fs_line_all(i: LOut) -> @location(0) vec4<f32> {
-    return out_color(i.c);
-}
-"#;
+const SHADER: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/shaders/viewport.wgsl"));
 
 fn tri_layout() -> wgpu::VertexBufferLayout<'static> {
     const A: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4];
@@ -956,13 +667,27 @@ fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize) -> Op
 }
 
 fn upload_with(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages) -> Option<Batch> {
-    if bytes.len() < stride {
+    if bytes.len() < stride || stride == 0 {
         return None;
     }
-    Some(Batch {
-        buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytes, usage }),
-        count: u32::try_from(bytes.len() / stride).unwrap_or(0),
-    })
+    let chunk = buffer_chunk(stride, device.limits().max_buffer_size);
+    let parts = bytes
+        .chunks(chunk)
+        .filter(|part| part.len() >= stride)
+        .map(|part| {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: part, usage });
+            (buffer, u32::try_from(part.len() / stride).unwrap_or(0))
+        })
+        .collect();
+    Some(Batch { parts, chunk })
+}
+
+/// Bytes per GPU buffer for vertices of `stride` bytes: within the device's limit and a
+/// whole number of triangles and line pairs, so no primitive straddles two buffers.
+fn buffer_chunk(stride: usize, max_buffer_size: u64) -> usize {
+    let unit = stride.max(1) * 6;
+    let max = usize::try_from(max_buffer_size).unwrap_or(usize::MAX).min(1 << 30);
+    (max / unit).max(1) * unit
 }
 
 /// Triangles (3 vertices of `TRI_SIZE` bytes each, position first) ordered far to near along
@@ -984,7 +709,10 @@ impl Batches {
         let (Some(g), false) = (&self.glass, self.glass_cpu.is_empty()) else { return };
         let turned = self.glass_sorted_for.is_none_or(|s| s[0] * back[0] + s[1] * back[1] + s[2] * back[2] < 0.9994);
         if turned {
-            queue.write_buffer(&g.buffer, 0, &sort_back_to_front(&self.glass_cpu, back));
+            let sorted = sort_back_to_front(&self.glass_cpu, back);
+            for ((buffer, _), bytes) in g.parts.iter().zip(sorted.chunks(g.chunk.max(1))) {
+                queue.write_buffer(buffer, 0, bytes);
+            }
             self.glass_sorted_for = Some(back);
         }
     }
@@ -1089,15 +817,19 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
         let tris = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, b: &Option<Batch>| {
             if let Some(b) = b {
                 pass.set_pipeline(p);
-                pass.set_vertex_buffer(0, b.buffer.slice(..));
-                pass.draw(0..b.count, 0..1);
+                for (buffer, count) in &b.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         };
         let lines = |pass: &mut wgpu::RenderPass<'static>, p: &wgpu::RenderPipeline, b: &Option<Batch>| {
             if let Some(b) = b {
                 pass.set_pipeline(p);
-                pass.set_vertex_buffer(0, b.buffer.slice(..));
-                pass.draw(0..6, 0..b.count);
+                for (buffer, count) in &b.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..6, 0..*count);
+                }
             }
         };
         let (m, sk, h, pv) = (&res.model, &res.sketch, &res.highlight, &res.preview);
@@ -1141,8 +873,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
             if let Some((_, bind)) = res.textures.get(id) {
                 pass.set_pipeline(&res.image);
                 pass.set_bind_group(1, bind, &[]);
-                pass.set_vertex_buffer(0, q.buffer.slice(..));
-                pass.draw(0..q.count, 0..1);
+                for (buffer, count) in &q.parts {
+                    pass.set_vertex_buffer(0, buffer.slice(..));
+                    pass.draw(0..*count, 0..1);
+                }
             }
         }
         tris(pass, &res.ghost, &pv.ghost);
@@ -1371,6 +1105,22 @@ mod tests {
 #[cfg(test)]
 mod glass_tests {
     use super::*;
+
+    /// A large import's triangles once went into one buffer past the device's limit (524 MB
+    /// against 256 MB) and the app crashed (#883): they are split into whole triangles.
+    #[test]
+    fn large_scenes_are_split_into_buffers_within_the_device_limit() {
+        let limit = 256u64 << 20;
+        for stride in [TRI_SIZE, LINE_SIZE, 4] {
+            let chunk = buffer_chunk(stride, limit);
+            assert!(chunk as u64 <= limit && chunk > limit as usize / 2);
+            assert_eq!(chunk % (stride * 3), 0, "whole triangles");
+            assert_eq!(chunk % (stride * 2), 0, "whole line pairs");
+        }
+        let scene = 524_434_680usize;
+        assert_eq!(scene.div_ceil(buffer_chunk(TRI_SIZE, limit)), 2);
+        assert!(buffer_chunk(TRI_SIZE, 1) >= TRI_SIZE * 6, "a tiny limit still holds one unit");
+    }
 
     #[test]
     fn glass_is_drawn_far_to_near() {

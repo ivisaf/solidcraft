@@ -215,3 +215,20 @@ fn ls_extruded_up_and_down_from_one_grid_join() {
     let v = volume(&s, "Logo");
     assert!((v - 6000.0).abs() < 1e-6, "{v}");
 }
+
+/// Press/pull on the sensor enclosure's lid top: joining the pulled face's prism imprints the
+/// contact (#825), and boxing the lid's faces by dividing their curved edges down to the
+/// contact tolerance ran away (over 24 GB and many minutes). It finishes in seconds.
+#[test]
+fn press_pull_on_the_enclosure_lid_is_prompt() {
+    let mut s = Session::default();
+    let script: Value = serde_json::from_str(include_str!("../../../examples/acceptance/sensor_enclosure.json")).unwrap();
+    s.run_script(&script).unwrap();
+    let total = |s: &Session| -> f64 { s.model.state().bodies.iter().map(|b| solidcraft_kernel::measure(&b.body).unwrap().volume).sum() };
+    let before = total(&s);
+    let t = std::time::Instant::now();
+    s.execute("solid.press_pull", &json!({"face": [-12.0, 27.4, 23.0], "distance": 5.0})).unwrap();
+    // A few seconds here; the bound leaves room for a loaded CI runner.
+    assert!(t.elapsed().as_secs() < 60, "took {:?}", t.elapsed());
+    assert!(total(&s) > before, "{before} -> {}", total(&s));
+}

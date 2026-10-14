@@ -10,7 +10,7 @@
 //! together; the flat solid is the outline extruded through the thickness.
 
 use serde::{Deserialize, Serialize};
-use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_geom::{LINEAR_TOL, Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_kernel::{self as kernel, Body, EdgeSpec, FaceSpec, SurfSpec};
 
 use crate::expr::{self, Kind, Value};
@@ -33,7 +33,12 @@ const MAX_FLAT_WORK: usize = 500_000_000;
 
 /// Starts the warning a fold gives when its `fixed` point touches no material: a recompute keeps
 /// the side the point lies on, and the `sheet.fold` command refuses such a point (#263).
+/// Tabs folded on one line whose material beyond the bend joins again.
+const FOLD_TABS_REJOIN: &str = "not supported yet: folding tabs that join again beyond the bend";
 pub const FOLD_FIXED_OFF_SHEET: &str = "the fold's fixed point is not on the sheet";
+
+/// The most bores one sheet keeps.
+const MAX_BORES: usize = 1000;
 
 fn flat_budget_error() -> DocError {
     DocError::Invalid("sheet metal flat geometry exceeds the bounded processing budget".into())
@@ -164,6 +169,46 @@ fn regions_complexity<'a>(regions: impl Iterator<Item = &'a Region2>) -> Result<
         }
     }
     Ok((edges, points))
+}
+
+/// A flat region's cut-outs by their bounding boxes, to clip tools against only the ones near
+/// them (the result is the same: a cut-out clear of a tool's box can't change what it meets).
+pub(crate) struct NearHoles<'a> {
+    region: &'a Region2,
+    boxes: Vec<(Vec2, Vec2)>,
+}
+
+/// A loop's bounding box, a little larger than its chords so arcs stay inside.
+fn loop_box(lp: &Loop2) -> Result<(Vec2, Vec2)> {
+    let pts = flat_polyline(lp)?;
+    let (lo, hi) = pts.iter().fold((Vec2::new(f64::MAX, f64::MAX), Vec2::new(f64::MIN, f64::MIN)), |(lo, hi), p| {
+        (Vec2::new(lo.x.min(p.x), lo.y.min(p.y)), Vec2::new(hi.x.max(p.x), hi.y.max(p.y)))
+    });
+    let pad = 1e-3 + 1e-9 * (lo.x.abs() + lo.y.abs() + hi.x.abs() + hi.y.abs());
+    Ok((lo - Vec2::new(pad, pad), hi + Vec2::new(pad, pad)))
+}
+
+impl<'a> NearHoles<'a> {
+    pub(crate) fn new(region: &'a Region2) -> Result<Self> {
+        Ok(Self { region, boxes: region.holes.iter().map(loop_box).collect::<Result<_>>()? })
+    }
+
+    /// The region with only the cut-outs whose boxes meet `tool`'s.
+    pub(crate) fn around(&self, tool: &Region2) -> Result<Region2> {
+        if self.region.holes.is_empty() {
+            return Ok(self.region.clone());
+        }
+        let (lo, hi) = loop_box(&tool.outer)?;
+        let holes = self
+            .region
+            .holes
+            .iter()
+            .zip(&self.boxes)
+            .filter(|(_, (a, b))| a.x <= hi.x && b.x >= lo.x && a.y <= hi.y && b.y >= lo.y)
+            .map(|(h, _)| h.clone())
+            .collect();
+        Ok(Region2 { outer: self.region.outer.clone(), holes })
+    }
 }
 
 pub(crate) fn material_boolean(a: &[Region2], b: &[Region2], op: kernel::BoolOp, work: &mut FlatWork) -> Result<Vec<Region2>> {
@@ -432,6 +477,11 @@ pub struct SheetBody {
     /// Derived from feature history; these records are not a document schema change.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pockets: Vec<SheetPocket>,
+    /// Straight bores drilled into a panel along its plane (a hole into a rim), in flat
+    /// coordinates, each kept inside its own panel's material so the folded part and its flat
+    /// pattern both carry it (#560). Derived from feature history, like `pockets`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bores: Vec<SheetBore>,
     /// Unfolded.
     pub flat: bool,
     /// Gap between flanges that meet at a corner.
@@ -446,6 +496,17 @@ pub struct SheetBody {
     /// The base sketch's lines (id, ends in flat coordinates), naming the base panel's edges.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_curves: Vec<(String, Vec2, Vec2)>,
+}
+
+/// A straight round bore of one panel (None = the base), in flat coordinates: a cylinder from
+/// `base` along the unit `axis` for `height`, cut only from that panel's material.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct SheetBore {
+    pub panel: Option<usize>,
+    pub base: Vec3,
+    pub axis: Vec3,
+    pub radius: f64,
+    pub height: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -593,6 +654,35 @@ fn clip(poly: &[Vec2], o: Vec2, n: Vec2) -> Vec<Vec2> {
         }
     }
     out
+}
+
+/// [`clip`] to the half-plane (p − o)·n ≥ 0 (`n` a unit vector) at a trim line: a corner within
+/// the model's tolerance of the line lies on it (it stays, moved onto the line), and an edge
+/// crosses the line only between corners clear of it on either side, so no corner comes out
+/// twice. Also says whether a corner lay on the line: the polygon may then run along the line
+/// out and back (a ledge beside the edge that ends on the line, or a hair either side of it,
+/// all of it in the strip that goes), which is no material.
+fn clip_at_line(poly: &[Vec2], o: Vec2, n: Vec2) -> (Vec<Vec2>, bool) {
+    let side = |p: Vec2| {
+        let v = (p - o).dot(n);
+        if v.abs() <= LINEAR_TOL { 0.0 } else { v }
+    };
+    let (mut out, mut on) = (Vec::new(), false);
+    let m = poly.len();
+    for i in 0..m {
+        let (Some(&a), Some(&b)) = (poly.get(i), poly.get((i + 1) % m)) else { continue };
+        let (da, db) = (side(a), side(b));
+        if da > 0.0 {
+            out.push(a);
+        } else if da == 0.0 {
+            out.push(snap(a - n * (a - o).dot(n)));
+            on = true;
+        }
+        if da * db < 0.0 {
+            out.push(snap(a + (b - a) * (da / (da - db))));
+        }
+    }
+    (out, on)
 }
 
 /// The smallest gap closed corners are given: closer than this the flanges' ends would touch.
@@ -1007,16 +1097,21 @@ impl SheetBody {
                     continue;
                 };
                 let d = b - a;
-                let l2 = d.len2();
+                let (l2, l) = (d.len2(), d.len());
+                // Not within the model's tolerance of an end or of each other: a corner that near
+                // an end is that end (sewing welds the two), and a piece that short is no edge. A
+                // short edge beside a bend's end (the side of a ledge a little taller than the
+                // setback) used to be cut where the bend's corner lies, under a nanometre from
+                // its own.
                 let mut ts: Vec<f64> = corners
                     .iter()
                     .filter_map(|p| {
                         let t = (*p - a).dot(d) / l2.max(1e-30);
-                        ((t > 1e-9 && t < 1.0 - 1e-9) && (a + d * t).dist(*p) < 1e-7).then_some(t)
+                        ((t * l > LINEAR_TOL && (1.0 - t) * l > LINEAR_TOL) && (a + d * t).dist(*p) < 1e-7).then_some(t)
                     })
                     .collect();
                 ts.sort_by(|x, y| x.total_cmp(y));
-                ts.dedup_by(|x, y| (*x - *y).abs() < 1e-12);
+                ts.dedup_by(|x, y| (*x - *y).abs() * l < LINEAR_TOL);
                 let mut prev = a;
                 for t in ts {
                     split_edges += 1;
@@ -1158,6 +1253,7 @@ impl SheetBody {
         local.frame = Plane::XY;
         let body = kernel::sew(&local.faces(&cells, 0.0, self.t, &mut work)?)?;
         let body = local.machine_pockets(body, &mut work)?;
+        let body = local.machine_bores(body, &mut work)?;
         self.place_local_solid(body)
     }
 
@@ -1173,7 +1269,9 @@ impl SheetBody {
         local.frame = Plane::XY;
         local.flat = true;
         let body = kernel::extrude_planar_regions(&Plane::XY, &regions, 0.0, self.t)?;
-        let body = local.machine_pockets(body, &mut FlatWork::new())?;
+        let mut work = FlatWork::new();
+        let body = local.machine_pockets(body, &mut work)?;
+        let body = local.machine_bores(body, &mut work)?;
         self.place_local_solid(body)
     }
 
@@ -1242,6 +1340,119 @@ impl SheetBody {
     }
 
     /// Replay exact planar machining after forming the full-thickness material.
+    /// Cut the bores (see [`SheetBore`]) from a solid built in the sheet's local frame.
+    fn machine_bores(&self, mut body: Body, work: &mut FlatWork) -> Result<Body> {
+        if self.bores.is_empty() {
+            return Ok(body);
+        }
+        if self.bores.len() > MAX_BORES {
+            return Err(flat_budget_error());
+        }
+        let panels = self.material_panels(None, work)?;
+        for bore in &self.bores {
+            let cells = panels.iter().filter(|(pi, _)| *pi == bore.panel).map(|(_, r)| fitted_region(r)).collect::<Result<Vec<_>>>()?;
+            if cells.is_empty() {
+                continue;
+            }
+            // BRep replay is costlier than planar clipping; share the command budget.
+            work.charge(100_000)?;
+            // The bore's own panel, flat: the bore never reaches a bend or another panel, in
+            // the folded part or in its flat pattern.
+            let slab = kernel::extrude_planar_regions(&Plane::XY, &cells, 0.0, self.t)?;
+            let drill = kernel::cylinder(bore.base, bore.axis, bore.radius, bore.height)?;
+            let Some(inside) = kernel::boolean(&drill, &slab, kernel::BoolOp::Intersect)? else { continue };
+            // Cut with the drill clipped to the panel. Where its ends, flush with the panel's
+            // rims, leave coincident faces the cut can't resolve, cut with the drill as long as
+            // the panel's material along it and a hair past it instead (the same material).
+            let place = |tool: Body| if self.flat { Ok(tool) } else { kernel::transform_matrix(&tool, self.world(bore.panel)) };
+            let mut last = None;
+            for longer in [false, true] {
+                let tool = if longer {
+                    let axis = bore.axis.normalized().ok_or_else(|| DocError::Invalid("invalid sheet bore".into()))?;
+                    let mesh = inside.tessellate((bore.radius * 0.1).max(1e-4))?;
+                    let (lo, hi) =
+                        mesh.positions.iter().map(|p| (*p - bore.base).dot(axis)).fold((f64::MAX, f64::MIN), |(lo, hi), d| (lo.min(d), hi.max(d)));
+                    if !(lo <= hi) {
+                        break;
+                    }
+                    let past = (bore.radius * 0.05).max(1e-3);
+                    kernel::cylinder(bore.base + axis * (lo - past), axis, bore.radius, hi - lo + 2.0 * past)?
+                } else {
+                    inside.clone()
+                };
+                match kernel::boolean(&body, &place(tool)?, kernel::BoolOp::Cut) {
+                    Ok(Some(cut)) => {
+                        body = cut;
+                        last = None;
+                        break;
+                    }
+                    Ok(None) => last = Some(DocError::Invalid("a sheet bore removes all sheet material".into())),
+                    Err(e) => last = Some(e.into()),
+                }
+            }
+            if let Some(e) = last {
+                return Err(e);
+            }
+        }
+        Ok(body)
+    }
+
+    /// Record a round bore drilled along the sheet (a hole into a rim): the world cylinder from
+    /// `base` along `axis`, one record per panel whose material it meets. Ok(false) when it
+    /// meets no material; an error when it meets a bend, or crosses a panel other than along
+    /// its plane (that machining has no exact place in the flat pattern).
+    pub(crate) fn add_bore(&mut self, base: Vec3, axis: Vec3, radius: f64, height: f64) -> Result<bool> {
+        let axis = axis.normalized().ok_or_else(|| DocError::Invalid("bore axis".into()))?;
+        if ![base.x, base.y, base.z, radius, height].iter().all(|v| v.is_finite()) || !(radius > 0.0) || height == 0.0 {
+            return Err(DocError::Invalid("invalid sheet bore".into()));
+        }
+        if self.bores.len() >= MAX_BORES {
+            return Err(flat_budget_error());
+        }
+        let mut work = FlatWork::new();
+        let drill = kernel::cylinder(base, axis, radius, height)?;
+        let mut found = Vec::new();
+        for cell in self.cells_with_work(&mut work)? {
+            work.charge(100_000)?;
+            let solid = if self.flat {
+                let region = fitted_region(&Region2 {
+                    outer: Loop2 { segs: cell.outer.clone() },
+                    holes: cell.holes.iter().map(|h| Loop2 { segs: h.clone() }).collect(),
+                })?;
+                kernel::extrude_planar_regions(&self.frame, &[region], 0.0, self.t)?
+            } else {
+                kernel::sew(&self.faces(std::slice::from_ref(&cell), 0.0, self.t, &mut work)?)?
+            };
+            if kernel::boolean(&solid, &drill, kernel::BoolOp::Intersect)?.is_none() {
+                continue;
+            }
+            let Piece::Panel(pi) = cell.piece else {
+                return Err(DocError::Invalid(
+                    "this hole runs into a bend; drill it into a flat panel, or unfold the sheet before machining that material".into(),
+                ));
+            };
+            let w = self.world(if self.flat { None } else { pi });
+            if apply_vector(&w, Vec3::Z).dot(axis).abs() > 1e-6 {
+                return Err(DocError::Invalid(
+                    "this hole crosses a sheet panel at an angle; drill it square to the panel, or along it into a rim".into(),
+                ));
+            }
+            let inv = mat_inverse(&w).ok_or_else(|| DocError::Invalid("invalid sheet panel frame".into()))?;
+            let bore = SheetBore { panel: pi, base: apply_point(&inv, base), axis: apply_vector(&inv, axis), radius, height };
+            if !found.contains(&bore) {
+                found.push(bore);
+            }
+        }
+        if found.is_empty() {
+            return Ok(false);
+        }
+        if self.bores.len().saturating_add(found.len()) > MAX_BORES {
+            return Err(flat_budget_error());
+        }
+        self.bores.extend(found);
+        Ok(true)
+    }
+
     fn machine_pockets(&self, mut body: Body, work: &mut FlatWork) -> Result<Body> {
         if self.pockets.len() > 1000 {
             return Err(flat_budget_error());
@@ -1267,11 +1478,22 @@ impl SheetBody {
                 }
             }
             for (pi, panel) in &panels {
-                let clipped = material_boolean(panel, std::slice::from_ref(outline), kernel::BoolOp::Intersect, work)?;
-                if clipped.is_empty() {
+                if material_boolean(panel, std::slice::from_ref(outline), kernel::BoolOp::Intersect, work)?.is_empty() {
                     continue;
                 }
-                // What the tool takes over from a free-form cut-out of the panel follows its
+                // The tool spans the cut-outs inside it (a counterbore's hole, whichever was made
+                // first): a wall of its own along a cut-out's wall would only touch it, which the
+                // cut cannot resolve. An island of the pocket that holds material stays.
+                let whole: Vec<Region2> = panel.iter().map(|r| Region2 { outer: r.outer.clone(), holes: Vec::new() }).collect();
+                let mut spanning = Region2 { outer: outline.outer.clone(), holes: Vec::new() };
+                for island in &outline.holes {
+                    let inside = Region2 { outer: island.ccw(), holes: Vec::new() };
+                    if !material_boolean(panel, std::slice::from_ref(&inside), kernel::BoolOp::Intersect, work)?.is_empty() {
+                        spanning.holes.push(island.clone());
+                    }
+                }
+                let clipped = material_boolean(&whole, std::slice::from_ref(&spanning), kernel::BoolOp::Intersect, work)?;
+                // What the tool takes over from a free-form outline of the panel follows its
                 // fitted arcs: walls of planes and cylinders, which the prism booleans take.
                 let clipped = clipped.iter().map(fitted_region).collect::<Result<Vec<_>>>()?;
                 let w = if self.flat { self.frame_mat() } else { self.world(*pi) };
@@ -1610,12 +1832,12 @@ impl SheetBody {
             None => {
                 let pts = self.base.outer.ccw().polyline(1e-3);
                 let o = a + inward * by;
-                let mut cut = clip(&pts, o, inward);
+                let (mut cut, on_line) = clip_at_line(&pts, o, inward);
                 // Only the material along this edge goes: other parts of the outline past the
                 // line (tabs side by side on one line) stay, and so does the base where it runs
                 // on past the edge's own line (beyond an inside corner at the edge's end).
                 let mut work = FlatWork::new();
-                let off = merge_loops(&[clip(&pts, o, inward * -1.0)], &mut work)?;
+                let off = merge_loops(&[clip_at_line(&pts, o, inward * -1.0).0], &mut work)?;
                 let mid = (a + b) * 0.5;
                 let touches = |p: &Vec<Vec2>| {
                     let m = p.len();
@@ -1637,10 +1859,13 @@ impl SheetBody {
                         keep.push(p.clone());
                     }
                 }
-                if !keep.is_empty() {
+                // Merged, a run along the trimmed line out and back cancels: the base ends on
+                // the line there, as it does beside a lower ledge.
+                if !keep.is_empty() || on_line {
                     keep.insert(0, cut);
                     cut = match merge_loops(&keep, &mut work)?.as_slice() {
                         [one] => one.clone(),
+                        [] => Vec::new(),
                         _ => return Err(DocError::Invalid("not supported yet: a flange setback that splits the sheet".into())),
                     };
                 }
@@ -2586,6 +2811,30 @@ impl SheetBody {
         fixed: Option<Vec3>,
         warning: &mut Option<String>,
     ) -> Result<usize> {
+        match self.fold_side(a, b, angle, radius, position, flip, fixed, warning, false) {
+            // The tabs the line folds can't take the side beyond them along, since it joins
+            // the side that stays through other material (a tab on an inside edge of an L,
+            // the fixed point on the far leg): the tabs' own ends fold instead, and the
+            // fixed point's material still stays (#639).
+            Err(DocError::Invalid(m)) if m == FOLD_TABS_REJOIN => self.fold_side(a, b, angle, radius, position, flip, fixed, warning, true),
+            r => r,
+        }
+    }
+
+    /// [`Self::add_fold`]; `other_side` moves the side the fixed point would keep.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_side(
+        &mut self,
+        a: Vec3,
+        b: Vec3,
+        angle: f64,
+        radius: f64,
+        position: &str,
+        flip: bool,
+        fixed: Option<Vec3>,
+        warning: &mut Option<String>,
+        other_side: bool,
+    ) -> Result<usize> {
         if !(angle > 1e-6 && angle <= std::f64::consts::PI - 1e-6) {
             return Err(DocError::Invalid("the fold angle must be between 0 and 180°".into()));
         }
@@ -2653,7 +2902,7 @@ impl SheetBody {
             }
             (None, None) => side_area(n) <= side_area(n * -1.0),
         };
-        if !moves_n {
+        if moves_n == other_side {
             n = n * -1.0;
         }
         let l = a2.dot(n);
@@ -2689,6 +2938,12 @@ impl SheetBody {
         // Separate tabs on one line (the zone falls apart into several pieces): fold the ones
         // the line's points span, each as its own bend.
         let strips = merge_loops(std::slice::from_ref(&strip), &mut FlatWork::new())?;
+        // A zone clipped across the root of a tab folded before on the same line keeps a sliver
+        // of no width there: one real piece is the zone (#638).
+        let strip = match strips.as_slice() {
+            [one] => one.clone(),
+            _ => strip,
+        };
         if strips.len() > 1 {
             let span = (a2.dot(d).min(b2.dot(d)), a2.dot(d).max(b2.dot(d)));
             let angle = if flip { -angle } else { angle };
@@ -2806,7 +3061,7 @@ impl SheetBody {
                         h.push(k);
                     }
                 }
-                _ => return Err(DocError::Invalid("not supported yet: folding tabs that join again beyond the bend".into())),
+                _ => return Err(DocError::Invalid(FOLD_TABS_REJOIN.into())),
             }
         }
         let chosen: Vec<usize> = (0..strips.len()).filter(|&i| strip_u.get(i).is_some_and(|&u| overlap(u, span) > EPS)).collect();
@@ -3588,6 +3843,7 @@ pub fn base_flange(body: &str, rule: &str, rv: &RuleValues, plane: Plane, region
         flanges: Vec::new(),
         holes,
         pockets: Vec::new(),
+        bores: Vec::new(),
         flat: false,
         gap: rv.gap,
         relief: rv.corner_relief_shape,
@@ -3643,6 +3899,7 @@ pub fn contour_flange(body: &str, rule: &str, rv: &RuleValues, plane: &Plane, pt
         flanges: Vec::new(),
         holes: Vec::new(),
         pockets: Vec::new(),
+        bores: Vec::new(),
         flat: false,
         gap: rv.gap,
         relief: rv.corner_relief_shape,
@@ -4901,6 +5158,87 @@ mod tests {
         let f = &s.flanges[made[0]];
         assert!(f.p.dist(Vec2::new(17.0, 30.0)) < 1e-9 && (f.len - 30.0).abs() < 1e-9, "{f:?}");
         holds_the_flat_material(&s, "side");
+    }
+
+    /// A 100 x 60 plate with a ledge 3 wide and `h` tall beside its y = 0 edge, at its right end
+    /// or at both ends, turned `turn` about the origin.
+    fn ledged(h: f64, both: bool, turn: f64) -> SheetBody {
+        let mut pts = vec![(0.0, 0.0), (100.0, 0.0), (100.0, h), (97.0, h), (97.0, 60.0)];
+        pts.extend(if both { vec![(3.0, 60.0), (3.0, h), (0.0, h)] } else { vec![(0.0, 60.0)] });
+        let pts: Vec<Vec2> = pts.into_iter().map(|(x, y)| turned(x, y, turn)).collect();
+        base_flange("Body1", "AL2", &alu(), Plane::XY, Region2 { outer: Loop2::polygon(&pts).ccw(), holes: vec![] })
+    }
+
+    fn turned(x: f64, y: f64, turn: f64) -> Vec2 {
+        Vec2::new(x * turn.cos() - y * turn.sin(), x * turn.sin() + y * turn.cos())
+    }
+
+    #[test]
+    fn a_ledge_beside_an_edge_as_tall_as_the_setback_goes_with_the_strip() {
+        // A 100 x 60 plate with a ledge 3 wide beside its y = 0 edge, as tall as the setback of a
+        // 90° flange 15 high on that edge: (R + T)·tan 45° = 3 inside, half of it in the middle;
+        // BA = (π/2)·(R + K·T) = π, panel 15 − 3 = 12. The setback takes the strip under the edge
+        // and the ledge with it, as it takes a lower one: the base ends on the bend line, 97 wide
+        // (94 with a ledge at either end), and the bend and the flange run along it. The trim
+        // used to leave the bend line running out to the ledge's corner and back, and the part
+        // failed to sew ("a degenerate edge"); so did a ledge within the model's tolerance of the
+        // setback. Square to the axes and turned (a 5-12-13 slope) alike.
+        let (ba, panel, quarter) = (std::f64::consts::PI, 12.0, std::f64::consts::FRAC_PI_2);
+        for (position, line) in [("inside", 3.0), ("middle", 3.0 / 2.0)] {
+            for both in [false, true] {
+                for turn in [0.0, (5.0f64 / 13.0).asin()] {
+                    // Exact square to the axes; to within the crossings' 1e-9 grid when turned.
+                    let tol = if turn == 0.0 { 1e-9 } else { 1e-6 };
+                    for hair in [0.0, 1e-7, -1e-7] {
+                        let what = format!("{position}, ledge {line}{hair:+e}, both ends {both}, turned {turn:.4}");
+                        let mut s = ledged(line + hair, both, turn);
+                        let pick = turned(50.0, 0.0, turn);
+                        let (made, notes) = s
+                            .add_flanges_noted(&[Vec3::new(pick.x, pick.y, 2.0)], 15.0, quarter, 1.0, position, false)
+                            .unwrap_or_else(|e| panic!("{what}: {e}"));
+                        assert!(notes.is_empty(), "{what}: {notes:?}");
+                        let x0 = if both { 3.0 } else { 0.0 };
+                        let got = corners_of(&s.base);
+                        let want = [(x0, line), (97.0, line), (97.0, 60.0), (x0, 60.0)].map(|(x, y)| turned(x, y, turn));
+                        assert!(got.len() == 4 && want.iter().all(|p| got.iter().any(|q| q.dist(*p) < tol)), "{what}: {got:?}");
+                        let base = (97.0 - x0) * (60.0 - line);
+                        assert!((s.base.area() - base).abs() < tol, "{what}: {} vs {base}", s.base.area());
+                        let f = &s.flanges[made[0]];
+                        assert!(f.p.dist(turned(x0, line, turn)) < tol && (f.len - (97.0 - x0)).abs() < tol, "{what}: {f:?}");
+                        assert!((s.bends()[0].length - (97.0 - x0)).abs() < tol, "{what}: {:?}", s.bends());
+                        assert!((flat_area(&s) - (base + (97.0 - x0) * (ba + panel))).abs() < 1e-6, "{what}: {}", flat_area(&s));
+                        holds_the_flat_material(&s, &what);
+                    }
+                    // A ledge clearly shorter goes the same way. One clearly taller keeps a sliver
+                    // above the bend line, and the bend runs on under it, the edge's whole 100;
+                    // turned, its bend used to end a fraction of a nanometre along the sliver's
+                    // side, which split that side there and failed to sew in the middle.
+                    for hair in [1e-4, 0.05, -1e-4, -0.05] {
+                        let what = format!("{position}, ledge {line}{hair:+e}, both ends {both}, turned {turn:.4}");
+                        let mut s = ledged(line + hair, both, turn);
+                        let pick = turned(50.0, 0.0, turn);
+                        let (made, notes) = s
+                            .add_flanges_noted(&[Vec3::new(pick.x, pick.y, 2.0)], 15.0, quarter, 1.0, position, false)
+                            .unwrap_or_else(|e| panic!("{what}: {e}"));
+                        assert!(notes.is_empty(), "{what}: {notes:?}");
+                        let (x0, ends) = (if both { 3.0 } else { 0.0 }, if both { 2.0 } else { 1.0 });
+                        let (from, len, sliver) = if hair > 0.0 { (0.0, 100.0, ends * 3.0 * hair) } else { (x0, 97.0 - x0, 0.0) };
+                        let f = &s.flanges[made[0]];
+                        assert!(f.p.dist(turned(from, line, turn)) < tol && (f.len - len).abs() < tol, "{what}: {f:?}");
+                        let base = (97.0 - x0) * (60.0 - line) + sliver;
+                        assert!((s.base.area() - base).abs() < tol, "{what}: {} vs {base}", s.base.area());
+                        assert!((flat_area(&s) - (base + len * (ba + panel))).abs() < 1e-6, "{what}: {}", flat_area(&s));
+                        // (A sliver 0.0001 wide is below the flat pattern's shortest edge.)
+                        if hair < 0.0 || hair > 1e-3 {
+                            holds_the_flat_material(&s, &what);
+                        } else {
+                            let b = s.solid().unwrap_or_else(|e| panic!("{what}: no solid: {e}"));
+                            assert!(b.validity().is_empty() && b.shell_count() == 1, "{what}: {:?}", b.validity());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

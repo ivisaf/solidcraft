@@ -33,7 +33,7 @@ pub(crate) fn domain(s: &EvalSurface) -> Domain {
 }
 
 impl Domain {
-    fn clamp(&self, uv: [f64; 2]) -> [f64; 2] {
+    pub(crate) fn clamp(&self, uv: [f64; 2]) -> [f64; 2] {
         let mut out = uv;
         for (d, x) in out.iter_mut().enumerate() {
             if let (Some((a, b)), None) = (self.range[d], self.period[d]) {

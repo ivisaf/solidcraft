@@ -9,6 +9,28 @@ fn run(s: &mut Session, id: &str, params: Value) -> Value {
 }
 
 #[test]
+fn g2_fillet_survives_edit_undo_and_reopen() {
+    use solidcraft_doc::{Document, FeatureKind, FilletStyle};
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 20, "name": "Base"}));
+    run(&mut s, "solid.fillet", json!({"edges": [[20, 0, 10]], "radius": 2, "type": "g2", "name": "Smooth"}));
+    assert!(matches!(&s.doc.find_feature("Smooth").unwrap().kind, FeatureKind::Fillet { style: FilletStyle::Curvature, .. }));
+    let before = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    run(&mut s, "timeline.edit", json!({"feature": "Smooth", "set": {"radius": "3"}}));
+    let after = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!(after < before);
+    run(&mut s, "edit.undo", json!({}));
+    let undo = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((undo - before).abs() < 1e-6);
+    run(&mut s, "edit.redo", json!({}));
+    let mut reopened = Session::new(Document::from_json(&s.doc.to_json()).unwrap());
+    assert!(matches!(&reopened.doc.find_feature("Smooth").unwrap().kind, FeatureKind::Fillet { style: FilletStyle::Curvature, .. }));
+    let volume = run(&mut reopened, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((volume - after).abs() < 1e-6);
+    assert!(s.execute("solid.fillet", &json!({"edges": [[0, 0, 10]], "radius": 2, "type": "curvature", "fit": "reduce"})).is_err());
+}
+
+#[test]
 fn redefining_a_blend_replaces_persistent_edge_selection_and_survives_resize() {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20, "name": "Base"}));

@@ -31,7 +31,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SOLID", "MODIFY")
         .icon("fillet")
         .key("F")
-        .params("edges: [[x,y,z] point on edge | {body, index}]; radius: expr; body?; type?: constant|chord (radius is the width across)|variable (radius at the end nearest start, radius2 at the other; one end may be 0, where the round closes to the corner)|spline (the radius along the edge is a clamped B-spline from the end nearest start: radius is its first control radius, radii the rest, knots its knot vector from 0 to 1; one end may be 0); radius2?; start?: [x,y,z]; radii?: [expr, …]; knots?: [number, …]; mid?: [[position 0…1 from start, radius expr], …] (variable radii between the ends); smooth?: bool (smooth instead of straight between the radii); fit?: exact|reduce|taper (exact, the default: a radius too large for the geometry around the edges is refused; reduce: where it doesn't fit it is reduced to the largest that does, one radius for edges sharing a face; the smallest used is returned as `radius_applied`, each edge's as `radii_applied: [{edge: [x,y,z], radius}]`, and noted in the feature's warning; taper: along each straight edge between planar faces where it doesn't fit, the radius follows the room there as a smooth spline, down to 0 where a face closes to a point, noted in the feature's warning)"),
+        .params("edges: [[x,y,z] point on edge | {body, index}]; radius: expr; body?; type?: constant|curvature (alias g2: curvature-continuous quintic between planar faces along straight edges, one perpendicular planar end face at each end; radius sets the equivalent circular setback, not constant curvature; exact fit only)|chord (radius is the width across)|variable (radius at the end nearest start, radius2 at the other; one end may be 0, where the round closes to the corner)|spline (the radius along the edge is a clamped B-spline from the end nearest start: radius is its first control radius, radii the rest, knots its knot vector from 0 to 1; one end may be 0); radius2?; start?: [x,y,z]; radii?: [expr, …]; knots?: [number, …]; mid?: [[position 0…1 from start, radius expr], …] (variable radii between the ends); smooth?: bool (smooth instead of straight between the radii); fit?: exact|reduce|taper (exact, the default: a radius too large for the geometry around the edges is refused; reduce: where it doesn't fit it is reduced to the largest that does, one radius for edges sharing a face; the smallest used is returned as `radius_applied`, each edge's as `radii_applied: [{edge: [x,y,z], radius}]`, and noted in the feature's warning; taper: along each straight edge between planar faces where it doesn't fit, the radius follows the room there as a smooth spline, down to 0 where a face closes to a point, noted in the feature's warning)"),
     CommandSpec::new("solid.chamfer", "Chamfer", chamfer).at("SOLID", "MODIFY").icon("chamfer").params("edges: [[x,y,z] | {body, index}]; distance: expr; distance2?: expr (along the second face) | angle?: expr (from the first face); flip?: bool (which face is first: by default the one facing up most); body?"),
     CommandSpec::new("solid.combine", "Combine", combine).at("SOLID", "MODIFY").icon("combine").params("target: body; tools: [body]; operation?: join|cut|intersect; keep_tools?: bool; new_component?: bool (the result goes into a new component; component_name?)"),
     CommandSpec::new("solid.pattern.rectangular", "Rectangular Pattern", pattern_rect)
@@ -51,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SOLID", "CREATE")
         .icon("hole")
         .key("H")
-        .params("position: [x,y,z] on a face | sketch + points: [sketch point ids] (one hole each, perpendicular to the sketch) | sketch alone (every sketch point: standalone points and circle centres); direction?: [x,y,z] (default: into the face); diameter | thread (a tapped hole: the tap drill, major − pitch) | clearance: \"M6\" with fit?: close|normal|loose (ISO 273); depth? (default through all) | to?: [x,y,z] (To Object: drill to that face or point); type?: simple|drilled|counterbore|countersink; tip_angle?; cb_diameter?, cb_depth?; cs_diameter?, cs_angle?; thread?: \"M6\" (cosmetic)"),
+        .params("position: [x,y,z] on a face | sketch + points: [sketch point ids] (one hole each, perpendicular to the sketch, into the material on whichever side of the sketch plane it is) | sketch alone (every sketch point: standalone points and circle centres); flip?: bool (sketch points: drill to the other side); direction?: [x,y,z] (default: into the face, against its outward normal; one that leaves the face is mirrored into it; ignored with sketch points); diameter | thread (a tapped hole: the tap drill, major − pitch) | clearance: \"M6\" with fit?: close|normal|loose (ISO 273); depth? (default through all) | to?: [x,y,z] (To Object: drill to that face or point); type?: simple|drilled|counterbore|countersink; tip_angle?; cb_diameter?, cb_depth?; cs_diameter?, cs_angle?; thread?: \"M6\" (cosmetic)"),
     CommandSpec::new("solid.pipe", "Pipe", pipe)
         .at("SOLID", "CREATE")
         .icon("pipe")
@@ -67,7 +67,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("face.delete", "Delete Face", delete_face)
         .at("SOLID", "MODIFY")
         .icon("delete")
-        .params("faces: [[x,y,z] points on the faces]; body?. The neighbouring planes close the gap, as when a rounded edge, hole or boss is taken off"),
+        .params("faces: [[x,y,z] points on the faces]; body?; heal?: bool (default true: the neighbouring planes close the gap, as when a rounded edge, hole or boss is taken off; false: the gap stays open and the faces left are a surface body)"),
     CommandSpec::new("solid.offset_face", "Offset Face", offset_face)
         .at("SOLID", "MODIFY")
         .icon("offset_face")
@@ -418,7 +418,7 @@ fn add_feature_in(s: &mut Session, p: &Value, kind: FeatureKind, world: bool) ->
         } else if pts.is_empty() {
             Vec::new()
         } else {
-            solidcraft_doc::naming::face_names_at(&s.model.state(), &pts)
+            solidcraft_doc::face_point_names(&s.doc, &s.model.state(), &kind, s.active_component)
         }
     };
     // Primitives have no `targets` of their own: their `targets` are the bodies taking part (#259).
@@ -576,18 +576,7 @@ fn revolve(s: &mut Session, p: &Value) -> Result<Value> {
         }
         None => (feature_sketch(s, p, cmd)?, None),
     };
-    let axis = if let Some(o) = p.get("axis").filter(|v| v.is_object()) {
-        let origin = o.get("origin").and_then(vec3).unwrap_or(Vec3::ZERO);
-        let dir = o.get("dir").and_then(vec3).ok_or_else(|| bad(cmd, "axis needs `dir`"))?;
-        AxisRef::Line { origin, dir }
-    } else {
-        match str_(p, "axis") {
-            Some(a @ ("X" | "Y" | "Z")) => AxisRef::World { axis: a.into() },
-            Some(a @ ("x" | "y")) => AxisRef::SketchAxis { axis: a.into() },
-            Some(id) => AxisRef::SketchLine { curve: id.into() },
-            None => return Err(bad(cmd, "`axis` must be a sketch line id, x, y (sketch axes), X, Y, Z or {origin, dir}")),
-        }
-    };
+    let axis = axis_param(p, cmd)?;
     let angle = expr(p, "angle").unwrap_or_else(|| "360 deg".into());
     check_expr(s, &angle, Kind::Angle, cmd, "angle")?;
     let profiles = match face_profile {
@@ -621,6 +610,22 @@ fn revolve(s: &mut Session, p: &Value) -> Result<Value> {
         to,
     };
     add_feature(s, p, kind)
+}
+
+/// A revolve axis from its parameter: a sketch line id, the sketch's x or y axis, a world axis,
+/// or {origin, dir}.
+pub(super) fn axis_param(p: &Value, cmd: &str) -> Result<AxisRef> {
+    if let Some(o) = p.get("axis").filter(|v| v.is_object()) {
+        let origin = o.get("origin").and_then(vec3).unwrap_or(Vec3::ZERO);
+        let dir = o.get("dir").and_then(vec3).ok_or_else(|| bad(cmd, "axis needs `dir`"))?;
+        return Ok(AxisRef::Line { origin, dir });
+    }
+    match str_(p, "axis") {
+        Some(a @ ("X" | "Y" | "Z")) => Ok(AxisRef::World { axis: a.into() }),
+        Some(a @ ("x" | "y")) => Ok(AxisRef::SketchAxis { axis: a.into() }),
+        Some(id) => Ok(AxisRef::SketchLine { curve: id.into() }),
+        None => Err(bad(cmd, "`axis` must be a sketch line id, x, y (sketch axes), X, Y, Z or {origin, dir}")),
+    }
 }
 
 fn radius_expr(s: &Session, p: &Value, cmd: &str) -> Result<String> {
@@ -852,6 +857,7 @@ fn fillet(s: &mut Session, p: &Value) -> Result<Value> {
     let style = match str_(p, "type").map(str::to_ascii_lowercase).as_deref() {
         None | Some("constant") | Some("rolling_ball") => solidcraft_doc::FilletStyle::Constant,
         Some("chord") | Some("chord_length") => solidcraft_doc::FilletStyle::Chord,
+        Some("curvature") | Some("g2") => solidcraft_doc::FilletStyle::Curvature,
         Some("variable") => {
             let radius2 = req_expr(cmd, p, "radius2")?;
             check_expr(s, &radius2, Kind::Length, cmd, "radius2")?;
@@ -901,7 +907,7 @@ fn fillet(s: &mut Session, p: &Value) -> Result<Value> {
             }
             solidcraft_doc::FilletStyle::Spline { start, knots, radii }
         }
-        Some(o) => return Err(bad(cmd, format!("unknown fillet type `{o}` (constant, chord, variable or spline)"))),
+        Some(o) => return Err(bad(cmd, format!("unknown fillet type `{o}` (constant, chord, variable, spline or curvature)"))),
     };
     let fit = match str_(p, "fit").map(str::to_ascii_lowercase).as_deref() {
         None | Some("exact") => solidcraft_doc::FilletFit::Exact,
@@ -1351,7 +1357,8 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
             let n = ss.plane.normal();
             let first =
                 ids.first().and_then(|id| ss.sketch.points.iter().find(|q| &q.id == id)).map(|q| ss.plane.to_world(q.pos)).unwrap_or_default();
-            Some((solidcraft_doc::SketchPoints { sketch, ids }, first, -n))
+            let flip = p.get("flip").and_then(Value::as_bool).unwrap_or(false);
+            Some((solidcraft_doc::SketchPoints { sketch, ids, flip }, first, -n))
         }
         _ => None,
     };
@@ -1371,20 +1378,10 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
         (d, _) => match d {
             Some(d) => d.normalized().ok_or_else(|| bad(cmd, "`direction` must be non-zero"))?,
             None => {
-                // Into the planar face the position lies on.
+                // Into the face the position lies on: against the outward normal of the face
+                // nearest it (planar or curved), as it faces out of its own body.
                 let st = s.model.state();
-                let mut found = None;
-                for b in &st.bodies {
-                    let tol = (b.body.size() * 1e-3).max(1e-3);
-                    for f in b.body.faces(tol).unwrap_or_default() {
-                        if let Some(n) = f.plane_normal
-                            && (position - f.centroid).dot(n).abs() < tol * 10.0
-                        {
-                            found = Some(-n);
-                        }
-                    }
-                }
-                found.ok_or_else(|| bad(cmd, "no planar face at `position`; give `direction`"))?
+                solidcraft_doc::hole_direction_at(&st, position).ok_or_else(|| bad(cmd, "no face at `position`; give `direction`"))?
             }
         },
     };
@@ -1649,7 +1646,8 @@ fn scale(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn delete_face(s: &mut Session, p: &Value) -> Result<Value> {
     let faces = face_points(p, "face.delete")?;
-    add_feature(s, p, FeatureKind::DeleteFace { faces, body: str_(p, "body").map(str::to_string) })
+    let heal = bool_(p, "heal").unwrap_or(true);
+    add_feature(s, p, FeatureKind::DeleteFace { faces, body: str_(p, "body").map(str::to_string), heal })
 }
 
 fn offset_face(s: &mut Session, p: &Value) -> Result<Value> {

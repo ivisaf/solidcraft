@@ -20,7 +20,7 @@ fn text_move_updates_the_source_once_preserves_ids_and_roundtrips() {
     run(&mut s, "sketch.move", json!({"entities":[curve,ids[1]],"translate":[10,-2],"center":[3,4],"angle":30}));
     let sk = s.doc.sketch(1).unwrap();
     assert_eq!(sk.curves.iter().map(|c| c.id.clone()).collect::<Vec<_>>(), ids);
-    let LinkSource::Text { at, angle, text, height, font } = &sk.link(&link).unwrap().source else { panic!() };
+    let LinkSource::Text { at, angle, text, height, font, .. } = &sk.link(&link).unwrap().source else { panic!() };
     assert!(at.dist(Vec2::new(13.0, 2.0)) < 1e-9);
     assert!((*angle - 45_f64.to_radians()).abs() < 1e-12);
     assert_eq!((text.as_str(), *height, font), ("II", 10.0, &None));
@@ -149,4 +149,68 @@ fn text_move_rejects_malformed_values_without_changing_history() {
         assert_eq!(s.doc.to_json(), before);
         assert_eq!(s.undo.len(), undo);
     }
+}
+
+/// The box around the solved outlines of text `link` in sketch 1: (min, max).
+fn text_box(s: &Session, link: &str) -> (Vec2, Vec2) {
+    let state = s.world_state();
+    let sk = &state.sketch(1).unwrap().sketch;
+    let pts: Vec<Vec2> = sk.link_curves(link).into_iter().flat_map(|ci| sk.polyline(ci)).collect();
+    let lo = pts.iter().fold(Vec2::new(f64::MAX, f64::MAX), |m, p| Vec2::new(m.x.min(p.x), m.y.min(p.y)));
+    let hi = pts.iter().fold(Vec2::new(f64::MIN, f64::MIN), |m, p| Vec2::new(m.x.max(p.x), m.y.max(p.y)));
+    (lo, hi)
+}
+
+#[test]
+fn text_on_a_path_follows_its_curve_when_the_curve_moves() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    // (Away from the origin, which would hold a line's end.)
+    let line = run(&mut s, "sketch.line", json!({"points":[[0,-30],[80,-30]]}))["curves"][0].as_str().unwrap().to_string();
+    let t = run(&mut s, "sketch.text", json!({"text":"HH","at":[5,5],"height":10,"angle":30,"path":line,"align":"center"}));
+    let link = t["link"].as_str().unwrap().to_string();
+    // Centred on the line's middle, standing on it; `at` and the angle do not place it.
+    let (lo, hi) = text_box(&s, &link);
+    assert!(((lo.x + hi.x) / 2.0 - 40.0).abs() < 0.05 && (lo.y + 30.0).abs() < 1e-6 && (hi.y + 20.0).abs() < 0.05, "{lo:?} {hi:?}");
+    // The line moves up 20 mm: the text with it.
+    run(&mut s, "sketch.move", json!({"entities":[line],"translate":[0,20]}));
+    let (lo, hi) = text_box(&s, &link);
+    assert!((lo.y + 10.0).abs() < 1e-6 && ((lo.x + hi.x) / 2.0 - 40.0).abs() < 0.05, "{lo:?} {hi:?}");
+    // It is moved with its curve, not on its own.
+    let outline = s.doc.sketch(1).unwrap().curves.iter().find(|c| c.link.as_deref() == Some(link.as_str())).unwrap().id.clone();
+    let e = s.execute("sketch.move", &json!({"entities":[outline],"translate":[5,0]})).unwrap_err().to_string();
+    assert!(e.contains("follows its curve"), "{e}");
+    // Off the path again: at `at`, turned by its angle.
+    run(&mut s, "sketch.edit_text", json!({"link":link,"path":"","align":"left"}));
+    let (lo, _) = text_box(&s, &link);
+    assert!(lo.x > 0.0 && lo.y > 4.0 && lo.y < 6.0, "{lo:?}");
+    // A design with styled text reads back the same.
+    let saved = s.doc.to_json();
+    assert_eq!(solidcraft_doc::Document::from_json(&saved).unwrap().to_json(), saved);
+}
+
+#[test]
+fn text_style_parameters_are_checked() {
+    let (mut s, link, _) = setup();
+    for (params, error) in [
+        (json!({"link":link,"bold":true}), "no bold face"),
+        (json!({"link":link,"bold":"yes"}), "`bold` must be true or false"),
+        (json!({"link":link,"align":"justify"}), "`align` must be left, center or right"),
+        (json!({"link":link,"line_spacing":0}), "`line_spacing` must be a positive factor"),
+        (json!({"link":link,"letter_spacing":"wide"}), "`letter_spacing` must be a length"),
+        (json!({"link":link,"path":"no-such-curve"}), "not a curve of this sketch"),
+    ] {
+        let before = s.doc.to_json();
+        let e = s.execute("sketch.edit_text", &params).unwrap_err().to_string();
+        assert!(e.contains(error), "{params}: {e}");
+        assert_eq!(s.doc.to_json(), before);
+    }
+    run(&mut s, "sketch.edit_text", json!({"link":link,"italic":true,"align":"right","letter_spacing":1.5,"line_spacing":1.2}));
+    let LinkSource::Text { style, text, .. } = &s.doc.sketch(1).unwrap().link(&link).unwrap().source else { panic!() };
+    assert_eq!(text, "II");
+    assert!(style.italic && style.align == solidcraft_sketch::TextAlign::Right && style.letter_spacing == 1.5 && style.line_spacing == 1.2);
+    // Left out, a style stays.
+    run(&mut s, "sketch.edit_text", json!({"link":link,"text":"I"}));
+    let LinkSource::Text { style, .. } = &s.doc.sketch(1).unwrap().link(&link).unwrap().source else { panic!() };
+    assert!(style.italic && style.letter_spacing == 1.5);
 }

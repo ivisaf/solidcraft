@@ -226,3 +226,22 @@ remain valid in an inch design. Angular dimensions keep their angular units. Del
 retain trailing zeros. Component/canvas distance controls and inspection, parts-library
 and flat-pattern measurements follow design units too; parameter expressions and metric
 standard names retain their explicit authored units.
+
+### Reviewing mirror, pattern, and offset results
+
+Mirror, rectangular/circular Pattern, and Offset show the active selection step in their
+shared tool window. Click an input to change it; click a selected object again or Ctrl/Cmd-click
+it to remove it. Each input has its own Clear button. Source inputs show a count, and single
+references identify the chosen mirror line, direction, or centre. Box selection also works
+while the window is open. Sketch modify tools take geometry from the sketch being edited.
+
+Proposed sketch geometry appears **green** before confirmation. Change the inputs or values to
+update the preview, then press **OK**. **Cancel** discards the preview. A circular pattern centre
+can be an existing point or a position clicked in empty sketch space.
+
+Offset distances are editable driving dimensions: double-click a dimension or change its model
+parameter to resize the offset without moving its source curves. The selected side, distance,
+and association survive save/reopen and undo/redo. Symmetric offsets share one driving distance;
+Two Sides has an independent distance for each side. Disconnected selected curves or chains are
+all offset. Breaking an association retains its current geometry and removes that association's
+driver. Older offsets retain their saved fixed distances.

@@ -105,7 +105,11 @@ fn frame(app: &SolveApp, link: &str) -> Option<Frame> {
     let state = app.session.world_state();
     let sk = &state.sketch(sid)?.sketch;
     let source = sk.link(link).filter(|l| l.kind == LinkKind::Text)?;
-    let LinkSource::Text { at, height, angle, .. } = &source.source else { return None };
+    let LinkSource::Text { at, height, angle, style, .. } = &source.source else { return None };
+    // A text on a path follows its curve: it is not placed by hand.
+    if style.path.is_some() {
+        return None;
+    }
     let mut f = Frame { link: link.to_owned(), at: *at, height: *height, angle: *angle, min: Vec2::ZERO, max: Vec2::ZERO };
     let mut first = true;
     for p in sk.link_curves(link).into_iter().flat_map(|ci| sk.polyline(ci)) {

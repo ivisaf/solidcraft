@@ -478,7 +478,7 @@ every row's place.
 expression, undo and redo. Each cell is before → after the evaluation cache, with the number of
 features recomputed in parentheses. Release build, on a machine shared with other build jobs (load average about 45; the
 times vary by ±50 % run to run, so compare the recompute counts and the zeros). "Early" edits a parameter of the
-first sketch or feature, "late" one of the last feature.
+first sketch or feature, "late" one of the last features.
 
 | Design | Edit | Build | Edit | Set back | Undo | Redo |
 |---|---|---|---|---|---|---|

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::model::{Result, SketchError};
 
-static DEFAULT_FONT: &[u8] = include_bytes!("../fonts/LiberationSans-Regular.ttf");
+static DEFAULT_FONT: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/liberation-sans/LiberationSans-Regular.ttf"));
 
 /// Family name of the built-in font (also what an empty or absent font name means).
 pub const DEFAULT_FONT_FAMILY: &str = "Liberation Sans";
@@ -69,8 +69,47 @@ pub fn font_data(name: Option<&str>) -> Result<FontData> {
         .ok_or_else(|| SketchError::Invalid(format!("unknown font `{name}`: not an installed font family, and not a .ttf/.otf file path")))
 }
 
+/// The face of a font for a style: the bold and/or italic face of an installed family (or the
+/// file or built-in font itself). True with it: the font has no italic face, so the text is to
+/// be slanted instead. A bold style the font does not have is an error (bold is not made up).
+pub fn font_data_styled(name: Option<&str>, bold: bool, italic: bool) -> Result<(FontData, bool)> {
+    let trimmed = name.map(str::trim).unwrap_or("");
+    let installed = !(trimmed.is_empty() || normalize(trimmed) == normalize(DEFAULT_FONT_FAMILY) || is_path(trimmed));
+    if !installed || !(bold || italic) {
+        let data = font_data(name)?;
+        let (face_bold, face_italic) = ttf_parser::Face::parse(data.bytes(), data.index)
+            .map(|face| (face.is_bold(), face.is_italic() || face.is_oblique()))
+            .map_err(|e| SketchError::Invalid(format!("font: {e}")))?;
+        if bold && !face_bold {
+            let which = if trimmed.is_empty() || normalize(trimmed) == normalize(DEFAULT_FONT_FAMILY) {
+                "the built-in font".to_string()
+            } else {
+                format!("the font file `{trimmed}`")
+            };
+            return Err(SketchError::Invalid(format!("{which} has no bold face: choose an installed font, or its bold file")));
+        }
+        return Ok((data, italic && !face_italic));
+    }
+    if trimmed.len() > MAX_FONT_NAME {
+        return Err(SketchError::Invalid("the font name is too long".into()));
+    }
+    let Some((data, face_bold, face_italic)) = find_style_in(&font_dirs(), trimmed, bold, italic)? else {
+        return Err(SketchError::Invalid(format!("unknown font `{trimmed}`: not an installed font family, and not a .ttf/.otf file path")));
+    };
+    if bold && !face_bold {
+        return Err(SketchError::Invalid(format!("the font `{trimmed}` has no bold face")));
+    }
+    Ok((data, italic && !face_italic))
+}
+
 /// An installed face whose family, full or PostScript name is `name`, searched in `dirs`.
 pub fn find_family_in(dirs: &[PathBuf], name: &str) -> Result<Option<FontData>> {
+    Ok(find_style_in(dirs, name, false, false)?.map(|(data, _, _)| data))
+}
+
+/// The installed face of `name` (a family, full or PostScript name) nearest to the style, in
+/// `dirs`, with whether it is bold and italic.
+pub fn find_style_in(dirs: &[PathBuf], name: &str, bold: bool, italic: bool) -> Result<Option<(FontData, bool, bool)>> {
     let want = normalize(name);
     if want.is_empty() {
         return Ok(None);
@@ -83,21 +122,21 @@ pub fn find_family_in(dirs: &[PathBuf], name: &str) -> Result<Option<FontData>> 
         stem.len() >= 3 && (stem.contains(&want) || want.contains(&stem))
     });
     for group in [likely, rest] {
-        let mut best: Option<(u32, PathBuf, u32)> = None;
+        let mut best: Option<(u32, PathBuf, u32, bool, bool)> = None;
         for path in group {
             for face in face_names(path).iter() {
-                let score = face.score(&want);
-                if score > 0 && best.as_ref().is_none_or(|(b, _, _)| score > *b) {
-                    best = Some((score, path.clone(), face.index));
+                let score = face.score(&want, bold, italic);
+                if score > 0 && best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, path.clone(), face.index, face.bold, face.italic));
                 }
             }
-            if best.as_ref().is_some_and(|(s, _, _)| *s >= 4) {
+            if best.as_ref().is_some_and(|b| b.0 >= FULL_NAME_SCORE) {
                 break;
             }
         }
-        if let Some((_, path, index)) = best {
+        if let Some((_, path, index, face_bold, face_italic)) = best {
             let bytes = read_font(&path).map_err(|e| SketchError::Invalid(format!("font file `{}`: {e}", path.display())))?;
-            return Ok(Some(FontData { bytes: FontBytes::File(bytes), index }));
+            return Ok(Some((FontData { bytes: FontBytes::File(bytes), index }, face_bold, face_italic)));
         }
     }
     Ok(None)
@@ -189,22 +228,30 @@ fn family_name(table: &ttf_parser::name::Table) -> Option<String> {
 /// The names of one face of a font file (normalised), for matching.
 struct FaceNames {
     index: u32,
-    regular: bool,
+    bold: bool,
+    italic: bool,
     names: Vec<(u16, String)>,
 }
 
+/// A face named by its full or PostScript name: that face, whatever the style asked for.
+const FULL_NAME_SCORE: u32 = 40;
+
 impl FaceNames {
-    /// How well the face answers to a (normalised) name: 4 full or PostScript name, 3 family
-    /// name of a regular face, 2 family name of another style, 0 no match.
-    fn score(&self, want: &str) -> u32 {
+    /// How well the face answers to a (normalised) name in a style: its full or PostScript
+    /// name in that style, else its family's face of that style, else (lower) another face of
+    /// the family, bold matching first, else its full name in another style (a regular face's
+    /// full name is often the family's: "Arial" is not the bold Arial); 0 no match.
+    fn score(&self, want: &str, bold: bool, italic: bool) -> u32 {
         use ttf_parser::name_id;
+        let style =
+            if self.bold == bold && self.italic == italic { 30 } else { 20 + 2 * u32::from(self.bold == bold) + u32::from(self.italic == italic) };
         self.names
             .iter()
             .filter(|(_, n)| n == want)
             .map(|(id, _)| match *id {
-                name_id::FULL_NAME | name_id::POST_SCRIPT_NAME => 4,
-                name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY if self.regular => 3,
-                name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY => 2,
+                name_id::FULL_NAME | name_id::POST_SCRIPT_NAME if self.bold == bold && self.italic == italic => FULL_NAME_SCORE,
+                name_id::FULL_NAME | name_id::POST_SCRIPT_NAME => 10,
+                name_id::FAMILY | name_id::TYPOGRAPHIC_FAMILY => style,
                 _ => 0,
             })
             .max()
@@ -242,7 +289,7 @@ fn face_names(path: &Path) -> Arc<Vec<FaceNames>> {
                     Some((n.name_id, normalize(&text)))
                 })
                 .collect();
-            faces.push(FaceNames { index, regular: face.is_regular() || (!face.is_bold() && !face.is_italic()), names });
+            faces.push(FaceNames { index, bold: face.is_bold(), italic: face.is_italic() || face.is_oblique(), names });
         }
     }
     let faces = Arc::new(faces);
@@ -257,6 +304,13 @@ fn face_names(path: &Path) -> Arc<Vec<FaceNames>> {
 /// Lower-case letters and digits only: "DejaVu_Sans", "Dejavu Sans" and "dejavu-sans" are one name.
 fn normalize(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+}
+
+/// The file a font name refers to (after `~` and `%VAR%` expansion), or `None` for the built-in
+/// font or an installed family, so callers can vet the path before [`font_data`] reads it.
+pub fn font_file_path(name: &str) -> Option<PathBuf> {
+    let name = name.trim();
+    (is_path(name) && name.len() <= MAX_FONT_NAME).then(|| expand(name))
 }
 
 fn is_path(name: &str) -> bool {
@@ -393,4 +447,33 @@ fn read_font(path: &Path) -> std::result::Result<Arc<Vec<u8>>, String> {
         c.insert(path.to_path_buf(), bytes.clone());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ttf_parser::name_id;
+
+    /// A face of family "Arial" whose full name is `full`.
+    fn face(full: &str, bold: bool, italic: bool) -> FaceNames {
+        FaceNames { index: 0, bold, italic, names: vec![(name_id::FAMILY, normalize("Arial")), (name_id::FULL_NAME, normalize(full))] }
+    }
+
+    #[test]
+    fn a_style_picks_its_face_even_when_the_regular_face_is_named_like_the_family() {
+        // As installed: the regular face's full name is the family's own.
+        let faces =
+            [face("Arial", false, false), face("Arial Bold", true, false), face("Arial Italic", false, true), face("Arial Bold Italic", true, true)];
+        let best = |bold: bool, italic: bool| {
+            let scores: Vec<u32> = faces.iter().map(|f| f.score("arial", bold, italic)).collect();
+            let top = scores.iter().copied().max().unwrap_or(0);
+            faces.iter().zip(&scores).find(|(_, s)| **s == top).map(|(f, _)| (f.bold, f.italic))
+        };
+        for style in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(best(style.0, style.1), Some(style), "{style:?}");
+        }
+        // A full name still finds its face, whatever style is asked (it is the only one by that name).
+        assert!(face("Arial Bold", true, false).score("arialbold", false, false) > 0);
+        assert_eq!(face("Arial", false, false).score("times", false, false), 0);
+    }
 }

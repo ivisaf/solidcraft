@@ -31,6 +31,7 @@ pub mod motion;
 mod name_lookup;
 pub mod naming;
 mod params;
+pub mod physical_material;
 mod piece_names;
 mod profile_refs;
 pub mod progress;
@@ -41,12 +42,15 @@ mod project3d;
 pub use project3d::iso_grid;
 pub mod sheet;
 
-pub use assembly::{IDENTITY, Mat, Occurrence, apply_point, apply_vector, is_identity, map_point_expr, mat_inverse, mat_mul, rigid};
+pub use assembly::{
+    IDENTITY, MAX_PLACEMENT_DEPTH, MAX_PLACEMENTS, Mat, Occurrence, apply_point, apply_vector, is_identity, map_point_expr, mat_inverse, mat_mul,
+    rigid,
+};
 pub use document::*;
 pub use eval::{
     EdgeRef, FeatureResult, Model, ModelBody, ModelState, RevolveExtent, SolvedSketch, ThreadInfo, curve_pick_error, edge_names_for, edge_refs,
-    object_height, parse_metric_thread, pattern_matrices, revolve_extent, revolve_extent_with_convention, select_profiles, state_in_frame,
-    state_in_frame_at, through_all_distance, world_state,
+    face_point_names, face_point_state, hole_direction_at, object_height, parse_metric_thread, pattern_matrices, revolve_extent,
+    revolve_extent_with_convention, select_profiles, sketch_hole_direction, state_in_frame, state_in_frame_at, through_all_distance, world_state,
 };
 pub use params::{ParamRow, ParamUser, cycles};
 pub use solidcraft_cam as cam;

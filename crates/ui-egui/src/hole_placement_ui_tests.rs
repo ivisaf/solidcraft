@@ -467,12 +467,12 @@ fn select_other_over_a_dense_cluster_off_the_face_tests_no_triangles() {
 #[test]
 fn select_other_over_a_dense_cluster_by_a_curved_face_looks_it_up_once() {
     // The points in a sketch through the cylinder's axis, seen from the front: the face under the
-    // cursor is the curved side, which takes no hole. It is looked up once, its triangles not at
-    // all, and nothing is offered.
+    // cursor is the curved side. A hole goes on it where it is picked (sketch points snap only
+    // on flat faces): it is looked up once, its triangles not at all, and only the face is offered.
     let mut c = cylinder_with_cluster(json!({"plane": "XZ"}), [5.0, -10.0], "front");
     let many = c.many;
     let (list, (lookups, tested)) = c.select_other();
-    assert_eq!(list["open"], json!(false), "nothing for a Single hole here: {list}");
+    assert_eq!((rows_named(&list, "Point"), rows_named(&list, "Face")), (0, 1), "the curved face alone: {list}");
     assert_eq!(lookups, 1, "the curved face is looked up once for {many} points");
     assert_eq!(tested, 0, "no triangle of a curved face is looked at");
 }

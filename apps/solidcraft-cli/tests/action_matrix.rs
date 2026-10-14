@@ -639,7 +639,14 @@ fn action_matrix_worker() {
     }
     let list = actions(&s);
     let edit = driving_parameter(&s);
+    // Local runs only: `ACTION_MATRIX_ACTIONS=edge.fillet,edge.chamfer` tries just those actions
+    // (don't bless such a run), `ACTION_MATRIX_VALIDITY=1` adds each passing action's body check.
+    let only: Option<Vec<String>> = std::env::var("ACTION_MATRIX_ACTIONS").ok().map(|v| v.split(',').map(str::to_string).collect());
+    let validity = std::env::var_os("ACTION_MATRIX_VALIDITY").is_some();
     for (i, a) in list.iter().enumerate().skip(from) {
+        if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == a.action)) {
+            continue;
+        }
         // Whole families of pieces are sampled together (see [`family`]).
         let k = key(&design, &family(&a.entity), a.action);
         if !stable_hash(&k).is_multiple_of(sample) {
@@ -650,12 +657,37 @@ fn action_matrix_worker() {
         let mut scratch = s.scratch();
         let r = perform(&mut scratch, &a.act, &before);
         let mut line = outcome(&design, &a.entity, a.action, &r, t.elapsed().as_millis());
+        if validity && r.is_ok() {
+            let st = scratch.model.state();
+            let bad: Vec<String> = st.bodies.iter().flat_map(|b| b.body.validity().into_iter().map(|v| format!("{}: {v}", b.name))).collect();
+            line["validity"] = json!(bad);
+        }
         // What was sent, for reproducing a failure (kept in the results, not the baseline).
         line["command"] = match &a.act {
             Act::Run(id, p) => json!({"command": id, "params": p}),
             Act::Project { plane, edge } => json!({"command": "sketch.project", "params": {"refs": [edge]}, "sketch_plane": plane}),
         };
         emit(line);
+        // With ACTION_MATRIX_UNFOLD, sheet metal must still unfold and fold back after the action.
+        if r.is_ok() && std::env::var_os("ACTION_MATRIX_UNFOLD").is_some() {
+            let t = Instant::now();
+            let sheets: Vec<String> = scratch.model.state().sheets.iter().map(|sh| sh.body.clone()).collect();
+            let mut r = Ok(());
+            for body in &sheets {
+                for id in ["sheet.unfold", "sheet.refold"] {
+                    if r.is_ok() {
+                        r = scratch
+                            .execute(id, &json!({"body": body}))
+                            .map(|_| ())
+                            .map_err(|e| (command_kind(&e).to_string(), format!("{body}: {e}")));
+                    }
+                }
+            }
+            if !sheets.is_empty() {
+                let unfold: &'static str = Box::leak(format!("{}+unfold", a.action).into_boxed_str());
+                emit(outcome(&design, &a.entity, unfold, &r, t.elapsed().as_millis()));
+            }
+        }
         // The edit round: a driving parameter changes; the new feature still resolves.
         if r.is_ok()
             && let Some((name, expr)) = &edit
@@ -1051,6 +1083,18 @@ fn a_through_hole_into_a_shelled_box_rim() {
     );
 }
 
+/// #559: a 6 mm hole drilled at an angle through a 920 mm prism, its through-all tool nearly
+/// 1.9 m long beside a thin bar it misses. The bar's cut came out empty: the tool filled too
+/// little of its own box for the sampled shortcut, and the boolean's tolerances (from the
+/// tool's length) were wider than the hole.
+#[test]
+fn an_oblique_through_hole_beside_a_thin_bar() {
+    reproduces(
+        Some("examples/regressions/oblique_cut_of_cylinder.json"),
+        json!([{"command": "solid.hole", "params": {"diameter": 6.0, "position": [296.66666666666663, -458.66666666666663, 848.7633333333333]}}]),
+    );
+}
+
 #[test]
 fn a_hole_through_a_sheet_metal_base() {
     let mut c: Vec<Value> = rectangle(json!("XY"), [0., 0.], [60., 40.]).into();
@@ -1059,6 +1103,29 @@ fn a_hole_through_a_sheet_metal_base() {
         json!({"command": "solid.hole", "params": {"position": [30, 20, 0], "direction": [0, 0, 1], "diameter": 5}}),
     ]);
     reproduces(None, Value::Array(c));
+}
+
+/// `face.hole` on a rim of the sheet metal corpus (#560): drilled along the panel, the hole is a
+/// bore of that panel, and the part still unfolds and folds back.
+#[test]
+fn a_hole_drilled_into_a_sheet_metal_rim() {
+    // What the matrix sends: the face's point, the hole square into it.
+    for (design, at, diameter) in [
+        // The base's end rim of the L bracket, through to the other end.
+        ("typical/sheet-metal-bracket", [60.0, 7.777777777777779, 0.8333333333333333], 0.667),
+        // The end rim of a tray's wall, beside the corner.
+        ("oracle/69-sm-tray", [99.58333333333333, 4.267766952966369, 15.0], 0.333),
+    ] {
+        let Some((_, path)) = designs().into_iter().find(|(n, _)| n == design) else { panic!("no design {design}") };
+        let mut s = load(&path).unwrap();
+        let before = errors(&s);
+        let start = s.doc.features.len();
+        s.execute("solid.hole", &json!({"position": at, "diameter": diameter})).unwrap_or_else(|e| panic!("{design}: {e}"));
+        check(&s, start, &before).unwrap_or_else(|(kind, e)| panic!("{design}: {kind}: {e}"));
+        for id in ["sheet.unfold", "sheet.refold"] {
+            s.execute(id, &json!({})).unwrap_or_else(|e| panic!("{design} {id}: {e}"));
+        }
+    }
 }
 
 #[test]

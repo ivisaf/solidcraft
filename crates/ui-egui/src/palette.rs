@@ -67,7 +67,9 @@ pub fn palette_bar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 ui.label(RichText::new("›").strong().color(t.accent));
                 let r = ui.add(
                     egui::TextEdit::singleline(&mut app.palette.text)
-                        .hint_text("Type a command, e.g. Extrude {\"distance\": 20}  — or press S to search")
+                        // The JSON example keeps its braces here rather than in the catalog, so the
+                        // placeholder parser never has to treat JSON punctuation as a name.
+                        .hint_text(crate::i18n::format("ui.command_palette_hint", &[("example", "Extrude {\"distance\": 20}")]))
                         .desired_width(520.0),
                 );
                 if app.palette.focus {

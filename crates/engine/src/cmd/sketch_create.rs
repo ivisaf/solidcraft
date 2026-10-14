@@ -3,7 +3,14 @@
 
 use serde_json::{Value, json};
 use solidcraft_geom::Vec2;
-use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Sketch};
+use solidcraft_sketch::{ConstraintKind, CurveKind, LinkKind, LinkSource, Sketch, TextAlign, TextStyle};
+
+/// The style parameters of `sketch.text` and `sketch.edit_text`.
+macro_rules! text_style_doc {
+    () => {
+        "bold?, italic?: bool (an installed family's bold or italic face; italic without one is slanted), align?: left|center|right (the lines against `at`, or along the path), letter_spacing?: extra mm between letters, line_spacing?: times the font's line distance (default 1), path?: a curve id of the sketch the baseline follows (\"\": none; `at` and `angle` then do not place the text), reverse?: bool (the other way along the path)"
+    };
+}
 
 use super::sketch::{add_c, circumcircle, edit, ids_of, mark_construction, req_parg, result, slot};
 use super::{CommandSpec, in_sketch};
@@ -84,20 +91,62 @@ pub static COMMANDS: &[CommandSpec] = &[
         .enabled(in_sketch)
         .params("curves: [line ids], value?: bool (default toggles): centerline line type (not in profiles; an axis)"),
     CommandSpec::new("sketch.text", "Text", text).at("SKETCH", "CREATE").icon("text").enabled(in_sketch).params(concat!(
-        "text: string (\\n breaks lines), at: baseline start [x,y], height?: capital height mm (default 5), angle?: deg, font?: an installed font's family or full name, or a .ttf/.otf file path (~ and %VAR% expand; default: the built-in Liberation Sans)",
+        "text: string (\\n breaks lines), at: baseline start [x,y], height?: capital height mm (default 5), angle?: deg, font?: an installed font's family or full name, or a .ttf/.otf file path (~ and %VAR% expand; default: the built-in Liberation Sans), ",
+        text_style_doc!(),
         created_doc!()
     )),
     CommandSpec::new("sketch.edit_text", "Edit Text", edit_text)
         .enabled(in_sketch)
         .live(edit_text_live)
         .params(concat!(
-            "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg, font?: family or file path (empty: the built-in font); live?: bool: one frame of an interactive resize or rotation (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
+            "link: the text's link id (or entity: one of its curves), text?, at?, height?, angle?: deg, font?: family or file path (empty: the built-in font), ",
+            text_style_doc!(),
+            " (each kept when left out); live?: bool: one frame of an interactive change (the sketch is solved, the features after it stay as they were until `sketch.drag_end`)",
             created_doc!()
         )),
 ];
 
-fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option<String>)>) -> Result<LinkSource> {
-    let (t0, at0, h0, a0, f0) = old.unwrap_or((String::new(), Vec2::ZERO, 5.0, 0.0, None));
+/// The style a command's parameters give, over `old`.
+fn text_style(p: &Value, cmd: &str, old: TextStyle) -> Result<TextStyle> {
+    let mut style = old;
+    for (key, slot) in [("bold", &mut style.bold), ("italic", &mut style.italic), ("reverse", &mut style.reverse)] {
+        match p.get(key) {
+            None | Some(Value::Null) => {}
+            Some(Value::Bool(b)) => *slot = *b,
+            Some(_) => return Err(bad(cmd, format!("`{key}` must be true or false"))),
+        }
+    }
+    match p.get("align") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(a)) => {
+            style.align = match a.trim().to_ascii_lowercase().as_str() {
+                "left" => TextAlign::Left,
+                "center" | "centre" => TextAlign::Center,
+                "right" => TextAlign::Right,
+                _ => return Err(bad(cmd, "`align` must be left, center or right")),
+            }
+        }
+        Some(_) => return Err(bad(cmd, "`align` must be left, center or right")),
+    }
+    if p.get("letter_spacing").is_some_and(|v| !v.is_null()) {
+        style.letter_spacing =
+            num(p, "letter_spacing").filter(|v| v.is_finite()).ok_or_else(|| bad(cmd, "`letter_spacing` must be a length in mm"))?;
+    }
+    if p.get("line_spacing").is_some_and(|v| !v.is_null()) {
+        style.line_spacing =
+            num(p, "line_spacing").filter(|v| v.is_finite() && *v > 0.0).ok_or_else(|| bad(cmd, "`line_spacing` must be a positive factor"))?;
+    }
+    match p.get("path") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(c)) if c.trim().is_empty() => style.path = None,
+        Some(Value::String(c)) => style.path = Some(c.trim().to_string()),
+        Some(_) => return Err(bad(cmd, "`path` must be a curve id")),
+    }
+    Ok(style)
+}
+
+fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option<String>, TextStyle)>) -> Result<LinkSource> {
+    let (t0, at0, h0, a0, f0, s0) = old.unwrap_or((String::new(), Vec2::ZERO, 5.0, 0.0, None, TextStyle::default()));
     let text = str_(p, "text").map(str::to_string).unwrap_or(t0);
     if text.trim().is_empty() {
         return Err(bad(cmd, "`text` must not be empty"));
@@ -117,9 +166,14 @@ fn text_source(p: &Value, cmd: &str, old: Option<(String, Vec2, f64, f64, Option
         Some(Value::String(f)) => Some(f.trim().to_string()),
         Some(_) => return Err(bad(cmd, "`font` must be a font family name or a font file path")),
     };
-    // An unknown font or an unreadable file is an error now, not a lost link later.
-    solidcraft_sketch::font_data(font.as_deref()).map_err(|e| bad(cmd, e.to_string()))?;
-    Ok(LinkSource::Text { text, at, height, angle, font })
+    let style = text_style(p, cmd, s0)?;
+    // A font file an agent names must lie in its folders (installed families are found by name).
+    if let Some(path) = font.as_deref().and_then(solidcraft_sketch::font_file_path) {
+        solidcraft_io::vfs::check(&path.to_string_lossy()).map_err(|e| bad(cmd, e.to_string()))?;
+    }
+    // An unknown font, an unreadable file or a style the font lacks is an error now, not a lost link later.
+    solidcraft_sketch::font_data_styled(font.as_deref(), style.bold, style.italic).map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(LinkSource::Text { text, at, height, angle, font, style })
 }
 
 fn text(s: &mut Session, p: &Value) -> Result<Value> {
@@ -131,7 +185,12 @@ fn text(s: &mut Session, p: &Value) -> Result<Value> {
     let id = s.active_sketch.ok_or_else(|| bad(cmd, "no sketch is being edited"))?;
     let mut doc = (*s.doc).clone();
     let mut sk = doc.sketch(id)?.clone();
-    let l = super::sketch_project::add_link(s, &doc, id, &mut sk, LinkKind::Text, src)?;
+    // A text needs nothing outside its sketch (a path is one of its curves).
+    let geom = sk.text_source_geometry(&src).map_err(|e| bad(cmd, e.to_string()))?;
+    if geom.is_empty() {
+        return Err(bad(cmd, "the text makes no outline"));
+    }
+    let l = sk.add_link(LinkKind::Text, src, &geom)?;
     let curves = ids_of(&sk, &sk.link_curves(&l));
     *doc.sketch_mut(id)? = sk;
     *s.doc_mut() = doc;
@@ -150,15 +209,18 @@ pub(super) fn text_link<'a>(sk: &'a Sketch, entity: &str) -> Option<&'a str> {
 
 /// Transform a text source as a unit; generated outlines remain linked and editable.
 pub(super) fn move_text(sk: &mut Sketch, link: &str, translate: Vec2, rotation: f64, center: Vec2, copy: bool) -> Result<Vec<usize>> {
-    let Some(LinkSource::Text { text, at, height, angle, font }) = sk.link(link).map(|l| l.source.clone()) else {
+    let Some(LinkSource::Text { text, at, height, angle, font, style }) = sk.link(link).map(|l| l.source.clone()) else {
         return Err(bad("sketch.move", "the selected source is not text"));
     };
+    if style.path.is_some() {
+        return Err(bad("sketch.move", "a text on a path follows its curve: move the curve, or take the text off it"));
+    }
     let q = at - center;
     let (sin, cos) = rotation.sin_cos();
     let at = center + Vec2::new(q.x * cos - q.y * sin, q.x * sin + q.y * cos) + translate;
     let angle = angle + rotation;
-    let geom = solidcraft_sketch::text_geometry_in(font.as_deref(), &text, at, height, angle)?;
-    let source = LinkSource::Text { text, at, height, angle, font };
+    let geom = solidcraft_sketch::text_geometry_styled(font.as_deref(), &text, at, height, angle, &style, None)?;
+    let source = LinkSource::Text { text, at, height, angle, font, style };
     let link = if copy {
         sk.add_link(LinkKind::Text, source, &geom)?
     } else {
@@ -201,12 +263,14 @@ fn apply_text_edit(sk: &mut Sketch, p: &Value) -> Result<Value> {
         _ => return Err(bad(cmd, "give `link` or `entity`")),
     };
     let old = match sk.link(&l).map(|x| (x.kind, x.source.clone())) {
-        Some((LinkKind::Text, LinkSource::Text { text, at, height, angle, font })) => (text, at, height, angle, font),
+        Some((LinkKind::Text, LinkSource::Text { text, at, height, angle, font, style })) => (text, at, height, angle, font, style),
         _ => return Err(bad(cmd, format!("`{l}` is not text"))),
     };
     let src = text_source(p, cmd, Some(old))?;
-    let LinkSource::Text { text, at, height, angle, font } = &src else { return Err(bad(cmd, "text")) };
-    let geom = solidcraft_sketch::text_geometry_in(font.as_deref(), text, *at, *height, *angle)?;
+    let geom = sk.text_source_geometry(&src).map_err(|e| bad(cmd, e.to_string()))?;
+    if geom.is_empty() {
+        return Err(bad(cmd, "the text makes no outline"));
+    }
     sk.set_link_source(&l, src.clone());
     sk.update_link(&l, &geom)?;
     let curves = ids_of(sk, &sk.link_curves(&l));

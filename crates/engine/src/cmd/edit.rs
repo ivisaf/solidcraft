@@ -667,7 +667,7 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
     }
     // New face points: their faces' names now.
     if nf.kind.face_points() != f.kind.face_points() {
-        nf.face_names = solidcraft_doc::naming::face_names_at(&s.model.state_before(id), &nf.kind.face_points());
+        nf.face_names = solidcraft_doc::face_point_names(&s.doc, &s.model.state_before(id), &nf.kind, nf.component);
     }
     if let Some(slot) = s.doc_mut().feature_mut(id) {
         *slot = nf;
@@ -821,7 +821,7 @@ fn input_keys(kind: &FeatureKind) -> Vec<(String, solidcraft_doc::expr::Kind)> {
                     *key = format!("fillet.control.{i}");
                 }
             }
-            solidcraft_doc::FilletStyle::Constant | solidcraft_doc::FilletStyle::Chord => {}
+            solidcraft_doc::FilletStyle::Constant | solidcraft_doc::FilletStyle::Chord | solidcraft_doc::FilletStyle::Curvature => {}
         }
     }
     keys

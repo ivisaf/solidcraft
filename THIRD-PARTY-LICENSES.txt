@@ -13349,11 +13349,11 @@ truck-topology 0.6.0: Apache-2.0 (https://github.com/ricosjp/truck)
 Bundled fonts (SIL Open Font License, Version 1.1)
 ================================================================================
 
-- LiberationSans-Regular.ttf (crates/sketch/fonts/LiberationSans-Regular.ttf)
+- LiberationSans-Regular.ttf (assets/fonts/liberation-sans/LiberationSans-Regular.ttf)
   Copyright 2012 Red Hat, Inc. (Liberation Fonts 2.x; digitized data Google)
   Source: https://github.com/liberationfonts
 
-- BIZUDPGothic-Regular.ttf (apps/solidcraft-web/fonts/BIZUDPGothic-Regular.ttf)
+- BIZUDPGothic-Regular.ttf (assets/fonts/biz-udp-gothic/BIZUDPGothic-Regular.ttf)
   Copyright 2022 The BIZ UDGothic Project Authors (https://github.com/googlefonts/morisawa-biz-ud-mincho)
   Source: https://github.com/googlefonts/morisawa-biz-ud-gothic
 

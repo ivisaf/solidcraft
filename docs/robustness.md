@@ -68,7 +68,11 @@ where the space it moves through holds what the Boolean leaves there anyway
 (nothing of the target for a cut's face, the target's material for a join's);
 a face with no such room stays, and the exact planar fallback is tried first.
 A tool nudge changes the relative operand
-placement and reports both its translation magnitude and rotation angle.
+placement and reports both its translation magnitude and rotation angle. When it
+fails, or leaves a sliver face (narrower than 1/200 of the part), it is tried the
+other way too: one way can push a face into a curved face it only touched (a cut
+whose end lies tangent to a round side) and leave a sliver of it, where the other
+way parts them (#897, #827).
 Exact planar and piecewise fallbacks report zero displacement. The existing
 volume and spatial acceptance checks still apply to all results.
 
