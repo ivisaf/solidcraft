@@ -227,7 +227,7 @@ impl FeatureKind {
             }
             FeatureKind::Fillet { edges, style, .. } => {
                 edges.iter_mut().for_each(pt);
-                if let crate::FilletStyle::Variable { start, .. } = style {
+                if let crate::FilletStyle::Variable { start, .. } | crate::FilletStyle::Spline { start, .. } = style {
                     pt(start);
                 }
             }
@@ -263,8 +263,12 @@ impl FeatureKind {
                 dir(direction);
             }
             FeatureKind::Thread { face, .. } => pt(face),
-            FeatureKind::SheetFlange { edges, .. } | FeatureKind::SheetHem { edges, .. } => edges.iter_mut().for_each(pt),
-            FeatureKind::SheetConvert { face, .. } => pt(face),
+            FeatureKind::SheetFlange { edges, .. } => edges.iter_mut().for_each(|e| pt(&mut e.point)),
+            FeatureKind::SheetHem { edges, .. } => edges.iter_mut().for_each(pt),
+            FeatureKind::SheetConvert { face, bends, .. } => {
+                pt(face);
+                bends.iter_mut().for_each(pt);
+            }
             FeatureKind::SheetFold { a, b, fixed, .. } => {
                 pt(a);
                 pt(b);
@@ -317,6 +321,7 @@ impl FeatureKind {
             }
             FeatureKind::Revolve { .. }
             | FeatureKind::Extrude { .. }
+            | FeatureKind::SurfaceExtrude { .. }
             | FeatureKind::Combine { .. }
             | FeatureKind::Loft { .. }
             | FeatureKind::Sweep { .. }
@@ -332,6 +337,7 @@ impl FeatureKind {
             | FeatureKind::MeshConvert { .. }
             | FeatureKind::BodyTransfer { .. } => {}
             FeatureKind::Patch { edges, .. } | FeatureKind::SurfaceExtend { edges, .. } => edges.iter_mut().for_each(pt),
+            FeatureKind::Unstitch { faces, .. } | FeatureKind::ReverseNormal { faces, .. } => faces.iter_mut().for_each(pt),
             FeatureKind::SurfaceTrim { plane, tool, keep, .. } => {
                 map_plane_ref(m, plane);
                 if let Some(t) = tool {

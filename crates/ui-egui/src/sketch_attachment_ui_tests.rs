@@ -115,10 +115,16 @@ fn lost_attachment_ghost_rebind_preview_cancel_apply_and_undo_preserve_sketch() 
     let repaired = h.app.session.doc.to_json();
     let path = h.dir.join("rebound-face.solidcraft");
     h.app.run("file.save", json!({"path":path})).unwrap();
+    // Saving the untitled design names it after its file; everything else is exact.
+    let named = |doc: &str| {
+        let mut doc = solidcraft_engine::doc::Document::from_json(doc).unwrap();
+        doc.name = "rebound-face".into();
+        doc.to_json()
+    };
     h.app.run("edit.undo", json!({})).unwrap();
-    assert_eq!(h.app.session.doc.to_json(), before);
+    assert_eq!(h.app.session.doc.to_json(), named(&before));
     h.app.run("doc.open", json!({"path":path})).unwrap();
-    assert_eq!(h.app.session.doc.to_json(), repaired);
+    assert_eq!(h.app.session.doc.to_json(), named(&repaired));
     assert_eq!(raw_sketch(&h, sketch), raw);
     assert!(h.app.session.model.result(sketch).unwrap().error.is_none());
 }
@@ -323,4 +329,44 @@ fn nested_anchor_saved_fixed_conversion_preserves_rotated_second_author_plane() 
     assert!(shown.x.dist(expected.x) < 1e-7 && shown.y.dist(expected.y) < 1e-7);
     h.app.run("edit.undo", json!({})).unwrap();
     assert_eq!(h.app.session.doc.to_json(), before);
+}
+
+/// Issue #489: extrude, sketch a rectangle over the whole top face (its corners snap to the
+/// face's projected boundary), extrude it up as a Join, then pick the new top face for a sketch.
+#[test]
+fn picked_top_face_of_a_stacked_join_extrude_takes_a_sketch() {
+    let mut h = Harness::new();
+    h.app.ui.show_origin = false;
+    h.app.run("sketch.create", json!({"plane":"XY","name":"Base"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,40]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("solid.extrude", json!({"distance":10,"name":"First"})).unwrap();
+    h.call("ui.view", json!({"view":"top"}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.settle();
+    let pick_face = |h: &mut Harness, z: f64| {
+        h.step(&json!({"start":"sketch.create"})).unwrap();
+        h.step(&json!({"click":{"world":[20,20,z]}})).unwrap();
+        h.settle();
+        let error = h.app.dialog.as_ref().and_then(|d| d.error.clone());
+        let sketch = h.app.session.active_sketch.unwrap_or_else(|| panic!("top face at z={z} must take a sketch: {error:?}"));
+        let FeatureKind::Sketch { plane: PlaneRef::Face { anchor: Some(_), .. }, .. } = &h.app.session.doc.feature(sketch).unwrap().kind else {
+            panic!("the top face at z={z} must give a certified attachment");
+        };
+        sketch
+    };
+    pick_face(&mut h, 10.);
+    h.step(&json!({"start":"sketch.rectangle.two_point"})).unwrap();
+    h.step(&json!({"click":{"world":[0,0,10]}})).unwrap();
+    h.step(&json!({"click":{"world":[40,40,10]}})).unwrap();
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.app.finish_sketch();
+    h.app.run("solid.extrude", json!({"distance":10,"operation":"join","name":"Second"})).unwrap();
+    assert_eq!(h.app.session.model.state().bodies.len(), 1);
+    h.settle();
+    let top = pick_face(&mut h, 20.);
+    let FaceAttachmentStatus::Healthy { plane, .. } = h.app.session.placed_document().sketch_face_attachment(top, &h.app.session.model) else {
+        panic!("attachment must be healthy");
+    };
+    assert!((plane.origin.z - 20.).abs() < 1e-9);
 }

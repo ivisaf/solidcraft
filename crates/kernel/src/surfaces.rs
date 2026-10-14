@@ -1,12 +1,14 @@
-//! Surface bodies (open shells) and the operations that turn them into solids: Patch (a planar
-//! face filling a closed loop of edges or a sketch region), Stitch (surfaces sharing edges sewn
+//! Surface bodies (open shells) and the operations that turn them into solids: Patch (a face
+//! filling a closed loop of edges — planar, or B-spline patches for a loop that is not — or a
+//! planar sketch region), Stitch (surfaces sharing edges sewn
 //! into one body, a solid when they close), Trim (a surface cut by a tool, one side kept),
-//! Thicken (a surface offset along its normals into a solid) and copying faces out of a body.
+//! Thicken (a surface offset along its normals into a solid), copying faces out of a body, and
+//! sheets swept from sketch curves (surface extrude).
 
 use std::collections::HashMap;
 
 use mt::{BoundedCurve, InnerSpace, MetricSpace, ParametricCurve, ParametricSurface3D, SearchNearestParameter};
-use solidcraft_geom::{Plane, Region2, Vec3};
+use solidcraft_geom::{Plane, Region2, Seg2, Vec3};
 use truck_modeling as mt;
 
 use crate::body::{Body, from_p3, p3};
@@ -30,6 +32,8 @@ pub(crate) fn surface_body(faces: Vec<mt::Face>) -> Body {
 fn surface_of(shell: mt::Shell) -> Body {
     Body {
         solid: std::sync::Arc::new(mt::Solid::new_unchecked(vec![shell])),
+        size: 0.0,
+        volume: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
         coarse_missing: None,
         mesh: None,
         color: None,
@@ -60,6 +64,42 @@ pub fn patch_region(plane: &Plane, region: &Region2) -> Result<Body> {
     Ok(rebuilt_body(surface_body(vec![f]), &[], &rec))
 }
 
+/// Most curve chains one surface extrude takes.
+const MAX_CHAINS: usize = 10_000;
+
+/// A surface extruded from chains of sketch segments on `plane`: each chain (open, or closed
+/// such as a profile's boundary) moved straight from `start` to `end` along the plane normal
+/// (offsets in mm). The walls it sweeps form one surface body with no caps. Its history has no
+/// operands: every face is new.
+pub fn extrude_sheet(plane: &Plane, chains: &[Vec<Seg2>], start: f64, end: f64) -> Result<Body> {
+    if !crate::build::frame_ok(plane) {
+        return Err(KernelError::Invalid("extrude frame is not finite and orthonormal".into()));
+    }
+    if !(start.is_finite() && end.is_finite() && start.abs() < 1e7 && end.abs() < 1e7) {
+        return Err(KernelError::Invalid("extrude distance is not finite".into()));
+    }
+    let (lo, hi) = if end >= start { (start, end) } else { (end, start) };
+    if hi - lo < 1e-6 {
+        return Err(KernelError::Invalid("extrude distance is zero".into()));
+    }
+    if chains.is_empty() || chains.len() > MAX_CHAINS {
+        return Err(KernelError::Invalid("pick the curves or profiles to extrude".into()));
+    }
+    let base = plane.offset(lo);
+    let along = crate::body::v3(plane.normal() * (hi - lo));
+    let mut rec = Rebuild::default();
+    let mut faces = Vec::new();
+    for chain in chains {
+        let wire = crate::build::chain_wire(&base, chain)?;
+        let walls: mt::Shell = guard("surface extrude", || Ok(mt::builder::tsweep(&wire, along)))?;
+        for f in walls.face_iter() {
+            rec.made(f, Vec::new());
+            faces.push(f.clone());
+        }
+    }
+    Ok(rebuilt_body(surface_body(faces), &[], &rec))
+}
+
 /// The edge of a body nearest a point (by samples along each edge).
 pub(crate) fn edge_near(body: &Body, p: Vec3) -> Option<mt::Edge> {
     let mut best: Option<(f64, mt::Edge)> = None;
@@ -76,13 +116,31 @@ pub(crate) fn edge_near(body: &Body, p: Vec3) -> Option<mt::Edge> {
     best.filter(|(d, _)| *d <= body.size() * 0.05 + 1e-6).map(|(_, e)| e)
 }
 
-/// A planar surface filling a closed loop of a body's edges (each picked by a point on it). Its
-/// history is over `[body]`: the face is new, its edges the body's.
+/// A surface filling a closed loop of a body's edges (each picked by a point on it): one face on
+/// the body's own edges, planar when the loop is certainly planar ([`crate::plane_fit`]), else a
+/// B-spline height field over the loop's plane ([`crate::fill`]; loops that do not bound one are
+/// refused). Its history is over `[body]`: the face is new, its edges the body's own.
 pub fn patch_edges(body: &Body, at: &[Vec3]) -> Result<Body> {
     body.require_brep("patch")?;
     if at.is_empty() || at.len() > 10_000 {
         return Err(KernelError::Invalid("pick the edges of a closed loop".into()));
     }
+    guard("patch", || {
+        let chain = picked_loop(body, at)?;
+        let Some(face) = crate::plane_fit::planar_face(&chain, crate::fill::planarity_tolerance(body))? else {
+            // Not certainly planar: a fitted surface.
+            return crate::fill::fill_loop(body, &chain);
+        };
+        // A new face on the body's own edges.
+        let mut rec = Rebuild::default();
+        rec.made(&face, Vec::new());
+        Ok(rebuilt_body(surface_body(vec![face]), &[&body.solid], &rec))
+    })
+}
+
+/// The edges of `body` picked by points on them, chained into one closed loop (each turned to
+/// run along it). Call it under [`guard`]: sampling an intersection curve can fail in truck.
+pub(crate) fn picked_loop(body: &Body, at: &[Vec3]) -> Result<Vec<mt::Edge>> {
     let mut edges: Vec<mt::Edge> = Vec::new();
     for p in at {
         let e = edge_near(body, *p).ok_or_else(|| KernelError::Invalid(format!("no edge at {p:?}")))?;
@@ -90,34 +148,25 @@ pub fn patch_edges(body: &Body, at: &[Vec3]) -> Result<Body> {
             edges.push(e);
         }
     }
-    guard("patch", || {
-        // Chain the edges into one loop (turning them round as needed).
-        let mut pool = edges;
-        let first = pool.pop().ok_or_else(|| KernelError::Invalid("no edges".into()))?;
-        let start = first.front().id();
-        let mut at_v = first.back().clone();
-        let mut chain = vec![first];
-        while at_v.id() != start {
-            let k = pool
-                .iter()
-                .position(|e| e.front().id() == at_v.id() || e.back().id() == at_v.id())
-                .ok_or_else(|| KernelError::Invalid("the edges do not form a closed loop".into()))?;
-            let e = pool.remove(k);
-            let e = if e.front().id() == at_v.id() { e } else { e.inverse() };
-            at_v = e.back().clone();
-            chain.push(e);
-        }
-        if !pool.is_empty() {
-            return Err(KernelError::Invalid("the edges form more than one loop".into()));
-        }
-        let wire: mt::Wire = chain.into();
-        let face = mt::builder::try_attach_plane(&[wire])
-            .map_err(|_| KernelError::Invalid("not supported yet: patching a loop that is not planar".into()))?;
-        // A new face on the body's own edges.
-        let mut rec = Rebuild::default();
-        rec.made(&face, Vec::new());
-        Ok(rebuilt_body(surface_body(vec![face]), &[&body.solid], &rec))
-    })
+    let mut pool = edges;
+    let first = pool.pop().ok_or_else(|| KernelError::Invalid("no edges".into()))?;
+    let start = first.front().id();
+    let mut at_v = first.back().clone();
+    let mut chain = vec![first];
+    while at_v.id() != start {
+        let k = pool
+            .iter()
+            .position(|e| e.front().id() == at_v.id() || e.back().id() == at_v.id())
+            .ok_or_else(|| KernelError::Invalid("the edges do not form a closed loop".into()))?;
+        let e = pool.remove(k);
+        let e = if e.front().id() == at_v.id() { e } else { e.inverse() };
+        at_v = e.back().clone();
+        chain.push(e);
+    }
+    if !pool.is_empty() {
+        return Err(KernelError::Invalid("the edges form more than one loop".into()));
+    }
+    Ok(chain)
 }
 
 /// Faces of a body copied out as a surface body (faces picked by points on them). Its history is
@@ -135,6 +184,67 @@ pub fn copy_faces(body: &Body, at: &[Vec3]) -> Result<Body> {
     }
     let copied = surface_body(chosen.into_iter().filter_map(|i| faces.get(i).map(|f| (*f).clone())).collect());
     Ok(rebuilt_body(copied, &[&body.solid], &Rebuild::default()))
+}
+
+/// The faces picked by points on them (each once, in the order picked); every face when no
+/// point is given.
+fn picked_faces(body: &Body, at: &[Vec3]) -> Result<Vec<usize>> {
+    if at.len() > 10_000 {
+        return Err(KernelError::Invalid("too many faces picked".into()));
+    }
+    if at.is_empty() {
+        return Ok((0..body.face_count()).collect());
+    }
+    let mut chosen = Vec::new();
+    for p in at {
+        let i = nearest_face(body, *p)?;
+        if !chosen.contains(&i) {
+            chosen.push(i);
+        }
+    }
+    Ok(chosen)
+}
+
+/// A body's faces taken apart: each picked face (by points on it; every face when none are
+/// given) its own surface body, and the faces left, if any, one surface body. A solid comes
+/// apart into surfaces. Histories are over `[body]`: each face is the body's.
+pub fn unstitch(body: &Body, at: &[Vec3]) -> Result<(Vec<Body>, Option<Body>)> {
+    body.require_brep("unstitch")?;
+    let chosen = picked_faces(body, at)?;
+    let faces: Vec<&mt::Face> = body.solid.face_iter().collect();
+    if faces.len() < 2 {
+        return Err(KernelError::Invalid("the body has one face: nothing to unstitch".into()));
+    }
+    let piece = |picked: Vec<mt::Face>| rebuilt_body(surface_body(picked), &[&body.solid], &Rebuild::default());
+    let pieces: Vec<Body> = chosen.iter().filter_map(|i| faces.get(*i)).map(|f| piece(vec![(*f).clone()])).collect();
+    let rest: Vec<mt::Face> = faces.iter().enumerate().filter(|(i, _)| !chosen.contains(i)).map(|(_, f)| (*f).clone()).collect();
+    Ok((pieces, (!rest.is_empty()).then(|| piece(rest))))
+}
+
+/// A surface body with the picked faces (by points on them; every face when none are given)
+/// turned over: their normals point the other way. A solid is refused (its faces face out).
+/// The history is over `[body]`: each face is the body's, turned over or not.
+pub fn reverse_faces(body: &Body, at: &[Vec3]) -> Result<Body> {
+    body.require_brep("reverse normal")?;
+    if !body.is_surface() {
+        return Err(KernelError::Invalid("a solid's faces face out: unstitch it into surfaces first".into()));
+    }
+    let chosen = picked_faces(body, at)?;
+    let mut rec = Rebuild::default();
+    let faces: Vec<mt::Face> = body
+        .solid
+        .face_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if !chosen.contains(&i) {
+                return f.clone();
+            }
+            let turned = f.inverse();
+            rec.whole(&turned, f);
+            turned
+        })
+        .collect();
+    Ok(rebuilt_body(surface_body(faces), &[&body.solid], &rec))
 }
 
 /// Index of the face nearest a point (over its mesh triangles).
@@ -616,6 +726,85 @@ mod tests {
 
     fn rel(a: f64, b: f64) -> f64 {
         (a - b).abs() / b.abs().max(1e-9)
+    }
+
+    /// Walls swept from an open line, an open arc and a closed square: areas are length × height,
+    /// no caps, and stitching two patches onto the square's walls closes the box.
+    #[test]
+    fn extrude_sheet_of_open_and_closed_chains() {
+        let line = vec![Seg2::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }];
+        let s = extrude_sheet(&Plane::XY, std::slice::from_ref(&line), 0.0, 5.0).unwrap();
+        assert!(s.is_surface() && s.face_count() == 1);
+        assert!(rel(measure(&s).unwrap().area, 50.0) < 1e-9);
+        // A quarter arc of radius 4, swept from -1 to 2: area r θ h.
+        let arc = vec![Seg2::Arc { center: Vec2::new(0.0, 0.0), radius: 4.0, start: 0.0, sweep: std::f64::consts::FRAC_PI_2 }];
+        let a = measure(&extrude_sheet(&Plane::XY, &[arc], 2.0, -1.0).unwrap()).unwrap().area;
+        let want = 4.0 * std::f64::consts::FRAC_PI_2 * 3.0;
+        assert!(rel(a, want) < 1e-3, "{a} vs {want}"); // (measured on meshes)
+        // A line then a line back up: one chain, two faces.
+        let bent = vec![line[0], Seg2::Line { a: Vec2::new(10.0, 0.0), b: Vec2::new(10.0, 6.0) }];
+        assert_eq!(extrude_sheet(&Plane::XY, &[bent], 0.0, 1.0).unwrap().face_count(), 2);
+        // A closed square: four walls, open at both ends; with a patch on each end, a solid box.
+        let sq = Region2 {
+            outer: Loop2::polygon(&[Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)]),
+            holes: vec![],
+        };
+        let walls = extrude_sheet(&Plane::XY, std::slice::from_ref(&sq.outer.segs), 0.0, 4.0).unwrap();
+        assert!(walls.is_surface() && walls.face_count() == 4);
+        assert!(rel(measure(&walls).unwrap().area, 160.0) < 1e-9);
+        let (bottom, top) = (patch_region(&Plane::XY, &sq).unwrap(), patch_region(&Plane::XY.offset(4.0), &sq).unwrap());
+        let closed = stitch(&[&walls, &bottom, &top], 1e-6).unwrap();
+        assert!(!closed.is_surface());
+        assert!(rel(measure(&closed).unwrap().volume, 400.0) < 1e-9);
+    }
+
+    #[test]
+    fn extrude_sheet_refuses_bad_input() {
+        let line = vec![Seg2::Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }];
+        assert!(extrude_sheet(&Plane::XY, std::slice::from_ref(&line), 0.0, 0.0).is_err());
+        assert!(extrude_sheet(&Plane::XY, std::slice::from_ref(&line), 0.0, f64::NAN).is_err());
+        assert!(extrude_sheet(&Plane::XY, &[], 0.0, 1.0).is_err());
+        assert!(extrude_sheet(&Plane::XY, &[vec![]], 0.0, 1.0).is_err());
+        let gap = vec![line[0], Seg2::Line { a: Vec2::new(11.0, 0.0), b: Vec2::new(12.0, 0.0) }];
+        assert!(extrude_sheet(&Plane::XY, &[gap], 0.0, 1.0).is_err());
+        let nan = vec![Seg2::Line { a: Vec2::new(0.0, f64::NAN), b: Vec2::new(1.0, 0.0) }];
+        assert!(extrude_sheet(&Plane::XY, &[nan], 0.0, 1.0).is_err());
+    }
+
+    /// A box taken apart into its six faces (each a 10 × 10 surface) and stitched back into
+    /// the same solid; two picked faces come off on their own, the other four stay together;
+    /// a one-face body has nothing to take apart.
+    #[test]
+    fn unstitch_a_box_and_stitch_it_back() {
+        let b = box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0)).unwrap();
+        let (pieces, rest) = unstitch(&b, &[]).unwrap();
+        assert!(rest.is_none() && pieces.len() == 6);
+        for p in &pieces {
+            assert!(p.is_surface() && p.face_count() == 1 && rel(measure(p).unwrap().area, 100.0) < 1e-9);
+        }
+        let back = stitch(&pieces.iter().collect::<Vec<_>>(), 1e-6).unwrap();
+        assert!(!back.is_surface() && rel(measure(&back).unwrap().volume, 1000.0) < 1e-9);
+        let (two, rest) = unstitch(&b, &[Vec3::new(5.0, 5.0, 10.0), Vec3::new(5.0, 5.0, 0.0)]).unwrap();
+        let rest = rest.unwrap();
+        assert!(two.len() == 2 && rest.is_surface() && rest.face_count() == 4);
+        assert!(unstitch(&two[0], &[]).is_err());
+    }
+
+    /// A patch thickened along its normal grows up; turned over, the same thickness grows down.
+    /// A solid's faces are not turned over.
+    #[test]
+    fn reverse_faces_turns_the_thicken_side() {
+        let r = Region2 {
+            outer: Loop2::polygon(&[Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), Vec2::new(10.0, 10.0), Vec2::new(0.0, 10.0)]),
+            holes: vec![],
+        };
+        let s = patch_region(&Plane::XY, &r).unwrap();
+        let up = measure(&thicken(&s, 2.0, false).unwrap()).unwrap().bbox;
+        let turned = reverse_faces(&s, &[]).unwrap();
+        assert!(turned.is_surface() && turned.face_count() == 1);
+        let down = measure(&thicken(&turned, 2.0, false).unwrap()).unwrap().bbox;
+        assert!((up.min.z - down.min.z - 2.0).abs() < 1e-9 && (up.max.z - down.max.z - 2.0).abs() < 1e-9, "{up:?} vs {down:?}");
+        assert!(reverse_faces(&box_solid(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0)).unwrap(), &[]).is_err());
     }
 
     #[test]

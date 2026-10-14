@@ -12,12 +12,17 @@ workspace = true
 solidcraft-engine = { workspace = true }
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
+solidcraft-gpu = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 web-time = { workspace = true }
 image = { workspace = true, features = ["jpeg"] }
 ttf-parser = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The offscreen viewport render test opens a device without a window.
+pollster = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

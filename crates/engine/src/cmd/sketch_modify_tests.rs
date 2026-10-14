@@ -429,6 +429,113 @@ fn text_makes_profiles_that_extrude_and_edit() {
     assert!(s.execute("sketch.text", &json!({"text": "", "at": [0, 0]})).is_err());
 }
 
+/// Volumes (mm³) of the bodies in the design, smallest first.
+fn body_volumes(s: &mut Session) -> Vec<f64> {
+    let m = run(s, "inspect.measure", json!({}));
+    let mut v: Vec<f64> = m["bodies"].as_array().unwrap().iter().map(|b| b["volume_mm3"].as_f64().unwrap()).collect();
+    v.sort_by(f64::total_cmp);
+    v
+}
+
+#[test]
+fn text_extrudes_with_its_counters_and_beside_other_curves() {
+    // Letter areas in mm² at a capital height of 10 mm, summed from the Liberation Sans contours (shoelace
+    // formula, quadratic pieces flattened finely), each outer contour minus its counters:
+    //   A 39.2159 - 9.0647   B 68.9283 - 12.9336 - 16.6277   8 56.8394 - 10.6451 - 13.7347   I 13.5557
+    // Extruded 2 mm, so the volumes are twice that. Faceted walls: within 0.02 mm³.
+    let near = |got: &[f64], want: &[f64]| {
+        assert_eq!(got.len(), want.len(), "{got:?} against {want:?}");
+        assert!(got.iter().zip(want).all(|(g, w)| (g - w).abs() < 0.02), "{got:?} against {want:?}");
+    };
+    // Letters with counters, alone: a letter is one body with its counters as holes. (A counter used to be
+    // extruded as a body of its own, or the extrude failed with "profile has no area".)
+    for (text, want) in
+        [("AB", vec![2.0 * (39.2159 - 9.0647), 2.0 * (68.9283 - 12.9336 - 16.6277)]), ("8", vec![2.0 * (56.8394 - 10.6451 - 13.7347)])]
+    {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.text", json!({"text": text, "at": [0, 0], "height": 10}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 2}));
+        near(&body_volumes(&mut s), &want);
+    }
+    // Text beside a drawn rectangle is extruded with it (it used to be left out): the 30 x 20 x 2 plate and an "I".
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
+    run(&mut s, "sketch.text", json!({"text": "I", "at": [40, 0], "height": 10}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 2}));
+    near(&body_volumes(&mut s), &[2.0 * 13.5557, 1200.0]);
+    // A counter can still be picked on its own, by a point inside it: the inner contour of an O, 47.4584 mm².
+    let mut s = new_sketch();
+    run(&mut s, "sketch.text", json!({"text": "O", "at": [0, 0], "height": 10}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 2, "profiles": [{"point": [5.65, 5.0]}]}));
+    near(&body_volumes(&mut s), &[2.0 * 47.4584]);
+}
+
+#[test]
+fn text_embossed_or_debossed_leaves_its_counters_alone() {
+    // A 40 x 30 x 5 plate (6000 mm³) with 10 mm tall text raised from, or cut 1 mm into, its top. Only the letters
+    // change the volume, by their area in mm² (see above) x 1 mm; the counters of the O and of A and B stay as
+    // they are. (Emboss and deboss used to fail with "boolean Cut: no result" or "boolean Union: no result",
+    // because each counter was a tool body of its own, filling the hole of its letter.)
+    let (o, ab) = (83.3133 - 47.4584, (39.2159 - 9.0647) + (68.9283 - 12.9336 - 16.6277));
+    for (text, mode, change) in [("O", "deboss", -o), ("O", "emboss", o), ("AB", "deboss", -ab)] {
+        let mut s = new_sketch();
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "body_name": "Plate"}));
+        run(&mut s, "construct.plane.offset", json!({"base": "XY", "offset": 5, "name": "Lid"}));
+        run(&mut s, "sketch.create", json!({"plane": "Lid", "name": "Text"}));
+        run(&mut s, "sketch.text", json!({"text": text, "at": [10, 10], "height": 10}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.emboss", json!({"sketch": "Text", "depth": 1, "mode": mode}));
+        let v = body_volumes(&mut s);
+        assert!(v.len() == 1 && (v[0] - (6000.0 + change)).abs() < 0.02, "{text} {mode}: {v:?} against {}", 6000.0 + change);
+    }
+}
+
+#[test]
+fn text_takes_a_font_and_edit_text_keeps_or_changes_it() {
+    // The repository's second font is BIZ UDPGothic. Its "I" is a polygon of two 606 x 145 bars and a 188 x 1369
+    // stem in font units, with a capital height of 1567 units, so at 10 mm its area is
+    // (2 x 606 x 145 + 188 x 1369) x (10 / 1567)^2 = 17.6385 mm². The built-in Liberation Sans "I" is 13.5557 mm².
+    let font = concat!(env!("CARGO_MANIFEST_DIR"), "/../../apps/solidcraft-web/fonts/BIZUDPGothic-Regular.ttf");
+    let near = |s: &Session, want: f64| {
+        let a = profiles(s);
+        assert!(a.len() == 1 && (a[0] - want).abs() < 1e-3, "{a:?} against {want}");
+    };
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.text", json!({"text": "I", "at": [0, 0], "height": 10}));
+    near(&s, 13.5557);
+    let link = r["link"].as_str().unwrap().to_string();
+    // A font by file path changes the outlines; the same edit with the built-in family's name changes them back.
+    run(&mut s, "sketch.edit_text", json!({"link": link, "font": font}));
+    near(&s, 17.6385);
+    run(&mut s, "sketch.edit_text", json!({"link": link, "font": "Liberation Sans"}));
+    near(&s, 13.5557);
+    run(&mut s, "sketch.edit_text", json!({"link": link, "font": font}));
+    // An edit that does not name a font keeps it (the height scales the area by 4), and an empty name is the built-in font.
+    run(&mut s, "sketch.edit_text", json!({"link": link, "height": 20}));
+    near(&s, 4.0 * 17.6385);
+    run(&mut s, "sketch.edit_text", json!({"link": link, "font": ""}));
+    near(&s, 4.0 * 13.5557);
+    run(&mut s, "sketch.edit_text", json!({"link": link, "font": font}));
+    // The font is kept in the design: after saving and reopening, the text is still in it.
+    let reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    let source = reopened.doc.sketch(s.active_sketch.unwrap()).unwrap().link(&link).unwrap().source.clone();
+    assert!(matches!(&source, solidcraft_sketch::LinkSource::Text { font: Some(f), .. } if f == font), "{source:?}");
+    // A new text takes the font too. Unknown fonts and values that are not names are errors.
+    let mut s = new_sketch();
+    run(&mut s, "sketch.text", json!({"text": "I", "at": [0, 0], "height": 10, "font": font}));
+    near(&s, 17.6385);
+    let e = s.execute("sketch.text", &json!({"text": "I", "at": [0, 0], "font": "No Such Family 12345"})).unwrap_err().to_string();
+    assert!(e.contains("unknown font `No Such Family 12345`"), "{e}");
+    assert!(s.execute("sketch.text", &json!({"text": "I", "at": [0, 0], "font": 12})).is_err());
+    assert!(s.execute("sketch.text", &json!({"text": "I", "at": [0, 0], "font": "C:/no/such/dir/font.ttf"})).is_err());
+    near(&s, 17.6385);
+}
+
 #[test]
 fn blend_curve_joins_tangentially() {
     let mut s = new_sketch();
@@ -910,4 +1017,185 @@ fn periodic_offset_extrusion_survives_post_extrude_span_changes_and_cold_reopen(
         assert_eq!(s.doc.to_json(), edited);
         run(&mut s, "edit.undo", json!({}));
     }
+}
+
+/// The bounding box of a set of sketch curves, from their polylines.
+fn bounds(sk: &solidcraft_sketch::Sketch, curves: &[String]) -> (Vec2, Vec2) {
+    let mut lo = Vec2::new(f64::INFINITY, f64::INFINITY);
+    let mut hi = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for id in curves {
+        let i = sk.curve_index(id).unwrap();
+        for p in sk.polyline(i) {
+            lo = Vec2::new(lo.x.min(p.x), lo.y.min(p.y));
+            hi = Vec2::new(hi.x.max(p.x), hi.y.max(p.y));
+        }
+    }
+    (lo, hi)
+}
+
+fn box_is(sk: &solidcraft_sketch::Sketch, curves: &[String], lo: [f64; 2], hi: [f64; 2]) -> bool {
+    let (a, b) = bounds(sk, curves);
+    a.dist(Vec2::new(lo[0], lo[1])) < 1e-6 && b.dist(Vec2::new(hi[0], hi[1])) < 1e-6
+}
+
+fn side_curves(v: &Value, i: usize) -> Vec<String> {
+    ids(&v["sides"][i]["curves"])
+}
+
+#[test]
+fn offset_symmetric_puts_the_same_distance_on_both_sides_of_a_chain() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let l = ids(&r["curves"]);
+    // A 40 by 30 rectangle offset symmetrically by 5: one chain 5 inside (5,5)-(35,25), a
+    // 30 by 20 rectangle, and one 5 outside (-5,-5)-(45,35), a 50 by 40 rectangle.
+    let o = run(&mut s, "sketch.offset", json!({"curves": [l[0]], "distance": 5, "symmetric": true}));
+    assert_eq!(o["sides"].as_array().map(Vec::len), Some(2), "{o}");
+    assert_eq!(ids(&o["curves"]).len(), 8, "{o}");
+    let (a, b) = (side_curves(&o, 0), side_curves(&o, 1));
+    assert_eq!((a.len(), b.len()), (4, 4), "{o}");
+    let sk = sketch(&s);
+    // The chain's walk direction decides which side is first, so match on the sizes.
+    let inner = box_is(&sk, &a, [5.0, 5.0], [35.0, 25.0]) && box_is(&sk, &b, [-5.0, -5.0], [45.0, 35.0]);
+    let outer = box_is(&sk, &b, [5.0, 5.0], [35.0, 25.0]) && box_is(&sk, &a, [-5.0, -5.0], [45.0, 35.0]);
+    assert!(inner || outer, "{:?} {:?}", bounds(&sk, &a), bounds(&sk, &b));
+    // The two distances are equal and opposite.
+    let d: Vec<f64> = o["sides"].as_array().unwrap().iter().map(|x| x["distance"].as_f64().unwrap()).collect();
+    assert!(close(d[0], -d[1]) && close(d[0].abs(), 5.0), "{d:?}");
+    // Both sides are parallel to their sources, so each one added four constraints.
+    assert_eq!(ids(&o["constraints"]).len(), 8, "{o}");
+}
+
+#[test]
+fn offset_two_sides_takes_an_independent_distance_the_other_way() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let l = ids(&r["curves"]);
+    // `side` sends `distance` 5 inward, so `distance2` 3 goes outward: (5,5)-(35,25), a 30 by
+    // 20 rectangle, and (-3,-3)-(43,33), a 46 by 36 one.
+    let o = run(&mut s, "sketch.offset", json!({"curves": [l[0]], "distance": 5, "distance2": 3, "side": [20, 15]}));
+    assert_eq!(o["sides"].as_array().map(Vec::len), Some(2), "{o}");
+    let sk = sketch(&s);
+    assert!(box_is(&sk, &side_curves(&o, 0), [5.0, 5.0], [35.0, 25.0]), "{:?}", bounds(&sk, &side_curves(&o, 0)));
+    assert!(box_is(&sk, &side_curves(&o, 1), [-3.0, -3.0], [43.0, 33.0]), "{:?}", bounds(&sk, &side_curves(&o, 1)));
+}
+
+#[test]
+fn offset_two_sides_of_one_curve_follows_the_sign_of_the_distance() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let l = ids(&r["curves"]);
+    // The bottom edge runs (0,0)-(40,0). Chain off, distance -5 and distance2 3: one line at
+    // y = -5 and one at y = 3, each 40 long.
+    let f = run(&mut s, "sketch.offset", json!({"curves": [l[0]], "distance": -5, "distance2": 3, "chain": false}));
+    assert_eq!(f["sides"].as_array().map(Vec::len), Some(2), "{f}");
+    let sk = sketch(&s);
+    let (one, two) = (bounds(&sk, &side_curves(&f, 0)), bounds(&sk, &side_curves(&f, 1)));
+    assert!(close(one.0.y, one.1.y) && close(two.0.y, two.1.y), "{one:?} {two:?}");
+    assert!(close(one.0.y, -5.0) && close(two.0.y, 3.0), "{one:?} {two:?}");
+    assert!(close(one.1.x - one.0.x, 40.0) && close(two.1.x - two.0.x, 40.0), "{one:?} {two:?}");
+}
+
+#[test]
+fn offset_both_sides_of_a_rounded_boundary_keep_separate_associations() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-38, -33], "p1": [38, 33]}));
+    run(&mut s, "sketch.fillet", json!({"points": ["l1.start", "l1.end", "l2.end", "l3.end"], "radius": "1 mm"}));
+    // A 76 by 66 boundary with 1 mm corners, offset symmetrically by 0.2: 75.6 by 65.6 with
+    // 0.8 mm corners inside, and 76.4 by 66.4 with 1.2 mm corners outside.
+    let o = run(&mut s, "sketch.offset", json!({"curves": ["l1"], "distance": 0.2, "symmetric": true}));
+    let sides = o["sides"].as_array().unwrap().clone();
+    assert_eq!(sides.len(), 2, "{o}");
+    // Each side is its own offset association; a single side still reports the one it always did.
+    let associations: Vec<&str> = sides.iter().filter_map(|x| x["association"].as_str()).collect();
+    assert_eq!(associations.len(), 2, "{o}");
+    assert_ne!(associations[0], associations[1], "{o}");
+    assert!(o["association"].is_null(), "two sides name no single association: {o}");
+    let sk = sketch(&s);
+    assert_eq!(sk.offsets.len(), 2);
+    for association in &associations {
+        assert_eq!(sk.offset_boundary(association).unwrap().len(), 8, "{association}");
+    }
+    let radii = |curves: &[String]| {
+        let mut r: Vec<f64> = curves
+            .iter()
+            .filter_map(|id| {
+                let CurveKind::Arc { c, a, .. } = sk.curves.get(sk.curve_index(id)?)?.kind else { return None };
+                Some(sk.point(c)?.dist(sk.point(a)?))
+            })
+            .collect();
+        r.sort_by(f64::total_cmp);
+        r
+    };
+    let (a, b) = (side_curves(&o, 0), side_curves(&o, 1));
+    let (ra, rb) = (radii(&a), radii(&b));
+    assert_eq!((ra.len(), rb.len()), (4, 4), "{ra:?} {rb:?}");
+    let shrunk = ra.iter().all(|r| close(*r, 0.8)) && rb.iter().all(|r| close(*r, 1.2));
+    let grown = rb.iter().all(|r| close(*r, 0.8)) && ra.iter().all(|r| close(*r, 1.2));
+    assert!(shrunk || grown, "{ra:?} {rb:?}");
+    let small = if shrunk { &a } else { &b };
+    let large = if shrunk { &b } else { &a };
+    assert!(box_is(&sk, small, [-37.8, -32.8], [37.8, 32.8]), "{:?}", bounds(&sk, small));
+    assert!(box_is(&sk, large, [-38.2, -33.2], [38.2, 33.2]), "{:?}", bounds(&sk, large));
+}
+
+#[test]
+fn offset_both_sides_of_a_circle_are_concentric() {
+    let mut s = new_sketch();
+    let c = ids(&run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}))["curves"])[0].clone();
+    // Symmetric by 3 on a 10 mm circle: a 7 mm circle and a 13 mm one, both about the centre.
+    let o = run(&mut s, "sketch.offset", json!({"curves": [c], "distance": 3, "symmetric": true}));
+    let sk = sketch(&s);
+    let radius = |id: &str| match sk.curves.get(sk.curve_index(id).unwrap()).unwrap().kind {
+        CurveKind::Circle { c, r } => (sk.point(c).unwrap(), r),
+        _ => panic!("not a circle"),
+    };
+    let made = ids(&o["curves"]);
+    assert_eq!(made.len(), 2, "{o}");
+    let (p0, r0) = radius(&made[0]);
+    let (p1, r1) = radius(&made[1]);
+    assert!(p0.dist(Vec2::default()) < 1e-9 && p1.dist(Vec2::default()) < 1e-9);
+    assert!(close(r0, 7.0) && close(r1, 13.0), "{r0} {r1}");
+    // A circle whose inward side would be offset away to nothing is refused, both sides with it.
+    assert!(s.execute("sketch.offset", &json!({"curves": [c], "distance": 10, "symmetric": true})).is_err());
+}
+
+#[test]
+fn offset_refuses_the_combinations_that_would_be_guesswork() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 30]}));
+    let l = ids(&r["curves"]);
+    let refused = |s: &mut Session, p: Value| s.execute("sketch.offset", &p).unwrap_err().to_string();
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "symmetric": true, "side": [20, 15]}));
+    assert!(e.contains("no side left to pick"), "{e}");
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "symmetric": true, "distance2": 3}));
+    assert!(e.contains("`distance2` or `symmetric`"), "{e}");
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "distance2": -3}));
+    assert!(e.contains("`distance2` must be a positive number"), "{e}");
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "distance2": 0}));
+    assert!(e.contains("`distance2` must be a positive number"), "{e}");
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "direction": "negative"}));
+    assert!(e.contains("no negative direction"), "{e}");
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 5, "direction": "sideways"}));
+    assert!(e.contains("unknown direction"), "{e}");
+    // An inward side the shape cannot hold refuses the whole command, the outward side with it.
+    let e = refused(&mut s, json!({"curves": [l[0]], "distance": 20, "symmetric": true}));
+    assert!(e.contains("larger than the shape allows"), "{e}");
+    assert_eq!(sketch(&s).curves.len(), 4, "a refused offset leaves the sketch alone");
+    // `direction: symmetric` is the word `solid.extrude` uses, and it means the same here.
+    let o = run(&mut s, "sketch.offset", json!({"curves": [l[0]], "distance": 5, "direction": "symmetric"}));
+    assert_eq!(o["sides"].as_array().map(Vec::len), Some(2), "{o}");
+}
+
+#[test]
+fn offset_one_side_still_reports_one_set_of_curves_and_its_association() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-38, -33], "p1": [38, 33]}));
+    run(&mut s, "sketch.fillet", json!({"points": ["l1.start", "l1.end", "l2.end", "l3.end"], "radius": "1 mm"}));
+    let o = run(&mut s, "sketch.offset", json!({"curves": ["l1"], "distance": 0.2, "side": [0, 0]}));
+    assert_eq!(o["sides"].as_array().map(Vec::len), Some(1), "{o}");
+    let association = o["association"].as_str().unwrap().to_string();
+    assert_eq!(o["sides"][0]["association"].as_str(), Some(association.as_str()), "{o}");
+    assert_eq!(ids(&o["curves"]), ids(&o["sides"][0]["curves"]), "{o}");
+    assert!(close(o["sides"][0]["distance"].as_f64().unwrap().abs(), 0.2), "{o}");
 }

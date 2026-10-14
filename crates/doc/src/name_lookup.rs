@@ -30,6 +30,8 @@ pub fn legacy_name(name: &str) -> Option<&str> {
 /// Where a stored edge name was found.
 #[derive(Clone, Copy, Debug)]
 pub struct EdgeHit {
+    /// The edge (its index in the body's mesh).
+    pub edge: usize,
     /// A point on the edge: the reference's own point when it lies on it, else the edge's middle.
     pub point: Vec3,
     /// The named edge is not one edge any more: the piece nearest the point was taken.
@@ -62,7 +64,7 @@ pub fn locate_edge(b: &ModelBody, name: &str, near: Vec3) -> Result<EdgeHit, Str
     let exact = |i: usize| -> Result<EdgeHit, String> {
         let on = edge_near(b, &m, i, near);
         mid(i)
-            .map(|p| EdgeHit { point: if on { near } else { p }, split: false, verified: verified(i), on_point: on, legacy: false })
+            .map(|p| EdgeHit { edge: i, point: if on { near } else { p }, split: false, verified: verified(i), on_point: on, legacy: false })
             .ok_or_else(|| "edge".into())
     };
     if let Some(i) = names.iter().position(|n| n == name) {
@@ -84,7 +86,7 @@ pub fn locate_edge(b: &ModelBody, name: &str, near: Vec3) -> Result<EdgeHit, Str
         .iter()
         .filter_map(|i| mid(*i).map(|p| (p, *i)))
         .min_by(|a, b| a.0.dist(near).total_cmp(&b.0.dist(near)))
-        .map(|(p, i)| EdgeHit { point: p, split: true, verified: verified(i), on_point: false, legacy: false })
+        .map(|(p, i)| EdgeHit { edge: i, point: p, split: true, verified: verified(i), on_point: false, legacy: false })
         .ok_or_else(|| format!("edge `{name}` no longer exists"))
 }
 
@@ -104,7 +106,8 @@ fn nearest_on_face(m: &Mesh, face: usize, p: Vec3) -> Option<(f64, Vec3)> {
         let Some([a, b, c]) = m.tri(t) else { continue };
         let q = closest(p, a, b, c);
         let d = q.dist(p);
-        if best.is_none_or(|x| d < x.0) {
+        // A non-finite candidate must never become the best: nothing compares less than NaN.
+        if d.is_finite() && best.is_none_or(|x| d < x.0) {
             best = Some((d, q));
         }
     }
@@ -136,15 +139,15 @@ fn legacy_locate_edge(b: &ModelBody, name: &str, near: Vec3) -> Result<EdgeHit, 
     if let Some(i) = names.iter().position(|n| n == name) {
         let on = edge_near(b, &m, i, near);
         return edge_mid(&m, i)
-            .map(|p| EdgeHit { point: if on { near } else { p }, split: false, verified: false, on_point: on, legacy: true })
+            .map(|p| EdgeHit { edge: i, point: if on { near } else { p }, split: false, verified: false, on_point: on, legacy: true })
             .ok_or(());
     }
     let stem = strip_edge_piece(name);
     (0..names.len())
         .filter(|i| names.get(*i).is_some_and(|n| strip_edge_piece(n) == stem))
-        .filter_map(|i| edge_mid(&m, i))
-        .min_by(|a, b| a.dist(near).total_cmp(&b.dist(near)))
-        .map(|p| EdgeHit { point: p, split: true, verified: false, on_point: false, legacy: true })
+        .filter_map(|i| edge_mid(&m, i).map(|p| (p, i)))
+        .min_by(|a, b| a.0.dist(near).total_cmp(&b.0.dist(near)))
+        .map(|(p, i)| EdgeHit { edge: i, point: p, split: true, verified: false, on_point: false, legacy: true })
         .ok_or(())
 }
 
@@ -208,6 +211,35 @@ impl FaceHit {
         } else {
             None
         }
+    }
+}
+
+impl FaceHit {
+    /// Where the line through `p` along `dir` meets the face found (the hit nearest `p`, on
+    /// either side of it), `None` when the line misses the face or runs along it. A place on
+    /// a face follows the face this way, along its own axis, instead of sliding sideways to
+    /// [`point`](Self::point), the face's nearest point.
+    pub fn along(&self, st: &ModelState, p: Vec3, dir: Vec3) -> Option<Vec3> {
+        let b = st.bodies.get(self.body)?;
+        let d = dir.normalized()?;
+        let m = b.mesh();
+        let slack = (b.body.size() * 1e-9).max(1e-9);
+        let mut best: Option<f64> = None;
+        for (t, f) in m.triangles.iter().zip(&m.tri_face) {
+            if *f as usize != self.face {
+                continue;
+            }
+            let Some([a, bb, c]) = m.tri(t) else { continue };
+            // A hair's width around each triangle, so a place on the seam of two is on the face.
+            let centre = (a + bb + c) * (1.0 / 3.0);
+            let grow = |v: Vec3| v + (v - centre).normalized().unwrap_or(Vec3::ZERO) * slack;
+            if let Some(hit) = naming::ray_hit(p, d, grow(a), grow(bb), grow(c))
+                && best.is_none_or(|old| hit.abs() < old.abs())
+            {
+                best = Some(hit);
+            }
+        }
+        best.map(|t| p + d * t)
     }
 }
 
@@ -288,7 +320,7 @@ fn legacy_locate<'a>(bodies: impl Iterator<Item = (usize, &'a ModelBody)>, name:
             let Some([a, bb, c]) = m.tri(t) else { continue };
             let q = closest(p, a, bb, c);
             let d = q.dist(p) - if exact { 1e-9 } else { 0.0 };
-            if best.is_none_or(|x| d < x.0) {
+            if d.is_finite() && best.is_none_or(|x| d < x.0) {
                 best = Some((d, bi, *f as usize, q, !exact, tol));
             }
         }

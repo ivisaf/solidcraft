@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use solidcraft_geom::{Loop2, Region2, Seg2, Vec2};
 
 use crate::model::{CurveKind, Sketch};
-use crate::shape::{Shape, intersections};
+use crate::shape::{Shape, intersections_within};
 use crate::union_find::{find, union};
 
 const MERGE_TOL: f64 = 1e-6;
@@ -61,6 +61,47 @@ struct Edge {
     /// A piece of an exact free-form segment: (curve, segment, piece, pieces).
     tag: Option<Piece>,
     coverage: Option<Piece>,
+    /// A piece of a line, arc or circle (not one sampled from a free-form curve).
+    analytic: bool,
+}
+
+/// Do two circles lie within `tol` of each other all the way round?
+fn same_circle(c: Vec2, r: f64, c2: Vec2, r2: f64, tol: f64) -> bool {
+    c.dist(c2) + (r - r2).abs() <= tol
+}
+
+/// Which edges stay in the graph: of pieces lying on top of each other between the same two
+/// nodes (a side drawn onto a projected edge, which the solver puts there only up to round-off),
+/// the first, so the earliest curve in sketch order names the shared edge, as when the pieces
+/// lie exactly on each other. Kept both, they would bound a sliver of no area, and the
+/// round-off in their directions would make the turns at their ends disagree, so the regions on
+/// both sides would be lost (#635).
+fn without_overlaps(edges: &[Edge], tol: f64) -> Vec<bool> {
+    // Between the same nodes, two pieces of lines run along one path, and so do two pieces of
+    // arcs or circles on one circle through the same middle (not the two halves of a circle). A
+    // line and an arc never do, nor does a sampled piece of a free-form curve: a chord and its
+    // curve bound a region, however thin.
+    let same_path = |a: &Edge, b: &Edge| match (a.seg, b.seg) {
+        _ if !(a.analytic && b.analytic) => false,
+        (Seg2::Line { .. }, Seg2::Line { .. }) => true,
+        (Seg2::Arc { center, radius, .. }, Seg2::Arc { center: c2, radius: r2, .. }) => {
+            same_circle(center, radius, c2, r2, tol) && a.seg.mid().dist(b.seg.mid()) <= 2.0 * tol
+        }
+        _ => false,
+    };
+    let mut kept: std::collections::HashMap<(usize, usize), Vec<usize>> = std::collections::HashMap::new();
+    edges
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let between = kept.entry((e.u.min(e.v), e.u.max(e.v))).or_default();
+            let first = !between.iter().any(|k| edges.get(*k).is_some_and(|f| same_path(f, e)));
+            if first {
+                between.push(i);
+            }
+            first
+        })
+        .collect()
 }
 
 type Piece = (usize, usize, usize, usize);
@@ -117,6 +158,20 @@ fn complete_loop(tags: &[Option<(Piece, bool)>], expected: &std::collections::Ha
         return None;
     }
     Some(ids)
+}
+
+/// Do two shapes of lines, arcs or circles lie on one line or circle (within `tol` all along)?
+/// Where they overlap they don't cross: the points where one ends on the other cut them (each
+/// end lies within `tol` of the other). Their crossing, computed from round-off alone, would
+/// land anywhere along them and cut both apart there. Two whole circles have no ends to cut
+/// them, so they keep their crossings.
+fn overlapping(x: &Shape, y: &Shape, tol: f64) -> bool {
+    let near_line = |a: Vec2, b: Vec2, ps: [Vec2; 2]| (b - a).normalized().is_some_and(|d| ps.iter().all(|p| (*p - a).cross(d).abs() <= tol));
+    match (*x, *y) {
+        (Shape::Line { a, b }, Shape::Line { a: c, b: d }) => near_line(a, b, [c, d]) && near_line(c, d, [a, b]),
+        (Shape::Round { c, r, .. }, Shape::Round { c: c2, r: r2, .. }) => !(x.is_full() && y.is_full()) && same_circle(c, r, c2, r2, tol),
+        _ => false,
+    }
 }
 
 /// Parameter of `p` at an end of the shape (lines: 0 or 1), for intersections at end points.
@@ -413,28 +468,89 @@ fn curvature(s: &Seg2) -> f64 {
     }
 }
 
-/// Find all closed profiles of a sketch. Curves are split where other curves end on them or
-/// cross them, like a drawing would be read.
-/// Profiles of the drawn geometry only (linked reference curves left out).
+/// Profiles of the drawn geometry only: linked reference curves (projections, intersections)
+/// are left out; text outlines count as drawn.
 pub fn find_drawn_profiles(sk: &Sketch) -> Vec<Profile> {
-    if sk.links.is_empty() {
+    if sk.links.iter().all(|l| l.kind == crate::LinkKind::Text) {
         return find_profiles(sk);
     }
     let mut d = sk.clone();
-    for c in &mut d.curves {
-        if c.link.is_some() {
+    for (ci, c) in d.curves.iter_mut().enumerate() {
+        if c.link.is_some() && !sk.is_text_curve(ci) {
             c.construction = true;
         }
     }
     find_profiles(&d)
 }
 
+/// The profiles without text counters: a profile bounded by text outlines alone that lies inside
+/// an odd number of other such profiles is the counter of a letter (the hole of A, B, 8...),
+/// which the letter's own profile already has as a hole. What "all profiles" means for text:
+/// the letters, not the letters with their counters filled in.
+pub fn without_text_counters(sk: &Sketch, profiles: Vec<Profile>) -> Vec<Profile> {
+    let index: std::collections::HashMap<&str, usize> = sk.curves.iter().enumerate().map(|(i, c)| (c.id.as_str(), i)).collect();
+    let text_only: Vec<bool> = profiles
+        .iter()
+        .map(|p| !p.outer_curves.is_empty() && p.outer_curves.iter().all(|id| index.get(id.as_str()).is_some_and(|ci| sk.is_text_curve(*ci))))
+        .collect();
+    if !text_only.iter().any(|t| *t) {
+        return profiles;
+    }
+    // Outer polylines and their boxes, once.
+    let polys: Vec<Vec<Vec2>> = profiles.iter().map(|p| p.region.outer.polyline(1e-3)).collect();
+    let boxes: Vec<(Vec2, Vec2)> = polys
+        .iter()
+        .map(|pl| {
+            pl.iter().fold((Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY)), |(lo, hi), p| {
+                (Vec2::new(lo.x.min(p.x), lo.y.min(p.y)), Vec2::new(hi.x.max(p.x), hi.y.max(p.y)))
+            })
+        })
+        .collect();
+    let areas: Vec<f64> = profiles.iter().map(|p| p.region.outer.signed_area().abs()).collect();
+    let inside = |pl: &[Vec2], p: Vec2| {
+        let n = pl.len();
+        let mut odd = false;
+        for i in 0..n {
+            let (Some(a), Some(b)) = (pl.get(i), pl.get((i + 1) % n)) else { continue };
+            if (a.y > p.y) != (b.y > p.y) && p.x < a.x + (p.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+                odd = !odd;
+            }
+        }
+        odd
+    };
+    let keep: Vec<bool> = (0..profiles.len())
+        .map(|i| {
+            if !text_only.get(i).copied().unwrap_or(false) {
+                return true;
+            }
+            let Some(probe) = profiles.get(i).and_then(|p| p.region.outer.segs.first()).map(Seg2::mid) else { return true };
+            let ai = areas.get(i).copied().unwrap_or(0.0);
+            let depth = (0..profiles.len())
+                .filter(|&j| {
+                    j != i
+                        && text_only.get(j).copied().unwrap_or(false)
+                        && areas.get(j).copied().unwrap_or(0.0) > ai
+                        && boxes.get(j).is_some_and(|(lo, hi)| probe.x >= lo.x && probe.x <= hi.x && probe.y >= lo.y && probe.y <= hi.y)
+                        && polys.get(j).is_some_and(|pl| inside(pl, probe))
+                })
+                .count();
+            depth % 2 == 0
+        })
+        .collect();
+    profiles.into_iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| p).collect()
+}
+
+/// Find all closed profiles of a sketch. Curves are split where other curves end on them or
+/// cross them, like a drawing would be read.
 pub fn find_profiles(sk: &Sketch) -> Vec<Profile> {
     find_profiles_bounded(sk, MAX_EDGES)
 }
 
 fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
     let tol = MERGE_TOL * 10.0;
+    // Lines, arcs and circles (free-form curves take part as sampled pieces).
+    let analytic =
+        |ci: usize| sk.curves.get(ci).is_some_and(|c| matches!(c.kind, CurveKind::Line { .. } | CurveKind::Arc { .. } | CurveKind::Circle { .. }));
     // Analytic shapes of the profile curves.
     let mut shapes: Vec<(usize, Shape)> = Vec::new();
     let mut tags: Vec<Option<Piece>> = Vec::new();
@@ -582,14 +698,51 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
         p.sort_unstable();
         p.dedup();
     }
+    // Lines (and arcs) lying on a line (or an arc) are one path with it, carried by it: another
+    // curve meets them all where it meets the carrier, so they are cut at the same points. Met
+    // one by one, a curve touching them, or crossing them at a shallow angle, would meet each a
+    // little apart, and pieces cut at different points would not be one edge. Their crossings
+    // with each other, computed from round-off alone, are no cuts. The carrier is the first of
+    // them, and each lies on it itself (not just on one that lies on it); a carrier takes one
+    // whole circle at most, as two whole circles keep their crossings.
+    let mut carrier: Vec<usize> = (0..shapes.len()).collect();
+    let mut anchors: Vec<Vec2> = Vec::new();
+    if shapes.len() <= 50_000 {
+        let mut whole: Vec<bool> = shapes.iter().map(|(_, s)| s.is_full()).collect();
+        for i in 0..shapes.len() {
+            let Some((ci, x)) = shapes.get(i) else { continue };
+            if carrier.get(i) != Some(&i) || !analytic(*ci) {
+                continue;
+            }
+            for &j in partners.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                let Some((cj, y)) = shapes.get(j) else { continue };
+                let taken = y.is_full() && whole.get(i).copied().unwrap_or(true);
+                if carrier.get(j) == Some(&j) && !taken && overlap(i, j) && analytic(*cj) && overlapping(x, y, tol) {
+                    if let Some(c) = carrier.get_mut(j) {
+                        *c = i;
+                    }
+                    if let Some(w) = whole.get_mut(i) {
+                        *w |= y.is_full();
+                    }
+                }
+            }
+        }
+    }
     if shapes.len() <= 50_000 {
         for i in 0..shapes.len() {
             for &j in partners.get(i).map(Vec::as_slice).unwrap_or(&[]) {
                 if !overlap(i, j) {
                     continue;
                 }
-                let (Some((_, x)), Some((_, y))) = (shapes.get(i), shapes.get(j)) else { continue };
-                let mut pts = intersections(x, y);
+                let (gi, gj) = (carrier.get(i).copied().unwrap_or(i), carrier.get(j).copied().unwrap_or(j));
+                let (Some((_, x)), Some((_, y)), Some((_, gx)), Some((_, gy))) = (shapes.get(i), shapes.get(j), shapes.get(gi), shapes.get(gj))
+                else {
+                    continue;
+                };
+                if gi == gj {
+                    continue;
+                }
+                let mut pts = intersections_within(gx, gy, tol);
                 // A tangent touch gives two nearly equal roots: one point.
                 if let [p, q] = pts[..]
                     && p.dist(q) < tol * 100.0
@@ -624,6 +777,9 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
                         {
                             c.push(ty);
                         }
+                        if (gi, gj) != (i, j) {
+                            anchors.push(p);
+                        }
                     }
                 }
             }
@@ -650,6 +806,11 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
         grid.entry((cx, cy)).or_default().push(i);
         i
     };
+    // Where curves meet at their carriers' crossing, the cuts on each lie within the tolerance of
+    // that point, though not always of each other: they meet at a node there.
+    for a in &anchors {
+        node(*a);
+    }
     let mut loops: Vec<(Loop2, Vec<String>, usize, Option<Vec<String>>)> = Vec::new(); // (ccw loop, curve ids, component)
     let mut edges: Vec<Edge> = Vec::new();
     for (k, (ci, sh)) in shapes.iter().enumerate() {
@@ -670,6 +831,7 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
             ts.pop();
         }
         let id = sk.curves.get(*ci).map(|c| c.id.clone()).unwrap_or_default();
+        let analytic = analytic(*ci);
         let coverage = tags.get(k).copied().flatten().or_else(|| {
             sk.curves
                 .get(*ci)
@@ -688,7 +850,7 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
                     let (p, q) = (w[0], w[1]);
                     if p.dist(q) > MERGE_TOL {
                         let (u, v) = (node(p), node(q));
-                        edges.push(Edge { seg: Seg2::Line { a: p, b: q }, u, v, id: id.clone(), tag, coverage });
+                        edges.push(Edge { seg: Seg2::Line { a: p, b: q }, u, v, id: id.clone(), tag, coverage, analytic });
                     }
                 }
             }
@@ -711,14 +873,14 @@ fn find_profiles_bounded(sk: &Sketch, max_edges: usize) -> Vec<Profile> {
                     }
                     let seg = Seg2::Arc { center: c, radius: r, start: start + t0, sweep: t1 - t0 };
                     let (u, v) = (node(seg.start()), node(seg.end()));
-                    edges.push(Edge { seg, u, v, id: id.clone(), tag: None, coverage });
+                    edges.push(Edge { seg, u, v, id: id.clone(), tag: None, coverage, analytic });
                 }
             }
         }
     }
     let n = nodes.len();
-    // Prune dangling edges.
-    let mut alive = vec![true; edges.len()];
+    // One edge where pieces overlap, then prune dangling edges.
+    let mut alive = without_overlaps(&edges, tol);
     loop {
         let mut deg = vec![0usize; n];
         for (e, a) in edges.iter().zip(&alive) {
@@ -981,8 +1143,33 @@ fn same_seg(a: &Seg2, b: &Seg2, tol: f64) -> bool {
                 && a.end().dist(b.end()) <= tol
                 && a.mid().dist(b.mid()) <= tol
         }
-        _ => false,
+        // Free-form segments (text outlines, ellipses, splines): the same curve when they run
+        // through the same points.
+        (Seg2::Line { .. } | Seg2::Arc { .. }, _) | (_, Seg2::Line { .. } | Seg2::Arc { .. }) => false,
+        _ => [0.0, 0.25, 0.5, 0.75, 1.0].iter().all(|t| a.point_at(*t).dist(b.point_at(*t)) <= tol),
     }
+}
+
+/// A closed loop's segments with each run that `joins` says continue one another made one line.
+fn rejoined(segs: Vec<Seg2>, joins: &impl Fn(&Seg2, &Seg2) -> bool) -> Vec<Seg2> {
+    let n = segs.len();
+    let join = |i: usize| segs.get((i + n - 1) % n).zip(segs.get(i)).is_some_and(|(s, t)| joins(s, t));
+    // Start where a run starts; a loop that is all one run (it can't close) stays as it is.
+    let Some(k) = (0..n).find(|&i| !join(i)) else { return segs };
+    let mut out: Vec<Seg2> = Vec::with_capacity(n);
+    for j in 0..n {
+        let i = (k + j) % n;
+        let Some(s) = segs.get(i).copied() else { continue };
+        if j > 0
+            && join(i)
+            && let Some(Seg2::Line { b, .. }) = out.last_mut()
+        {
+            *b = s.end();
+            continue;
+        }
+        out.push(s);
+    }
+    out
 }
 
 /// Union of regions that touch along shared boundary segments (one extrude of several adjacent
@@ -1022,6 +1209,17 @@ pub fn merge_regions(regions: &[Region2]) -> Vec<Region2> {
     if !shared {
         return regions.to_vec();
     }
+    // Where the shared boundaries ended, the outline is left split in two: the lines on either
+    // side are one edge again (else they make split faces and vertices that booleans trip on).
+    let ends: Vec<Vec2> = segs.iter().zip(&alive).filter(|(_, a)| !**a).flat_map(|(s, _)| [s.start(), s.end()]).collect();
+    let rejoin = |s: &Seg2, t: &Seg2| match (*s, *t) {
+        (Seg2::Line { a, b }, Seg2::Line { a: b2, b: c }) => {
+            b.dist(b2) <= tol
+                && ends.iter().any(|e| e.dist(b) <= tol)
+                && (b - a).normalized().zip((c - b).normalized()).is_some_and(|(u, v)| u.dot(v) > 1.0 - 1e-12)
+        }
+        _ => false,
+    };
     let rest: Vec<Seg2> = segs.iter().zip(&alive).filter(|(_, a)| **a).map(|(s, _)| *s).collect();
     // Chain into loops, taking the sharpest left turn where several continue.
     let mut used = vec![false; rest.len()];
@@ -1057,8 +1255,12 @@ pub fn merge_regions(regions: &[Region2]) -> Vec<Region2> {
                 None => break,
             }
         }
+        // A loop that encloses nothing (pieces running back over themselves) is no boundary.
         if !lp.is_empty() && lp.first().zip(lp.last()).is_some_and(|(f, l)| l.end().dist(f.start()) <= tol) {
-            loops.push(Loop2 { segs: lp });
+            let lp = Loop2 { segs: rejoined(lp, &rejoin) };
+            if lp.signed_area().abs() > 1e-9 {
+                loops.push(lp);
+            }
         }
     }
     let outers: Vec<&Loop2> = loops.iter().filter(|l| l.signed_area() > 0.0).collect();

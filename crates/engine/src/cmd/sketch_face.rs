@@ -79,6 +79,7 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
         by_component.entry(doc.model_body_component(body)).or_default().push(body);
     }
     let mut chosen = None;
+    let mut sheet_face: Option<(String, Plane)> = None;
     let mut work = state.bodies.len().saturating_add(doc.occurrences.len());
     for (component, path, placement) in placements {
         let Some(bodies) = by_component.get(&component) else {
@@ -104,6 +105,22 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
             let inverse = mat_inverse(&frame).ok_or_else(|| bad(cmd, "invalid selected face frame"))?;
             let local_point = apply_point(&inverse, point);
             let tolerance = (body.body.size() * 1e-4).max(1e-5);
+            // A flat face of a sheet metal body attaches to its panel (or a panel's rim): the
+            // exact plane comes from the panel's flat region and fold, and the sketch keeps the
+            // face's name to follow it.
+            if !fixed
+                && let Some(sheet) = state.sheets.iter().find(|sheet| sheet.body == body.name)
+                && let Some((face, plane)) = sheet.panel_face_at(local_point, tolerance * 10.0)
+            {
+                if chosen.is_some() || sheet_face.is_some() {
+                    return Err(bad(cmd, "face point is ambiguous; pick an exact body and face index"));
+                }
+                let relative = mat_mul(&author_inverse, &frame);
+                let plane = Plane::new(apply_point(&relative, plane.origin), apply_vector(&relative, plane.x), apply_vector(&relative, plane.y))
+                    .ok_or_else(|| bad(cmd, "invalid sheet face plane"))?;
+                sheet_face = Some((solidcraft_doc::sheet::sheet_face_name(&body.name, &face), plane));
+                continue;
+            }
             let faces = body.body.faces(tolerance)?;
             let mesh = body.body.tessellate(tolerance)?;
             work = work.saturating_add(mesh.triangles.len().saturating_mul(if requested_index.is_some() { 1 } else { faces.len() }));
@@ -138,6 +155,12 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
             }
         }
     }
+    if let Some((name, plane)) = sheet_face {
+        if chosen.is_some() {
+            return Err(bad(cmd, "face point is ambiguous; pick an exact body and face index"));
+        }
+        return Ok(PlaneRef::Face { plane, at: apply_point(&author_inverse, point), name: Some(name), anchor: None });
+    }
     let (body, index, path, plane) =
         chosen.ok_or_else(|| bad(cmd, "the selected planar face no longer exists; choose another face or an explicit fixed plane"))?;
     if fixed {
@@ -159,6 +182,19 @@ fn capture_impl(s: &Session, value: &Value, cmd: &str, internal: bool) -> Result
                 return Err(bad(cmd, "capture the source occurrence position before generating a legacy face profile across components"));
             }
             None
+        }
+        Err(solidcraft_doc::DocError::Invalid(message))
+            if matches!(
+                message.as_str(),
+                "this face has no exact planar source; choose a fixed plane instead"
+                    | "this face has no supported construction certificate; choose a fixed plane instead"
+            ) =>
+        {
+            return Err(bad(
+                cmd,
+                "this face can't keep an attachment: it was merged from more than one feature's faces or reshaped by an edit. \
+                 Pick another face, or use a fixed plane here (fixed:true), which won't follow later changes to the face",
+            ));
         }
         Err(error) => return Err(bad(cmd, format!("{error}; choose a supported exact face or explicitly use fixed:true"))),
     };

@@ -1,5 +1,5 @@
-//! Toolbar layout of the tabs that share commands with others (Fusion's layout): the SOLID
-//! tab's ASSEMBLE panel, SHEET METAL and PLASTIC. A command is registered on one tab and panel;
+//! Explicit toolbar layouts: Sketch CREATE, the SOLID tab's ASSEMBLE panel, SHEET METAL and
+//! PLASTIC. A command is registered on one tab and panel;
 //! these panels list the commands they show in order (the first few get big buttons), so Extrude
 //! or Joint appear on several tabs. Commands registered on such a panel but not listed follow at
 //! the end.
@@ -100,6 +100,20 @@ pub fn panels(tab: &str) -> Option<&'static [&'static str]> {
 /// to the registry.
 pub fn layout<'a>(tab: &str, panel: &str, specs: &[&'a CommandSpec]) -> Option<(Vec<&'a CommandSpec>, usize)> {
     let (ids, promoted, own_tab): (&[&str], usize, &str) = match (tab, panel) {
+        ("SKETCH", "CREATE") => (
+            &[
+                "sketch.line",
+                "sketch.rectangle.two_point",
+                "sketch.circle.center",
+                "sketch.arc.three_point",
+                "sketch.slot.center_to_center",
+                "sketch.polygon.inscribed",
+                "sketch.spline.fit_point",
+                "sketch.point",
+            ],
+            8,
+            tab,
+        ),
         ("SOLID", "CONFIGURE") => (&["parameters.change", "config.table"], 2, tab),
         ("SOLID" | "SHEET METAL" | "PLASTIC", "ASSEMBLE") => (ASSEMBLE, 3, tab),
         ("SHEET METAL", "CREATE") => (SHEET_CREATE, 3, tab),

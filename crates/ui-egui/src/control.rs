@@ -95,9 +95,16 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
             let Some(id) = s("command").or(s("id")) else { return err("missing `command`") };
             let params = p.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}));
             let r = app.run(id, params);
-            if r.is_ok() && app.session.active_sketch.is_none() && app.session.world_state().bodies.len() == 1 && app.session.undo.len() <= 2 {
+            if r.is_ok()
+                && id != "view.navigate"
+                && app.session.active_sketch.is_none()
+                && app.session.world_state().bodies.len() == 1
+                && app.session.undo.len() <= 2
+            {
                 app.fit_view();
             }
+            // After the first-body fit, so a camera the command asked for (`view.apply`) wins.
+            app.follow_view_request(false);
             wrap(r)
         }
         "ui.agent_cursor" => {
@@ -116,7 +123,11 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
             }
             ok(json!(app.ui.agent_cursor))
         }
-        "engine.script" => wrap(app.session.run_script(p).map(|v| json!(v)).map_err(|e| e.to_string())),
+        "engine.script" => {
+            let r = app.session.run_script(p).map(|v| json!(v)).map_err(|e| e.to_string());
+            app.follow_view_request(false);
+            wrap(r)
+        }
         "engine.commands" => wrap(app.session.execute("engine.commands", &json!({})).map_err(|e| e.to_string())),
         "document.inspect" => wrap(app.session.execute("document.inspect", p).map_err(|e| e.to_string())),
         "ui.inspect" => ok(json!({
@@ -126,6 +137,7 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
             "camera": app.cam,
             "tool": app.tool.as_ref().map(|t| t.cmd),
             "dialog": app.dialog.as_ref().map(|d| format!("{d:?}")),
+            "status": app.status.as_ref().map(|(text, _, error)| json!({"text": text, "error": error})),
             "hover": app.viewport.hover.as_ref().map(|h| format!("{h:?}")),
             "renderer": if app.viewport.gpu.is_some() { "gpu" } else { "cpu" },
             "frame_ms": app.frame_ms,
@@ -357,7 +369,7 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
                     .and_then(|id| st.sketch(id))
                     .map(|ss| ss.plane.to_world(solidcraft_engine::geom::Vec2::new(num(s, 0), num(s, 1))))
             } else if let Some(n) = p.get("plane").and_then(Value::as_str) {
-                crate::viewport::origin_planes(app).into_iter().find(|(name, _, _)| *name == n).map(|(_, _, q)| (q[0] + q[1] + q[2] + q[3]) / 4.0)
+                crate::viewport::origin_plane_target(app, &proj, n)
             } else if let Some(n) = p.get("axis").and_then(Value::as_str) {
                 // Along an origin axis, on its solid part.
                 let size = crate::selection::origin_size(app.cam.half_height());
@@ -501,6 +513,7 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 json!({"diagnostics": crate::help::diagnostics(app), "version": crate::help::VERSION, "commit": crate::help::COMMIT, "built": crate::help::BUILD_DATE}),
             ),
         },
+        "ui.selectOther" => wrap(crate::select_other::control(app, p)),
         "ui.menuPick" => {
             let Some(key) = s("item") else { return err("missing `item` (id or label)") };
             wrap(crate::context_menu::pick(app, key))

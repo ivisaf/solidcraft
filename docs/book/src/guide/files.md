@@ -2,10 +2,12 @@
 
 | Format | Read | Write |
 |---|---|---|
-| `.solidcraft` (JSON design, versioned) | yes | yes |
+| `.solidcraft` (versioned container or JSON design) | yes | yes |
+| `.json` (self-contained plain JSON design) | yes | yes |
 | STEP (AP203, AP214, AP242) | solids, assemblies, units, names, colours | AP242 with names, colours and the component tree |
 | IGES 5.3 | manifold solids, or trimmed surfaces sewn into solids | manifold solids with names and colours |
 | 3MF, STL, OBJ | mesh bodies | yes |
+| 3MF with face tags | as 3MF | each triangle tagged with its B-rep face, exact coordinates |
 | DXF, SVG | into a sketch | sketches and flat patterns as DXF |
 | PNG, JPEG | canvases and decals | |
 
@@ -27,12 +29,47 @@ tapers, stepped parts and organic scans are refused by this first reconstruction
 method; it does not silently substitute a faceted solid. Conversion currently
 accepts at most 50,000 triangles and a bounded number of boundary segments.
 
+**File → Export 3MF with Face Tags** (`file.export` with `format: "3mf-tagged"`) writes an
+ordinary 3MF in which every triangle also names the B-rep face it lies on and every coordinate
+is the tessellation's own double-precision value. Meshing and analysis tools can use the tags to
+keep a model's faces (for loads, boundary conditions or feature edges); other 3MF readers ignore
+them. The format is specified in [`docs/formats/3mf-face-tags.md`](https://github.com/bherbruck/solidcraft/blob/main/docs/formats/3mf-face-tags.md).
+
 Saves are atomic: a crash at any moment leaves either the old file or the new one, and the
-replaced version is kept as `<file>.bak`. Unsaved changes are autosaved to a recovery folder,
+replaced version is kept as `<file>.bak`. A save keeps the file's permissions, and a design
+opened through a symbolic link (a synced folder linked into a project) is saved into the file the
+link points to, so the link stays. Unsaved changes are autosaved to a recovery folder,
 and the next launch offers to recover them. Older design files are upgraded on open, and files
 from a newer version are refused with a message.
 
-Current designs use format 12, including persistent analytic offset boundary roles and
+**Save** writes a container by default; files named `.json` keep JSON on subsequent saves.
+**Save As** offers a container or plain JSON on
+desktop; **Save As JSON** is also available in the File menu on desktop and web. Choose
+the `.json` extension for plain JSON. **Export Design as JSON** writes an independent,
+self-contained copy without changing the current file. Scripts can explicitly pass
+`"format": "json"` to `file.save` or `file.save_as` even with a `.solidcraft` name.
+Opening detects the format from the contents, so existing JSON designs keep working.
+Containers favor fast reading and saving by default. Scripts can request
+`"compression": "compact"` when file size matters more than CPU time.
+
+Containers deduplicate identical STEP, mesh and image payloads. Mesh coordinates retain
+their original double precision; this is not a conversion to STL. Geometry still rebuilds
+from the timeline when opening. When a saved display preview is available, desktop Open
+shows it while checking geometry; editing starts after the complete rebuild. Cancelling
+keeps the current design. Previews cannot be edited or measured. Scripts can opt in to a disposable geometry
+cache with `cache: true` on warm saves; saving never rebuilds cold geometry just to
+create one. Ordinary saves and browser downloads default to `cache: false`. An additional display-mesh cache remains opt-in
+with `preview: true`. Unsupported or mismatched caches are ignored. Browser opening
+still rebuilds synchronously.
+Warm saves with explicit `cache: true` can also include a small PNG thumbnail. It travels with the file, so
+Home can show the recent design without reconstructing it when no local picture
+is available. Missing or incompatible pictures use the usual thumbnail generation.
+The default `cache: false` omits the portable thumbnail too.
+The repository's `docs/design-container.md` describes limits and encoding details.
+
+Current designs use format 17, including face anchors on a piece of a face by its own name, sheet metal rims and bend ends, bend edges for Convert to Sheet Metal, the tear corner relief of sheet metal rules, the names of projected edges, physical materials defined in the design, the font of sketch text, sheet metal corner relief shapes, sketch face anchors on cylinder caps, sketch axis
+links, persistent
+names from exact face history, exact planar shell-face anchors, persistent analytic offset boundary roles and
 association profile references, durable sketch face anchors, periodic fit splines and versioned
 revolve conventions. It also retains recorded body transfers, explicit 3D curve coordinate
 spaces and certified face bindings, alongside semantic configuration styles, associative

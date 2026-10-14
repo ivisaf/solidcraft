@@ -19,13 +19,13 @@ Generated-in-code assets are original and have no file to list:
 |---|---|---|---|
 | assets/icon.svg | SolidCraft contributors | original macOS adaptation of the code-drawn SolidCraft mark, edited and exported with VectorCraft; Apple HIG and production templates consulted as layout references only | MIT OR Apache-2.0 |
 | assets/SolidCraft.icon/icon.json | SolidCraft contributors | approved Icon Composer composition and appearance settings for the original SolidCraft artwork | MIT OR Apache-2.0 |
-| assets/SolidCraft.icon/Assets/01-background.svg | SolidCraft contributors | original full-square porcelain background exported from VectorCraft for system masking | MIT OR Apache-2.0 |
 | assets/SolidCraft.icon/Assets/02-grid.svg | SolidCraft contributors | original perspective grid with elliptical radial alpha, exported from VectorCraft | MIT OR Apache-2.0 |
-| assets/SolidCraft.icon/Assets/03-solid.svg | SolidCraft contributors | original blue CAD solid with white edges clipped to its silhouette, exported from VectorCraft | MIT OR Apache-2.0 |
+| assets/SolidCraft.icon/Assets/02-grid-dark.svg | SolidCraft contributors | original blue perspective grid with elliptical radial alpha, exported from VectorCraft for the Dark appearance | MIT OR Apache-2.0 |
+| assets/SolidCraft.icon/Assets/03-solid-blue-cutout.svg | SolidCraft contributors | original saturated blue CAD solid with transparent topology cutouts, edited and exported with VectorCraft | MIT OR Apache-2.0 |
 | assets/Assets.car | SolidCraft contributors | Apple actool compilation of assets/SolidCraft.icon for macOS; contains original artwork only | MIT OR Apache-2.0 |
 | assets/icon.vectorcraft | SolidCraft contributors | editable VectorCraft source for assets/icon.svg, with named face and background layers | MIT OR Apache-2.0 |
 | assets/icon.png | SolidCraft contributors | 1024 × 1024 transparent sRGB export of assets/icon.svg from VectorCraft | MIT OR Apache-2.0 |
-| assets/icon.icns | SolidCraft contributors | traditional macOS fallback packaged from assets/icon.png by Apple's iconutil | MIT OR Apache-2.0 |
+| assets/icon.icns | SolidCraft contributors | macOS fallback compiled by Apple's actool from the approved assets/SolidCraft.icon composition | MIT OR Apache-2.0 |
 | assets/icon.iconset/icon_16x16.png | SolidCraft contributors | native sips export from assets/icon.png | MIT OR Apache-2.0 |
 | assets/icon.iconset/icon_16x16@2x.png | SolidCraft contributors | native sips export from assets/icon.png | MIT OR Apache-2.0 |
 | assets/icon.iconset/icon_32x32.png | SolidCraft contributors | native sips export from assets/icon.png | MIT OR Apache-2.0 |
@@ -37,8 +37,11 @@ Generated-in-code assets are original and have no file to list:
 | assets/icon.iconset/icon_512x512.png | SolidCraft contributors | native sips export from assets/icon.png | MIT OR Apache-2.0 |
 | assets/icon.iconset/icon_512x512@2x.png | SolidCraft contributors | native sips export from assets/icon.png | MIT OR Apache-2.0 |
 | docs/screenshots/sample-plate.png | SolidCraft contributors | screenshot of SolidCraft itself (`solidcraft --sample`) | MIT OR Apache-2.0 |
-| docs/screenshots/enclosure-demo-0.2.1.gif | SolidCraft contributors | original electronics enclosure screen recording of the actual SolidCraft 0.2.1 English desktop UI, generated with examples/demo/record_ui.sh and its original animated pointer overlay (4× playback) | MIT OR Apache-2.0 |
-| docs/screenshots/enclosure-demo-0.2.1.mp4 | SolidCraft contributors | original electronics enclosure screen recording of the actual SolidCraft 0.2.1 English desktop UI, generated with examples/demo/record_ui.sh and its original animated pointer overlay (4× playback) | MIT OR Apache-2.0 |
+| docs/screenshots/demo-0.8.gif | SolidCraft contributors | original screen recording of the actual SolidCraft 0.8 English desktop UI modelling an original Raspberry Pi 4 case (no logos or branding; the engraved text is set in the system's DejaVu Sans Bold), generated with examples/demo/record_ui.sh and its original animated pointer overlay (9× playback) | MIT OR Apache-2.0 |
+| docs/screenshots/demo-0.8.mp4 | SolidCraft contributors | original screen recording of the actual SolidCraft 0.8 English desktop UI modelling an original Raspberry Pi 4 case (no logos or branding; the engraved text is set in the system's DejaVu Sans Bold), generated with examples/demo/record_ui.sh and its original animated pointer overlay (9× playback) | MIT OR Apache-2.0 |
+| docs/screenshots/rover-build.gif | 0xlillith (model); SolidCraft contributors (recording) | screen recording of the actual SolidCraft desktop UI replaying the timeline of the SELENE rover (`Rover-recorded.solidcraft` from https://github.com/0xlillith/solidcraft-rover, an original model by 0xlillith built through SolidCraft MCP); the model's lettering follows Ubuntu Light outlines (Canonical Ltd., Ubuntu Font Licence 1.0, as noted in that repository); the emblem is the SolidCraft project icon (2× playback) | MIT OR Apache-2.0 |
+| docs/screenshots/rover-build.mp4 | 0xlillith (model); SolidCraft contributors (recording) | screen recording of the actual SolidCraft desktop UI replaying the timeline of the SELENE rover (`Rover-recorded.solidcraft` from https://github.com/0xlillith/solidcraft-rover, an original model by 0xlillith built through SolidCraft MCP); the model's lettering follows Ubuntu Light outlines (Canonical Ltd., Ubuntu Font Licence 1.0, as noted in that repository); the emblem is the SolidCraft project icon | MIT OR Apache-2.0 |
+| docs/book/src/og.png | SolidCraft contributors | original 1280 × 640 social preview card (the SolidCraft mark, name and tagline), served by the docs site for link previews | MIT OR Apache-2.0 |
 | docs/book/src/generated/sample-plate.png | SolidCraft contributors | copy of docs/screenshots/sample-plate.png made by `cargo xtask book` (gitignored) | MIT OR Apache-2.0 |
 | docs/book/src/generated/bracket.png | SolidCraft contributors | rendered by `cargo xtask book` (`solidcraft-cli snapshot examples/bracket.json`; gitignored) | MIT OR Apache-2.0 |
 | docs/book/src/generated/enclosure.png | SolidCraft contributors | rendered by `cargo xtask book` (`solidcraft-cli snapshot docs/book/scripts/enclosure.json`; gitignored) | MIT OR Apache-2.0 |
@@ -83,6 +86,16 @@ Generated-in-code assets are original and have no file to list:
 | LICENSE-MIT, LICENSE-APACHE (licence text) | CADCraft | — |
 | .github/workflows/release.yml, .github/workflows/packaging-lint.yml and packaging/ (release pipeline: Linux AppImage/deb/rpm/Flatpak/tar.gz, FreeBSD, macOS dmg, Windows MSI/portable zip, web zip; AppRun, nfpm, Flatpak, WiX and Info.plist templates) | PhotoCraft (https://github.com/storytold/photocraft) `.github/workflows/{release,packaging-lint}.yml`, `packaging/` | Apache-2.0 |
 
+## Incremental HDR codec adapter
+
+`crates/render/src/lighting/hdr.rs` adapts the scanline/component/old-RLE decoding
+state machines from the Radiance decoder in `image` 0.25.10
+([source](https://docs.rs/crate/image/0.25.10/source/src/codecs/hdr/decoder.rs)),
+MIT OR Apache-2.0. Metadata parsing still uses that library. The adapter makes row
+work cooperative and adds checked run lengths, zero-run rejection, width validation,
+header/input/radiance bounds and cancellation. Original licence texts are retained
+in THIRD-PARTY-LICENSES.txt; no images or artwork from that project are copied.
+
 ## Recovered contributions
 
 | SolidCraft file | Original contribution | Licence |
@@ -93,7 +106,7 @@ Generated-in-code assets are original and have no file to list:
 
 | Directory | Source | Licence | Changes |
 |---|---|---|---|
-| vendor/truck-meshalgo | truck-meshalgo 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | meshing: parameter searches kept inside the surface domain (vendor/README.md) |
+| vendor/truck-meshalgo | truck-meshalgo 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | meshing: bounded parameter searches, subdivision and provisional fixed-grid previews (vendor/README.md) |
 | vendor/truck-stepio | truck-stepio 0.3.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | STEP writer: intersection-curve surfaces written at unique ids (vendor/README.md) |
 | vendor/truck-shapeops | truck-shapeops 0.4.0, https://github.com/ricosjp/truck (RICOS Co. Ltd.) | Apache-2.0 | robust meshing and nearest-parameter fallback in booleans; degenerate intersection-curve rejection; face and edge history of booleans; trace macro (vendor/README.md) |
 | vendor/matext4cgmath | matext4cgmath 0.1.0, https://github.com/ricosjp/matext4cgmath (RICOS Co. Ltd.) | Apache-2.0 | root refinement stops after 100 Newton steps (vendor/README.md) |

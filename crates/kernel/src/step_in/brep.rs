@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use mt::{BoundedCurve, EuclideanSpace, InnerSpace, MetricSpace, ParametricCurve};
+use mt::{BoundedCurve, InnerSpace, MetricSpace, ParametricCurve};
 use truck_modeling as mt;
 
 use super::Ctx;
@@ -244,7 +244,7 @@ impl Builder {
             })
             .collect();
         let surface = if e.name() == "FACE" {
-            plane_through(&extent).ok_or("polygonal face without a plane")?
+            crate::plane_fit::plane_through(&extent).map(mt::Surface::Plane).ok_or("polygonal face without a plane")?
         } else {
             let sid = rid(p.get(2), "face geometry")?;
             let sense = p.get(3).and_then(Param::as_bool).unwrap_or(true);
@@ -344,30 +344,6 @@ impl Builder {
     }
 }
 
-/// Plane through a polygon (Newell's normal).
-fn plane_through(pts: &[mt::Point3]) -> Option<mt::Surface> {
-    let n = pts.len();
-    let mut nrm = mt::Vector3::new(0.0, 0.0, 0.0);
-    let mut c = mt::Vector3::new(0.0, 0.0, 0.0);
-    for i in 0..n {
-        let (a, b) = (pts.get(i)?, pts.get((i + 1) % n)?);
-        nrm.x += (a.y - b.y) * (a.z + b.z);
-        nrm.y += (a.z - b.z) * (a.x + b.x);
-        nrm.z += (a.x - b.x) * (a.y + b.y);
-        c += a.to_homogeneous().truncate();
-    }
-    let len = nrm.magnitude();
-    if !(len > 1e-12) || n == 0 {
-        return None;
-    }
-    let z = nrm / len;
-    let o = mt::Point3::from_vec(c / n as f64);
-    let a = if z.x.abs() < 0.9 { mt::Vector3::unit_x() } else { mt::Vector3::unit_y() };
-    let x = (a - z * a.dot(z)).normalize();
-    let y = z.cross(x);
-    Some(mt::Surface::Plane(mt::Plane::new(o, o + x, o + y)))
-}
-
 /// Read a solid-like representation item: MANIFOLD_SOLID_BREP, BREP_WITH_VOIDS, FACETED_BREP,
 /// or a SHELL_BASED_SURFACE_MODEL (closed shells give solids, open ones open bodies).
 pub(crate) fn read_item(cx: &Ctx, id: u64) -> R<BrepOut> {
@@ -419,12 +395,29 @@ pub(crate) fn read_item(cx: &Ctx, id: u64) -> R<BrepOut> {
     if shells.is_empty() {
         return Err(failed.first().cloned().unwrap_or_else(|| "no shells".into()));
     }
-    let solid = match guard("step solid", || mt::Solid::try_new(shells.clone()).map_err(|e| crate::KernelError::Failed(e.to_string()))) {
-        Ok(s) => s,
-        Err(_) => {
-            closed = false;
-            mt::Solid::new_unchecked(shells)
+    // `mt::Solid::try_new` only checks each shell (non-empty, connected, closed, no singular
+    // vertex) and hands the shells back unchanged (truck-topology 0.6.0), so the same checks run
+    // here on the borrowed shells. The successful path used to clone every face, edge, vertex,
+    // curve and surface to keep a copy that was then dropped.
+    let checked = guard("step solid", || {
+        for shell in &shells {
+            if shell.is_empty() {
+                return Err(crate::KernelError::Failed("empty shell".into()));
+            }
+            if !shell.is_connected() {
+                return Err(crate::KernelError::Failed("shell is not connected".into()));
+            }
+            if shell.shell_condition() != mt::ShellCondition::Closed {
+                return Err(crate::KernelError::Failed("shell is not closed".into()));
+            }
+            if !shell.singular_vertices().is_empty() {
+                return Err(crate::KernelError::Failed("shell is not manifold".into()));
+            }
         }
-    };
-    Ok(BrepOut { solid, failed, closed, file_faces, face_origin })
+        Ok(())
+    });
+    if checked.is_err() {
+        closed = false;
+    }
+    Ok(BrepOut { solid: mt::Solid::new_unchecked(shells), failed, closed, file_faces, face_origin })
 }

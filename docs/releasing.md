@@ -11,11 +11,11 @@ version bump and no patch release for every merge.
 Every release asset, binary, installer product name and package uses the SolidCraft name
 (`solidcraft-<version>-linux-<arch>.AppImage`, `SolidCraft-<version>-windows-x64.exe`,
 `solidcraft-cli` archives, …). The old name survives only in the shims listed in
-[compatibility.md](compatibility.md) (the Linux app ID, the legacy `.zsync` and `.flatpakrepo`
+[compatibility.md](compatibility.md) (the end-of-life Flatpak refs of the old Linux app ID, the legacy `.zsync` and `.flatpakrepo`
 copies, the deprecated old-name CLI alias); keep them until that document says they can go. Do not
 rewrite published assets, checksums, tags or historical release notes of earlier versions.
 
-The main installers (`.msi`, portable `.zip`, `.dmg`, `.AppImage`, `.deb`, `.rpm`, `.flatpak`) are
+The main installers (`.msi`, portable `.zip`, `.dmg`, `.AppImage`, `.deb`, `.rpm`, `.flatpak`, `.snap`) are
 also attached without the version in their names, for example `solidcraft-windows-x64.msi` and
 `solidcraft-linux-x86_64.AppImage`, and listed in `SHA256SUMS.txt`. The README's Download section
 links to `https://github.com/bherbruck/solidcraft/releases/latest/download/<name>`, which follows
@@ -144,6 +144,55 @@ Pages assembles the documentation, browser app, and Flatpak repository together.
 docs updates include the latest stable Flatpak release too. Verify the resulting Pages run,
 not only the dispatch job, so a release cannot erase the docs or app and docs updates cannot
 erase the package repository.
+
+## Snap package and Snap Store
+
+Every release and nightly attaches `solidcraft-<version>-linux-<arch>.snap` for x86_64 and
+aarch64 (`packaging/linux/snap-pack.sh`, manifest `packaging/linux/snap/snapcraft.yaml`). Like the
+Flatpak, it repackages the Linux job's tarball. The `snap` job installs it with `--dangerous`,
+starts the confined app on headless X11 and Wayland (`packaging/linux/snap-smoke.py`), models a
+box over the control channel and keeps the captured frames as the `snap-smoke-<arch>` artifact.
+
+The Snap Store steps run only when the `SNAPCRAFT_STORE_CREDENTIALS` repository secret exists;
+without it they are skipped and the `.snap` files are still attached to the release:
+
+- nightlies are uploaded to `latest/edge`;
+- release drafts (pushes to `release`) are uploaded to `latest/candidate`, after every package
+  built and the draft was staged;
+- publishing a non-prerelease GitHub release runs `snap-store.yml`, which promotes
+  `latest/candidate` to `latest/stable`. As with the Flatpak repository, a publication made with
+  `GITHUB_TOKEN` doesn't trigger it: then run `gh workflow run snap-store.yml`.
+
+To enable the Snap Store once (owner):
+
+1. Sign in at <https://snapcraft.io> with an Ubuntu One account and register the name at
+   <https://snapcraft.io/register-snap> (or `snapcraft login` then `snapcraft register solidcraft`).
+2. On a machine with snapcraft (`sudo snap install snapcraft --classic`), export upload-only
+   credentials for this snap:
+
+   ```sh
+   snapcraft export-login --snaps=solidcraft \
+     --channels=edge,candidate,stable \
+     --acls=package_access,package_push,package_update,package_release \
+     --expires=2027-10-01 solidcraft-store-credentials.txt
+   ```
+
+3. Store them as the repository secret and delete the file:
+
+   ```sh
+   gh secret set SNAPCRAFT_STORE_CREDENTIALS -R bherbruck/solidcraft < solidcraft-store-credentials.txt
+   rm solidcraft-store-credentials.txt
+   ```
+
+4. Optional: fill in the store listing at <https://snapcraft.io/solidcraft/listing> (the icon,
+   summary and description come from the snap; add screenshots and the category "Art and design").
+5. The next nightly fills `edge` and the next release fills `candidate`, then `stable` on
+   publication. To fill `stable` from an already published release right away, download its
+   `.snap` files and run `snapcraft upload --release=stable <file>` for each.
+
+Renew the credentials before `--expires` by repeating steps 2 and 3. The snap uses strict
+confinement and only plugs that connect automatically, apart from `removable-media`, which users
+connect with `sudo snap connect solidcraft:removable-media` (getting-started.md).
 
 ## Repository setup
 

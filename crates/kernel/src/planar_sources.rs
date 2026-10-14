@@ -30,6 +30,7 @@ fn base_plane(source: &FaceSource, actual: &Plane) -> Option<Plane> {
         FaceSource::CertifiedExtrudeSide { plane: Some(p), .. }
         | FaceSource::CertifiedExtrudeCap { plane: p, .. }
         | FaceSource::Box { producer: Some(_), plane: p, .. }
+        | FaceSource::CylinderCap { plane: p, .. }
         | FaceSource::ShellPlanar { producer: Some(_), plane: p, .. } => Some(*p),
         FaceSource::Imported { producer: Some(_), payload_sha256: Some(_), .. } => Some(*actual),
         _ => None,
@@ -41,6 +42,7 @@ pub(super) fn certified_plane(source: &FaceSource) -> Option<Plane> {
         FaceSource::CertifiedExtrudeSide { plane: Some(p), .. }
         | FaceSource::CertifiedExtrudeCap { plane: p, .. }
         | FaceSource::Box { producer: Some(_), plane: p, .. }
+        | FaceSource::CylinderCap { plane: p, .. }
         | FaceSource::ShellPlanar { producer: Some(_), plane: p, .. } => Some(*p),
         _ => None,
     }
@@ -93,7 +95,7 @@ pub(super) fn descriptor_cost(source: &FaceSource) -> Option<usize> {
             }
             cost = cost.checked_add(count.checked_mul(128)?)?;
         }
-        FaceSource::ExtrudeSide { .. } | FaceSource::Imported { .. } | FaceSource::Box { .. } => {}
+        FaceSource::ExtrudeSide { .. } | FaceSource::Imported { .. } | FaceSource::Box { .. } | FaceSource::CylinderCap { .. } => {}
         _ => return None,
     }
     Some(cost)
@@ -102,13 +104,13 @@ pub(super) fn descriptor_cost(source: &FaceSource) -> Option<usize> {
 impl Body {
     /// Preserve uniquely certified unchanged planar construction supports.
     pub fn with_preserved_planar_sources(self, input: &Body) -> Result<Self> {
-        self.map_planar_sources(input, None, None, &[], false)
+        self.map_planar_sources(&[input], None, None, &[], false)
     }
 
     /// Generate distinct outer/inner roles from the exact original supports of
     /// an inside shell. Generated rims and curved walls are intentionally absent.
     pub(crate) fn with_shell_planar_sources(self, input: &Body, thickness: f64, open: &[Vec3]) -> Result<Self> {
-        self.map_planar_sources(input, Some(thickness), None, open, false)
+        self.map_planar_sources(&[input], Some(thickness), None, open, false)
     }
 
     /// Retain exact shell roles, and construction roles for Cut, only on unchanged
@@ -118,19 +120,38 @@ impl Body {
         if !input.face_sources().is_some_and(|sources| sources.iter().flatten().any(|s| boolean_source(s, constructed))) {
             return Ok(self_);
         }
-        self_.map_planar_sources(input, None, Some(tool), &[], constructed)
+        self_.map_planar_sources(&[input], None, Some(tool), &[], constructed)
     }
 
-    fn map_planar_sources(mut self, input: &Body, shell: Option<f64>, blocker: Option<&Body>, open: &[Vec3], constructed: bool) -> Result<Self> {
-        self.regularization_protected |= input.regularization_protected;
-        let Some(sources) = input.face_sources() else { return Ok(self) };
-        if input.solid.face_iter().count() > 16_384
+    /// Retain exact construction and shell roles through a Union from both operands, only on
+    /// unchanged supports. Coplanar supports of the two operands carry distinct identities, so
+    /// a face merged from both stays without a role.
+    pub(crate) fn with_preserved_union_planar_sources(self, a: &Body, b: &Body) -> Result<Self> {
+        let self_ = self.inherit_regularization_protection(a).inherit_regularization_protection(b);
+        if ![a, b].iter().any(|input| input.face_sources().is_some_and(|sources| sources.iter().flatten().any(|s| boolean_source(s, true)))) {
+            return Ok(self_);
+        }
+        self_.map_planar_sources(&[a, b], None, None, &[], true)
+    }
+
+    fn map_planar_sources(mut self, inputs: &[&Body], shell: Option<f64>, blocker: Option<&Body>, open: &[Vec3], constructed: bool) -> Result<Self> {
+        // Every boolean (a Cut's tool, or a Union's second operand) leaves the result with
+        // faces whose support no input role describes.
+        let boolean = blocker.is_some() || inputs.len() > 1;
+        for input in inputs {
+            self.regularization_protected |= input.regularization_protected;
+        }
+        if inputs.iter().all(|input| input.face_sources().is_none()) {
+            return Ok(self);
+        }
+        if inputs.len() > 2
+            || inputs.iter().any(|input| input.solid.face_iter().count() > 16_384)
             || self.solid.face_iter().count() > 16_384
             || blocker.is_some_and(|b| b.solid.face_iter().count() > 16_384)
         {
             return Err(KernelError::Invalid("planar source face budget exceeded".into()));
         }
-        if sources.len() != input.solid.face_iter().count() {
+        if inputs.iter().any(|input| input.face_sources().is_some_and(|sources| sources.len() != input.solid.face_iter().count())) {
             return Err(KernelError::Invalid("planar source alignment mismatch".into()));
         }
         if shell.is_some_and(|t| !t.is_finite() || t <= 0.) {
@@ -139,20 +160,22 @@ impl Body {
         if open.len() > 256 {
             return Ok(self);
         }
-        let opening_tolerance = if shell.is_some() { input.size() * 1e-4 + 1e-6 } else { 0. };
+        let opening_tolerance = if shell.is_some() { inputs.iter().map(|input| input.size()).fold(0., f64::max) * 1e-4 + 1e-6 } else { 0. };
         let mapped = guard("exact planar support lineage", || {
             let competing: Vec<_> = blocker.into_iter().flat_map(|b| b.solid.face_iter()).filter_map(actual_plane).collect();
             let mut candidates = Vec::new();
             let mut unknown_supports = Vec::new();
-            for (face, source) in input.solid.face_iter().zip(sources) {
+            let faces = inputs.iter().flat_map(|input| {
+                let sources = input.face_sources().unwrap_or_default();
+                input.solid.face_iter().enumerate().map(move |(index, face)| (face, sources.get(index).and_then(Option::as_ref)))
+            });
+            for (face, source) in faces {
                 let Some(actual) = actual_plane(face) else { continue };
-                let Some(source) = source.as_ref() else {
+                let Some(source) = source else {
                     unknown_supports.push(actual);
                     continue;
                 };
-                if (blocker.is_some() && !boolean_source(source, constructed))
-                    || (shell.is_some() && matches!(source, FaceSource::ShellPlanar { .. }))
-                {
+                if (boolean && !boolean_source(source, constructed)) || (shell.is_some() && matches!(source, FaceSource::ShellPlanar { .. })) {
                     unknown_supports.push(actual);
                     continue;
                 }
@@ -207,7 +230,7 @@ impl Body {
                             .face_sources()
                             .and_then(|sources| sources.get(index))
                             .and_then(|s| s.as_ref())
-                            .filter(|s| (blocker.is_some() || self.face_was_coalesced(index)) && !boolean_source(s, constructed));
+                            .filter(|s| (boolean || self.face_was_coalesced(index)) && !boolean_source(s, constructed));
                         let keep = existing.and_then(|s| {
                             descriptor_cost(s).and_then(|cost| {
                                 metadata.checked_sub(cost).map(|remaining| {
@@ -251,7 +274,7 @@ impl Body {
                         });
                     }
                 }
-                if found.is_none() && (blocker.is_some() || self.face_was_coalesced(index)) {
+                if found.is_none() && (boolean || self.face_was_coalesced(index)) {
                     found = self
                         .face_sources()
                         .and_then(|sources| sources.get(index))
@@ -383,7 +406,9 @@ mod tests {
             assert!(display.contains(Vec3::new(width / 2. - thickness / 2., 0., thickness / 2.)));
             assert!(display.contains(Vec3::new(width / 2. - thickness / 2., 0., 15.)));
             assert!(!display.contains(Vec3::new(0., 0., 15.)));
-            assert_eq!(raw.measure().volume, display.measure().volume);
+            // Different meshers (the display plan and the reference), both within 0.01 mm.
+            let (rv, dv) = (raw.measure().volume, display.measure().volume);
+            assert!((rv - dv).abs() <= raw.measure().area * 0.01, "display volume {dv} vs {rv}");
             let expected = (width * 60. - (4. - std::f64::consts::PI) * 36.) * 30.
                 - ((width - 2. * thickness) * (60. - 2. * thickness) - (4. - std::f64::consts::PI) * (6. - thickness).powi(2)) * (30. - thickness);
             assert!((cup.tessellate(1e-4).unwrap().measure().volume - expected).abs() < 0.2);
@@ -426,6 +451,34 @@ mod tests {
         let copy = &imported.bodies[0].body;
         assert_eq!(copy.solid.face_iter().count(), 11);
         assert!((copy.tessellate(0.01).unwrap().measure().volume - mesh.measure().volume).abs() < 1e-6);
+    }
+    #[test]
+    fn union_keeps_unchanged_supports_of_both_operands_and_drops_shared_ones() {
+        use crate::{BoolOp, boolean};
+        let a = box_solid(Vec3::ZERO, Vec3::new(20., 20., 10.)).unwrap().with_box_certificate(1).unwrap();
+        // A taller box overlapping one side: the bottoms share z = 0, the tops do not.
+        let b = box_solid(Vec3::new(10., 5., 0.), Vec3::new(30., 15., 15.)).unwrap().with_box_certificate(2).unwrap();
+        let joined = boolean(&a, &b, BoolOp::Union).unwrap().unwrap();
+        let sources = joined.face_sources().unwrap();
+        let mut seen = Vec::new();
+        for (i, face) in joined.solid.face_iter().enumerate() {
+            let plane = actual_plane(face).unwrap();
+            let source = sources[i].as_ref();
+            let height = plane.origin.z;
+            if plane.normal().z > 0.999 && (height - 10.).abs() < 1e-9 {
+                assert!(matches!(source, Some(FaceSource::Box { producer: Some(1), axis: 2, high: true, .. })), "{source:?}");
+                seen.push("a top");
+            } else if plane.normal().z > 0.999 && (height - 15.).abs() < 1e-9 {
+                assert!(matches!(source, Some(FaceSource::Box { producer: Some(2), axis: 2, high: true, .. })), "{source:?}");
+                seen.push("b top");
+            } else if plane.normal().z < -0.999 {
+                assert!(source.is_none(), "a bottom merged from both operands has no single identity: {source:?}");
+                seen.push("bottom");
+            }
+        }
+        for want in ["a top", "b top", "bottom"] {
+            assert!(seen.contains(&want), "{want} missing from {seen:?}");
+        }
     }
     #[test]
     fn coincident_competing_source_planes_and_tool_planes_stay_unknown() {
@@ -498,7 +551,8 @@ mod tests {
         assert!(!display.contains(Vec3::new(0., 0., 5.)));
         assert!(display.contains(Vec3::new(28., 0., 5.)));
         assert!((display.measure().volume - (60. * 54. * 10. - 4. * x * y * 9.)).abs() < 1e-7);
-        assert_eq!(raw.measure().volume, display.measure().volume);
+        // Different triangulations of the same polyhedron: equal up to rounding.
+        assert!((raw.measure().volume - display.measure().volume).abs() < 1e-9 * raw.measure().volume);
         let imported = crate::step_import(&crate::step_export(&[&pocket], "regularized pocket").unwrap()).unwrap();
         assert!(imported.warnings.is_empty());
         let copy = &imported.bodies[0].body;

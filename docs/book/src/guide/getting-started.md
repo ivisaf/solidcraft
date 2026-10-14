@@ -36,20 +36,39 @@ to the same user installation:
 ```sh
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak remote-add --user --if-not-exists solidcraft https://bherbruck.github.io/solidcraft/flatpak/solidcraft.flatpakrepo
-flatpak install --user solidcraft ai.storyteller.solvecraft
-flatpak run ai.storyteller.solvecraft
+flatpak install --user solidcraft ai.storyteller.solidcraft
+flatpak run ai.storyteller.solidcraft
 ```
 
-The application ID is unchanged, so existing installations keep
-receiving updates under whatever remote name they were added with (see the
-[compatibility notes](https://github.com/bherbruck/solidcraft/blob/main/docs/compatibility.md#package-ids)).
+Releases up to 0.7 used the application ID `ai.storyteller.solvecraft`. If you installed one
+of those from the SolidCraft remote, `flatpak update --user` reports it as end-of-life and offers
+to replace it with `ai.storyteller.solidcraft`; accept, and your settings and autosaves move with
+it. If you installed a `.flatpak` bundle, install the new bundle, launch it once (it copies your
+settings), then run `flatpak uninstall --user ai.storyteller.solvecraft` (see the
+[compatibility notes](https://github.com/bherbruck/solidcraft/blob/main/docs/compatibility.md#linux-app-id)).
 
 Alternatively, download the release's `.flatpak` file for your architecture and run
 `flatpak install --user ./solidcraft-VERSION-linux-ARCH.flatpak`. The bundle supplies the
 Flathub runtime repository address; installation still needs internet access to fetch any
-missing runtime. Launch with `flatpak run ai.storyteller.solvecraft`, rather than looking for
+missing runtime. Launch with `flatpak run ai.storyteller.solidcraft`, rather than looking for
 a host `solidcraft` binary. Files chosen through Open/Save use the desktop file-chooser portal;
 command-line paths outside Documents may need a specific additional filesystem permission.
+
+### Linux Snap
+
+On Ubuntu and other distributions with snapd:
+
+```sh
+sudo snap install solidcraft
+solidcraft                # or open SolidCraft from the app menu
+solidcraft.cli --version  # the CLI, for scripts and `solidcraft.cli mcp`
+```
+
+The snap can open designs in your home folder (not hidden folders) and, through the file
+chooser, anywhere else. For USB drives and other mounted disks, run
+`sudo snap connect solidcraft:removable-media` once. A release's `.snap` file installs without
+the store with `sudo snap install --dangerous ./solidcraft-VERSION-linux-ARCH.snap`; it then
+doesn't update automatically.
 
 ## Web
 
@@ -87,6 +106,11 @@ A script is a list of commands:
 ```
 
 ![The bracket example, rendered by solidcraft-cli snapshot](../generated/bracket.png)
+
+A command that fails stops the script. A feature can also fail later, when a parameter change
+rebuilds it; `run` then exits with status 1, lists the failing features and writes none of
+its `--out` and `--save` files, because the bodies lack what those features should have made.
+`--allow-errors` writes them anyway.
 
 Units are millimetres and degrees unless an expression says otherwise (`"1 in"`, `"30 deg"`),
 and Z is up.

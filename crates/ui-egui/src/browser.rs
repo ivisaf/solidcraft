@@ -19,6 +19,7 @@ use solidcraft_engine::doc::FeatureKind;
 
 use crate::context_menu::{Item, Target};
 use crate::theme::Tokens;
+
 use crate::{SolveApp, icons};
 
 thread_local! {
@@ -55,6 +56,10 @@ pub struct TreeState {
     pub picked_components: Vec<u64>,
     /// Canvases picked in the tree.
     pub picked_canvases: Vec<u64>,
+    /// Folders picked in the feature history (features use the engine selection).
+    pub picked_timeline_groups: Vec<u64>,
+    /// Last feature-history item clicked, for Shift ranges (`f:<id>` or `g:<id>`).
+    pub timeline_anchor: Option<String>,
     /// The Edit Canvas / Calibrate panel.
     pub canvas_panel: Option<CanvasPanel>,
     /// What waits for the Capture Position question: a command id, or [`SAVE`].
@@ -496,6 +501,15 @@ struct Actions {
 }
 
 pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
+    browser_panel(app, ui, false);
+}
+
+/// The left-sidebar layout: feature history first, parts and scene browser below it.
+pub fn browser_below_timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
+    browser_panel(app, ui, true);
+}
+
+fn browser_panel(app: &mut SolveApp, ui: &mut egui::Ui, timeline_above: bool) {
     let t = Tokens::get();
     app.tree.order.clear();
     DRAWN.with(|d| d.borrow_mut().clear());
@@ -506,16 +520,66 @@ pub fn browser(app: &mut SolveApp, ui: &mut egui::Ui) {
         .resizable(false)
         .frame(egui::Frame::NONE.fill(t.panel).inner_margin(egui::Margin::symmetric(6, 6)))
         .show(ui, |ui| {
-            ui.label(RichText::new("BROWSER").size(11.0).strong().color(t.text_dim));
-            ui.add_space(4.0);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .scroll_source(egui::scroll_area::ScrollSource { scroll_bar: true, mouse_wheel: true, ..egui::scroll_area::ScrollSource::NONE })
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    component_rows(app, ui, 0, 0, &mut acts);
+            if timeline_above {
+                let available = ui.available_height();
+                let browser_collapsed = app.preferences.timeline_left_browser_collapsed;
+                let max_timeline_height = (available - if browser_collapsed { 30.0 } else { 130.0 }).max(150.0);
+                let remembered = app.preferences.timeline_left_height;
+                let timeline_height =
+                    if remembered.is_finite() { remembered.clamp(150.0, max_timeline_height) } else { 360.0_f32.clamp(150.0, max_timeline_height) };
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), timeline_height), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    crate::timeline_left::left_timeline(app, ui)
                 });
+                if !browser_collapsed {
+                    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 8.0), egui::Sense::hover());
+                    let response = ui
+                        .interact(rect, egui::Id::new("left_history_divider"), egui::Sense::drag())
+                        .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+                    if response.dragged() {
+                        let delta = ui.input(|input| input.pointer.delta().y);
+                        if delta.is_finite() {
+                            app.preferences.timeline_left_height = (timeline_height + delta).clamp(150.0, max_timeline_height);
+                        }
+                    }
+                    ui.painter().hline(rect.x_range(), rect.center().y, egui::Stroke::new(1.0, t.border));
+                    crate::scenario::publish_handle("left-history-divider", rect.center());
+                }
+                let arrow = if browser_collapsed { "▶" } else { "▼" };
+                let response =
+                    ui.add(egui::Button::new(RichText::new(format!("{arrow}  BROWSER")).size(11.0).strong().color(t.text_dim)).frame(false));
+                crate::scenario::publish_handle("left-browser-toggle", response.rect.center());
+                if response.clicked() {
+                    app.preferences.timeline_left_browser_collapsed = !browser_collapsed;
+                }
+                if !browser_collapsed {
+                    ui.add_space(4.0);
+                    browser_rows(app, ui, &mut acts);
+                }
+            } else {
+                browser_contents(app, ui, &mut acts);
+            }
         });
+    finish_browser(app, ui, acts);
+}
+
+fn browser_contents(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
+    let t = Tokens::get();
+    ui.label(RichText::new(crate::i18n::tr_label("BROWSER")).size(11.0).strong().color(t.text_dim));
+    ui.add_space(4.0);
+    browser_rows(app, ui, acts);
+}
+
+fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, acts: &mut Actions) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .scroll_source(egui::scroll_area::ScrollSource { scroll_bar: true, mouse_wheel: true, ..egui::scroll_area::ScrollSource::NONE })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            component_rows(app, ui, 0, 0, acts);
+        });
+}
+
+fn finish_browser(app: &mut SolveApp, ui: &mut egui::Ui, acts: Actions) {
     app.viewport.hover_bodies = acts.hover_bodies;
     if let Some(d) = acts.drop {
         apply_drop(app, d);
@@ -862,10 +926,8 @@ pub fn restore_view(app: &mut SolveApp, name: &str) {
         app.animate_view(v);
         return;
     }
-    let Some(v) = app.session.doc.named_views.iter().find(|v| v.name == name) else { return };
-    let j = json!({ "target": v.target, "yaw": v.yaw, "pitch": v.pitch, "distance": v.distance, "fov": v.fov });
-    if let Ok(cam) = serde_json::from_value::<solidcraft_engine::render::Camera>(j) {
-        app.animate_to(cam);
+    if app.run("view.apply", json!({ "view": name })).is_ok() {
+        app.follow_view_request(true);
     }
 }
 
@@ -1016,27 +1078,27 @@ fn canvas_panel(app: &mut SolveApp, ctx: &egui::Context) {
                         });
                         ui.end_row();
                     }
-                    ui.label("Distance");
+                    ui.label(crate::i18n::tr_label("Distance"));
                     ui.add(crate::prefs::length_drag(&mut m.distance, &app.session.doc.units, app.preferences.length_decimals).range(0.001..=1e6));
                     ui.end_row();
                 } else {
                     let (mut x, mut y, mut w, mut ang, mut op, mut flip) = (c.center.x, c.center.y, c.width, c.angle.to_degrees(), c.opacity, c.flip);
-                    ui.label("Center X");
+                    ui.label(crate::i18n::tr_label("Center X"));
                     let r1 = ui.add(crate::prefs::length_drag(&mut x, &app.session.doc.units, app.preferences.length_decimals));
                     ui.end_row();
-                    ui.label("Center Y");
+                    ui.label(crate::i18n::tr_label("Center Y"));
                     let r2 = ui.add(crate::prefs::length_drag(&mut y, &app.session.doc.units, app.preferences.length_decimals));
                     ui.end_row();
-                    ui.label("Width");
+                    ui.label(crate::i18n::tr_label("Width"));
                     let r3 = ui.add(crate::prefs::length_drag(&mut w, &app.session.doc.units, app.preferences.length_decimals).range(0.01..=1e6));
                     ui.end_row();
-                    ui.label("Angle");
+                    ui.label(crate::i18n::tr_label("Angle"));
                     let r4 = ui.add(egui::DragValue::new(&mut ang).speed(1.0).suffix(" deg"));
                     ui.end_row();
-                    ui.label("Opacity");
+                    ui.label(crate::i18n::tr_label("Opacity"));
                     let r5 = ui.add(egui::Slider::new(&mut op, 0.0..=1.0));
                     ui.end_row();
-                    ui.label("Flip");
+                    ui.label(crate::i18n::tr_label("Flip"));
                     let r6 = ui.checkbox(&mut flip, "");
                     ui.end_row();
                     if [r1, r2, r3, r4, r5, r6].iter().any(|r| r.changed()) {
@@ -1567,7 +1629,7 @@ fn occurrence_panel(app: &mut SolveApp, ui: &mut egui::Ui) {
         .collapsible(false)
         .show(&ctx, |ui| {
             if !m.path.is_empty() && app.session.occurrence_scope_count(&m.path).is_ok_and(|n| n > 1) {
-                ui.label("This child is shared. Position changes apply to every copy of its parent.");
+                ui.label(crate::i18n::tr_label("This child is shared. Position changes apply to every copy of its parent."));
             }
             egui::Grid::new("sc_occ_grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 for (k, axis) in ["X distance", "Y distance", "Z distance"].iter().enumerate() {
@@ -1589,10 +1651,10 @@ fn occurrence_panel(app: &mut SolveApp, ui: &mut egui::Ui) {
             });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Capture All Positions").clicked() {
+                if ui.button(crate::i18n::tr_label("Capture All Positions")).clicked() {
                     action = Some("capture");
                 }
-                if ui.button("Revert All Positions").clicked() {
+                if ui.button(crate::i18n::tr_label("Revert All Positions")).clicked() {
                     action = Some("revert");
                 }
             });
@@ -1781,7 +1843,7 @@ fn capture_prompt(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let n = app.session.pending_moves.len();
     let mut answer: Option<&str> = None;
-    crate::frame::window(ctx, "Capture Position", crate::frame::Width::Normal)
+    crate::frame::window(ctx, crate::i18n::tr_label("Capture Position"), crate::frame::Width::Normal)
         .id(egui::Id::new("sc_capture_prompt"))
         .collapsible(false)
         .resizable(false)
@@ -1795,10 +1857,10 @@ fn capture_prompt(app: &mut SolveApp, ctx: &egui::Context) {
             ui.label(RichText::new("Capture keeps the new position; Revert puts it back.").color(Tokens::get().text_dim));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Capture Position").clicked() {
+                if ui.button(crate::i18n::tr_label("Capture Position")).clicked() {
                     answer = Some("capture");
                 }
-                if ui.button("Revert").clicked() {
+                if ui.button(crate::i18n::tr_label("Revert")).clicked() {
                     answer = Some("revert");
                 }
                 if ui.button("Cancel").clicked() {

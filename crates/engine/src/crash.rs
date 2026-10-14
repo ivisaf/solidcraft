@@ -24,7 +24,7 @@ use std::backtrace::Backtrace;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -89,8 +89,6 @@ struct State {
     /// Renderer, GPU and the like (set by the UI).
     environment: Mutex<String>,
     journal: Mutex<Journal>,
-    /// This run's journal (read by the hook without taking the lock).
-    journal_path: Option<PathBuf>,
     /// Signatures already reported (this run's count; the report's folder name).
     known: Mutex<HashMap<u64, (u64, String)>>,
     written: AtomicUsize,
@@ -297,14 +295,12 @@ pub fn install(dir: PathBuf, build: Build) -> Vec<Summary> {
     let _ = fs::write(&seen_file, all.iter().map(|s| s.id.as_str()).collect::<Vec<_>>().join("\n"));
     let known = all.into_iter().filter_map(|s| sig_of(&s.id).map(|sig| (sig, (0, s.id)))).collect();
     let journal = Journal::open(&dir, &build, started);
-    let journal_path = journal.path.clone();
     if STATE
         .set(State {
             dir,
             build,
             environment: Mutex::new(String::new()),
             journal: Mutex::new(journal),
-            journal_path,
             known: Mutex::new(known),
             written: AtomicUsize::new(0),
             started,
@@ -388,7 +384,7 @@ fn hook(info: &std::panic::PanicHookInfo<'_>) -> bool {
     } else {
         // Outside any command: what the journal knows has to do.
         let kind = if recovered { "kernel_panic_recovered" } else { "panic" };
-        if let Some(id) = write_from_journal(state, kind, Some(&p), state.journal_path.as_deref()) {
+        if let Some(id) = write_from_journal(state, kind, Some(&p)) {
             eprintln!("SolidCraft: internal error; crash report {}", state.dir.join(&id).display());
             if !recovered && let Ok(mut j) = state.journal.try_lock() {
                 j.record(&json!({ "reported": id }));
@@ -469,7 +465,7 @@ pub(crate) fn command_done(
         let kind = if p.recovered { "kernel_panic_recovered" } else { "command_panic" };
         let design = solidcraft_io::write_design(before);
         let replay = json!({ "commands": [{ "command": id, "params": params }] });
-        let recent = if journaled { state.journal_path.as_deref().map(|p| read_journal(p).recent).unwrap_or_default() } else { Vec::new() };
+        let recent = if journaled { read_live_journal(state).recent } else { Vec::new() };
         let extra = Extra {
             command: Some(json!({ "command": id, "params": params })),
             design: Some(design),
@@ -518,7 +514,8 @@ impl Journal {
     fn open(dir: &Path, build: &Build, started: u64) -> Journal {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path = dir.join("sessions").join(format!("{}-{}-{seq}.jsonl", stamp(started), std::process::id()));
-        let file = OpenOptions::new().create(true).append(true).open(&path).ok().filter(|f| f.try_lock().is_ok());
+        // Append-only handles cannot truncate on Windows; seek explicitly for each write.
+        let file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path).ok().filter(|f| f.try_lock().is_ok());
         let header = json!({ "start": utc(started), "pid": std::process::id(), "version": build.version, "commit": build.commit }).to_string();
         let mut j = Journal { path: file.as_ref().map(|_| path), file, bytes: 0, full: false, last_doc: 0, header, running_at: None };
         j.rebase(&json!("new"), 0);
@@ -527,7 +524,7 @@ impl Journal {
 
     fn write(&mut self, line: &str) {
         let Some(f) = &mut self.file else { return };
-        if f.write_all(line.as_bytes()).and_then(|()| f.write_all(b"\n")).is_err() {
+        if f.seek(SeekFrom::End(0)).and_then(|_| f.write_all(line.as_bytes())).and_then(|()| f.write_all(b"\n")).is_err() {
             self.file = None;
         }
         self.bytes += line.len() as u64 + 1;
@@ -606,10 +603,20 @@ struct JournalRead {
     reported: bool,
 }
 
+// Read through the lock-owning file object. On Windows an independently opened
+// handle cannot read a live journal's exclusively locked byte range.
+fn read_live_journal(state: &State) -> JournalRead {
+    state.journal.try_lock().ok().and_then(|j| j.file.as_ref()?.try_clone().ok().map(read_journal_file)).unwrap_or_default()
+}
+
 fn read_journal(path: &Path) -> JournalRead {
+    File::open(path).ok().map(read_journal_file).unwrap_or_default()
+}
+
+fn read_journal_file(mut file: File) -> JournalRead {
     let mut text = String::new();
-    if let Ok(f) = File::open(path) {
-        let _ = f.take(MAX_JOURNAL_BYTES + (64 << 10)).read_to_string(&mut text);
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.take(MAX_JOURNAL_BYTES + (64 << 10)).read_to_string(&mut text);
     }
     let mut r = JournalRead { complete: true, ..Default::default() };
     let mut running: Option<Value> = None;
@@ -687,7 +694,6 @@ fn unclean_exit(dir: &Path, build: &Build, journal: &Path) {
         build: build.clone(),
         environment: Mutex::new(String::new()),
         journal: Mutex::new(Journal { path: None, file: None, bytes: 0, full: true, last_doc: 0, header: String::new(), running_at: None }),
-        journal_path: None,
         known: Mutex::new(list(dir).into_iter().filter_map(|s| sig_of(&s.id).map(|sig| (sig, (0, s.id)))).collect()),
         written: AtomicUsize::new(0),
         started: now(),
@@ -759,8 +765,8 @@ fn from_journal(j: JournalRead) -> Extra {
     Extra { command: j.in_flight, design, replay: replay.then(|| json!({ "commands": commands })), recent: j.recent, base: j.base, notes }
 }
 
-fn write_from_journal(state: &State, kind: &str, p: Option<&Panic>, journal: Option<&Path>) -> Option<String> {
-    let j = journal.map(read_journal).unwrap_or_default();
+fn write_from_journal(state: &State, kind: &str, p: Option<&Panic>) -> Option<String> {
+    let j = read_live_journal(state);
     let extra = from_journal(j);
     write_report(state, kind, p, extra)
 }

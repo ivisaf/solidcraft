@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::joints::{self, Joint, JointKind, JointOrigin, MotionLink, NamedOrigin, Snap};
-use solidcraft_geom::Vec3;
+use solidcraft_geom::{Aabb3, Vec3};
 
 use super::CommandSpec;
 use crate::params::{bad, bool_, num, str_, string_list, vec3};
@@ -37,7 +37,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("joint.list", "List Joints", list).noundo().params("→ joints (type, occurrences, values, limits), origins, links, degrees of freedom, conflicts"),
     CommandSpec::new("joint.solve", "Solve Joints", solve_cmd).params("re-place the occurrences from the joints → conflicts, errors, dof"),
     CommandSpec::new("inspect.interference", "Interference", interference).at("SOLID", "INSPECT").icon("interference").noundo().params(
-        "bodies?: [names] (default: all, in world placement) → pairs that overlap with the overlap volume, area, bounding box and centre",
+        "bodies?: [names] (default: all, in world placement) → interferences: pairs that overlap with the overlap volume, area, bounding box and centre; unchecked: pairs that could not be checked, with the reason. Bodies are pruned by bounding box first, so any number of bodies is fine; at most 20000 pairs whose boxes overlap are intersected per call (truncated: true and skipped_pairs: n say when more were left out)",
     ),
 ];
 
@@ -523,35 +523,79 @@ fn solve_cmd(s: &mut Session, _p: &Value) -> Result<Value> {
 }
 
 fn interference(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "inspect.interference";
     let want = string_list(p, "bodies");
     let st = s.world_state();
     let bodies: Vec<&solidcraft_doc::ModelBody> =
         st.bodies.iter().filter(|b| want.is_empty() || want.contains(&b.name)).filter(|b| !b.body.is_mesh()).collect();
-    if bodies.len() > 200 {
-        return Err(bad(cmd, "too many bodies (200 at most)"));
-    }
-    let mut hits = Vec::new();
-    for (i, a) in bodies.iter().enumerate() {
-        for b in bodies.iter().skip(i + 1) {
-            let (ba, bb) = (a.mesh().bounds(), b.mesh().bounds());
-            let apart = ba.max.x < bb.min.x
-                || bb.max.x < ba.min.x
-                || ba.max.y < bb.min.y
-                || bb.max.y < ba.min.y
-                || ba.max.z < bb.min.z
-                || bb.max.z < ba.min.z;
-            if apart {
+    // Prune by bounding boxes first (sort and sweep), so the cost follows the pairs that can
+    // touch rather than the square of the body count.
+    let boxes: Vec<Aabb3> = bodies.iter().map(|b| b.mesh().bounds()).collect();
+    let (pairs, skipped) = overlapping_pairs(&boxes, MAX_INTERFERENCE_PAIRS);
+    let (mut hits, mut unchecked) = (Vec::new(), Vec::new());
+    for (i, j) in pairs {
+        let (Some(a), Some(b)) = (bodies.get(i), bodies.get(j)) else { continue };
+        // A pair whose shared part can't be worked out is reported, not passed as clear.
+        let (shared, report) =
+            solidcraft_kernel::capture_boolean_diagnostics(|| solidcraft_kernel::boolean(&a.body, &b.body, solidcraft_kernel::BoolOp::Intersect));
+        let mut skip = |reason: String| unchecked.push(json!({"a": a.name, "b": b.name, "reason": reason}));
+        let shared = match shared {
+            Ok(o) => o,
+            Err(e) => {
+                skip(e.to_string());
                 continue;
             }
-            let Ok(Some(o)) = solidcraft_kernel::boolean(&a.body, &b.body, solidcraft_kernel::BoolOp::Intersect) else { continue };
-            let Ok(m) = solidcraft_kernel::measure(&o) else { continue };
-            if m.volume > 1e-9 * a.body.size().max(1.0).powi(3) {
-                hits.push(json!({"a": a.name, "b": b.name, "volume_mm3": m.volume, "area_mm2": m.area, "center": m.centroid, "bbox": {"min": m.bbox.min, "max": m.bbox.max}}));
+        };
+        if let Some(reason) = report.unverified() {
+            skip(reason);
+        }
+        let Some(o) = shared else { continue };
+        let m = match solidcraft_kernel::measure(&o) {
+            Ok(m) => m,
+            Err(e) => {
+                skip(e.to_string());
+                continue;
+            }
+        };
+        if m.volume > 1e-9 * a.body.size().max(1.0).powi(3) {
+            hits.push(json!({"a": a.name, "b": b.name, "volume_mm3": m.volume, "area_mm2": m.area, "center": m.centroid, "bbox": {"min": m.bbox.min, "max": m.bbox.max}}));
+        }
+    }
+    Ok(json!({"interferences": hits, "count": hits.len(), "checked": bodies.len(), "unchecked": unchecked,
+        "truncated": skipped > 0, "skipped_pairs": skipped}))
+}
+
+/// Most pairs with overlapping bounding boxes `inspect.interference` intersects in one call.
+const MAX_INTERFERENCE_PAIRS: usize = 20_000;
+
+/// Index pairs `(i, j)`, `i < j`, whose boxes overlap or touch (sort and sweep along X), at most
+/// `limit` of them, plus how many more there were.
+fn overlapping_pairs(boxes: &[Aabb3], limit: usize) -> (Vec<(usize, usize)>, usize) {
+    let mut order: Vec<usize> = (0..boxes.len()).collect();
+    order.sort_by(|&a, &b| match (boxes.get(a), boxes.get(b)) {
+        (Some(a), Some(b)) => a.min.x.total_cmp(&b.min.x),
+        _ => std::cmp::Ordering::Equal,
+    });
+    let (mut pairs, mut skipped) = (Vec::new(), 0);
+    for (k, &i) in order.iter().enumerate() {
+        let Some(a) = boxes.get(i) else { continue };
+        for &j in order.iter().skip(k + 1) {
+            let Some(b) = boxes.get(j) else { continue };
+            // Sorted by min.x: once one starts past `a`, all later ones do.
+            if b.min.x > a.max.x {
+                break;
+            }
+            if b.max.x < a.min.x || a.max.y < b.min.y || b.max.y < a.min.y || a.max.z < b.min.z || b.max.z < a.min.z {
+                continue;
+            }
+            if pairs.len() < limit {
+                pairs.push((i.min(j), i.max(j)));
+            } else {
+                skipped += 1;
             }
         }
     }
-    Ok(json!({"interferences": hits, "count": hits.len(), "checked": bodies.len()}))
+    pairs.sort_unstable();
+    (pairs, skipped)
 }
 
 #[cfg(test)]

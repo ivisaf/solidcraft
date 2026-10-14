@@ -31,11 +31,41 @@ fn wire_sources(plane: &Plane, lp: &Loop2) -> Result<(mt::Wire, Vec<(mt::Edge, S
     if !lp.is_closed(1e-6) {
         return Err(KernelError::Invalid("profile loop is not closed".into()));
     }
-    let verts: Vec<mt::Vertex> = lp.segs.iter().map(|s| builder::vertex(p3(plane.to_world(s.start())))).collect();
+    chain_sources(plane, &lp.segs, true)
+}
+
+/// An open wire in 3D through a chain of sketch segments, each starting where the one before
+/// ends (a closed chain makes a closed wire).
+pub(crate) fn chain_wire(plane: &Plane, segs: &[Seg2]) -> Result<mt::Wire> {
+    let n = segs.len();
+    if n == 0 || n > MAX_SEGS {
+        return Err(KernelError::Invalid(format!("curve chain with {n} segments")));
+    }
+    if !segs.iter().all(seg_ok) {
+        return Err(KernelError::Invalid("non-finite curve".into()));
+    }
+    for (s, t) in segs.iter().zip(segs.iter().skip(1)) {
+        if s.end().dist(t.start()) > 1e-6 {
+            return Err(KernelError::Invalid("the curves are not connected end to end".into()));
+        }
+    }
+    let closed = segs.first().zip(segs.last()).is_some_and(|(f, l)| l.end().dist(f.start()) <= 1e-6);
+    chain_sources(plane, segs, closed).map(|(wire, _)| wire)
+}
+
+/// The edges of a chain of segments (closed: the last one ends on the first's start vertex),
+/// with each edge's segment and that segment's position in the chain (a big arc makes two
+/// edges).
+fn chain_sources(plane: &Plane, segs: &[Seg2], closed: bool) -> Result<(mt::Wire, Vec<(mt::Edge, Seg2, usize)>)> {
+    let n = segs.len();
+    let mut verts: Vec<mt::Vertex> = segs.iter().map(|s| builder::vertex(p3(plane.to_world(s.start())))).collect();
+    if !closed && let Some(last) = segs.last() {
+        verts.push(builder::vertex(p3(plane.to_world(last.end()))));
+    }
     let mut edges = Vec::with_capacity(n);
     let mut sources = Vec::with_capacity(n);
-    for (i, s) in lp.segs.iter().enumerate() {
-        let (Some(a), Some(b)) = (verts.get(i), verts.get((i + 1) % n)) else { continue };
+    for (i, s) in segs.iter().enumerate() {
+        let (Some(a), Some(b)) = (verts.get(i), verts.get(if closed { (i + 1) % n } else { i + 1 })) else { continue };
         let e: mt::Edge = match *s {
             Seg2::Line { .. } => builder::line(a, b),
             Seg2::Arc { sweep, .. } => {
@@ -128,32 +158,38 @@ fn region_ok(r: &Region2) -> Result<()> {
     if r.area().abs() < 1e-9 {
         return Err(KernelError::Invalid("profile has no area".into()));
     }
-    for s in std::iter::once(&r.outer).chain(&r.holes).flat_map(|l| &l.segs) {
-        let ok = match *s {
-            Seg2::Line { a, b } => a.is_finite() && b.is_finite(),
-            Seg2::Arc { center, radius, start, sweep } => {
-                center.is_finite() && radius.is_finite() && radius > 1e-9 && start.is_finite() && sweep.is_finite()
-            }
-            Seg2::Cubic { p0, p1, p2, p3 } => p0.is_finite() && p1.is_finite() && p2.is_finite() && p3.is_finite(),
-            Seg2::Conic { a, apex, b, w } => a.is_finite() && apex.is_finite() && b.is_finite() && w.is_finite() && w > 1e-9,
-            Seg2::Bezier { n, p } => (4..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(&n) && p.iter().all(|q| q.is_finite()),
-        };
-        if !ok {
-            return Err(KernelError::Invalid("non-finite profile".into()));
-        }
+    if !std::iter::once(&r.outer).chain(&r.holes).flat_map(|l| &l.segs).all(seg_ok) {
+        return Err(KernelError::Invalid("non-finite profile".into()));
     }
     Ok(())
 }
 
+/// A segment with finite, well-formed numbers.
+fn seg_ok(s: &Seg2) -> bool {
+    match *s {
+        Seg2::Line { a, b } => a.is_finite() && b.is_finite(),
+        Seg2::Arc { center, radius, start, sweep } => {
+            center.is_finite() && radius.is_finite() && radius > 1e-9 && start.is_finite() && sweep.is_finite()
+        }
+        Seg2::Cubic { p0, p1, p2, p3 } => p0.is_finite() && p1.is_finite() && p2.is_finite() && p3.is_finite(),
+        Seg2::Conic { a, apex, b, w } => a.is_finite() && apex.is_finite() && b.is_finite() && w.is_finite() && w > 1e-9,
+        Seg2::Bezier { n, p } => (4..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(&n) && p.iter().all(|q| q.is_finite()),
+    }
+}
+
+/// A finite, orthonormal sketch frame.
+pub(crate) fn frame_ok(plane: &Plane) -> bool {
+    plane.origin.is_finite()
+        && plane.x.is_finite()
+        && plane.y.is_finite()
+        && (plane.x.len2() - 1.).abs() <= 1e-8
+        && (plane.y.len2() - 1.).abs() <= 1e-8
+        && plane.x.dot(plane.y).abs() <= 1e-8
+}
+
 /// Extrude each region from `start` to `end` along the plane normal (offsets in mm, `end > start`).
 pub fn extrude(plane: &Plane, regions: &[Region2], start: f64, end: f64) -> Result<Vec<Body>> {
-    if !plane.origin.is_finite()
-        || !plane.x.is_finite()
-        || !plane.y.is_finite()
-        || (plane.x.len2() - 1.).abs() > 1e-8
-        || (plane.y.len2() - 1.).abs() > 1e-8
-        || plane.x.dot(plane.y).abs() > 1e-8
-    {
+    if !frame_ok(plane) {
         return Err(KernelError::Invalid("extrude frame is not finite and orthonormal".into()));
     }
     let (start, end) = (finite(start, "start")?, finite(end, "end")?);
@@ -341,7 +377,15 @@ pub fn revolve(plane: &Plane, regions: &[Region2], axis_origin: Vec2, axis_dir: 
                 _ => nl,
             }
         };
-        let given = numbered_region(r)?.map_loops(|l| reseam(snap_loop(l)));
+        // Adjacent profiles revolved together leave the axis edge split where they met: one
+        // edge again, so the builders for a profile with an edge on the axis take it (swept
+        // pieces of the axis are zero-area faces that booleans fail on).
+        let on_axis = |p: Vec2| d.cross(p - axis_origin).abs() < 1e-9;
+        let axis_run = |s: &Seg2, t: &Seg2| {
+            let (a, b, c) = (s.start(), s.end(), t.end());
+            on_axis(a) && on_axis(b) && on_axis(c) && (b - a).dot(c - b) > 0.0
+        };
+        let given = numbered_region(r)?.map_loops(|l| reseam(snap_loop(l).merged_lines(axis_run)));
         let r = &given.region();
         // A half disc on the axis revolved fully is a sphere: build it without poles. Every
         // patch is swept from the half disc's arcs.
@@ -384,9 +428,24 @@ pub fn revolve(plane: &Plane, regions: &[Region2], axis_origin: Vec2, axis_dir: 
             out.push(b);
             continue;
         }
-        let solid: Solid = guard("revolve", || Ok(builder::rsweep(&f, p3(o), v3(axis), mt::Rad(angle))))?;
+        // Edges on the axis (a spherical shell's two radial lines, say) sweep into degenerate faces
+        // there, which truck only tessellates reliably with the axis through the world origin. Off
+        // it, the body measured too large and booleans with it failed or removed the wrong side.
+        // Build such a profile there and move it into place, as `revolve_touching_axis` does.
+        let axis_edges = r.outer.segs.iter().filter(|s| matches!(**s, Seg2::Line { a, b } if on_axis(a) && on_axis(b))).count();
+        let shift = if axis_edges > 0 { o } else { Vec3::ZERO };
+        let (profile, f) = if shift.len() > 0.0 {
+            let local = Plane { origin: plane.origin - shift, ..*plane };
+            let profile = region_wires(&local, &given.oriented())?;
+            let f = attach_profile(&wires_of(&profile))?;
+            (profile, f)
+        } else {
+            (profile, f)
+        };
+        let solid: Solid = guard("revolve", || Ok(builder::rsweep(&f, p3(o - shift), v3(axis), mt::Rad(angle))))?;
         let closed = angle.abs() >= std::f64::consts::TAU;
         let history = guard("revolve history", || Ok(record::swept_face(&solid, &f, &seeds(&profile), closed)))?;
+        let solid = if shift.len() > 0.0 { builder::translated(&solid, v3(shift)) } else { solid };
         out.push(record::attach(Body::new(solid)?, &[], history, Default::default())?);
     }
     Ok(out)
@@ -471,7 +530,8 @@ pub fn torus(center: Vec3, major: f64, minor: f64) -> Result<Body> {
 }
 
 /// Offset every segment of a loop to its right by `d` (outward for a region's outer loop and
-/// holes alike). Loops of lines (mitred corners) and loops of arcs on one circle are supported.
+/// holes alike). Loops of lines (mitred corners), loops of arcs on one circle, and loops of lines
+/// and arcs that meet the arcs tangentially are supported.
 fn offset_loop(lp: &Loop2, d: f64) -> Result<Loop2> {
     if d == 0.0 {
         return Ok(lp.clone());
@@ -495,6 +555,9 @@ fn offset_loop(lp: &Loop2, d: f64) -> Result<Loop2> {
             .collect::<Result<Vec<_>>>()?;
         return Ok(Loop2 { segs });
     }
+    if lp.segs.iter().any(|s| matches!(s, Seg2::Arc { .. })) {
+        return offset_lines_and_arcs(lp, d);
+    }
     let n = lp.segs.len();
     let mut lines: Vec<(Vec2, Vec2)> = Vec::with_capacity(n);
     for s in &lp.segs {
@@ -517,6 +580,75 @@ fn offset_loop(lp: &Loop2, d: f64) -> Result<Loop2> {
     let out = Loop2::polygon(&pts);
     if out.signed_area().signum() != lp.signed_area().signum() || out.signed_area().abs() < 1e-9 {
         return Err(KernelError::Invalid("the taper closes the profile".into()));
+    }
+    Ok(out)
+}
+
+/// [`offset_loop`] for a loop of lines and arcs. Each arc keeps its centre and angles and its
+/// radius moves by `d` (so its side stays an exact cone), each line moves `d` to its right, and
+/// two lines meeting at a corner are mitred. An arc has to meet its neighbours tangentially: at
+/// a corner its side would meet the next one along a conic, not a straight ruling.
+fn offset_lines_and_arcs(lp: &Loop2, d: f64) -> Result<Loop2> {
+    let closes = || KernelError::Invalid("the taper closes the profile".into());
+    let right = |v: Vec2| Vec2::new(v.y, -v.x);
+    let n = lp.segs.len();
+    let moved: Vec<Option<Seg2>> = lp
+        .segs
+        .iter()
+        .map(|s| match *s {
+            Seg2::Line { .. } => Ok(None),
+            Seg2::Arc { center, radius, start, sweep } => {
+                let r = radius + sweep.signum() * d;
+                if r > 1e-6 { Ok(Some(Seg2::Arc { center, radius: r, start, sweep })) } else { Err(closes()) }
+            }
+            _ => Err(KernelError::Failed("not supported yet: tapered profiles with splines or conics".into())),
+        })
+        .collect::<Result<_>>()?;
+    // Where each segment starts after the offset.
+    let mut joints = Vec::with_capacity(n);
+    for (i, s) in lp.segs.iter().enumerate() {
+        let k = (i + n - 1) % n;
+        let (Some(prev), Some(prev_moved), Some(this_moved)) = (lp.segs.get(k), moved.get(k), moved.get(i)) else {
+            return Err(KernelError::Failed("taper: profile loop".into()));
+        };
+        let (tin, tout) = (prev.end_tangent(), s.start_tangent());
+        let tangent = tin.cross(tout).abs() < 1e-6 && tin.dot(tout) > 0.0;
+        joints.push(match (prev_moved, this_moved) {
+            (Some(a), _) if tangent => a.end(),
+            (None, Some(b)) if tangent => b.start(),
+            (None, None) => {
+                let v = s.start();
+                let (p0, p1) = (v + right(tin) * d, v + right(tout) * d);
+                let den = tin.cross(tout);
+                if den.abs() < 1e-12 { p1 } else { p0 + tin * ((p1 - p0).cross(tout) / den) }
+            }
+            _ => return Err(KernelError::Failed("not supported yet: tapered profiles where an arc meets another edge at a corner".into())),
+        });
+    }
+    let mut segs = Vec::with_capacity(n);
+    for (i, s) in lp.segs.iter().enumerate() {
+        let (Some(&a), Some(&b), Some(m)) = (joints.get(i), joints.get((i + 1) % n), moved.get(i)) else {
+            return Err(KernelError::Failed("taper: profile loop".into()));
+        };
+        match m {
+            Some(arc) => {
+                if arc.start().dist(a) > 1e-6 || arc.end().dist(b) > 1e-6 {
+                    return Err(KernelError::Failed("not supported yet: tapered profiles where an arc meets another edge at a corner".into()));
+                }
+                segs.push(*arc);
+            }
+            None => {
+                // A line that turned around has been swallowed by its neighbours.
+                if (b - a).dot(s.end() - s.start()) <= 0.0 {
+                    return Err(closes());
+                }
+                segs.push(Seg2::Line { a, b });
+            }
+        }
+    }
+    let out = Loop2 { segs };
+    if out.signed_area().signum() != lp.signed_area().signum() || out.signed_area().abs() < 1e-9 {
+        return Err(closes());
     }
     Ok(out)
 }

@@ -1,8 +1,9 @@
 //! Resolving sketch links against the model: projecting edges, faces, body silhouettes, other
 //! sketches and the origin onto a sketch plane, and intersecting bodies with it.
 //!
-//! Model geometry is found again on every recompute from the reference point stored in the
-//! link (like fillet edges). Edge polylines from the tessellation lie exactly on their curves,
+//! Model geometry is found again on every recompute: a face or an edge by the persistent name
+//! its link keeps, anything else (and a link saved without a name) from the reference point
+//! stored in the link. Edge polylines from the tessellation lie exactly on their curves,
 //! so lines and circular arcs are recovered exactly by fitting; anything else (an ellipse from
 //! a tilted circle, a spline edge) becomes a chain of lines.
 
@@ -35,6 +36,9 @@ pub struct Resolved {
     /// Exact face selected during this resolution, before its closest point is
     /// projected onto an edge shared with another face. Computed metadata only.
     pub face_index: Option<usize>,
+    /// The edge an `Edge` reference resolved to (its index in the body's mesh), whose
+    /// persistent name the link keeps ([`resolved_edge_name`]). Computed metadata only.
+    pub edge_index: Option<usize>,
 }
 
 /// Resolutions of body-based references, keyed by the reference, the sketch plane and the
@@ -98,13 +102,9 @@ fn resolve_uncached(
     let lost = |what: &str| DocError::Invalid(format!("{what} no longer exists"));
     let mut moved = false;
     let mut face_index = None;
+    let mut edge_index = None;
     let mut source = src.clone();
     let mut wires: Vec<Vec<Vec3>> = Vec::new();
-    // Included curves that leave the sketch plane stay 3D.
-    let off_plane = |pts: &[Vec3]| {
-        let size = pts.iter().fold(1.0_f64, |m, p| m.max(p.len()));
-        pts.iter().any(|p| plane.height(*p).abs() > size * 1e-7)
-    };
     let geom = match src {
         LinkSource::Edge { body, at } => {
             let (bi, mesh) = body_mesh(st, body, *at)?;
@@ -116,15 +116,8 @@ fn resolve_uncached(
             moved = d > (size * 2e-3).max(1e-3);
             let name = st.bodies.get(bi).map(|b| b.name.clone()).unwrap_or_else(|| body.clone());
             source = LinkSource::Edge { body: name, at: q };
-            let pts = mesh.edges.get(e).cloned().unwrap_or_default();
-            match kind {
-                LinkKind::Intersect => section_of_polyline(plane, &pts),
-                LinkKind::Include if off_plane(&pts) => {
-                    wires.push(pts);
-                    Vec::new()
-                }
-                _ => fit_world(plane, &pts),
-            }
+            edge_index = Some(e);
+            edge_geom(plane, kind, mesh.edges.get(e).cloned().unwrap_or_default(), &mut wires)
         }
         LinkSource::Face { body, at } => {
             let (bi, mesh) = body_mesh(st, body, *at)?;
@@ -188,7 +181,7 @@ fn resolve_uncached(
                 }
                 LinkKind::Include => {
                     let pts: Vec<Vec3> = ss.sketch.polyline(ci).iter().map(|p| ss.plane.to_world(*p)).collect();
-                    if off_plane(&pts) {
+                    if off_plane(plane, &pts) {
                         wires.push(pts);
                         Vec::new()
                     } else {
@@ -259,7 +252,10 @@ fn resolve_uncached(
                 _ => vec![LinkGeom::Point(o)],
             }
         }
-        LinkSource::Text { text, at, height, angle } => solidcraft_sketch::text_geometry(text, *at, *height, *angle)?,
+        LinkSource::SketchAxis { name } => {
+            vec![solidcraft_sketch::sketch_axis_geom(name).ok_or_else(|| DocError::Unknown(format!("sketch axis `{name}`")))?]
+        }
+        LinkSource::Text { text, at, height, angle, font } => solidcraft_sketch::text_geometry_in(font.as_deref(), text, *at, *height, *angle)?,
         LinkSource::Plane { name } => {
             let pr =
                 if Plane::named(name).is_some() { PlaneRef::Origin { name: name.clone() } } else { PlaneRef::Construction { name: name.clone() } };
@@ -270,13 +266,70 @@ fn resolve_uncached(
     if geom.is_empty() && wires.is_empty() {
         return Err(DocError::Invalid(format!("the {} projects to nothing on this sketch plane", src.describe())));
     }
-    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved, face_index })
+    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved, face_index, edge_index })
+}
+
+/// Whether a curve (world points) leaves the sketch plane: included, it then stays 3D.
+fn off_plane(plane: &Plane, pts: &[Vec3]) -> bool {
+    let size = pts.iter().fold(1.0_f64, |m, p| m.max(p.len()));
+    pts.iter().any(|p| plane.height(*p).abs() > size * 1e-7)
+}
+
+/// What a body edge (its points) gives a sketch: its section with the sketch plane, itself as a
+/// 3D curve (into `wires`) when it is included and leaves the plane, else its projection.
+fn edge_geom(plane: &Plane, kind: LinkKind, pts: Vec<Vec3>, wires: &mut Vec<Vec<Vec3>>) -> Vec<LinkGeom> {
+    match kind {
+        LinkKind::Intersect => section_of_polyline(plane, &pts),
+        LinkKind::Include if off_plane(plane, &pts) => {
+            wires.push(pts);
+            Vec::new()
+        }
+        _ => fit_world(plane, &pts),
+    }
+}
+
+/// The persistent name of the edge an `Edge` reference resolved to, for its link to keep and
+/// be found by from then on. None on a mesh body, whose edges have no names.
+pub fn resolved_edge_name(st: &ModelState, r: &Resolved) -> Option<String> {
+    let (LinkSource::Edge { body, .. }, Some(index)) = (&r.source, r.edge_index) else { return None };
+    let body = st.body(body).filter(|body| !body.body.is_mesh())?;
+    crate::naming::edge_names(body).get(index).filter(|name| !name.is_empty()).cloned()
 }
 
 /// Re-resolve every link of a sketch (in place). Returns warnings for lost, moved or rebuilt
 /// links; lost links keep their last geometry.
 fn lost(reference: &str) -> DocError {
     DocError::Unknown(format!("{reference} no longer exists"))
+}
+
+/// The edge a link's stored name finds, and the body it is on: the link's body, or, when no
+/// body has that name any more (it was joined into another), the body on which the name finds
+/// the edge nearest the link's point.
+fn locate_named_edge(st: &ModelState, body: &str, name: &str, at: Vec3) -> Option<(String, crate::naming::EdgeHit)> {
+    let hit = |b: &crate::ModelBody| crate::naming::locate_edge(b, name, at).ok().map(|hit| (b.name.clone(), hit));
+    match st.body(body) {
+        Some(b) => hit(b),
+        None => st.bodies.iter().filter(|b| !b.body.is_mesh()).filter_map(hit).min_by(|a, b| a.1.point.dist(at).total_cmp(&b.1.point.dist(at))),
+    }
+}
+
+/// An edge found by its persistent name: edge `index` of `body`, with the link's point `near`
+/// moved onto it.
+fn resolve_named_edge(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str, index: usize, near: Vec3) -> Result<Resolved> {
+    let target = st.body(body).ok_or_else(|| lost("named projection body"))?;
+    let pts = target.mesh().edges.get(index).cloned().unwrap_or_default();
+    let at = pts
+        .windows(2)
+        .filter_map(|w| Some(closest_on_segment(near, *w.first()?, *w.get(1)?)))
+        .min_by(|a, b| a.dist(near).total_cmp(&b.dist(near)))
+        .ok_or_else(|| lost("named projection edge"))?;
+    let mut wires = Vec::new();
+    let geom = edge_geom(plane, kind, pts, &mut wires);
+    if geom.is_empty() && wires.is_empty() {
+        return Err(DocError::Invalid("named edge projects to nothing on this sketch plane".into()));
+    }
+    let source = LinkSource::Edge { body: body.into(), at };
+    Ok(Resolved { geom: merge_split_circles(geom), wires, source, moved: false, face_index: None, edge_index: Some(index) })
 }
 
 fn resolve_named_face(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str, index: usize, at: Vec3) -> Result<Resolved> {
@@ -302,7 +355,7 @@ fn resolve_named_face(st: &ModelState, plane: &Plane, kind: LinkKind, body: &str
     if geom.is_empty() {
         return Err(DocError::Invalid("named face projects to nothing on this sketch plane".into()));
     }
-    Ok(Resolved { geom, wires: Vec::new(), source: LinkSource::Face { body: body.into(), at }, moved: false, face_index })
+    Ok(Resolved { geom, wires: Vec::new(), source: LinkSource::Face { body: body.into(), at }, moved: false, face_index, edge_index: None })
 }
 
 fn projection_face_edges(body: &crate::ModelBody, mesh: &Mesh, index: u32, plane: &Plane) -> Result<Vec<usize>> {
@@ -321,6 +374,7 @@ fn certified_planar_construction(body: &crate::ModelBody, index: usize) -> bool 
             Some(
                 solidcraft_kernel::FaceSource::ShellPlanar { producer: Some(_), .. }
                     | solidcraft_kernel::FaceSource::Box { producer: Some(_), .. }
+                    | solidcraft_kernel::FaceSource::CylinderCap { .. }
                     | solidcraft_kernel::FaceSource::CertifiedExtrudeSide { plane: Some(_), .. }
                     | solidcraft_kernel::FaceSource::CertifiedExtrudeCap { .. }
             )
@@ -388,6 +442,7 @@ pub fn resolve_face_indices(st: &ModelState, plane: &Plane, kind: LinkKind, body
         source: LinkSource::Face { body: body.name.clone(), at: point },
         moved: false,
         face_index: if indices.len() == 1 { indices.first().copied() } else { None },
+        edge_index: None,
     })
 }
 
@@ -515,6 +570,22 @@ fn refresh_links_in(
                 continue;
             }
         }
+        // An edge the link keeps by name is that edge of its body, wherever it went. When no
+        // edge has the name any more the link is lost: no other edge is taken for it.
+        let mut named_edge = None;
+        if let (Some(name), LinkSource::Edge { body, at }) = (&l.edge_name, &source) {
+            match locate_named_edge(st, body, name, *at) {
+                Some((body, hit)) => {
+                    warn.extend(hit.note(name).map(|note| format!("projected {note}")));
+                    named_edge = Some((body, hit.edge, *at));
+                }
+                None => {
+                    sk.set_link_lost(&l.id, true);
+                    warn.push(format!("projected reference lost: edge `{name}` no longer exists; last geometry retained"));
+                    continue;
+                }
+            }
+        }
         let resolved = if l.auto_face {
             anchor
                 .filter(|anchor| {
@@ -524,11 +595,21 @@ fn refresh_links_in(
                 .and_then(|anchor| resolve_anchored_face(doc, st, plane, l.kind, anchor))
         } else if let Some((body, index, at)) = named_face {
             resolve_named_face(st, plane, l.kind, &body, index, at)
+        } else if let Some((body, index, at)) = named_edge {
+            resolve_named_edge(st, plane, l.kind, &body, index, at)
         } else {
             resolve(doc, vals, st, plane, l.kind, &source)
         };
         match resolved {
             Ok(r) => {
+                // An edge link saved without a name takes the name of the edge it was found
+                // on. A sketch that is edited stores it; evaluation leaves the design as it is.
+                if l.edge_name.is_none()
+                    && let Some(name) = resolved_edge_name(st, &r)
+                    && let Some(link) = sk.links.iter_mut().find(|link| link.id == l.id)
+                {
+                    link.edge_name = Some(name);
+                }
                 sk.set_link_source(&l.id, r.source);
                 let _ = sk.set_link_wires(&l.id, &r.wires);
                 match sk.update_link(&l.id, &r.geom) {
@@ -889,20 +970,32 @@ pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeo
     let size = m.bounds().diagonal().max(1e-9);
     let q = size * 1e-7;
     let key = |p: Vec3| ((p.x / q).round() as i64, (p.y / q).round() as i64, (p.z / q).round() as i64);
-    // Surface normal at each mesh vertex where the surface is smooth (None at creases).
-    let mut normals: BTreeMap<(i64, i64, i64), Option<Vec3>> = BTreeMap::new();
-    for (t, _) in m.triangles.iter().zip(&m.tri_face) {
+    // Surface normal at each mesh vertex where the surface is smooth (None at creases), over
+    // all faces and per face.
+    type Key = (i64, i64, i64);
+    let mut normals: BTreeMap<Key, Option<Vec3>> = BTreeMap::new();
+    let mut face_normals: BTreeMap<(u32, Key), Option<Vec3>> = BTreeMap::new();
+    // Faces on either side of each mesh edge.
+    let mut edge_faces: BTreeMap<(Key, Key), Vec<u32>> = BTreeMap::new();
+    let merge = |e: &mut Option<Vec3>, n: Vec3| {
+        if e.is_some_and(|o| o.dot(n) < 1.0 - 1e-6) {
+            *e = None;
+        }
+    };
+    for (t, f) in m.triangles.iter().zip(&m.tri_face) {
         for k in t {
             let (Some(p), Some(n)) = (m.positions.get(*k as usize), m.normals.get(*k as usize)) else { continue };
             let Some(n) = n.normalized() else { continue };
-            normals
-                .entry(key(*p))
-                .and_modify(|e| {
-                    if e.is_some_and(|o| o.dot(n) < 1.0 - 1e-6) {
-                        *e = None;
-                    }
-                })
-                .or_insert(Some(n));
+            normals.entry(key(*p)).and_modify(|e| merge(e, n)).or_insert(Some(n));
+            face_normals.entry((*f, key(*p))).and_modify(|e| merge(e, n)).or_insert(Some(n));
+        }
+        for (i, j) in [(0usize, 1usize), (1, 2), (2, 0)] {
+            let (Some(a), Some(b)) = (t.get(i).and_then(|k| m.positions.get(*k as usize)), t.get(j).and_then(|k| m.positions.get(*k as usize)))
+            else {
+                continue;
+            };
+            let (ka, kb) = (key(*a), key(*b));
+            edge_faces.entry(if ka <= kb { (ka, kb) } else { (kb, ka) }).or_default().push(*f);
         }
     }
     // Where the plane crosses a mesh edge: on a cubic through the end points whose end
@@ -916,8 +1009,16 @@ pub(crate) fn section(plane: &Plane, m: &Mesh, face: Option<u32>) -> Vec<LinkGeo
             return None;
         }
         let d = b - a;
+        // An edge inside one face takes that face's normals (its ends may lie on the face's
+        // boundary, a crease for the whole mesh); an edge between faces, the merged ones, so
+        // both faces agree on the crossing.
+        let inside = edge_faces.get(&(key(a), key(b))).and_then(|fs| fs.first().filter(|f| fs.len() == 2 && fs.iter().all(|x| x == *f)).copied());
+        let normal = |p: Vec3| match inside {
+            Some(f) => face_normals.get(&(f, key(p))).copied().flatten(),
+            None => normals.get(&key(p)).copied().flatten(),
+        };
         // Tangent length: the arc length of a circle through both ends with these normals.
-        let (na, nb) = (normals.get(&key(a)).copied().flatten(), normals.get(&key(b)).copied().flatten());
+        let (na, nb) = (normal(a), normal(b));
         let l = match (na, nb) {
             (Some(x), Some(y)) => {
                 let half = 0.5 * x.dot(y).clamp(-1.0, 1.0).acos();

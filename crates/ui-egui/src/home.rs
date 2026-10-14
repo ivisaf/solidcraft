@@ -13,7 +13,7 @@ use crate::theme::Tokens;
 
 /// Recent designs kept.
 pub const MAX_RECENT: usize = 12;
-const THUMB: [usize; 2] = [240, 150];
+const THUMB: [usize; 2] = solidcraft_engine::io::THUMBNAIL_SIZE;
 
 /// What a background job makes: a key ("sample:N" or a path), the picture, and for samples the
 /// built design (opened at once when picked).
@@ -96,6 +96,13 @@ fn cached(key: &str) -> Option<egui::ColorImage> {
         return None;
     }
     let bytes = std::fs::read(path).ok()?;
+    decode_thumbnail(bytes)
+}
+
+fn decode_thumbnail(bytes: Vec<u8>) -> Option<egui::ColorImage> {
+    if bytes.len() > 512 * 1024 {
+        return None;
+    }
     let mut reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(THUMB[0] as u32);
@@ -169,6 +176,11 @@ pub(crate) fn install(h: &mut HomeState, ctx: &egui::Context, key: &str, img: Op
 fn make(key: &str) -> Made {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(img) = cached(key) {
+        return (key.to_string(), Some(img), None);
+    }
+    if !key.starts_with("sample:")
+        && let Some(img) = solidcraft_engine::io::read_design_thumbnail_file(key).and_then(decode_thumbnail)
+    {
         return (key.to_string(), Some(img), None);
     }
     let mut s = Session::default();
@@ -345,7 +357,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("SolidCraft").size(26.0).strong().color(t.text));
                 ui.add_space(12.0);
-                ui.label(RichText::new("Start").size(16.0).color(t.text_dim));
+                ui.label(RichText::new(crate::i18n::tr_label("Start")).size(16.0).color(t.text_dim));
             });
             ui.add_space(16.0);
             ui.horizontal(|ui| {
@@ -406,7 +418,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             ui.add_space(16.0);
             section(ui, "Recent");
             if recent.is_empty() {
-                ui.label(RichText::new("Designs you open or save appear here.").color(t.text_dim));
+                ui.label(RichText::new(crate::i18n::tr_label("Designs you open or save appear here.")).color(t.text_dim));
             } else {
                 grid(ui, recent.len(), |ui, i| {
                     let Some(p) = recent.get(i) else { return };
@@ -439,12 +451,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                         .on_hover_text(p.as_str());
                     crate::scenario::publish_handle(&format!("home:recent:{i}"), response.rect.center());
                     response.context_menu(|ui| {
-                        if ui.button("Remove from list").clicked() {
+                        if ui.button(crate::i18n::tr_label("Remove from list")).clicked() {
                             app.home.recent.retain(|x| x != p);
                             app.home.opened_at.remove(p);
                             ui.close();
                         }
-                        if !cfg!(target_arch = "wasm32") && ui.button("Show in folder").clicked() {
+                        if !cfg!(target_arch = "wasm32") && ui.button(crate::i18n::tr_label("Show in folder")).clicked() {
                             if let Some(show) = &app.services.show_in_folder {
                                 show(p);
                             }
@@ -573,6 +585,32 @@ mod tests {
         assert!(cached(&key).is_none());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(png).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn portable_thumbnail_loads_without_a_local_picture_or_model_rebuild() {
+        let mut session = Session::default();
+        session.execute("solid.box", &serde_json::json!({"length":10,"width":20,"height":30})).unwrap();
+        for body in &session.world_state().bodies {
+            body.mesh();
+        }
+        let bytes = session.design_container(solidcraft_engine::io::DesignCompression::Fast, false, true).unwrap();
+        let png = solidcraft_engine::io::read_design_thumbnail(&bytes).unwrap();
+        let image = decode_thumbnail(png).unwrap();
+        assert_eq!(image.size, THUMB);
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("solidcraft-portable-thumb-{}-{nonce}.solidcraft", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let key = path.to_string_lossy().to_string();
+        assert!(cached(&key).is_none());
+        let (_, picture, rebuilt) = make(&key);
+        assert!(rebuilt.is_none());
+        assert_eq!(picture.unwrap().pixels, image.pixels);
+        assert!(!cache_path(&key).unwrap().exists(), "fallback rebuilding would create a local picture");
+        std::fs::remove_file(path).unwrap();
+        assert!(decode_thumbnail(vec![0; 600_000]).is_none());
+        assert!(decode_thumbnail(vec![0; 24]).is_none());
     }
 
     #[test]

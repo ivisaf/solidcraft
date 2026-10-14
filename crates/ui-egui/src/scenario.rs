@@ -7,6 +7,7 @@
 //! - `{"widget": "Revolute", "near"?: "Type"}`: click a dialog field, choice or button by its
 //!   text (with `near`: the one in that label's row)
 //! - `{"click": AT, "double"?, "shift"?, "ctrl"?, "button"?}`, `{"move": AT}`,
+//!   `{"hold": AT, "frames"?}` (press and hold still: Select Other),
 //!   `{"drag": [AT, AT], "shift"?, "ctrl"?, "steps"?}` where AT is `[x, y]` (screen), `{"world": [x,y,z]}`
 //!   or `{"sketch": [x,y]}` (the sketch being edited)
 //! - `{"queued": "engine.execute", "params": {…}, "min_frames"?: n, "max_frames"?: n}`: a request sent the way an
@@ -33,6 +34,7 @@
 //! - `{"note": "…"}`: a comment; `{"pending": "why"}`: the scenario waits for a fix (its test
 //!   is ignored)
 //! - `{"expect": {…}}`: checks, see [`check`]; `{"until": {…}}` waits (frames) until they pass
+//!   (`"status"` takes a substring of the status line, or null for none)
 //!
 //! The same files drive the live app over the control channel for screenshots.
 
@@ -224,6 +226,12 @@ impl Harness {
             }
             self.frame();
         }
+        // A file opening or recovering in the background: wait for it (as a person would).
+        let began = std::time::Instant::now();
+        while !self.app.file_load.idle() && began.elapsed() < std::time::Duration::from_secs(120) {
+            self.frame();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         self.frames(4);
     }
 
@@ -378,6 +386,16 @@ impl Harness {
                 let [x, y] = found.ok_or_else(|| format!("no widget `{text}` on screen"))?;
                 self.call("ui.move", json!({"x": x, "y": y}));
                 self.call("ui.click", json!({"x": x, "y": y}))
+            } else if let Some(at) = s.get("hold") {
+                // Press and hold still (Select Other): `frames` with the button down (default 40,
+                // about 0.67 s), then let go.
+                let [x, y] = self.at(at)?;
+                self.call("ui.move", json!({"x": x, "y": y}));
+                let frames = s.get("frames").and_then(Value::as_u64).unwrap_or(40);
+                self.call(
+                    "ui.drag",
+                    json!({"x0": x, "y0": y, "x1": x, "y1": y, "steps": 1, "hold": frames, "shift": flag("shift"), "ctrl": flag("ctrl")}),
+                )
             } else if let Some(at) = s.get("move") {
                 let [x, y] = self.at(at)?;
                 self.call("ui.move", json!({"x": x, "y": y}))
@@ -545,7 +563,8 @@ fn approx(got: f64, want: &Value, what: &str) -> Result<(), String> {
 
 /// Checks: `bodies` (count), `volume` / `area` (total, number or [value, rel tol]), `faces`,
 /// `features` (count), `errors` (timeline features in error, default 0), `dialog` (null: none
-/// open, or a word its kind must contain), `tool` (null or command id), `sketching` (bool),
+/// open, or a word its kind must contain), `tool` (null or command id), `status` (null, or a
+/// substring of the status line), `sketching` (bool),
 /// `selection` (count), `glyphs` ({constraint id: count}, none overlapping one another or a dimension value), `param` ({name: value}), `sketch_status` (solved|…), `dof`, `query`
 /// ({command, params?, path, value}: a command's result).
 pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
@@ -697,6 +716,19 @@ pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
                     return Err(format!("{a} {lo:?} does not span {b} {hi:?} (±{tol})"));
                 }
             }
+            "disjoint" => {
+                // {"disjoint": ["a", "b"]}: both published rects are on screen and neither
+                // covers any part of the other (a dialog beside the Sketch Palette).
+                let names: Vec<&str> = v.as_array().map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
+                let (Some(a), Some(b)) = (names.first(), names.get(1)) else {
+                    return Err("disjoint takes two published rect names".to_string());
+                };
+                let ra = rect_of(a).ok_or(format!("no rect {a}"))?;
+                let rb = rect_of(b).ok_or(format!("no rect {b}"))?;
+                if ra.intersect(rb).is_positive() {
+                    return Err(format!("{a} {ra:?} overlaps {b} {rb:?}"));
+                }
+            }
             "dialog_docked" => {
                 // The command dialog: docked at the viewport's right, its width in [min, max].
                 let r = h.ctx.memory(|m| m.area_rect(egui::Id::new("sc_dialog"))).ok_or("no command dialog")?;
@@ -741,6 +773,18 @@ pub fn check(h: &mut Harness, e: &Value) -> Result<(), String> {
             "tool" => {
                 if ui["tool"] != *v {
                     return Err(format!("tool: got {}, want {v}", ui["tool"]));
+                }
+            }
+            "status" => {
+                // A substring of the status line's text, or null for no status at all.
+                let got = &ui["status"]["text"];
+                let ok = match v {
+                    Value::Null => ui["status"].is_null(),
+                    Value::String(w) => got.as_str().is_some_and(|g| g.contains(w.as_str())),
+                    _ => false,
+                };
+                if !ok {
+                    return Err(format!("status: got {}, want {v}", ui["status"]));
                 }
             }
             "glyphs" => {

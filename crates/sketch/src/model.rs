@@ -499,6 +499,11 @@ pub struct SketchView {
     pub hide_constraints: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hide_projected: bool,
+    /// Construction geometry (the `construction` line type) is not drawn and cannot be picked.
+    /// Centerlines are a line type of their own and keep showing; projected construction
+    /// geometry belongs to `hide_projected`, the way its colour already says it does.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hide_construction: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hide_grid: bool,
     /// Clicks don't snap to the grid.

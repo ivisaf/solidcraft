@@ -68,7 +68,8 @@ fn format_5_xz_design_opens_where_it_was_saved() {
     let path = dir.join("old-xz.solidcraft");
     let mut s = Session::default();
     build(&mut s);
-    run(&mut s, "file.save_as", json!({"path": path.to_string_lossy()}));
+    // This fixture edits the historical JSON metadata directly; request JSON explicitly.
+    run(&mut s, "file.save_as", json!({"path": path.to_string_lossy(), "format": "json"}));
     // Stamp the file as format 5: its XZ references then mean the old frame (sketch y = +Z,
     // normal −Y), which is what a build before format 6 wrote and evaluated.
     let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -87,7 +88,7 @@ fn format_5_xz_design_opens_where_it_was_saved() {
 
     // Saving the migrated design writes the current format and keeps the geometry.
     let resaved = dir.join("resaved.solidcraft");
-    run(&mut old, "file.save_as", json!({"path": resaved.to_string_lossy()}));
+    run(&mut old, "file.save_as", json!({"path": resaved.to_string_lossy(), "format": "json"}));
     let text = std::fs::read_to_string(&resaved).unwrap();
     assert!(text.contains(&format!("\"solidcraft/{}\"", solidcraft_doc::format::FORMAT)), "resaved at the current format");
     let mut again = Session::default();

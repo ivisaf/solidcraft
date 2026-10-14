@@ -17,15 +17,18 @@ mod blend_corner;
 mod blend_variable;
 mod body;
 mod boolean_diagnostics;
+mod boolean_guard;
 mod boolean_record;
 mod bore_guard;
 mod build;
+mod clearance;
 mod coplanar;
 mod curveblend;
 mod delete_face;
 mod emboss;
 #[cfg(test)]
 mod face_source_tests;
+mod fill;
 mod freeform;
 pub mod fuzz;
 mod heal;
@@ -35,6 +38,12 @@ mod iges_in;
 mod iges_out;
 #[cfg(test)]
 mod intersection_curve_tests;
+#[cfg(test)]
+mod issue_616_tests;
+#[cfg(test)]
+mod issue_674_tests;
+#[cfg(test)]
+mod issue_679_tests;
 mod lip;
 mod loopblend;
 mod measure;
@@ -42,9 +51,14 @@ mod mesh_convert;
 mod meshbody;
 #[cfg(test)]
 mod modify_history_tests;
+mod native;
 mod numbered;
 mod offset;
 mod ops;
+mod par;
+#[cfg(test)]
+mod pinch_tests;
+mod plane_fit;
 mod polybool;
 mod polyhedron;
 mod prism;
@@ -54,6 +68,7 @@ pub mod provenance;
 mod record;
 mod sew;
 mod smooth_edges;
+mod spline_conv;
 mod splitface;
 mod step;
 mod step_in;
@@ -61,15 +76,18 @@ mod step_out;
 mod surface_kind;
 mod surfaces;
 mod sweep_path;
+mod tess;
 #[cfg(test)]
 mod thread_tests;
 mod topo;
 mod tspline;
+#[cfg(test)]
+mod untouched_faces_tests;
 
-pub use blend::{ChamferSide, chamfer, chamfer_sides, fillet, fillet_max};
+pub use blend::{ChamferSide, chamfer, chamfer_sides, fillet, fillet_each, fillet_max, fillet_max_each};
 pub use blend_corner::fillet_radii;
-pub use blend_variable::{fillet_chord, fillet_variable, fillet_variable_points};
-pub use body::{Body, CapSignature, EdgeInfo, FaceInfo, FacePaint, FaceSource, Paint};
+pub use blend_variable::{RadiusSpline, Taper, fillet_chord, fillet_tapered, fillet_variable, fillet_variable_points, fillet_variable_spline, taper};
+pub use body::{Body, CapSignature, DISPLAY_ANGLE, EdgeInfo, FaceInfo, FacePaint, FaceSource, Paint};
 pub use boolean_diagnostics::{BooleanDiagnostics, BooleanFallback, BooleanStrategy, capture_boolean_diagnostics};
 pub use build::{PathSeg, box_solid, canonical_revolve_axis, cylinder, extrude, extrude_tapered, loft, revolve, sphere, sweep, torus};
 pub use delete_face::delete_faces;
@@ -81,11 +99,12 @@ pub use lip::raise_band;
 pub use measure::{BodyMeasure, measure};
 pub use mesh_convert::convert_prismatic_mesh;
 pub use meshbody::{MAX_TRIANGLES, mesh_body};
+pub use native::{decode_native_body, encode_native_body, native_preview_mesh};
 pub use offset::with_same_surface;
 pub use ops::{BoolOp, boolean, can_join_touching_faces, split_by_plane, transform, transform_matrix, union_apart};
 pub use polybool::{faceted_boolean, planar_boolean};
 pub use polyhedron::{HalfSpace, convex_polyhedron, draft, offset_faces, shell};
-pub use prism::{extrude_planar_regions, planar_regions_boolean};
+pub use prism::{PLANAR_FIT_TOL, extrude_planar_regions, planar_regions_boolean};
 pub use prism_measure::certified_prism_equivalent;
 pub use sew::{EdgeSpec, FaceSpec, SurfSpec, sew};
 pub use splitface::{SplitTool, split_body, split_faces, split_faces_with_map};
@@ -93,7 +112,7 @@ pub use step::step_export;
 pub use step_in::{ImportedBody, StepImport, StepNode, step_import, step_import_shared, step_orientation_errors, step_validate};
 pub use step_out::{ExportBody, ExportProduct, StepHeader, step_export_bodies, step_export_products};
 pub use surface_kind::{FaceSurface, face_surface};
-pub use surfaces::{copy_faces, extend, patch_edges, patch_region, stitch, thicken, trim};
+pub use surfaces::{copy_faces, extend, extrude_sheet, patch_edges, patch_region, reverse_faces, stitch, thicken, trim, unstitch};
 pub use sweep_path::sweep_path;
 pub use topo::{CylinderFace, cylinder_face_at};
 pub use topo::{TopoCounts, merged_topology, seam_flags};

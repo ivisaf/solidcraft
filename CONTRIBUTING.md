@@ -100,6 +100,8 @@ The [README](README.md#architecture) has the layer table. The short version:
    not.) Permissive
    dependencies are fine. Note which one you're adding and why in the PR, and run
    `cargo xtask licences` so THIRD-PARTY-LICENSES.txt lists it (CI checks that it is current).
+   Nightly/manual CI also scans advisories, bans and sources with cargo-deny; see
+   [the local command and coverage limits](docs/book/src/dev/testing.md#dependency-advisories).
 3. **Every asset is original or openly licensed and has a row in
    [ATTRIBUTION.md](ATTRIBUTION.md).** Icons are drawn in code (`crates/ui-egui/src/icons.rs`).
    `cargo xtask assets` enforces this.
@@ -159,12 +161,18 @@ Pull requests skip a few heavy tests (one to four minutes each), which run on ev
 `main` and nightly; check the `main` run after merging. They are listed in
 `.config/nextest.toml` and the [testing page](docs/book/src/dev/testing.md):
 
-- `solidcraft-engine`: `tests::hostile_params_never_panic`, everything in `tests::robustness`,
+- `solidcraft-engine`: `tests::hostile_params_never_panic`, everything in `tests::robustness` and
+  `tests::robustness_goldens` (pull requests that touch `crates/kernel` run its `sample_*` part),
   `pattern_suppress_tests::enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen`,
   `pattern_suppress_tests::enclosure_datums_follow_wall_height_and_board_depth_with_material_proofs`,
   `cmd::plastic::tests::enclosure_snap_fit_follows_resized_front_wall`
 - `solidcraft-kernel`: `tests::boolean_identity_on_tangent_primitives`
 - `solidcraft-ui-egui` scenarios: `acceptance_sensor_enclosure`
+
+**The action matrix** tries every ordinary action on every face, edge, vertex and body of a
+corpus of designs against a checked-in ratchet ([docs/action-matrix.md](docs/action-matrix.md)).
+A pull request that makes an action pass should record it with `cargo xtask action-matrix --bless`;
+one that makes a passing action fail fails the sample every CI run checks.
 
 **The reference tests** are 76 parts in [`tests/oracle/`](tests/oracle/), each a `recipe.json`
 in our own format with an `expected.json` beside it. SolidCraft rebuilds the recipe and compares

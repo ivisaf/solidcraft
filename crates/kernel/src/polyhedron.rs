@@ -192,7 +192,7 @@ fn cavity_history(poly: &Body, on: &[usize], groups: &[Vec<usize>]) -> Option<Hi
 /// Hollow a convex planar body: walls of `thickness` inside, faces near `open` removed. The
 /// result's history is over `[b]`: the inner walls are offsets of the faces they line.
 pub fn shell(b: &Body, open: &[Vec3], thickness: f64) -> Result<Body> {
-    shell_impl(b, open, thickness)?.with_shell_planar_sources(b, thickness, open)
+    guard("shell", || shell_impl(b, open, thickness)?.with_shell_planar_sources(b, thickness, open))
 }
 
 fn shell_impl(b: &Body, open: &[Vec3], thickness: f64) -> Result<Body> {
@@ -306,6 +306,8 @@ fn draft_walls(b: &Body, at: &[Vec3], neutral: &Plane, pull: Vec3, angle: f64) -
             _ => return Err(KernelError::Invalid(format!("no face at {:?}", [p.x, p.y, p.z]))),
         }
     }
+    // A round wall is stored in pieces (a cylinder's two halves): picking one drafts the whole wall.
+    let chosen = crate::offset::with_same_surface(&healed, &chosen);
     Ok(record::after(crate::offset::draft_walls(&healed, &chosen, neutral, pull, angle)?, &healed, &record::counts(&[b])))
 }
 
@@ -480,8 +482,16 @@ fn shell_planar(b: &Body, open: &[Vec3], thickness: f64) -> Result<Body> {
     if opened.is_empty() {
         return Err(KernelError::Invalid("select at least one face to remove".into()));
     }
+    // A successful Boolean is not evidence that a tangential rim has wall thickness.
+    // Refuse only when the entire planar opening loses its rim. A single collapsed
+    // round can still end in a valid sharp edge (the tutorial plate, for example).
+    if let Some(r) = rim_without_thickness(&healed, &opened, thickness, true) {
+        return Err(unsupported_shell(&format!(
+            "the rim would have no thickness: an open face meets a round of radius {r:.4} mm tangentially, and the shell is {thickness:.4} mm thick (make the round smaller than the thickness)"
+        )));
+    }
     let margin = thickness + size * 0.05;
-    shell_opened(b, &healed, open, &opened, thickness, margin).map_err(|e| match rim_without_thickness(&healed, &opened, thickness) {
+    shell_opened(b, &healed, open, &opened, thickness, margin).map_err(|e| match rim_without_thickness(&healed, &opened, thickness, false) {
         Some(r) => unsupported_shell(&format!(
             "the rim would have no thickness: an open face meets a round of radius {r:.4} mm tangentially, and the shell is {thickness:.4} mm thick (make the round smaller than the thickness)"
         )),
@@ -492,25 +502,53 @@ fn shell_planar(b: &Body, open: &[Vec3], thickness: f64) -> Result<Body> {
 /// The radius of a convex round (cylinder or torus) that meets an open face tangentially and
 /// is at least `thickness`: the cavity's wall then passes through the rim where the round meets
 /// the open face, leaving nothing between them.
-fn rim_without_thickness(b: &Body, opened: &[usize], thickness: f64) -> Option<f64> {
+fn rim_without_thickness(b: &Body, opened: &[usize], thickness: f64, whole_rim: bool) -> Option<f64> {
     use mt::{BoundedCurve, ParametricCurve};
-    let faces: Vec<&mt::Face> = b.solid.face_iter().collect();
+    let faces: Vec<&mt::Face> = b.solid.face_iter().take(if whole_rim { 4097 } else { usize::MAX }).collect();
     let tol = (b.size() * 1e-7).max(1e-9) * 100.0;
+    // A distant shell can make the body's tolerance larger than this wall.
+    // Such a diagnostic candidate is not sufficient to refuse a valid opening.
+    if whole_rim && tol > thickness * 1e-3 {
+        return None;
+    }
     opened.iter().filter_map(|fi| faces.get(*fi)).find_map(|open| {
         let plane = crate::offset::surf_of(open, tol)?;
-        faces.iter().filter(|g| !std::ptr::eq(**g, *open)).find_map(|g| {
-            let round = crate::offset::surf_of(g, tol)?;
-            let r = match round {
-                crate::offset::Surf::Cylinder { r, convex: true, .. } | crate::offset::Surf::Torus { r, convex: true, .. } => r,
-                _ => return None,
-            };
-            let shared = g.edge_iter().find(|e| open.edge_iter().any(|x| x.id() == e.id()))?;
-            let c = shared.curve();
-            let (t0, t1) = c.range_tuple();
-            let mid = from_p3(c.subs((t0 + t1) / 2.0));
-            let tangent = plane.normal(mid)?.dot(round.normal(mid)?) > 1.0 - 1e-6;
-            (tangent && r >= thickness - tol).then_some(r)
-        })
+        if whole_rim && (!matches!(plane, crate::offset::Surf::Plane { .. }) || faces.len() > 4096 || open.edge_iter().take(1025).count() > 1024) {
+            return None;
+        }
+        let radius = |edge: &mt::Edge| {
+            faces.iter().filter(|g| !std::ptr::eq(**g, *open)).find_map(|g| {
+                if !g.edge_iter().any(|e| e.id() == edge.id()) {
+                    return None;
+                }
+                let round = crate::offset::surf_of(g, tol)?;
+                let r = match round {
+                    crate::offset::Surf::Cylinder { r, convex: true, .. } | crate::offset::Surf::Torus { r, convex: true, .. } => r,
+                    _ => return None,
+                };
+                let c = edge.curve();
+                let (t0, t1) = c.range_tuple();
+                if !t0.is_finite() || !t1.is_finite() || t0 >= t1 {
+                    return None;
+                }
+                let parameter = t0 * 0.5 + t1 * 0.5;
+                if !parameter.is_finite() || parameter < t0 || parameter > t1 {
+                    return None;
+                }
+                let mid = from_p3(c.subs(parameter));
+                let tangent = plane.normal(mid)?.dot(round.normal(mid)?) > 1.0 - 1e-6;
+                (tangent && r >= thickness - tol).then_some(r)
+            })
+        };
+        if whole_rim {
+            let mut found = None;
+            for edge in open.edge_iter() {
+                found = Some(radius(&edge)?);
+            }
+            found
+        } else {
+            open.edge_iter().find_map(|edge| radius(&edge))
+        }
     })
 }
 
@@ -682,4 +720,20 @@ fn press_pieces(b: &Body, chosen: &[usize], distance: f64) -> Result<Body> {
         cur = crate::ops::boolean(&cur, &tool, op)?.ok_or_else(|| KernelError::Failed("offset: the piece moved off the body".into()))?;
     }
     Ok(cur.with_split_lines(b.splits.clone()).without_history())
+}
+
+#[cfg(test)]
+mod rim_preflight_tests {
+    use super::*;
+
+    #[test]
+    fn a_distant_shell_does_not_turn_a_smaller_local_round_into_a_zero_rim() {
+        let block = crate::box_solid(Vec3::ZERO, Vec3::new(40.0, 30.0, 10.0)).unwrap();
+        let edges = [Vec3::new(20.0, 0.0, 0.0), Vec3::new(40.0, 15.0, 0.0), Vec3::new(20.0, 30.0, 0.0), Vec3::new(0.0, 15.0, 0.0)];
+        let rounded = crate::fillet(&block, &edges, 1.5).unwrap();
+        let distant = crate::box_solid(Vec3::new(1_000_000.0, 0.0, 0.0), Vec3::new(1_000_010.0, 10.0, 10.0)).unwrap();
+        let combined = crate::boolean(&rounded, &distant, crate::BoolOp::Union).unwrap().unwrap();
+        let faces: Vec<_> = (0..combined.solid.face_iter().count()).collect();
+        assert!(rim_without_thickness(&combined, &faces, 2.0, true).is_none());
+    }
 }

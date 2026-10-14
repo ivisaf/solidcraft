@@ -29,11 +29,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  dependency-advisories:
+    name: Dependency advisories
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install advisory scanner
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Check locked dependencies
+        run: cargo deny --locked check --warn unmaintained advisories bans sources
+
   changes:
     name: Select checks
     runs-on: ubuntu-24.04
     outputs:
       native: ${{ steps.paths.outputs.native }}
+      kernel: ${{ steps.paths.outputs.kernel }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,12 +60,14 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           native=false
+          kernel=false
           if [ "$EVENT_NAME" != pull_request ]; then
             native=true
           else
             # Compare both old and new paths of renames; unknown paths run native checks.
             git diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/ci-paths"
             while IFS= read -r -d '' path; do
+              case "$path" in crates/kernel/*|vendor/truck-*) kernel=true ;; esac
               case "$path" in
                 .github/workflows/ci.yml) native=true ;;
                 *.rs|Cargo.toml|Cargo.lock|*/Cargo.toml|.cargo/*|rust-toolchain*) native=true ;;
@@ -61,6 +77,7 @@ jobs:
             done < "$RUNNER_TEMP/ci-paths"
           fi
           echo "native=$native" >> "$GITHUB_OUTPUT"
+          echo "kernel=$kernel" >> "$GITHUB_OUTPUT"
 
   checks:
     name: Format and repository checks
@@ -137,7 +154,7 @@ jobs:
 
   tests:
     name: Native Linux tests (${{ matrix.shard }}/4)
-    needs: build-tests
+    needs: [changes, build-tests]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -164,6 +181,16 @@ jobs:
           # the build job's path, which is the same checkout path here.
           cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
             --profile ci --partition "slice:$SHARD/4" "${all[@]}"
+      - name: Robustness goldens sample (pull requests that touch the kernel)
+        # Every 8th seed of tests/robustness/goldens.json, a quarter per shard; pushes to main and
+        # the nightly run every seed in the step above.
+        if: github.event_name == 'pull_request' && needs.changes.outputs.kernel == 'true'
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
+            --profile ci --ignore-default-filter \
+            -E "package(solidcraft-engine) & test(=tests::robustness_goldens::sample_$((SHARD - 1)))"
       - name: Upload test timings
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -171,6 +198,34 @@ jobs:
           name: junit-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
           retention-days: 7
+
+  action-matrix:
+    # Every ordinary action on every face, edge, vertex and body of the design corpus, against
+    # tests/action_matrix/baseline.json (docs/action-matrix.md). Every test run checks a sample;
+    # the whole matrix runs nightly (or by hand), a quarter per job.
+    name: Action matrix (${{ matrix.part }}/4)
+    needs: build-tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Run a quarter of the matrix
+        env:
+          PART: ${{ matrix.part }}
+        run: |
+          cargo nextest run --archive-file tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite \
+            --profile ci --run-ignored only -E "binary(action_matrix) & test(=action_matrix_full_$PART)"
 
   doc-tests:
     name: Doc tests

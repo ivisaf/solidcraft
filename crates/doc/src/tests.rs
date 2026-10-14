@@ -386,6 +386,25 @@ fn timeline_clones_share_meshes_even_when_cloned_before_tessellation() {
     assert!(!a.mesh().triangles.is_empty());
 }
 
+#[test]
+fn feature_inserted_at_a_marker_inside_a_timeline_folder_joins_it() {
+    let mut doc = Document::new("folder insertion");
+    let first = doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: Sketch::new() }, Some("First")).unwrap();
+    let second =
+        doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: Sketch::new() }, Some("Second")).unwrap();
+    doc.timeline_groups.push(TimelineGroup { id: 100, name: "Pair".into(), parent: None, features: vec![first, second] });
+    doc.marker = Some(1);
+
+    let inserted =
+        doc.add_feature(FeatureKind::Sketch { plane: PlaneRef::Origin { name: "XY".into() }, sketch: Sketch::new() }, Some("Inserted")).unwrap();
+
+    assert_eq!(doc.features.iter().map(|feature| feature.id).collect::<Vec<_>>(), vec![first, inserted, second]);
+    assert_eq!(doc.timeline_groups[0].features, vec![first, inserted, second]);
+    assert_eq!(doc.marker, Some(2));
+    assert!(non_contiguous_timeline_group(&doc.features, &doc.timeline_groups).is_none());
+    assert!(Document::from_json(&doc.to_json()).is_ok(), "the inserted feature must leave a reopenable design");
+}
+
 /// A construction plane that is its own side resolves through the model and back into the
 /// document. The depth count has to survive that hop, or the recursion overflows the stack and
 /// aborts the process, which no panic guard can intercept.

@@ -81,16 +81,7 @@
   }
  },
  {
-  "note": "The sheet flange face is uncertified; choose the displayed fixed-plane option explicitly before drawing the fold line."
- },
- {
-  "expect": {
-   "sketching": false,
-   "dialog": "this face has no exact planar source"
-  }
- },
- {
-  "widget": "Use fixed plane"
+  "note": "A flat face of a sheet attaches the sketch to its panel (by name), in the flat pattern's coordinates."
  },
  {
   "expect": {

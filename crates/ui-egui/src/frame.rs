@@ -3,9 +3,13 @@
 //! other file creates an `egui::Window`, and that every dialog stays within the limits).
 //!
 //! - [`docked`]: command dialogs and command panels, flush to the right edge of the viewport.
+//! - [`docked_on`]: the same, against either edge ([`Side`]), with [`dock_frame`] for its
+//!   chrome. A dialog opened while the Sketch Palette holds the right edge takes the left.
 //! - [`window`]: floating windows (Preferences, Parameters, prompts…), centred by default.
 //! - [`right_aligned`]: right-align a row's last items without widening the window (a
 //!   right-to-left layout would stretch it to its maximum width).
+//! - [`heading`]: a panel's title row and its section headings, each on a band darker than the
+//!   panel ([`Level`]), so every dialog marks them the same way.
 
 use egui::{Align2, Pos2, Ui, WidgetText, vec2};
 
@@ -26,17 +30,60 @@ pub enum Width {
     Wide,
 }
 
+/// Which edge of the viewport a docked panel sits against. The Sketch Palette holds the right
+/// edge while a sketch is open, so a dialog started there takes the left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Right,
+    Left,
+}
+
+impl Side {
+    /// The x of the viewport edge this side docks against.
+    pub fn anchor_x(self, viewport: egui::Rect) -> f32 {
+        match self {
+            Side::Right => viewport.right(),
+            Side::Left => viewport.left(),
+        }
+    }
+}
+
+/// The window frame of a docked panel: the two corners away from its edge are rounded, and the
+/// shadow falls the same way, so a left dock mirrors a right one.
+pub fn dock_frame(ctx: &egui::Context, side: Side) -> egui::Frame {
+    let t = crate::theme::Tokens::get();
+    let (corner_radius, shadow_x) = match side {
+        Side::Right => (egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 }, -2),
+        Side::Left => (egui::CornerRadius { nw: 0, sw: 0, ne: 4, se: 4 }, 2),
+    };
+    egui::Frame::window(&ctx.global_style())
+        .fill(t.dialog_bg)
+        .stroke(egui::Stroke::new(1.0, t.dialog_border))
+        .corner_radius(corner_radius)
+        .shadow(egui::Shadow { offset: [shadow_x, 2], blur: 8, spread: 0, color: egui::Color32::from_black_alpha(40) })
+}
+
 /// A command dialog docked at `anchor` (its top right corner), shrink-wrapped to its content.
 pub fn docked<'a>(title: impl Into<WidgetText>, id: egui::Id, anchor: Pos2, max_height: f32, width: Width) -> egui::Window<'a> {
+    docked_on(title, id, anchor, max_height, width, Side::Right)
+}
+
+/// A command dialog docked against `side` at `anchor` (its top corner on that side),
+/// shrink-wrapped to its content.
+pub fn docked_on<'a>(title: impl Into<WidgetText>, id: egui::Id, anchor: Pos2, max_height: f32, width: Width, side: Side) -> egui::Window<'a> {
     let max = match width {
         Width::Normal => DIALOG_MAX_W,
         Width::Wide => DIALOG_WIDE_MAX_W,
+    };
+    let pivot = match side {
+        Side::Right => Align2::RIGHT_TOP,
+        Side::Left => Align2::LEFT_TOP,
     };
     egui::Window::new(title)
         .enabled(!crate::issue_report::cad_input_blocked())
         .id(id)
         .title_bar(false)
-        .pivot(Align2::RIGHT_TOP)
+        .pivot(pivot)
         .fixed_pos(anchor)
         .constrain(false)
         .auto_sized()
@@ -64,6 +111,38 @@ pub fn window<'a>(ctx: &egui::Context, title: impl Into<WidgetText>, width: Widt
 /// Floating model controls share the report's read-only drawing boundary with windows.
 pub fn area(id: egui::Id) -> egui::Area {
     egui::Area::new(id).enabled(!crate::issue_report::cad_input_blocked())
+}
+
+/// Heading levels inside a panel: its title, and the sections below it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// The panel's title row (`Tokens::heading_bg`).
+    Title,
+    /// A section heading (`Tokens::subheading_bg`).
+    Section,
+}
+
+/// Horizontal inner margin of a heading band, on each side.
+pub const HEADING_MARGIN: f32 = 4.0;
+
+/// A heading row drawn on a band `width` wide (a content width, so the band never widens the
+/// window); `add` lays out the row left to right in `width - 2 * HEADING_MARGIN`.
+pub fn heading<R>(ui: &mut Ui, level: Level, width: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let t = crate::theme::Tokens::get();
+    let fill = match level {
+        Level::Title => t.heading_bg,
+        Level::Section => t.subheading_bg,
+    };
+    let inner = (width - 2.0 * HEADING_MARGIN).max(0.0);
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(3)
+        .inner_margin(egui::Margin::symmetric(HEADING_MARGIN as i8, 1))
+        .show(ui, |ui| {
+            ui.set_width(inner);
+            ui.horizontal(add).inner
+        })
+        .inner
 }
 
 /// The width a window's content had last frame (at least `min`), for laying out rows that end at

@@ -176,7 +176,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 ui.separator();
             }
             let te = ui.add(
-                egui::TextEdit::singleline(&mut app.sbox.text).hint_text("Search commands").desired_width(W - 20.0).id(egui::Id::new("sc_sbox_text")),
+                egui::TextEdit::singleline(&mut app.sbox.text)
+                    .hint_text(crate::i18n::tr_label("Search commands"))
+                    .desired_width(W - 20.0)
+                    .id(egui::Id::new("sc_sbox_text")),
             );
             te.request_focus();
             if te.changed() {
@@ -184,7 +187,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
             ui.add_space(4.0);
             if app.sbox.text.trim().is_empty() && !app.sbox.recent.is_empty() {
-                ui.label(egui::RichText::new("RECENT").size(10.0).color(t.text_dim));
+                ui.label(egui::RichText::new(crate::i18n::tr_label("RECENT")).size(10.0).color(t.text_dim));
             }
             egui::ScrollArea::vertical().max_height(h - 90.0).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;

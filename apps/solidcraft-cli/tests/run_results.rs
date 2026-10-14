@@ -44,9 +44,26 @@ fn body_count(path: &Path) -> Value {
 }
 
 #[test]
+fn cli_loads_both_design_encodings_by_contents() {
+    let dir = Scratch::new();
+    for extension in ["solidcraft", "solvecraft", "json"] {
+        let saved = dir.0.join(format!("box.{extension}"));
+        json_output(cli().arg("run").arg(dir.script()).arg("--save").arg(&saved).output().unwrap());
+        let bytes = std::fs::read(&saved).unwrap();
+        assert_eq!(solidcraft_engine::io::is_design_container(&bytes), extension != "json");
+        let renamed = dir.0.join(format!("{extension}.unusual"));
+        std::fs::write(&renamed, bytes).unwrap();
+        let measured = json_output(cli().arg("eval").arg(&renamed).output().unwrap());
+        assert_eq!(measured["body_count"], 1);
+        assert!((measured["bodies"][0]["volume_mm3"].as_f64().unwrap() - 24.0).abs() < 1e-6);
+    }
+}
+
+#[test]
 fn results_still_save_and_export_the_script_once() {
     let dir = Scratch::new();
-    let saved = dir.0.join("box.solidcraft");
+    // JSON is explicit here because the fixture edits its saved format tag.
+    let saved = dir.0.join("box.json");
     let stl = dir.0.join("box.stl");
     let obj = dir.0.join("box.obj");
     let result = json_output(
@@ -101,7 +118,8 @@ fn results_without_script_still_fail() {
 #[test]
 fn legacy_extension_and_format_tag_still_open() {
     let dir = Scratch::new();
-    let saved = dir.0.join("box.solidcraft");
+    // JSON is explicit here because the fixture edits its saved format tag.
+    let saved = dir.0.join("box.json");
     json_output(cli().arg("run").arg(dir.script()).arg("--save").arg(&saved).output().unwrap());
     let text = std::fs::read_to_string(&saved).unwrap();
     assert!(text.contains("\"solidcraft/"), "new designs carry the current tag");
@@ -111,5 +129,6 @@ fn legacy_extension_and_format_tag_still_open() {
     let resaved = dir.0.join("resaved.solidcraft");
     json_output(cli().args(["run", "--in"]).arg(&legacy).arg(dir.script()).arg("--save").arg(&resaved).output().unwrap());
     assert_eq!(body_count(&resaved), 2);
-    assert!(std::fs::read_to_string(&resaved).unwrap().contains("\"solidcraft/"));
+    let reopened = solidcraft_engine::io::read_design(&std::fs::read(&resaved).unwrap()).unwrap();
+    assert!(reopened.to_json().contains("\"solidcraft/"));
 }

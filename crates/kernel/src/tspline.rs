@@ -11,6 +11,7 @@ use solidcraft_geom::tspline::TSpline;
 use truck_modeling as mt;
 
 use crate::body::Body;
+use crate::spline_conv::{h4, nurbs_curve, nurbs_surface};
 use crate::{KernelError, Result, guard};
 
 /// A T-spline as a surface body (an open shell of NURBS faces whose normals follow
@@ -34,23 +35,9 @@ fn fail(m: impl std::fmt::Display) -> KernelError {
     KernelError::Failed(format!("t-spline sheet: {m}"))
 }
 
-fn h4(h: HPoint) -> mt::Vector4 {
-    mt::Vector4::new(h.x, h.y, h.z, h.w)
-}
-
 fn vertex(h: HPoint) -> Result<mt::Vertex> {
     let p = h.project().ok_or_else(|| fail("a corner has no position"))?;
     Ok(mt::builder::vertex(crate::body::p3(p)))
-}
-
-fn nurbs_curve(knots: mt::KnotVec, ctrl: &[HPoint]) -> Result<mt::Curve> {
-    let c = mt::BSplineCurve::try_new(knots, ctrl.iter().copied().map(h4).collect()).map_err(fail)?;
-    Ok(mt::Curve::NurbsCurve(mt::NurbsCurve::new(c)))
-}
-
-fn surface(knots: (mt::KnotVec, mt::KnotVec), rows: Vec<Vec<mt::Vector4>>) -> Result<mt::Surface> {
-    let s = mt::BSplineSurface::try_new(knots, rows).map_err(fail)?;
-    Ok(mt::Surface::NurbsSurface(mt::NurbsSurface::new(s)))
 }
 
 /// One face from a clamped tensor surface, bounded by its four boundary curves.
@@ -69,8 +56,7 @@ fn tensor_face(n: &NurbsSurface) -> Result<mt::Face> {
     let top = edge(v3, v2, nurbs_curve(ku.clone(), &row(nv - 1))?)?;
     let left = edge(v0, v3, nurbs_curve(kv.clone(), &column(0))?)?;
     let wire: mt::Wire = vec![bottom, right, top.inverse(), left.inverse()].into();
-    let rows: Vec<Vec<mt::Vector4>> = (0..nu).map(|i| (0..nv).map(|j| h4(n.point(i, j))).collect()).collect();
-    mt::Face::try_new(vec![wire], surface((ku, kv), rows)?).map_err(fail)
+    mt::Face::try_new(vec![wire], crate::spline_conv::surface(n)?).map_err(fail)
 }
 
 /// A parameter point, exact (knot values are shared, so equal points have equal bits).
@@ -148,7 +134,7 @@ fn patch_faces(patches: &[BezierPatch]) -> Result<Vec<mt::Face>> {
         }
         let [ps, pt] = p.degree;
         let rows: Vec<Vec<mt::Vector4>> = (0..=ps).map(|i| (0..=pt).map(|j| h4(p.point(i, j))).collect()).collect();
-        let surf = surface((mt::KnotVec::bezier_knot(ps), mt::KnotVec::bezier_knot(pt)), rows)?;
+        let surf = nurbs_surface((mt::KnotVec::bezier_knot(ps), mt::KnotVec::bezier_knot(pt)), rows)?;
         faces.push(mt::Face::try_new(vec![wire.into()], surf).map_err(fail)?);
     }
     Ok(faces)

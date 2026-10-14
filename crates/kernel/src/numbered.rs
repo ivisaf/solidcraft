@@ -125,6 +125,35 @@ impl NumberedLoop {
         out
     }
 
+    /// Each run of lines that `joins` says continue one another as a single line, over what
+    /// they all ran over. (Adjacent profiles merged into one region keep a vertex where each
+    /// shared edge met the outline.)
+    pub(crate) fn merged_lines(&self, joins: impl Fn(&Seg2, &Seg2) -> bool) -> NumberedLoop {
+        let n = self.lp.segs.len();
+        let join = |i: usize, j: usize| match (self.lp.segs.get(i), self.lp.segs.get(j)) {
+            (Some(s @ Seg2::Line { .. }), Some(t @ Seg2::Line { .. })) => joins(s, t),
+            _ => false,
+        };
+        // Start where a run starts (a loop of nothing but one run stays as it is).
+        let Some(k) = (0..n).find(|&i| !join((i + n - 1) % n, i)) else { return self.clone() };
+        let mut out = NumberedLoop { lp: Loop2 { segs: Vec::new() }, from: Vec::new() };
+        for j in 0..n {
+            let i = (k + j) % n;
+            let (Some(s), from) = (self.lp.segs.get(i).copied(), self.numbers(i)) else { continue };
+            if j > 0
+                && join((i + n - 1) % n, i)
+                && let (Some(Seg2::Line { b, .. }), Some(prev)) = (out.lp.segs.last_mut(), out.from.last_mut())
+            {
+                *b = s.end();
+                *prev = union([prev.as_slice(), from]);
+                continue;
+            }
+            out.lp.segs.push(s);
+            out.from.push(from.to_vec());
+        }
+        out
+    }
+
     /// Split segment `k` in half, both halves over what it ran over.
     fn split_half(&mut self, k: usize) {
         if k >= self.lp.segs.len() || k >= self.from.len() {

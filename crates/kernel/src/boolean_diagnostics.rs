@@ -17,6 +17,9 @@ pub enum BooleanStrategy {
     PlanarFallback,
     ToolNudge,
     Piecewise,
+    /// No retry gave a result, and the answer from sample points was kept although the bodies'
+    /// facetings disagree with it.
+    UnverifiedShortcut,
 }
 
 /// Numerical adjustments used by a successful retry, in millimetres/radians.
@@ -47,6 +50,10 @@ impl BooleanFallback {
             BooleanStrategy::PlanarFallback => "exact planar fallback (no displacement)".into(),
             BooleanStrategy::ToolNudge => format!("tool displacement {:.6e} mm, rotation {:.6e} rad", self.translation_mm, self.rotation_rad),
             BooleanStrategy::Piecewise => "piecewise retry (no displacement)".into(),
+            BooleanStrategy::UnverifiedShortcut => format!(
+                "not verified: the bodies' facets pass through each other by more than {:.6e} mm, but they could not be intersected there; that part is ignored",
+                self.tolerance_mm
+            ),
         }
     }
 }
@@ -64,6 +71,12 @@ impl BooleanDiagnostics {
         } else {
             self.truncated = true;
         }
+    }
+
+    /// Why the result is not verified, when it ignores a place where the bodies seem to pass
+    /// through each other ([`BooleanStrategy::UnverifiedShortcut`]).
+    pub fn unverified(&self) -> Option<String> {
+        self.events.iter().find(|event| event.strategy == BooleanStrategy::UnverifiedShortcut).map(BooleanFallback::description)
     }
 
     pub fn warning(&self) -> Option<String> {

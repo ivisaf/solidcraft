@@ -7,11 +7,18 @@
           "glass-specializations" : [
             {
               "appearance" : "tinted",
-              "value" : false
+              "value" : true
             }
           ],
-          "image-name" : "03-solid.svg",
-          "name" : "03-solid"
+          "image-name" : "03-solid-blue-cutout.svg",
+          "name" : "03-solid-blue-cutout",
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
         }
       ],
       "name" : "03 Solid",
@@ -28,73 +35,60 @@
     {
       "layers" : [
         {
+          "blend-mode-specializations" : [
+            {
+              "appearance" : "dark",
+              "value" : "normal"
+            }
+          ],
           "fill" : "none",
           "glass-specializations" : [
             {
-              "value" : true
+              "value" : false
+            },
+            {
+              "appearance" : "dark",
+              "value" : false
             },
             {
               "appearance" : "tinted",
-              "value" : false
+              "value" : true
             }
           ],
           "hidden" : false,
-          "image-name" : "02-grid.svg",
+          "image-name-specializations" : [
+            {
+              "value" : "02-grid.svg"
+            },
+            {
+              "appearance" : "dark",
+              "value" : "02-grid-dark.svg"
+            }
+          ],
           "name" : "02-grid",
           "opacity-specializations" : [
             {
               "value" : 1
             },
             {
+              "appearance" : "dark",
+              "value" : 1
+            },
+            {
               "appearance" : "tinted",
               "value" : 1
             }
-          ]
+          ],
+          "position" : {
+            "scale" : 0.9,
+            "translation-in-points" : [
+              0,
+              0
+            ]
+          }
         }
       ],
       "name" : "02 Grid",
-      "shadow" : {
-        "kind" : "none",
-        "opacity" : 0
-      },
-      "specular" : false,
-      "translucency" : {
-        "enabled" : false,
-        "value" : 0.3
-      }
-    },
-    {
-      "layers" : [
-        {
-          "fill" : "none",
-          "glass" : false,
-          "hidden" : false,
-          "image-name" : "01-background.svg",
-          "name" : "01-background",
-          "position-specializations" : [
-            {
-              "value" : {
-                "scale" : 1,
-                "translation-in-points" : [
-                  0,
-                  0
-                ]
-              }
-            },
-            {
-              "idiom" : "watchOS",
-              "value" : {
-                "scale" : 1.09,
-                "translation-in-points" : [
-                  0,
-                  0
-                ]
-              }
-            }
-          ]
-        }
-      ],
-      "name" : "01 Background",
       "shadow" : {
         "kind" : "none",
         "opacity" : 0

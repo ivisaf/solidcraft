@@ -55,6 +55,9 @@ pub enum LinkSource {
     Origin,
     /// An origin axis (`X`, `Y`, `Z`).
     Axis { name: String },
+    /// One of the sketch's own axes (`x` or `y`): the line through the sketch origin along it,
+    /// whatever plane the sketch is on (see [`sketch_axis_geom`]).
+    SketchAxis { name: String },
     /// An origin plane (`XY`, `XZ`, `YZ`) or a construction plane (by name): its trace on the
     /// sketch plane.
     Plane { name: String },
@@ -68,13 +71,16 @@ pub enum LinkSource {
     Iso { body: String, at: Vec3, dir: String },
     /// The outline of a body spun about an axis (world line), laid into the sketch plane.
     Spun { body: String, origin: Vec3, dir: Vec3 },
-    /// Text: baseline start `at` (sketch coordinates), capital height and angle (radians).
+    /// Text: baseline start `at` (sketch coordinates), capital height and angle (radians), in
+    /// `font` (a font file path or an installed family name; none: the built-in font).
     Text {
         text: String,
         at: Vec2,
         height: f64,
         #[serde(default)]
         angle: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        font: Option<String>,
     },
 }
 
@@ -90,6 +96,7 @@ impl LinkSource {
             LinkSource::SketchPoint { point, .. } => format!("sketch point {point}"),
             LinkSource::Origin => "origin".into(),
             LinkSource::Axis { name } => format!("{name} axis"),
+            LinkSource::SketchAxis { name } => format!("sketch {name} axis"),
             LinkSource::Plane { name } => format!("{name} plane"),
             LinkSource::OnSurface { curve, .. } => format!("{curve} on a face"),
             LinkSource::Intersection { a, b } => format!("intersection of {} and {}", a.describe(), b.describe()),
@@ -98,6 +105,19 @@ impl LinkSource {
             LinkSource::Text { text, .. } => format!("text \"{}\"", text.chars().take(20).collect::<String>()),
         }
     }
+}
+
+/// Half length of the line a sketch axis link produces.
+pub const SKETCH_AXIS_HALF: f64 = 100.0;
+
+/// The geometry of sketch axis `name` (`x` or `y`, sketch coordinates); `None` for any other name.
+pub fn sketch_axis_geom(name: &str) -> Option<LinkGeom> {
+    let u = match name {
+        "x" => Vec2::X,
+        "y" => Vec2::Y,
+        _ => return None,
+    };
+    Some(LinkGeom::Line(Vec2::ZERO - u * SKETCH_AXIS_HALF, u * SKETCH_AXIS_HALF))
 }
 
 /// One link and its state.
@@ -110,6 +130,10 @@ pub struct Link {
     /// Persistent model face identity, resolved by the document before geometry refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_name: Option<String>,
+    /// Persistent model edge identity of an `Edge` source, resolved by the document before
+    /// geometry refresh. None: the edge is the one nearest the source's point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_name: Option<String>,
     /// Automatically projected borders owned by a durable sketch face attachment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_face: bool,
@@ -417,6 +441,34 @@ impl Sketch {
         self.curves.get(ci).and_then(|c| c.link.as_deref()).and_then(|l| self.link(l)).is_some_and(|l| l.lost)
     }
 
+    /// The line of sketch axis `name` (`x` or `y`) when the sketch already has one (see
+    /// [`Sketch::sketch_axis_line`]).
+    pub fn sketch_axis_curve(&self, name: &str) -> Option<usize> {
+        self.links
+            .iter()
+            .filter(|l| matches!(&l.source, LinkSource::SketchAxis { name: n } if n == name))
+            .find_map(|l| self.link_curves(&l.id).into_iter().find(|c| matches!(self.curves.get(*c).map(|c| &c.kind), Some(CurveKind::Line { .. }))))
+    }
+
+    /// The line of sketch axis `name` (`x` or `y`) that constraints can refer to: a linked
+    /// construction line on the axis (it stays there and is left out of profiles), shared by
+    /// every reference to that axis and added on first use. `None` when `name` is not a sketch
+    /// axis.
+    pub fn sketch_axis_line(&mut self, name: &str) -> Result<Option<usize>> {
+        let Some(geom) = sketch_axis_geom(name) else { return Ok(None) };
+        if let Some(c) = self.sketch_axis_curve(name) {
+            return Ok(Some(c));
+        }
+        let id = self.add_link(LinkKind::Project, LinkSource::SketchAxis { name: name.into() }, &[geom])?;
+        let curves = self.link_curves(&id);
+        for c in &curves {
+            if let Some(cu) = self.curves.get_mut(*c) {
+                cu.construction = true;
+            }
+        }
+        curves.first().copied().map(Some).ok_or_else(|| SketchError::Invalid(format!("sketch {name} axis")))
+    }
+
     /// Add linked geometry. Returns the link id; the new curve and point ids are
     /// [`Sketch::link_curves`] / [`Sketch::link_points`] of it.
     pub fn add_link(&mut self, kind: LinkKind, source: LinkSource, geom: &[LinkGeom]) -> Result<String> {
@@ -428,7 +480,7 @@ impl Sketch {
             return Err(SketchError::TooLarge);
         }
         let id = self.fresh("j")?;
-        self.links.push(Link { id: id.clone(), kind, source, face_name: None, auto_face: false, lost: false });
+        self.links.push(Link { id: id.clone(), kind, source, face_name: None, edge_name: None, auto_face: false, lost: false });
         self.build_link(&id, &lay)?;
         Ok(id)
     }
@@ -804,6 +856,21 @@ impl Sketch {
         Ok(true)
     }
 
+    /// Where this sketch's points were in `stored`, the same sketch before its links were
+    /// moved to where their sources are now ([`Sketch::update_link`]): point by point, as
+    /// [`crate::solve_after_edit`] takes them. Points are matched by id (a rebuilt link has
+    /// new ones); a point `stored` does not have is where it is now. `None` when none moved.
+    pub fn positions_in(&self, stored: &Sketch) -> Option<Vec<Vec2>> {
+        let aligned = self.points.len() == stored.points.len() && self.points.iter().zip(&stored.points).all(|(p, q)| p.id == q.id);
+        let was: Vec<Vec2> = if aligned {
+            stored.points.iter().map(|p| p.pos).collect()
+        } else {
+            let by_id: std::collections::BTreeMap<&str, Vec2> = stored.points.iter().map(|p| (p.id.as_str(), p.pos)).collect();
+            self.points.iter().map(|p| by_id.get(p.id.as_str()).copied().unwrap_or(p.pos)).collect()
+        };
+        self.points.iter().zip(&was).any(|(p, w)| p.pos != *w).then_some(was)
+    }
+
     fn drop_link_entities(&mut self, id: &str) {
         let curves = self.link_curves(id);
         let keep = self.links.clone();
@@ -873,3 +940,7 @@ impl Sketch {
 #[cfg(test)]
 #[path = "link_identity_tests.rs"]
 mod identity_tests;
+
+#[cfg(test)]
+#[path = "link_side_tests.rs"]
+mod side_tests;

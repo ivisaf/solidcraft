@@ -1,11 +1,11 @@
 //! Surface commands: Patch, Stitch, Thicken and Trim (surface bodies and turning them into
-//! solids).
+//! solids), and the planned surface toolset (`planned!`: registered, not built yet).
 
 use serde_json::Value;
 use solidcraft_doc::{FaceAt, FeatureKind, PlaneRef, ProfileSel, expr::Kind};
 
 use super::CommandSpec;
-use super::features::{add_feature, check_expr, feature_sketch, operation, plane_param, profiles};
+use super::features::{add_feature, check_expr, extent_param, feature_sketch, operation, plane_param, profiles};
 use crate::params::{bad, bool_, expr, str_, string_list, vec3};
 use crate::{Result, Session};
 
@@ -13,7 +13,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("surface.patch", "Patch", patch)
         .at("SURFACE", "CREATE")
         .icon("patch")
-        .params("sketch?: id|name and profiles? (planar patches of sketch regions) | edges: [[x,y,z]] (points on a closed loop of a body's edges) and body?; name?, body_name?"),
+        .params("sketch?: id|name and profiles? (planar patches of sketch regions) | edges: [[x,y,z]] (points on a closed loop of a body's edges: one face on them, planar when the loop is, else a smooth B-spline surface) and body?; name?, body_name?"),
     CommandSpec::new("surface.stitch", "Stitch", stitch)
         .at("SURFACE", "MODIFY")
         .icon("stitch")
@@ -30,6 +30,54 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SURFACE", "MODIFY")
         .icon("trim")
         .params("body: surface name; plane: XY|XZ|YZ|plane name|{origin, normal} or tool: {body, point} (a face, its surface extended); keep: [x,y,z] (a point on the side to keep)"),
+    CommandSpec::new("surface.extrude", "Surface Extrude", surface_extrude)
+        .at("SURFACE", "CREATE")
+        .icon("surface_extrude")
+        .params("sketch?: id|name; curves?: [curve ids] (open or closed chains of curves meeting end to end) and/or profiles? (their boundaries; the default when no curves are given); distance: expr; direction?: positive|negative|symmetric; distance2?: expr; start_offset?: expr; name?, body_name? (a surface body: walls only, no caps)"),
+    planned!("surface.revolve", "Surface Revolve", "757")
+        .at("SURFACE", "CREATE")
+        .icon("surface_revolve")
+        .params("planned: the parameters of solid.revolve, with open curve chains as well as profiles (no caps); caps?: bool"),
+    planned!("surface.sweep", "Surface Sweep", "757")
+        .at("SURFACE", "CREATE")
+        .icon("surface_sweep")
+        .params("planned: the parameters of solid.sweep, with an open profile chain as well as a closed one (no caps); caps?: bool"),
+    planned!("surface.loft", "Surface Loft", "757")
+        .at("SURFACE", "CREATE")
+        .icon("surface_loft")
+        .params("planned: the parameters of solid.loft, with open sections as well as closed ones (no caps); caps?: bool"),
+    planned!("surface.offset", "Offset Surface", "758")
+        .at("SURFACE", "CREATE")
+        .icon("surface_offset")
+        .params("planned: faces: [{body, point}]; distance: expr (signed, along the normals; 0 copies the faces); chain?: bool (the whole tangent chain of each pick); tolerance?: expr (B-spline fit, default 0.01 mm)"),
+    planned!("surface.ruled", "Ruled Surface", "762")
+        .at("SURFACE", "CREATE")
+        .icon("ruled")
+        .params("planned: body; edges: [[x,y,z]] (points on an edge chain); distance: expr; mode?: normal|tangent|angle|direction; angle?: expr; direction?: [x,y,z]; flip?: bool; corners?: mitre|round"),
+    planned!("surface.boundary", "Boundary Surface", "763")
+        .at("SURFACE", "CREATE")
+        .icon("boundary")
+        .params("planned: u: [curves], v?: [curves] (sketch curves, 3D sketch wires or {body, point} edges; 2–4 boundaries, more make a network); continuity?: [{curve, g: 0|1|2}] for edge boundaries; operation?: new|join"),
+    planned!("surface.blend", "Blend Surface", "764")
+        .at("SURFACE", "CREATE")
+        .icon("surface_blend")
+        .params("planned: from, to: {body, edges: [[x,y,z]]} (two edge chains apart); continuity?: [g0|g1|g2, g0|g1|g2] (each side); bulge?: [number, number]; align?: auto|[[x,y,z], [x,y,z]]; stitch?: bool"),
+    planned!("surface.untrim", "Untrim", "761")
+        .at("SURFACE", "MODIFY")
+        .icon("untrim")
+        .params("planned: face: {body, point}; holes?: all|[[x,y,z]] (points on the inner loops to remove); outer?: bool (restore the natural bounds); in_place?: bool (a surface body only)"),
+    CommandSpec::new("surface.unstitch", "Unstitch", unstitch)
+        .at("SURFACE", "MODIFY")
+        .icon("unstitch")
+        .params("body; faces?: [[x,y,z]] (points on the faces to take out, each its own surface body; the rest stay together under the body's name; default: every face its own surface body). A solid comes apart into surfaces"),
+    CommandSpec::new("surface.reverse_normal", "Reverse Normal", reverse_normal)
+        .at("SURFACE", "MODIFY")
+        .icon("reverse_normal")
+        .params("body (a surface); faces?: [[x,y,z]] (points on the faces to turn over; default: all of them)"),
+    planned!("surface.fillet", "Surface Fillet", "769")
+        .at("SURFACE", "MODIFY")
+        .icon("surface_fillet")
+        .params("planned: a, b: {body, point} (two faces of separate bodies that meet or cross; the points pick the side the ball rolls on); radius: expr; trim?: both|first|none"),
 ];
 
 fn patch(s: &mut Session, p: &Value) -> Result<Value> {
@@ -45,6 +93,44 @@ fn patch(s: &mut Session, p: &Value) -> Result<Value> {
     let sketch = feature_sketch(s, p, cmd)?;
     let profiles = profiles(p, cmd)?;
     add_feature(s, p, FeatureKind::Patch { sketch: Some(sketch), profiles, body: None, edges: Vec::new() })
+}
+
+fn surface_extrude(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "surface.extrude";
+    let sketch = feature_sketch(s, p, cmd)?;
+    let curves = string_list(p, "curves");
+    if curves.len() > 1000 {
+        return Err(bad(cmd, "at most 1000 curves"));
+    }
+    let profiles = if curves.is_empty() || p.get("profiles").is_some() { Some(profiles(p, cmd)?) } else { None };
+    let extent = extent_param(s, p, cmd)?;
+    if extent.through_all || extent.taper.is_some() || extent.to.is_some() || extent.from.is_some() {
+        return Err(bad(cmd, "not supported yet: through all, to or from an object, or a taper"));
+    }
+    add_feature(s, p, FeatureKind::SurfaceExtrude { sketch, profiles, curves, extent })
+}
+
+/// A body by name, and points on some of its faces (none: all of them).
+fn body_faces(s: &Session, p: &Value, cmd: &str) -> Result<(String, Vec<solidcraft_geom::Vec3>)> {
+    let body = str_(p, "body").ok_or_else(|| bad(cmd, "`body` is required"))?.to_string();
+    if s.model.state().body(&body).is_none() {
+        return Err(bad(cmd, format!("no body `{body}`")));
+    }
+    let faces: Vec<solidcraft_geom::Vec3> = p.get("faces").and_then(Value::as_array).map(|a| a.iter().filter_map(vec3).collect()).unwrap_or_default();
+    if faces.len() > 10_000 {
+        return Err(bad(cmd, "too many faces"));
+    }
+    Ok((body, faces))
+}
+
+fn unstitch(s: &mut Session, p: &Value) -> Result<Value> {
+    let (body, faces) = body_faces(s, p, "surface.unstitch")?;
+    add_feature(s, p, FeatureKind::Unstitch { body, faces })
+}
+
+fn reverse_normal(s: &mut Session, p: &Value) -> Result<Value> {
+    let (body, faces) = body_faces(s, p, "surface.reverse_normal")?;
+    add_feature(s, p, FeatureKind::ReverseNormal { body, faces })
 }
 
 fn bodies_param(s: &Session, p: &Value, cmd: &str) -> Result<Vec<String>> {
@@ -129,7 +215,165 @@ mod tests {
         solidcraft_kernel::measure(&st.body(name).unwrap().body).unwrap().volume
     }
 
-    /// A rectangle patched, trimmed by a plane and thickened; a box's faces stitched back.
+    fn area(s: &Session, name: &str) -> f64 {
+        solidcraft_kernel::measure(&s.world_state().body(name).unwrap().body).unwrap().area
+    }
+
+    /// Surface Extrude of open curves: a line and an arc joined end to end (listed in either
+    /// order) make one sheet of two walls; both sides of the sketch; undo, redo and reopening
+    /// give the same sheet.
+    #[test]
+    fn surface_extrude_open_curves() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+        run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0]], "ids": ["l1"]}));
+        let arc = run(&mut s, "sketch.arc.three_point", json!({"start": [10, 0], "end": [20, 0], "through": [15, 5]}))["created"]["curves"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "surface.extrude", json!({"sketch": "S", "curves": [arc, "l1"], "distance": 4, "body_name": "Wall"}));
+        let st = s.world_state();
+        let wall = &st.body("Wall").unwrap().body;
+        assert!(wall.is_surface() && wall.face_count() == 2);
+        // The line's wall and the half circle's (radius 5): length × height.
+        let want = (10.0 + std::f64::consts::PI * 5.0) * 4.0;
+        assert!((area(&s, "Wall") - want).abs() < want * 1e-3, "{} vs {want}", area(&s, "Wall"));
+        run(&mut s, "surface.extrude", json!({"sketch": "S", "curves": ["l1"], "distance": 2, "direction": "symmetric", "body_name": "Both"}));
+        let bb = solidcraft_kernel::measure(&s.world_state().body("Both").unwrap().body).unwrap().bbox;
+        assert!((bb.min.z + 2.0).abs() < 1e-9 && (bb.max.z - 2.0).abs() < 1e-9, "{bb:?}");
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.world_state().body("Both").is_none());
+        run(&mut s, "edit.redo", json!({}));
+        assert!(s.world_state().body("Both").is_some());
+        let cold = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert!((area(&cold, "Wall") - area(&s, "Wall")).abs() < 1e-9);
+        // Refused: no such curve, a zero distance, and an extent a sheet does not take yet.
+        assert!(s.execute("surface.extrude", &json!({"sketch": "S", "curves": ["nope"], "distance": 4})).is_err());
+        assert!(s.execute("surface.extrude", &json!({"sketch": "S", "curves": ["l1"], "distance": 0})).is_err());
+        assert!(s.execute("surface.extrude", &json!({"sketch": "S", "curves": ["l1"], "distance": 4, "through_all": true})).is_err());
+    }
+
+    /// Surface Extrude of a profile gives its walls alone; patching both ends and stitching
+    /// makes the solid that solid.extrude makes of the same profile.
+    #[test]
+    fn surface_extrude_profile_walls_stitch_into_the_solid() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "R"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 6]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "surface.extrude", json!({"sketch": "R", "distance": 3, "body_name": "Walls"}));
+        let st = s.world_state();
+        let walls = &st.body("Walls").unwrap().body;
+        assert!(walls.is_surface() && walls.face_count() == 4);
+        assert!((area(&s, "Walls") - 96.0).abs() < 1e-9);
+        let edges = |z: f64| json!([[5, 0, z], [10, 3, z], [5, 6, z], [0, 3, z]]);
+        run(&mut s, "surface.patch", json!({"edges": edges(0.0), "body": "Walls", "body_name": "Bottom"}));
+        run(&mut s, "surface.patch", json!({"edges": edges(3.0), "body": "Walls", "body_name": "Top"}));
+        run(&mut s, "surface.stitch", json!({"bodies": ["Walls", "Bottom", "Top"]}));
+        let st = s.world_state();
+        assert!(!st.body("Walls").unwrap().body.is_surface());
+        run(&mut s, "solid.extrude", json!({"sketch": "R", "distance": 3, "body_name": "Solid"}));
+        assert!((volume(&s, "Walls") - volume(&s, "Solid")).abs() < 1e-9);
+        assert!((volume(&s, "Walls") - 180.0).abs() < 1e-9);
+    }
+
+    /// Unstitch a box: six surface bodies whose faces keep the names they had on the box,
+    /// stitched back into a solid of the same volume; two faces taken out leave the other four
+    /// under the box's name; undo, redo and reopening.
+    #[test]
+    fn unstitch_a_box_and_stitch_it_back() {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Box"}));
+        let names_before: Vec<String> = solidcraft_doc::naming::face_names(s.model.state().body("Box").unwrap()).to_vec();
+        run(&mut s, "surface.unstitch", json!({"body": "Box"}));
+        let st = s.world_state();
+        assert!(st.body("Box").is_none());
+        let pieces: Vec<String> = st.bodies.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(pieces.len(), 6);
+        let mut names_after: Vec<String> = Vec::new();
+        for n in &pieces {
+            let b = st.body(n).unwrap();
+            assert!(b.body.is_surface() && b.body.face_count() == 1);
+            names_after.extend(solidcraft_doc::naming::face_names(s.model.state().body(n).unwrap()).iter().cloned());
+        }
+        let (mut a, mut b) = (names_before.clone(), names_after);
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "the faces keep their names");
+        run(&mut s, "surface.stitch", json!({"bodies": pieces}));
+        let st = s.world_state();
+        let back = st.bodies.first().unwrap();
+        assert!(!back.body.is_surface());
+        assert!((solidcraft_kernel::measure(&back.body).unwrap().volume - 1000.0).abs() < 1e-9);
+        run(&mut s, "edit.undo", json!({}));
+        run(&mut s, "edit.undo", json!({}));
+        assert!(s.world_state().body("Box").is_some());
+        run(&mut s, "surface.unstitch", json!({"body": "Box", "faces": [[5, 5, 10], [5, 5, 0]]}));
+        let st = s.world_state();
+        assert_eq!(st.bodies.len(), 3);
+        assert_eq!(st.body("Box").unwrap().body.face_count(), 4);
+        let cold = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+        assert_eq!(cold.world_state().bodies.len(), 3);
+        assert!(s.execute("surface.unstitch", &json!({"body": "Nope"})).is_err());
+        assert!(s.execute("surface.unstitch", &json!({})).is_err());
+    }
+
+    /// A patch turned over thickens the other way; a solid is not turned over.
+    #[test]
+    fn reverse_normal_turns_the_thicken_side() {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "surface.patch", json!({"sketch": "S", "body_name": "Sheet"}));
+        run(&mut s, "surface.thicken", json!({"bodies": ["Sheet"], "thickness": 2, "body_name": "Up"}));
+        let up = solidcraft_kernel::measure(&s.world_state().body("Up").unwrap().body).unwrap().bbox;
+        run(&mut s, "edit.undo", json!({}));
+        run(&mut s, "surface.reverse_normal", json!({"body": "Sheet"}));
+        run(&mut s, "surface.thicken", json!({"bodies": ["Sheet"], "thickness": 2, "body_name": "Down"}));
+        let down = solidcraft_kernel::measure(&s.world_state().body("Down").unwrap().body).unwrap().bbox;
+        assert!((up.max.z - down.max.z - 2.0).abs() < 1e-9 && (up.min.z - down.min.z - 2.0).abs() < 1e-9, "{up:?} vs {down:?}");
+        run(&mut s, "solid.box", json!({"length": 1, "width": 1, "height": 1, "corner": [20, 0, 0], "body_name": "Cube"}));
+        assert!(s.execute("surface.reverse_normal", &json!({"body": "Cube"})).is_err());
+    }
+
+    /// The planned surface commands are registered but refuse to run: disabled with the
+    /// issue that tracks them, an error (never a panic) from every caller, and the design left
+    /// as it was.
+    #[test]
+    fn planned_commands_refuse_and_leave_the_design_alone() {
+        let planned = [
+            "surface.revolve",
+            "surface.sweep",
+            "surface.loft",
+            "surface.offset",
+            "surface.ruled",
+            "surface.boundary",
+            "surface.blend",
+            "surface.untrim",
+            "surface.fillet",
+            "inspect.continuity",
+        ];
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "B"}));
+        let before = s.doc.features.len();
+        for id in planned {
+            let spec = crate::find_command(id).unwrap_or_else(|| panic!("{id} is not registered"));
+            let info = spec.info(&s);
+            assert!(!info.enabled, "{id} must stay disabled until it is built");
+            let why = info.disabled_reason.unwrap_or_default();
+            assert!(why.starts_with("not supported yet (issue #"), "{id}: {why}");
+            assert!(!spec.icon.is_empty() && !spec.params.is_empty(), "{id}: icon and params doc");
+            assert!(s.execute(id, &json!({"body": "B"})).is_err(), "{id} ran");
+            let e = (spec.run)(&mut s, &json!({})).unwrap_err().to_string();
+            assert!(e.starts_with("not supported yet: ") && e.contains("(issue #"), "{id}: {e}");
+        }
+        assert_eq!(s.doc.features.len(), before, "a planned command changed the design");
+    }
+
+    /// A rectangle patched, trimmed by a plane and thickened; a box's open top patched; a rim
+    /// that is not planar patched.
     #[test]
     fn patch_trim_thicken_and_stitch() {
         let mut s = Session::default();
@@ -148,6 +392,24 @@ mod tests {
         run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "body_name": "Cup"}));
         run(&mut s, "surface.patch", json!({"edges": [[25, 0, 10], [30, 5, 10], [25, 10, 10], [20, 5, 10]], "body": "Cup", "body_name": "Lid"}));
         assert!(s.world_state().body("Lid").unwrap().body.is_surface());
+        // A rim that is not planar: a box with its top cut away by a sideways cylinder.
+        run(&mut s, "solid.box", json!({"length": 28, "width": 28, "height": 20, "corner": [-14, -14, 0], "body_name": "Saddle"}));
+        run(
+            &mut s,
+            "solid.cylinder",
+            json!({"radius": 40, "height": 120, "base": [0, -60, 50], "axis": "Y", "operation": "cut", "targets": ["Saddle"]}),
+        );
+        let z = |x: f64| 50.0 - (1600.0 - x * x).sqrt();
+        let rim = json!([[14, 0, z(14.0)], [0, 14, z(0.0)], [-14, 0, z(-14.0)], [0, -14, z(0.0)]]);
+        run(&mut s, "surface.patch", json!({"edges": rim, "body": "Saddle", "body_name": "Cover"}));
+        let st = s.world_state();
+        let cover = &st.body("Cover").unwrap().body;
+        assert!(cover.is_surface() && cover.face_count() == 1);
+        // The cover is a smooth surface on the rim, close to the cylinder that cut it (its area
+        // within 1% of the cylinder's inside the rim).
+        let area = solidcraft_kernel::measure(cover).unwrap().area;
+        let want = 28.0 * 40.0 * 2.0 * (14.0f64 / 40.0).asin();
+        assert!((area - want).abs() < want * 1e-2, "{area} vs {want}");
         assert!(s.execute("surface.thicken", &json!({"bodies": ["Nope"], "thickness": 1})).is_err());
         assert!(s.execute("surface.trim", &json!({"body": "Sheet"})).is_err());
     }

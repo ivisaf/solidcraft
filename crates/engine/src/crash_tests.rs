@@ -272,7 +272,7 @@ fn dates_are_formatted_in_utc() {
 
 #[test]
 fn backtraces_lose_the_panic_machinery_and_the_home_folder() {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "/home/u".into());
     let bt = format!(
         "   0: std::backtrace::Backtrace::force_capture\n             at /rustc/abc123/library/std/src/backtrace.rs:312:13\n   1: hook\n   1: {{closure#3}}\n   1: <alloc::boxed::Box<F,A> as core::ops::function::Fn<Args>>::call\n   2: std::panicking::rust_panic_with_hook\n   3: core::panicking::panic_fmt\n   4: solidcraft_kernel::fillet::blend\n             at {home}/src/kernel/fillet.rs:10:5\n   5: do_call<F>\n             at /rustc/abc/library/std/src/panicking.rs:1:1\n   5: std::sys::backtrace::__rust_begin_short_backtrace\n   6: main"
     );

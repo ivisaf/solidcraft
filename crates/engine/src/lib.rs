@@ -29,6 +29,7 @@ use solidcraft_geom::Vec3;
 pub use cmd::{CommandInfo, CommandSpec, auto_operation, command_specs, find_command};
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
+pub use solidcraft_doc::Visibility;
 pub use solidcraft_geom as geom;
 pub use solidcraft_io as io;
 pub use solidcraft_kernel as kernel;
@@ -159,6 +160,8 @@ pub struct Preview {
     pub before: Arc<ModelState>,
     /// The model after the commands.
     pub after: Arc<ModelState>,
+    /// What each command replied (as `execute` returns it).
+    pub replies: Vec<Value>,
 }
 
 /// Prepared world geometry depends on design/model identity and placement context, not
@@ -193,6 +196,9 @@ pub struct Session {
     pub active_sketch: Option<u64>,
     pub selection: Vec<Sel>,
     pub path: Option<String>,
+    /// One-shot display-only notification during doc.open, before authoritative evaluation.
+    /// Interactive loaders may show it provisionally; it never becomes model state.
+    pub open_preview: Option<Box<dyn Fn(solidcraft_io::DesignPreview) + Send + Sync>>,
     saved: Arc<Document>,
     /// Messages for the command line / log.
     pub log: Vec<String>,
@@ -214,8 +220,15 @@ pub struct Session {
     pub section: Option<(Vec3, Vec3)>,
     /// Surface analysis shading the model (zebra, draft, curvature map).
     pub analysis: Option<SurfaceAnalysis>,
-    /// What is hidden or shown in the view (`browser.visibility`).
+    /// What is hidden or shown in the view (`browser.visibility`): saved with the design, not an
+    /// undo step. A design brings its saved visibility when it opens (`Session::new`).
     pub visibility: Visibility,
+    /// The camera `view.apply` asked the view to use (view state, not saved). The desktop app
+    /// moves its viewport there and takes it; headless renders keep using it until a standard
+    /// view is chosen.
+    pub camera: Option<render::Camera>,
+    /// The visibility the design file holds (what `is_dirty` compares with).
+    saved_visibility: Visibility,
     /// States to go back to (`edit.checkpoint`, `edit.restore_checkpoint`): how batches of
     /// commands are undone however long the undo history is.
     pub(crate) checkpoints: Vec<Checkpoint>,
@@ -249,22 +262,6 @@ pub(crate) struct Checkpoint {
     pub redo: Vec<Snapshot>,
 }
 
-/// Items hidden or shown one by one (view state, not part of the design and not an undo step).
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct Visibility {
-    /// Bodies by name.
-    pub hidden_bodies: Vec<String>,
-    /// Exact occurrence placements hidden with all descendants.
-    pub hidden_occurrences: Vec<Vec<u64>>,
-    /// Origin items (O, X, Y, Z, XY, XZ, YZ) and construction geometry, by name.
-    pub hidden_origin: Vec<String>,
-    /// Sketches by feature id.
-    pub hidden_sketches: Vec<u64>,
-    /// Finished sketches shown although a feature uses them.
-    pub shown_sketches: Vec<u64>,
-}
-
 /// A way of shading the model's faces to judge their shape (view state, not part of the design).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -294,7 +291,9 @@ impl Default for Session {
 }
 
 impl Session {
-    pub fn new(doc: Document) -> Self {
+    pub fn new(mut doc: Document) -> Self {
+        // The session keeps what is hidden (not an undo step); the design file carries it.
+        let visibility = std::mem::take(&mut doc.visibility);
         let doc = Arc::new(doc);
         let mut model = Model::new();
         model.evaluate(&doc);
@@ -307,6 +306,7 @@ impl Session {
             active_sketch: None,
             selection: Vec::new(),
             path: None,
+            open_preview: None,
             log: Vec::new(),
             revision: 1,
             auto_project: true,
@@ -320,18 +320,32 @@ impl Session {
             analysis: None,
             checkpoints: Vec::new(),
             next_checkpoint: 1,
-            visibility: Visibility::default(),
+            saved_visibility: visibility.clone(),
+            visibility,
+            camera: None,
             #[cfg(test)]
             evaluations: 0,
             crash_journal: false,
         }
     }
 
+    /// The design has changes not in its file: in the document, or in what is hidden.
     pub fn is_dirty(&self) -> bool {
-        !Arc::ptr_eq(&self.doc, &self.saved) && *self.doc != *self.saved
+        (!Arc::ptr_eq(&self.doc, &self.saved) && *self.doc != *self.saved) || self.visibility != self.saved_visibility
     }
     pub fn mark_saved(&mut self) {
         self.saved = self.doc.clone();
+        self.saved_visibility = self.visibility.clone();
+    }
+
+    /// The design as a file holds it: the document with what is hidden in it.
+    pub fn design(&self) -> std::borrow::Cow<'_, Document> {
+        if self.visibility.is_empty() {
+            return std::borrow::Cow::Borrowed(&*self.doc);
+        }
+        let mut doc = (*self.doc).clone();
+        doc.visibility = self.visibility.clone();
+        std::borrow::Cow::Owned(doc)
     }
     /// The design has changes not in its file (a recovered design).
     pub fn mark_unsaved(&mut self) {
@@ -349,6 +363,15 @@ impl Session {
     /// Mutable document (copy-on-write).
     pub fn doc_mut(&mut self) -> &mut Document {
         Arc::make_mut(&mut self.doc)
+    }
+
+    /// Prepared placements only: optional save caches must not compute a cold world.
+    pub(crate) fn cached_world_state(&self) -> Option<Arc<solidcraft_doc::ModelState>> {
+        let state = self.model.state();
+        if self.doc.occurrences.is_empty() {
+            return Some(state);
+        }
+        self.world_cache.lock().ok()?.as_ref().filter(|cache| cache.matches(self, &state)).map(|cache| cache.world.clone())
     }
 
     /// Re-evaluate the model after a document change.
@@ -638,6 +661,7 @@ impl Session {
             active_sketch: self.active_sketch,
             selection: self.selection.clone(),
             path: None,
+            open_preview: None,
             saved: self.saved.clone(),
             log: Vec::new(),
             revision: self.revision,
@@ -653,6 +677,8 @@ impl Session {
             checkpoints: Vec::new(),
             next_checkpoint: 1,
             visibility: self.visibility.clone(),
+            camera: self.camera,
+            saved_visibility: self.saved_visibility.clone(),
             #[cfg(test)]
             evaluations: 0,
             crash_journal: false,
@@ -695,12 +721,12 @@ impl Session {
     /// A `timeline.redefine` is shown even while the timeline is rolled back to the feature
     /// being edited.
     pub fn preview(&self, commands: &[(String, Value)]) -> Result<Preview> {
-        self.scratch().preview_in_place(commands).map(|after| Preview { before: self.model.state(), after: after.model.state() })
+        self.scratch().preview_in_place(commands).map(|(after, replies)| Preview { before: self.model.state(), after: after.model.state(), replies })
     }
 
     /// The same evaluated preview in occurrence coordinates, including uncaptured moves.
     pub fn preview_world(&self, commands: &[(String, Value)]) -> Result<Preview> {
-        self.scratch().preview_in_place(commands).map(|after| Preview { before: self.world_state(), after: after.world_state() })
+        self.scratch().preview_in_place(commands).map(|(after, replies)| Preview { before: self.world_state(), after: after.world_state(), replies })
     }
 
     /// World preview with each session's visibility applied, including new body placements.
@@ -711,15 +737,17 @@ impl Session {
             shown.bodies.retain(|body| session.body_visible(&body.name));
             Arc::new(shown)
         };
-        self.scratch().preview_in_place(commands).map(|after| Preview { before: visible(self), after: visible(&after) })
+        self.scratch().preview_in_place(commands).map(|(after, replies)| Preview { before: visible(self), after: visible(&after), replies })
     }
 
-    fn preview_in_place(mut self, commands: &[(String, Value)]) -> Result<Self> {
+    fn preview_in_place(mut self, commands: &[(String, Value)]) -> Result<(Self, Vec<Value>)> {
         if commands.is_empty() {
             return Err(EngineError::Other("nothing to preview".into()));
         }
+        let mut replies = Vec::with_capacity(commands.len());
         for (id, params) in commands {
             let r = self.execute(id, params)?;
+            replies.push(r.clone());
             if id == "timeline.redefine"
                 && let Some(fid) = r.get("feature").and_then(Value::as_u64)
                 && let Some(idx) = self.doc.feature_index(fid)
@@ -732,7 +760,7 @@ impl Session {
                 }
             }
         }
-        Ok(self)
+        Ok((self, replies))
     }
 
     /// Measure one or two selections (see `inspect.measure` with `items`); errors come back as
@@ -777,7 +805,13 @@ mod construct_tests;
 #[cfg(test)]
 mod delete_face_tests;
 #[cfg(test)]
+mod derived_units_tests;
+#[cfg(test)]
+mod display_mesh_tests;
+#[cfg(test)]
 mod extent_tests;
+#[cfg(test)]
+mod hole_face_tests;
 #[cfg(test)]
 mod naming_history_tests;
 #[cfg(test)]
@@ -792,6 +826,8 @@ mod split_face_tests;
 mod tests;
 #[cfg(test)]
 mod thread_tests;
+#[cfg(test)]
+mod view_bounds_tests;
 #[cfg(test)]
 mod world_placement_cache_tests;
 

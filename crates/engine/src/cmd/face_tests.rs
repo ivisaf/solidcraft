@@ -136,30 +136,42 @@ fn generated_profiles_and_press_pull_convert_rotated_occurrence_picks_once() {
     }
 }
 
+/// A 40 x 30 x 20 box whose top is split at x = 20 and its left half raised 5 by Offset Face:
+/// the raised top has no construction certificate and no exact history name yet (#494).
+fn raised_half(s: &mut Session, body: &str) {
+    run(s, "solid.box", json!({"length":40,"width":30,"height":20,"body_name":body}));
+    run(s, "solid.split_face", json!({"faces":[[10,15,20]],"plane":{"origin":[20,0,0],"normal":[1,0,0]}}));
+    run(s, "solid.offset_face", json!({"faces":[[10,15,20]],"distance":5}));
+}
+
 #[test]
 fn legacy_internal_capture_refuses_an_uncaptured_source_in_another_component() {
     let mut s = Session::default();
     let component = run(&mut s, "component.create", json!({"name":"Source"}));
     let occurrence = component["occurrence"].as_u64().unwrap();
-    run(&mut s, "solid.box", json!({"length":40,"width":30,"height":20,"body_name":"Stock"}));
-    run(&mut s, "solid.press_pull", json!({"face":[5,5,20],"distance":5}));
+    // A face Offset Face raised has no construction certificate or exact history name yet:
+    // the legacy path.
+    raised_half(&mut s, "Stock");
     run(&mut s, "component.activate", json!({"component":0}));
     run(&mut s, "occurrence.move", json!({"occurrence":occurrence,"translate":[30,0,0],"capture":false}));
     let state = s.model.state();
-    let index = state
+    // The raised half's top.
+    let end = state
         .body("Stock")
         .unwrap()
         .body
         .faces(1e-4)
         .unwrap()
-        .iter()
+        .into_iter()
         .find(|face| face.plane_normal.is_some_and(|normal| normal.z > 0.999) && (face.centroid.z - 25.0).abs() < 1e-6)
-        .unwrap()
-        .index;
+        .unwrap();
     let before = s.doc.to_json();
-    let error =
-        super::super::sketch::face::capture_internal(&s, &json!({"face":[35,5,25],"body":"Stock","index":index,"path":[occurrence]}), "internal")
-            .unwrap_err();
+    let error = super::super::sketch::face::capture_internal(
+        &s,
+        &json!({"face":[40,15,25],"body":"Stock","index":end.index,"path":[occurrence]}),
+        "internal",
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("capture the source occurrence position"), "{error}");
     assert_eq!(s.doc.to_json(), before);
 }
@@ -228,4 +240,154 @@ fn blind_cut_inside_a_cylinder_keeps_only_planes_and_cylinders() {
     let body = &m["bodies"][0];
     assert_eq!(body["face_types"], json!({"cylinder": 2, "plane": 12}), "{m}");
     assert_eq!(body["faces"], 14, "{m}");
+}
+
+fn face_anchor(s: &Session, sketch: u64) -> solidcraft_doc::FaceAnchor {
+    let FeatureKind::Sketch { plane: PlaneRef::Face { anchor: Some(anchor), .. }, .. } = &s.doc.feature(sketch).unwrap().kind else {
+        panic!("sketch {sketch} has no face anchor")
+    };
+    (**anchor).clone()
+}
+
+#[test]
+fn join_keeps_exact_face_attachments_from_both_operands() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0":[-10,-10],"p1":[10,10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let base = run(&mut s, "solid.extrude", json!({"distance":40,"name":"Base"}))["feature"].as_u64().unwrap();
+    // A cross bar joined through the base (the shape of #420) and a boss joined on its top.
+    run(&mut s, "sketch.create", json!({"plane":"YZ"}));
+    run(&mut s, "sketch.circle.center", json!({"center":[0,20],"radius":5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance":20,"symmetric":true,"operation":"join"}));
+    run(&mut s, "sketch.create", json!({"plane":{"face":[0,0,40]}}));
+    run(&mut s, "sketch.circle.center", json!({"center":[0,0],"radius":4}));
+    run(&mut s, "sketch.finish", json!({}));
+    let boss = run(&mut s, "solid.extrude", json!({"distance":10,"operation":"join","name":"Boss"}))["feature"].as_u64().unwrap();
+    assert_eq!(s.model.state().bodies.len(), 1);
+
+    // The base's top around the boss, and the boss's own top (the Union's second operand).
+    let on_base = run(&mut s, "sketch.create", json!({"plane":{"face":[8,8,40]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    let on_boss = run(&mut s, "sketch.create", json!({"plane":{"face":[0,0,50]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    assert_eq!(face_anchor(&s, on_base).target.origin_feature, base);
+    assert_eq!(face_anchor(&s, on_boss).target.origin_feature, boss);
+
+    // The attachments follow their faces through an upstream edit and a reopen.
+    run(&mut s, "timeline.edit", json!({"feature":"Base","set":{"extent":{"distance":"50"}}}));
+    s.refresh();
+    assert!(s.model.results.iter().all(|result| result.error.is_none()), "{:?}", s.model.results);
+    let state = s.model.state();
+    assert!((state.sketch(on_base).unwrap().plane.origin.z - 50.0).abs() < 1e-6);
+    assert!((state.sketch(on_boss).unwrap().plane.origin.z - 60.0).abs() < 1e-6);
+    let mut reopened = Session::new(Document::from_json(&s.doc.to_json()).unwrap());
+    reopened.refresh();
+    assert!(reopened.model.results.iter().all(|result| result.error.is_none()), "{:?}", reopened.model.results);
+    assert!((reopened.model.state().sketch(on_boss).unwrap().plane.origin.z - 60.0).abs() < 1e-6);
+}
+
+#[test]
+fn join_gives_a_face_merged_from_both_operands_its_history_name() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10}));
+    run(&mut s, "solid.box", json!({"length":20,"width":20,"height":10,"corner":[20,0,0],"operation":"join"}));
+    // Both boxes' tops share one support: no single construction certificate owns it, but its
+    // exact history names it (#491).
+    let top = run(&mut s, "sketch.create", json!({"plane":{"face":[10,10,10]}}))["sketch"].as_u64().unwrap();
+    assert_eq!(face_anchor(&s, top).target.certificate, Some(solidcraft_doc::config::FaceCertificate::Lineage));
+    // An unshared support keeps its box role.
+    run(&mut s, "sketch.finish", json!({}));
+    let side = run(&mut s, "sketch.create", json!({"plane":{"face":[0,10,5]}}))["sketch"].as_u64().unwrap();
+    assert!(matches!(face_anchor(&s, side).target.certificate, Some(solidcraft_doc::config::FaceCertificate::Box { axis: 0, high: false })));
+}
+
+#[test]
+fn join_covering_a_whole_attached_face_loses_the_attachment_without_moving_it() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane":"XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance":10,"name":"Block"}));
+    let top = run(&mut s, "sketch.create", json!({"plane":{"face":[30,15,10]},"name":"Top"}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.circle.center", json!({"center":[30,15],"radius":3}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":"Top","distance":5,"operation":"join","name":"Peg"}));
+    // An earlier join whose roof replaces Block's whole top.
+    run(&mut s, "timeline.roll_to", json!({"feature":"Block"}));
+    run(&mut s, "sketch.create", json!({"plane":"XY","name":"B"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0":[-5,-5],"p1":[45,35]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch":"B","distance":20,"operation":"join","name":"Boss"}));
+    run(&mut s, "timeline.roll_to", json!({}));
+    let failed = |s: &Session, id: u64| s.model.results.iter().find(|r| r.id == id).unwrap().error.is_some();
+    assert!(failed(&s, top), "the attachment never follows the substitute roof");
+    assert!(s.model.state().sketch(top).is_none());
+    run(&mut s, "timeline.suppress", json!({"feature":"Boss","suppressed":true}));
+    assert!(!failed(&s, top));
+    assert!((s.model.state().sketch(top).unwrap().plane.origin.z - 10.).abs() < 1e-9);
+}
+
+fn certificate_of(s: &Session, sketch: u64) -> Option<solidcraft_doc::config::FaceCertificate> {
+    let FeatureKind::Sketch { plane: PlaneRef::Face { anchor: Some(anchor), .. }, .. } = &s.doc.feature(sketch).unwrap().kind else {
+        return None;
+    };
+    anchor.target.certificate.clone()
+}
+
+#[test]
+fn cylinder_primitive_caps_take_attachments_that_follow_edits_and_reopen() {
+    use solidcraft_doc::config::FaceCertificate;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius":10,"height":40,"name":"Post"}));
+    let top = run(&mut s, "sketch.create", json!({"plane":{"face":[2,1,40]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    let bottom = run(&mut s, "sketch.create", json!({"plane":{"face":[2,1,0]}}))["sketch"].as_u64().unwrap();
+    run(&mut s, "sketch.finish", json!({}));
+    assert_eq!(certificate_of(&s, top), Some(FaceCertificate::CylinderCap { high: true }));
+    assert_eq!(certificate_of(&s, bottom), Some(FaceCertificate::CylinderCap { high: false }));
+    let heights = |s: &Session| {
+        let state = s.model.state();
+        (state.sketch(top).unwrap().plane.origin.z, state.sketch(bottom).unwrap().plane.origin.z)
+    };
+    run(&mut s, "timeline.edit", json!({"feature":"Post","set":{"height":"55","base":[0,0,5]}}));
+    s.refresh();
+    assert!(s.model.results.iter().all(|result| result.error.is_none()), "{:?}", s.model.results);
+    let (high, low) = heights(&s);
+    assert!((high - 60.).abs() < 1e-9 && (low - 5.).abs() < 1e-9, "{high} {low}");
+    let mut reopened = Session::new(Document::from_json(&s.doc.to_json()).unwrap());
+    reopened.refresh();
+    assert!(reopened.model.results.iter().all(|result| result.error.is_none()), "{:?}", reopened.model.results);
+    assert_eq!(heights(&reopened), (high, low));
+}
+
+#[test]
+fn crossed_cylinder_primitives_keep_their_caps_attachable() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius":10,"height":40}));
+    run(&mut s, "solid.cylinder", json!({"radius":5,"height":40,"base":[-20,0,20],"axis":"X","operation":"join"}));
+    assert_eq!(s.model.state().bodies.len(), 1);
+    for face in [[0., 0., 40.], [20., 0., 20.]] {
+        let sketch = run(&mut s, "sketch.create", json!({"plane":{"face":face}}))["sketch"].as_u64().unwrap();
+        run(&mut s, "sketch.finish", json!({}));
+        assert!(certificate_of(&s, sketch).is_some(), "{face:?}");
+    }
+}
+
+#[test]
+fn shelled_cylinder_floor_keeps_its_cap_identity() {
+    use solidcraft_doc::config::FaceCertificate;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius":10,"height":40}));
+    run(&mut s, "solid.shell", json!({"faces":[[2,1,40]],"thickness":2}));
+    let floor = run(&mut s, "sketch.create", json!({"plane":{"face":[2,1,2]}}))["sketch"].as_u64().unwrap();
+    assert!(
+        matches!(
+            certificate_of(&s, floor),
+            Some(FaceCertificate::ShellPlanar { source, inner: true, .. }) if *source == FaceCertificate::CylinderCap { high: false }
+        ),
+        "{:?}",
+        certificate_of(&s, floor)
+    );
 }

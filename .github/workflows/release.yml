@@ -6,7 +6,7 @@
 # At midnight Eastern, changed main commits build and publish a nightly pre-release.
 # A version with a suffix (0.2.0-rc.1) is a pre-release. Nothing is signed yet.
 #
-#   Linux x86_64, aarch64   AppImage (+ .zsync), .deb, .rpm, .flatpak, .tar.gz     packaging/linux
+#   Linux x86_64, aarch64   AppImage (+ .zsync), .deb, .rpm, .flatpak, .snap, .tar.gz packaging/linux
 #   FreeBSD x86_64          .tar.gz (built in a FreeBSD VM)                        packaging/freebsd
 #   macOS universal         .dmg, and the CLI as a .zip                            packaging/macos
 #   Windows x64, x86, arm64 .msi and a portable .zip; x64 also the plain .exe      packaging/windows
@@ -199,6 +199,59 @@ jobs:
 
 
 
+  snap:
+    name: Snap ${{ matrix.arch }}
+    needs: [version, linux]
+    if: needs.version.outputs.build == 'true'
+    # Repackages the Linux job's tarball, like the Flatpak. On 24.04 because the core24 base is
+    # Ubuntu 24.04, which lets snapcraft build on the runner itself (--destructive-mode).
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      SOLIDCRAFT_VERSION: ${{ needs.version.outputs.version }}
+      SOLIDCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/linux
+      - name: Install snapcraft and the smoke-test tools
+        run: |
+          sudo snap install snapcraft --classic
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth weston dbus-x11
+      - name: Build the snap
+        run: |
+          sudo --preserve-env=SOLIDCRAFT_VERSION,SOLIDCRAFT_BUILD_DATE env "PATH=$PATH" \
+            packaging/linux/snap-pack.sh --destructive-mode "dist/linux/solidcraft-$SOLIDCRAFT_VERSION-linux-${{ matrix.arch }}.tar.gz"
+          sudo chown -R "$(id -u):$(id -g)" dist target
+      - name: Install it and start the app on headless X11 and Wayland
+        run: |
+          snap_file="dist/release/solidcraft-$SOLIDCRAFT_VERSION-linux-${{ matrix.arch }}.snap"
+          sudo snap install --dangerous "$snap_file"
+          snap info --verbose "$snap_file" | head -n 12
+          snap connections solidcraft
+          solidcraft.cli --version
+          # Snaps expect the login session's runtime directory, which runners don't create.
+          sudo install -d -m 700 -o "$(id -u)" -g "$(id -g)" "/run/user/$(id -u)"
+          python3 packaging/linux/snap-smoke.py --out snap-smoke
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snap-smoke-${{ matrix.arch }}
+          path: snap-smoke/*.png
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-snap-${{ matrix.arch }}
+          path: dist/release/*.snap
+          if-no-files-found: error
+
   freebsd:
     name: FreeBSD x86_64
     needs: version
@@ -337,7 +390,7 @@ jobs:
 
   release:
     name: GitHub Release or dry-run artifacts
-    needs: [version, linux, flatpak, freebsd, macos, windows, web]
+    needs: [version, linux, flatpak, snap, freebsd, macos, windows, web]
     if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -425,6 +478,35 @@ jobs:
             echo
             sed 's/^/    /' SHA256SUMS.txt
           } >>"$GITHUB_STEP_SUMMARY"
+      # Snap Store: nightlies go to the edge channel and release drafts to candidate, only after
+      # every package built and the GitHub release was staged. Publishing the GitHub release
+      # promotes candidate to stable (snap-store.yml). Dry runs never upload. Skipped until the
+      # owner adds the SNAPCRAFT_STORE_CREDENTIALS secret (docs/releasing.md).
+      - id: snapstore
+        name: Check for Snap Store credentials
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -n "$SNAPCRAFT_STORE_CREDENTIALS" ]; then
+            echo "configured=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "No SNAPCRAFT_STORE_CREDENTIALS secret: skipping the Snap Store upload."
+          fi
+      - name: Upload the snaps to the Snap Store
+        if: >-
+          steps.snapstore.outputs.configured == 'true' && (github.event_name == 'schedule' ||
+          (github.ref == 'refs/heads/release' && (github.event_name == 'push' || inputs.draft)))
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        working-directory: artifacts
+        run: |
+          sudo snap install snapcraft --classic
+          channel=candidate
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then channel=edge; fi
+          for arch in x86_64 aarch64; do
+            snapcraft upload --release="$channel" "solidcraft-$VERSION-linux-$arch.snap"
+          done
+          echo "Uploaded the snaps to the Snap Store's $channel channel." >>"$GITHUB_STEP_SUMMARY"
       - name: Keep the files (dry run)
         if: github.event_name == 'workflow_dispatch' && !inputs.draft
         run: cp notes.md artifacts/release-notes.md

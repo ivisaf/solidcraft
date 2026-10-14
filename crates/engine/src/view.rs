@@ -39,18 +39,30 @@ pub mod colors {
     pub const SECTION_CAP: Rgb = solidcraft_render::SECTION_CAP;
 }
 
-/// Bounds of everything visible.
+/// Bounds of everything visible now, in world space: shown bodies where their occurrences,
+/// joints and moves place them, and the sketches the view draws (not ones used by a feature,
+/// hidden ones, or ones in hidden components). What Home, Fit and the orbit pivot frame.
 pub fn bounds(s: &Session) -> Aabb3 {
+    visible_bounds(s, true)
+}
+
+/// [`bounds`], with the browser's Sketches folder shown (`sketches`) or hidden.
+pub fn visible_bounds(s: &Session, sketches: bool) -> Aabb3 {
     let st = s.world_state();
     let mut b = Aabb3::EMPTY;
-    let v = &s.visibility;
     for body in st.bodies.iter().filter(|x| s.body_visible(&x.name)) {
         b = b.union(&body.mesh().bounds());
     }
-    for ss in st.sketches.iter().filter(|x| !v.hidden_sketches.contains(&x.feature)) {
+    for ss in st.sketches.iter().filter(|x| sketch_drawn(s, x.feature, sketches)) {
+        // All four corners: on a tilted plane two opposite ones don't span the rectangle.
         if let Some((lo, hi)) = ss.sketch.bounds() {
-            for p in [lo, hi] {
+            for p in [lo, hi, solidcraft_geom::Vec2::new(lo.x, hi.y), solidcraft_geom::Vec2::new(hi.x, lo.y)] {
                 b.add(ss.plane.to_world(p));
+            }
+        }
+        for w in ss.sketch.wires.iter().filter(|w| !w.fit.is_empty() || !ss.sketch.view.hide_projected) {
+            for p in &w.pts {
+                b.add(*p);
             }
         }
     }
@@ -95,7 +107,7 @@ pub fn sketch_lines_with_sampler(
 ) -> Vec<(Vec<Vec3>, Rgb, bool)> {
     let mut out = Vec::new();
     for (i, c) in sk.curves.iter().enumerate() {
-        if c.link.is_some() && sk.view.hide_projected && !sk.is_text_curve(i) {
+        if !sketch_curve_visible(sk, i) {
             continue;
         }
         let col = if c.link.is_some() && !sk.is_text_curve(i) {
@@ -137,6 +149,24 @@ pub fn sketch_lines_with_sampler(
         out.push((w.pts.clone(), col, false));
     }
     out
+}
+
+/// Should sketch curve `i` be drawn and picked? The Sketch Palette's two geometry toggles each
+/// hide one category, and a curve belongs to the category its colour already names in
+/// [`sketch_lines_with_sampler`]: a linked curve is projected reference geometry (Projected
+/// Geometries), anything else carrying the `construction` line type is construction geometry
+/// (Construction Geometries). Text outlines are linked curves that the Text feature draws, so
+/// they are never reference geometry and always show. Centerlines are their own line type and
+/// no toggle hides them.
+///
+/// Drawing and picking share this one answer so they cannot drift: geometry that is not on
+/// screen is never clickable, and geometry on screen always is.
+pub fn sketch_curve_visible(sk: &Sketch, i: usize) -> bool {
+    let Some(c) = sk.curves.get(i) else { return false };
+    if c.link.is_some() && !sk.is_text_curve(i) {
+        return !sk.view.hide_projected;
+    }
+    !(c.construction && sk.view.hide_construction)
 }
 
 /// Should sketch point `i` be drawn? Text outlines' points are not (they are not picked or
@@ -284,8 +314,38 @@ pub fn section_segments(m: &solidcraft_geom::Mesh, o: Vec3, n: Vec3) -> Vec<(Vec
 /// Is a sketch drawn? The active one is; others unless hidden. Finished sketches are hidden
 /// once a feature uses them, like Fusion's default, unless shown one by one.
 pub fn sketch_shown(s: &Session, id: u64) -> bool {
+    sketch_drawn(s, id, true)
+}
+
+/// Is a sketch drawn, with the browser's Sketches folder shown (`folder`) or hidden? The sketch
+/// being edited always is; otherwise not when hidden, nor in a hidden component, and one used by
+/// a feature only when shown on its own.
+pub fn sketch_drawn(s: &Session, id: u64, folder: bool) -> bool {
     let v = &s.visibility;
-    s.active_sketch == Some(id) || (!v.hidden_sketches.contains(&id) && (v.shown_sketches.contains(&id) || !sketch_consumed(s, id)))
+    if s.active_sketch == Some(id) {
+        return true;
+    }
+    if v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) {
+        return false;
+    }
+    v.shown_sketches.contains(&id) || (folder && !sketch_consumed(s, id))
+}
+
+/// Is the placement a sketch is drawn at shown (the active one while its component is being
+/// edited, else the component's first)?
+fn sketch_component_visible(s: &Session, id: u64) -> bool {
+    if s.visibility.hidden_occurrences.is_empty() {
+        return true;
+    }
+    let component = s.doc.feature(id).map_or(0, |f| f.component);
+    if component == 0 {
+        return true;
+    }
+    let path = match &s.active_occurrence_path {
+        Some(p) if s.active_component == component => p.clone(),
+        _ => s.doc.first_path(component),
+    };
+    s.occurrence_visible(&path)
 }
 
 /// Is a sketch used by a later feature?

@@ -154,6 +154,18 @@ pub fn check_knots(knots: &[f64]) -> SplineResult<()> {
 /// A knot vector shorter than two knots gives zeros.
 pub fn local_basis(knots: &[f64], u: f64, side: Side, n: usize) -> Vec<f64> {
     let mut out = vec![0.0; n + 1];
+    let ders = local_basis_array(knots, u, side, n);
+    for (o, d) in out.iter_mut().zip(ders) {
+        *o = d;
+    }
+    out
+}
+
+/// [`local_basis`] into a fixed array (no allocation): element `k` is the `k`-th derivative,
+/// for `k ≤ min(n, MAX_SPLINE_DEGREE)`, the rest zero.
+pub(crate) fn local_basis_array(knots: &[f64], u: f64, side: Side, n: usize) -> [f64; MAX_SPLINE_DEGREE + 1] {
+    const W: usize = MAX_SPLINE_DEGREE + 1;
+    let mut out = [0.0; W];
     let Some(p) = knots.len().checked_sub(2) else { return out };
     if p > MAX_SPLINE_DEGREE || !u.is_finite() {
         return out;
@@ -163,7 +175,6 @@ pub fn local_basis(knots: &[f64], u: f64, side: Side, n: usize) -> Vec<f64> {
     // table[k][j]: k-th derivative of N_{j,q} for the current degree q (j = 0..=p−q), updated
     // in place: k descending (level k reads level k−1 of the previous degree), j ascending
     // (N_{j,q} reads N_{j+1,q−1}, not yet overwritten). Derivatives above p are zero.
-    const W: usize = MAX_SPLINE_DEGREE + 1;
     let levels = n.min(p);
     let mut table = [[0.0f64; W]; W];
     for (j, slot) in table[0].iter_mut().enumerate().take(p + 1) {
@@ -286,15 +297,16 @@ pub fn find_span(knots: &[f64], p: usize, n: usize, u: f64) -> Option<usize> {
     if u < lo || u > hi {
         return None;
     }
-    // The last non-empty span in [p, n−1] that starts at or before u.
-    let mut k = p;
-    for i in p..n {
-        if let (Some(&a), Some(&b)) = (knots.get(i), knots.get(i + 1))
-            && a <= u
-            && a < b
-        {
-            k = i;
-        }
+    // The last non-empty span in [p, n−1] that starts at or before u: by bisection (the knots
+    // are sorted), and at the domain end the last non-empty span.
+    let mut k = if u >= hi {
+        n - 1
+    } else {
+        let below = knots.get(p..n)?.partition_point(|&x| x <= u);
+        p + below.checked_sub(1)?
+    };
+    while k > p && !(knots.get(k)? < knots.get(k + 1)?) {
+        k -= 1;
     }
     Some(k)
 }
@@ -331,16 +343,62 @@ pub fn insert_knot(p: usize, knots: &[f64], ctrl: &[HPoint], u: f64) -> SplineRe
     Ok((nk, q))
 }
 
+/// The binomial coefficient `(n k)` (zero for `k > n`).
+pub(crate) fn binomial(n: usize, k: usize) -> f64 {
+    if k > n {
+        return 0.0;
+    }
+    (0..k).fold(1.0, |c, m| c * (n - m) as f64 / (m + 1) as f64)
+}
+
 /// Bernstein polynomial `Bᵢ,ₚ(x)`.
 pub fn bernstein(p: usize, i: usize, x: f64) -> f64 {
     if i > p {
         return 0.0;
     }
-    let mut c = 1.0;
-    for m in 0..i {
-        c = c * (p - m) as f64 / (m + 1) as f64;
+    binomial(p, i) * x.powi(i as i32) * (1.0 - x).powi((p - i) as i32)
+}
+
+/// One row of a B-spline (degree `p`, knots, homogeneous control points) clamped on its domain
+/// `[knots[p], knots[n]]`: each domain end inserted until it repeats `p` times (§5.2), then the
+/// basis functions that vanish on the domain dropped (a basis function's last span does not
+/// depend on its first knot, so that knot moves to the domain end). The curve on the domain is
+/// unchanged.
+pub(crate) fn clamp_row(p: usize, knots: &[f64], row: &[HPoint]) -> SplineResult<(Vec<f64>, Vec<HPoint>)> {
+    let n = row.len();
+    let (Some(&a), Some(&b)) = (knots.get(p), knots.get(n)) else { return invalid("too few knots") };
+    let (mut knots, mut row) = (knots.to_vec(), row.to_vec());
+    for (at_end, x) in [(false, a), (true, b)] {
+        let mult = |k: &[f64]| k.iter().filter(|&&y| y == x).count();
+        let mut guard = 0;
+        while mult(&knots) < p {
+            guard += 1;
+            if guard > MAX_SPLINE_DEGREE + 1 {
+                return invalid("clamping did not converge");
+            }
+            (knots, row) = insert_knot(p, &knots, &row, x)?;
+        }
+        let n = row.len();
+        let (first, last) = if at_end {
+            // Functions i with i ≥ (first index of x) start at or past the end.
+            (0, knots.iter().position(|&y| y == x).unwrap_or(n).min(n))
+        } else {
+            // Functions i with i + p + 1 ≤ (last index of x) end at or before the start.
+            (knots.iter().rposition(|&y| y == x).unwrap_or(p).saturating_sub(p), n)
+        };
+        if last <= first + p {
+            return invalid("too few control points remain after clamping");
+        }
+        let mut nk: Vec<f64> = knots.get(first..last + p + 1).map(<[f64]>::to_vec).unwrap_or_default();
+        if at_end {
+            nk.last_mut().into_iter().for_each(|y| *y = x);
+        } else {
+            nk.first_mut().into_iter().for_each(|y| *y = x);
+        }
+        row = row.get(first..last).map(<[HPoint]>::to_vec).unwrap_or_default();
+        knots = nk;
     }
-    c * x.powi(i as i32) * (1.0 - x).powi((p - i) as i32)
+    Ok((knots, row))
 }
 
 /// A Bézier curve's point at `x ∈ [0, 1]` (de Casteljau, NURBS Book §1.4).
@@ -543,65 +601,36 @@ impl NurbsSurface {
     }
 
     /// The same surface on the same domain with clamped knot vectors (`p+1` equal knots at
-    /// each end, so the boundary curves are given by the boundary rows of control points):
-    /// insert each domain end until it has multiplicity `p`, then drop the basis functions
-    /// that vanish on the domain (NURBS Book §5.2 knot insertion; a basis function's last span
-    /// does not depend on its first knot, so that knot can be moved to the domain end).
+    /// each end, so the boundary curves are given by the boundary rows of control points): each
+    /// row of control points clamped in turn ([`clamp_row`]).
     pub fn clamped(&self) -> SplineResult<NurbsSurface> {
         let mut s = self.clone();
-        for dir in [Dir::S, Dir::T] {
-            let d = dir.pick(0, 1);
+        for d in 0..2 {
             let p = s.degree[d];
-            for end in 0..2 {
-                let a = s.domain()[d][end];
-                while s.knots[d].iter().filter(|&&x| x == a).count() < p {
-                    s = s.insert_knot(dir, a)?;
-                }
-                s = s.trim_end(d, end, a)?;
+            let [nu, nv] = s.count;
+            let (lines, len) = if d == 0 { (nv, nu) } else { (nu, nv) };
+            let mut knots = Vec::new();
+            let mut rows = Vec::with_capacity(lines);
+            for line in 0..lines {
+                let row: Vec<HPoint> = (0..len).map(|k| if d == 0 { s.point(k, line) } else { s.point(line, k) }).collect();
+                let (k, r) = clamp_row(p, &s.knots[d], &row)?;
+                knots = k;
+                rows.push(r);
             }
+            let new_len = rows.first().map_or(0, Vec::len);
+            let mut ctrl = Vec::with_capacity(lines * new_len);
+            if d == 0 {
+                rows.iter().for_each(|r| ctrl.extend_from_slice(r));
+            } else {
+                for j in 0..new_len {
+                    ctrl.extend(rows.iter().map(|r| r.get(j).copied().unwrap_or(HPoint::ZERO)));
+                }
+            }
+            let mut all = s.knots.clone();
+            all[d] = knots;
+            s = NurbsSurface::from_homogeneous(s.degree, all, ctrl)?;
         }
         Ok(s)
-    }
-
-    /// Drop the basis functions that vanish on the domain past the knot `a` (multiplicity ≥ p)
-    /// at the start (`end == 0`) or the end of direction `d`.
-    fn trim_end(&self, d: usize, end: usize, a: f64) -> SplineResult<NurbsSurface> {
-        let p = self.degree[d];
-        let kn = &self.knots[d];
-        let n = self.count[d];
-        let (first, last) = match end {
-            0 => {
-                let last_a = kn.iter().rposition(|&x| x == a).ok_or_else(|| SplineError::Invalid("clamp".into()))?;
-                // Functions i with i + p + 1 ≤ last_a vanish on [a, …).
-                (last_a.saturating_sub(p), n)
-            }
-            _ => {
-                let first_a = kn.iter().position(|&x| x == a).ok_or_else(|| SplineError::Invalid("clamp".into()))?;
-                // Functions i with i ≥ first_a vanish on (…, a].
-                (0, first_a.min(n))
-            }
-        };
-        if last <= first + p {
-            return invalid("clamp: too few control points remain");
-        }
-        let mut knots = self.knots.clone();
-        let mut nk: Vec<f64> = kn.get(first..last + p + 1).map(<[f64]>::to_vec).unwrap_or_default();
-        match end {
-            0 => nk.first_mut().into_iter().for_each(|x| *x = a),
-            _ => nk.last_mut().into_iter().for_each(|x| *x = a),
-        }
-        knots[d] = nk;
-        let [nu, nv] = self.count;
-        let mut ctrl = Vec::new();
-        for j in 0..nv {
-            for i in 0..nu {
-                let k = if d == 0 { i } else { j };
-                if k >= first && k < last {
-                    ctrl.push(self.point(i, j));
-                }
-            }
-        }
-        NurbsSurface::from_homogeneous(self.degree, knots, ctrl)
     }
 }
 
@@ -664,6 +693,21 @@ pub(crate) mod tests {
             }
         }
         assert!(worst < 1e-5, "derivative error {worst}");
+    }
+
+    #[test]
+    fn span_search_finds_the_last_non_empty_span_at_or_before_u() {
+        let p = 3;
+        let knots = [0.0, 0.0, 0.0, 0.0, 0.3, 0.3, 0.5, 0.9, 0.9, 0.9, 1.0, 1.0, 1.0, 1.0];
+        let n = knots.len() - p - 1;
+        for k in 0..=1000 {
+            let u = k as f64 / 1000.0;
+            // The plain search: the last span [knots[i], knots[i+1]) with knots[i] ≤ u.
+            let want = (p..n).filter(|&i| knots[i] <= u && knots[i] < knots[i + 1]).max().unwrap();
+            assert_eq!(find_span(&knots, p, n, u), Some(want), "u = {u}");
+        }
+        assert_eq!(find_span(&knots, p, n, 1.5), None);
+        assert_eq!(find_span(&knots, p, n, f64::NAN), None);
     }
 
     #[test]

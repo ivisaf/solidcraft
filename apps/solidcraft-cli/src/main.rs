@@ -1,7 +1,7 @@
 //! SolidCraft headless command line.
 //!
 //! ```text
-//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet]
+//! solidcraft-cli run <script.json|design.solidcraft|part.step|mesh.3mf> [--in design|part.step|mesh.3mf] [--out FILE]... [--save FILE] [--quiet] [--allow-errors]
 //! solidcraft-cli eval <script.json|design.solidcraft|part.step> (alias: inspect) measurements as JSON
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] loading timings as JSON lines
 //! solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|top|…]
@@ -32,8 +32,9 @@ use solidcraft_engine::Session;
 use solidcraft_engine::render::{StandardView, render_png};
 
 const USAGE: &str = "usage:
-  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results]
+  solidcraft-cli run <script.json|design.solidcraft|part.step> [--in design.solidcraft|part.step] [--out FILE]... [--save FILE] [--quiet] [--results] [--allow-errors]
   solidcraft-cli run --in <design.solidcraft|part.step> [--out FILE]...
+      (a timeline feature that fails fails the run and nothing is written; --allow-errors writes anyway)
   solidcraft-cli eval <script.json|design.solidcraft|part.step>     (alias: inspect; or --in FILE)
   solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only]
   solidcraft-cli snapshot <script|design> --out shot.png [--width W] [--height H] [--view iso|front|back|top|bottom|left|right]
@@ -122,7 +123,14 @@ pub fn load(path: &str) -> Result<Session, String> {
         s.execute("doc.open", &json!({"path": path})).map_err(|e| e.to_string())?;
         return Ok(s);
     }
-    let v = read_json(path)?;
+    let bytes = solidcraft_engine::io::vfs::read(path, solidcraft_engine::io::MAX_DESIGN_BYTES).map_err(|e| format!("{path}: {e}"))?;
+    if solidcraft_engine::io::is_design_container(&bytes) {
+        let doc = solidcraft_engine::io::read_design(&bytes).map_err(|e| format!("{path}: {e}"))?;
+        let mut session = Session::new(doc);
+        session.path = Some(path.to_owned());
+        return Ok(session);
+    }
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| format!("{path}: {e}"))?;
     if v.get("format").and_then(Value::as_str).is_some_and(|f| solidcraft_engine::doc::format::version_of(f).is_some()) {
         s.execute("doc.open", &json!({"path": path})).map_err(|e| e.to_string())?;
     } else if v.get("features").is_some() && v.get("commands").is_none() {
@@ -147,7 +155,7 @@ fn positional(args: &[String]) -> Option<&String> {
     let mut i = 0;
     while let Some(a) = args.get(i) {
         if a.starts_with("--") {
-            i += if matches!(a.as_str(), "--quiet" | "--results") { 1 } else { 2 };
+            i += if matches!(a.as_str(), "--quiet" | "--results" | "--allow-errors") { 1 } else { 2 };
             continue;
         }
         return Some(a);
@@ -182,6 +190,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         }
         None
     };
+    // A feature that fails leaves the bodies as they were before it (a parameter change can
+    // break a feature without failing the command that made it): writing them would hand out
+    // the wrong part with success, so fail the run unless asked to write it anyway.
+    if !args.iter().any(|a| a == "--allow-errors") {
+        timeline_ok(&s)?;
+    }
     for out in flags(args, "--out") {
         s.execute("file.export", &json!({"path": out})).map_err(|e| e.to_string())?;
     }
@@ -195,6 +209,19 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         println!("{}", pretty(&m));
     }
     Ok(())
+}
+
+/// Every failing timeline feature, one per line, as an error; Ok when none fails.
+fn timeline_ok(s: &Session) -> Result<(), String> {
+    let failed: Vec<String> = s.model.results.iter().filter_map(|r| r.error.as_ref().map(|e| format!("  {}: {e}", r.name))).collect();
+    if failed.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} timeline feature(s) failed, so nothing was written (--allow-errors writes the bodies anyway):\n{}",
+        failed.len(),
+        failed.join("\n")
+    ))
 }
 
 fn cmd_eval(args: &[String]) -> Result<(), String> {

@@ -147,7 +147,7 @@ impl Document {
             .get(name)
             .cloned()
             .or_else(|| self.appearances.components.get(&self.model_body_component(body)).cloned())
-            .or_else(|| self.materials.get(name).and_then(|material| material_look(material)))
+            .or_else(|| self.materials.get(name).and_then(|material| self.material_look(material)))
     }
     /// Effective body opacity, including paint carried from an imported body.
     pub fn model_body_opacity(&self, body: &crate::ModelBody) -> f64 {
@@ -168,7 +168,7 @@ impl Document {
                 let c = self.body_component(name, feature);
                 (c != 0).then(|| self.appearances.components.get(&c).cloned()).flatten()
             })
-            .or_else(|| self.materials.get(name).and_then(|m| material_look(m)))
+            .or_else(|| self.materials.get(name).and_then(|m| self.material_look(m)))
     }
 
     /// Face appearances on a body: (point on the face, look).
@@ -239,6 +239,12 @@ impl Document {
 
 /// The B-rep face of a body nearest a point (within 5% of the body's size).
 pub fn face_index_at(b: &crate::ModelBody, p: Vec3) -> Option<usize> {
+    let (d, f) = nearest_face(b, p)?;
+    (d <= pick_tolerance(b)).then_some(f)
+}
+
+/// The face of `b` nearest `p` and how far it is, however far.
+pub fn nearest_face(b: &crate::ModelBody, p: Vec3) -> Option<(f64, usize)> {
     let m = b.mesh();
     let mut best: Option<(f64, u32)> = None;
     for (t, f) in m.triangles.iter().zip(&m.tri_face) {
@@ -248,8 +254,12 @@ pub fn face_index_at(b: &crate::ModelBody, p: Vec3) -> Option<usize> {
             best = Some((d, *f));
         }
     }
-    let (d, f) = best?;
-    (d <= b.body.size() * 0.05 + 1e-6).then_some(f as usize)
+    best.map(|(d, f)| (d, f as usize))
+}
+
+/// How far from a face of `b` a picked point may lie and still pick it (`face_index_at`).
+pub fn pick_tolerance(b: &crate::ModelBody) -> f64 {
+    b.body.size() * 0.05 + 1e-6
 }
 
 /// The point of triangle abc nearest p.

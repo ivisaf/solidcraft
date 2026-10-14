@@ -1,6 +1,6 @@
 //! Preferences, one dialog in the spirit of Fusion's, opened from the gear at the top right of the
 //! window, File › Preferences or Ctrl+, (Cmd+, on macOS): General (theme, UI scale, units of new
-//! designs, autosave, display precision, the agent cursor), Navigation (mouse presets, zoom
+//! designs, autosave, display precision, timeline layout, the agent cursor), Navigation (mouse presets, zoom
 //! direction, zoom to the cursor, orbit centre, Look At animation), Keyboard Shortcuts (search,
 //! rebind, conflicts; `keymap`), Design (default modelling orientation, Y up or Z up), Graphics
 //! (visual style, grid, shadow, perspective, anti-aliasing), Sketch and Selection. Changes apply
@@ -173,6 +173,26 @@ pub const PAGE_GRAPHICS: usize = 4;
 pub const THEMES: [(&str, &str); 3] = [("dark", "Dark"), ("light", "Light"), ("system", "System")];
 pub const MSAA: [u32; 4] = [1, 2, 4, 8];
 
+/// Original view navigators, independent of the mouse navigation preset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigatorStyle {
+    #[default]
+    Axes,
+    Cube,
+}
+
+impl NavigatorStyle {
+    pub const ALL: [Self; 2] = [Self::Axes, Self::Cube];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Axes => "Signed axes",
+            Self::Cube => "Cube",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -180,6 +200,8 @@ pub struct Prefs {
     pub default_units: String,
     /// Mouse mapping: `fusion`, `solidworks` or `inventor`.
     pub nav: String,
+    /// View orientation widget: original signed axes (default) or compact cube.
+    pub navigator_style: NavigatorStyle,
     /// Show the radial ring and enable hold/flick gestures for viewport context menus.
     pub radial_context_menu: bool,
     /// The wheel zooms out when turned forward.
@@ -201,6 +223,13 @@ pub struct Prefs {
     pub language: String,
     /// Interface scale (1 = 100 %).
     pub ui_scale: f32,
+    /// Put the feature history above the parts browser in the left sidebar instead of along the
+    /// bottom of the viewport.
+    pub timeline_left: bool,
+    /// Height of the feature-history section when it shares the left sidebar with the browser.
+    pub timeline_left_height: f32,
+    /// Whether the browser below the left feature history is collapsed.
+    pub timeline_left_browser_collapsed: bool,
     /// The wheel zooms toward the point under the cursor (else toward the view's centre).
     pub zoom_to_cursor: bool,
     /// Spread discrete wheel input across frames (off: apply each event immediately).
@@ -214,6 +243,36 @@ pub struct Prefs {
     pub up_axis: String,
     /// After a STEP or IGES file opens, offer to stand a Y-up part up (`stand_up`).
     pub offer_stand_up: bool,
+    /// What a middle-button double-click in the view does: `home`, `fit` or `off`.
+    pub middle_double_click: String,
+}
+
+/// What a middle-button double-click in the view does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiddleDoubleClick {
+    /// Go Home (the iso view, framing what is shown).
+    Home,
+    /// Frame what is shown, keeping the orientation.
+    Fit,
+    Off,
+}
+
+impl MiddleDoubleClick {
+    pub const ALL: [(MiddleDoubleClick, &'static str, &'static str); 3] =
+        [(MiddleDoubleClick::Home, "home", "Home"), (MiddleDoubleClick::Fit, "fit", "Fit"), (MiddleDoubleClick::Off, "off", "Off")];
+
+    /// The preference's setting (Home for an unknown one).
+    pub fn of(app: &SolveApp) -> MiddleDoubleClick {
+        Self::parse(&app.preferences.middle_double_click).unwrap_or(MiddleDoubleClick::Home)
+    }
+
+    pub fn parse(id: &str) -> Option<MiddleDoubleClick> {
+        Self::ALL.iter().find(|(_, i, _)| *i == id).map(|(m, _, _)| *m)
+    }
+
+    pub fn label(self) -> &'static str {
+        Self::ALL.iter().find(|(m, _, _)| *m == self).map_or("Home", |(_, _, l)| l)
+    }
 }
 
 impl Default for Prefs {
@@ -221,6 +280,7 @@ impl Default for Prefs {
         Prefs {
             default_units: "mm".into(),
             nav: "fusion".into(),
+            navigator_style: NavigatorStyle::default(),
             radial_context_menu: false,
             zoom_reverse: false,
             orbit_cursor: false,
@@ -232,6 +292,9 @@ impl Default for Prefs {
             theme: "dark".into(),
             language: "en".into(),
             ui_scale: 1.0,
+            timeline_left: false,
+            timeline_left_height: 360.0,
+            timeline_left_browser_collapsed: false,
             zoom_to_cursor: true,
             smooth_wheel_zoom: true,
             trackpad_pan: true,
@@ -239,6 +302,7 @@ impl Default for Prefs {
             look_at_speed: 1.0,
             up_axis: "z".into(),
             offer_stand_up: true,
+            middle_double_click: "home".into(),
         }
     }
 }
@@ -322,6 +386,9 @@ fn defaults(app: &mut SolveApp, page: usize) {
             p.theme = d.theme;
             p.language = d.language;
             p.ui_scale = d.ui_scale;
+            p.timeline_left = d.timeline_left;
+            p.timeline_left_height = d.timeline_left_height;
+            p.timeline_left_browser_collapsed = d.timeline_left_browser_collapsed;
             p.default_units = d.default_units;
             p.length_decimals = d.length_decimals;
             p.angle_decimals = d.angle_decimals;
@@ -332,6 +399,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
         }
         1 => {
             p.nav = d.nav;
+            p.navigator_style = d.navigator_style;
             p.radial_context_menu = d.radial_context_menu;
             p.zoom_reverse = d.zoom_reverse;
             p.zoom_to_cursor = d.zoom_to_cursor;
@@ -342,6 +410,7 @@ fn defaults(app: &mut SolveApp, page: usize) {
             p.space_mouse_speed = d.space_mouse_speed;
             p.look_at_anim = d.look_at_anim;
             p.look_at_speed = d.look_at_speed;
+            p.middle_double_click = d.middle_double_click;
         }
         PAGE_SHORTCUTS => crate::keymap::reset(app, None),
         PAGE_DESIGN => {
@@ -376,8 +445,24 @@ pub fn apply(app: &mut SolveApp, ctx: &egui::Context) {
     {
         app.ui.dark = t == egui::Theme::Dark;
     }
+    // egui's end-of-frame shortcuts only change its context; the saved preference would
+    // overwrite that change next frame. Consume the desktop shortcuts into the preference.
+    if ctx.options(|o| o.zoom_with_keyboard) && !crate::keymap::capturing(app) {
+        use egui::gui_zoom::kb_shortcuts::{ZOOM_IN, ZOOM_IN_SECONDARY, ZOOM_OUT, ZOOM_RESET};
+        if ctx.input_mut(|i| i.consume_shortcut(&ZOOM_RESET)) {
+            app.preferences.ui_scale = 1.0;
+        } else {
+            let zoom_in = ctx.input_mut(|i| i.consume_shortcut(&ZOOM_IN) || i.consume_shortcut(&ZOOM_IN_SECONDARY));
+            let zoom_out = ctx.input_mut(|i| i.consume_shortcut(&ZOOM_OUT));
+            if zoom_in != zoom_out {
+                app.preferences.ui_scale = (app.preferences.ui_scale + if zoom_in { 0.1 } else { -0.1 }).clamp(0.5, 2.5);
+            }
+        }
+    }
+    // Scaling while the pointer is held moves the slider under the pointer, feeding a
+    // different value back into it. Commit the layout change after the drag ends.
     let z = app.preferences.ui_scale.clamp(0.5, 2.5);
-    if z.is_finite() && (ctx.zoom_factor() - z).abs() > 1e-3 {
+    if z.is_finite() && !ctx.input(|i| i.pointer.any_down()) && (ctx.zoom_factor() - z).abs() > 1e-3 {
         ctx.set_zoom_factor(z);
     }
 }
@@ -414,7 +499,9 @@ pub fn zoom_sign(app: &SolveApp) -> f64 {
 }
 
 /// Orbit by pixel deltas: around the view's centre, or, with "orbit around the cursor", around
-/// the model point that was under the cursor when the drag began (kept still on screen).
+/// the model point that was under the cursor when the drag began (kept still on screen). A drag
+/// that begins over empty space turns around the centre of the visible geometry instead, so the
+/// model never swings around a far-off point. The pivot is chosen once, when the drag begins.
 pub fn orbit(app: &mut SolveApp, rect: egui::Rect, dx: f64, dy: f64, press: Option<Pos2>) {
     if !app.preferences.orbit_cursor {
         app.cam.orbit(dx, dy);
@@ -438,7 +525,8 @@ pub fn orbit(app: &mut SolveApp, rect: egui::Rect, dx: f64, dy: f64, press: Opti
     }
 }
 
-/// The model point under a screen position, or the point at the view's depth.
+/// The model point under a screen position. Over empty space: the centre of the visible bodies
+/// and sketches (what Fit frames), or the view's centre when nothing is visible.
 fn pivot_under(app: &SolveApp, proj: &crate::viewport::Proj, at: Pos2) -> Vec3 {
     use crate::viewport::Hit;
     for h in crate::viewport::pick(app, proj, at) {
@@ -448,10 +536,8 @@ fn pivot_under(app: &SolveApp, proj: &crate::viewport::Proj, at: Pos2) -> Vec3 {
             _ => {}
         }
     }
-    let (o, d) = proj.ray(at);
-    let n = app.cam.back();
-    let den = d.dot(n);
-    if den.abs() > 1e-9 { o + d * ((app.cam.target - o).dot(n) / den) } else { app.cam.target }
+    let b = crate::viewport::view_bounds(app);
+    if b.is_empty() { app.cam.target } else { b.center() }
 }
 
 /// Units per millimetre and the unit's name.
@@ -769,8 +855,18 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             });
             ui.end_row();
             ui.label(app.tr("ui.ui_scale"));
-            ui.add(egui::Slider::new(&mut app.preferences.ui_scale, 0.75..=2.0).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)));
+            let scale = ui.add(
+                egui::Slider::new(&mut app.preferences.ui_scale, 0.5..=2.5).step_by(0.05).custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+            );
+            crate::scenario::publish_rect("prefs:scale", scale.rect);
             ui.end_row();
+            ui.label("Feature history");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut app.preferences.timeline_left, false, "Bottom timeline");
+                ui.radio_value(&mut app.preferences.timeline_left, true, "Left sidebar");
+            });
+            ui.end_row();
+            note(ui, "The left layout shows the rollback bar above the parts and scene browser.");
             ui.label(app.tr("ui.units_of_new_designs"));
             egui::ComboBox::from_id_salt("pref_units").selected_text(app.preferences.default_units.clone()).show_ui(ui, |ui| {
                 for u in UNITS {
@@ -783,7 +879,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                 set_autosave(app);
             }
             ui.end_row();
-            note(ui, "0 turns it off");
+            note(ui, crate::i18n::tr_label("0 turns it off"));
             ui.label(app.tr("ui.length_decimals"));
             ui.add(egui::DragValue::new(&mut app.preferences.length_decimals).range(0..=6));
             ui.end_row();
@@ -793,7 +889,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.label(app.tr("ui.agent_cursor"));
             let speed_label = app.tr("ui.agent_cursor_speed");
             let s = &mut app.ui.agent_cursor;
-            ui.checkbox(&mut s.show, "Show the pointer an AI agent moves (#35)");
+            ui.checkbox(&mut s.show, crate::i18n::tr_label("Show the pointer an AI agent moves (#35)"));
             ui.end_row();
             ui.label(speed_label);
             ui.add_enabled_ui(s.show, |ui| {
@@ -801,95 +897,122 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             });
             ui.end_row();
             ui.label("");
-            ui.add_enabled(s.show, egui::Checkbox::new(&mut s.follow_camera, "Follow the camera (Look At sketches)"));
+            ui.add_enabled(s.show, egui::Checkbox::new(&mut s.follow_camera, crate::i18n::tr_label("Follow the camera (Look At sketches)")));
             ui.end_row();
         }
         1 => {
-            ui.label("Pan, zoom, orbit");
-            egui::ComboBox::from_id_salt("pref_nav").selected_text(nav_preset(&app.preferences.nav).label).show_ui(ui, |ui| {
+            ui.label(app.tr_label("Pan, zoom, orbit"));
+            let current_preset_label = app.tr_label(nav_preset(&app.preferences.nav).label);
+            egui::ComboBox::from_id_salt("pref_nav").selected_text(current_preset_label).show_ui(ui, |ui| {
                 for p in &NAV_PRESETS {
-                    if ui.selectable_value(&mut app.preferences.nav, p.id.to_string(), p.label).clicked() {
+                    if ui.selectable_value(&mut app.preferences.nav, p.id.to_string(), crate::i18n::tr_label(p.label)).clicked() {
                         app.preferences.zoom_reverse = p.reverse_zoom;
                     }
                 }
             });
             ui.end_row();
             let snap_help = if app.preferences.nav == OPENSCAD_NAV { "" } else { "; hold Shift during orbit to snap" };
-            note(ui, &format!("{}{snap_help}; the wheel zooms", nav_preset(&app.preferences.nav).help));
-            ui.label("Context menu");
-            ui.checkbox(&mut app.preferences.radial_context_menu, "Radial context menu");
+            let raw_help = format!("{}; Ctrl+left drag on empty space orbits{snap_help}; the wheel zooms", nav_preset(&app.preferences.nav).help);
+            note(ui, crate::i18n::tr_label(&raw_help));
+            ui.label(crate::i18n::tr_label("Context menu"));
+            ui.checkbox(&mut app.preferences.radial_context_menu, crate::i18n::tr_label("Radial context menu"));
             ui.end_row();
-            ui.label("Reverse zoom direction");
+            ui.label(crate::i18n::tr_label("View navigator"));
+            let picker =
+                egui::ComboBox::from_id_salt("pref_navigator_style").selected_text(crate::i18n::tr_label(app.preferences.navigator_style.label())).show_ui(ui, |ui| {
+                    for style in NavigatorStyle::ALL {
+                        let response = ui.selectable_value(&mut app.preferences.navigator_style, style, crate::i18n::tr_label(style.label()));
+                        crate::scenario::publish_rect(&format!("prefs:navigator:{}", style.label()), response.rect);
+                        crate::scenario::publish_handle(&format!("prefs:navigator:{}", style.label()), response.rect.center());
+                    }
+                });
+            crate::scenario::publish_rect("prefs:navigator", picker.response.rect);
+            crate::scenario::publish_handle("prefs:navigator", picker.response.rect.center());
+            ui.end_row();
+            ui.label(crate::i18n::tr_label("Reverse zoom direction"));
             ui.checkbox(&mut app.preferences.zoom_reverse, "");
             ui.end_row();
-            ui.label("Zoom to the cursor");
+            ui.label(crate::i18n::tr_label("Zoom to the cursor"));
             ui.checkbox(&mut app.preferences.zoom_to_cursor, "")
-                .on_hover_text("The wheel zooms toward the point under the cursor (off: toward the view's centre)");
+                .on_hover_text(crate::i18n::tr_label("The wheel zooms toward the point under the cursor (off: toward the view's centre)"));
             ui.end_row();
-            ui.label("Smooth wheel zoom");
+            ui.label(crate::i18n::tr_label("Smooth wheel zoom"));
             ui.checkbox(&mut app.preferences.smooth_wheel_zoom, "")
-                .on_hover_text("Turn off to apply each wheel event immediately, without a smoothing tail");
+                .on_hover_text(crate::i18n::tr_label("Turn off to apply each wheel event immediately, without a smoothing tail"));
             ui.end_row();
-            ui.label("Two-finger scroll pans");
-            ui.checkbox(&mut app.preferences.trackpad_pan, "").on_hover_text(
+            ui.label(crate::i18n::tr_label("Two-finger scroll pans"));
+            ui.checkbox(&mut app.preferences.trackpad_pan, "").on_hover_text(crate::i18n::tr_label(
                 "Trackpad gestures pan (off: they zoom like the wheel); mouse wheel zooms, thumb wheel pans sideways, pinch always zooms",
-            );
+            ));
             ui.end_row();
-            ui.label("Orbit around");
+            ui.label(crate::i18n::tr_label("Orbit around"));
             ui.horizontal(|ui| {
-                ui.radio_value(&mut app.preferences.orbit_cursor, false, "View centre");
-                ui.radio_value(&mut app.preferences.orbit_cursor, true, "Point under the cursor");
+                ui.radio_value(&mut app.preferences.orbit_cursor, false, crate::i18n::tr_label("View centre"));
+                ui.radio_value(&mut app.preferences.orbit_cursor, true, crate::i18n::tr_label("Point under the cursor"));
             });
             ui.end_row();
-            ui.label("Animate view changes");
-            ui.checkbox(&mut app.preferences.look_at_anim, "Axis view, Look At, Home and Fit");
+            ui.label(crate::i18n::tr_label("Middle double-click"));
+            let current = MiddleDoubleClick::of(app);
+            egui::ComboBox::from_id_salt("pref_middle_double_click").selected_text(crate::i18n::tr_label(current.label())).show_ui(ui, |ui| {
+                for (m, id, label) in MiddleDoubleClick::ALL {
+                    if ui.selectable_label(current == m, crate::i18n::tr_label(label)).clicked() {
+                        app.preferences.middle_double_click = id.into();
+                    }
+                }
+            })
+            .response
+            .on_hover_text(crate::i18n::tr_label("Double-clicking the middle button in the view: Home (the home view, framing what is shown), Fit (frame what is shown, keeping the orientation) or nothing"));
             ui.end_row();
-            ui.label("Animation speed");
+            ui.label(crate::i18n::tr_label("Animate view changes"));
+            ui.checkbox(&mut app.preferences.look_at_anim, crate::i18n::tr_label("Axis view, Look At, Home and Fit"));
+            ui.end_row();
+            ui.label(crate::i18n::tr_label("Animation speed"));
             ui.add_enabled(
                 app.preferences.look_at_anim,
                 egui::Slider::new(&mut app.preferences.look_at_speed, 0.5..=3.0).step_by(0.25).custom_formatter(|v, _| format!("{v:.2}×")),
             );
             ui.end_row();
-            ui.label("3D mouse (Windows)");
-            ui.checkbox(&mut app.preferences.space_mouse_enabled, "Navigate with SpaceNavigator / SpaceMouse");
+            ui.label(crate::i18n::tr_label("3D mouse (Windows)"));
+            ui.checkbox(&mut app.preferences.space_mouse_enabled, crate::i18n::tr_label("Navigate with SpaceNavigator / SpaceMouse"));
             ui.end_row();
-            ui.label("3D mouse speed");
+            ui.label(crate::i18n::tr_label("3D mouse speed"));
             ui.add_enabled(
                 app.preferences.space_mouse_enabled,
                 egui::Slider::new(&mut app.preferences.space_mouse_speed, 0.25..=3.0).step_by(0.05).custom_formatter(|v, _| format!("{v:.2}×")),
             );
             ui.end_row();
-            note(ui, "Move and rotate the view together; sketches use pan and zoom only.");
+            note(ui, crate::i18n::tr_label("Move and rotate the view together; sketches use pan and zoom only."));
         }
         PAGE_DESIGN => {
-            ui.label("Default modelling orientation");
+            ui.label(crate::i18n::tr_label("Default modelling orientation"));
             ui.horizontal(|ui| {
-                ui.radio_value(&mut app.preferences.up_axis, "z".to_string(), "Z up");
-                ui.radio_value(&mut app.preferences.up_axis, "y".to_string(), "Y up");
+                ui.radio_value(&mut app.preferences.up_axis, "z".to_string(), crate::i18n::tr_label("Z up"));
+                ui.radio_value(&mut app.preferences.up_axis, "y".to_string(), crate::i18n::tr_label("Y up"));
             });
             ui.end_row();
-            note(ui, "Which axis points up in the views (axis view, Home, Look At). Designs are unchanged.");
-            ui.label("Offer to stand up Y-up files");
+            note(ui, crate::i18n::tr_label("Which axis points up in the views (axis view, Home, Look At). Designs are unchanged."));
+            ui.label(crate::i18n::tr_label("Offer to stand up Y-up files"));
             ui.checkbox(&mut app.preferences.offer_stand_up, "")
-                .on_hover_text("After a STEP or IGES file opens with Z up, offer a quarter turn about X");
+                .on_hover_text(crate::i18n::tr_label("After a STEP or IGES file opens with Z up, offer a quarter turn about X"));
             ui.end_row();
         }
         4 => {
-            ui.label("Visual style");
+            ui.label(crate::i18n::tr_label("Visual style"));
             let styles = ["Shaded with edges", "Shaded", "Wireframe", "Shaded with hidden edges"];
-            egui::ComboBox::from_id_salt("pref_style").selected_text(styles[usize::from(app.ui.visual_style.min(3))]).show_ui(ui, |ui| {
+            let selected_label = crate::i18n::tr_label(styles[usize::from(app.ui.visual_style.min(3))]);
+            egui::ComboBox::from_id_salt("pref_style").selected_text(selected_label).show_ui(ui, |ui| {
                 for (i, s) in styles.iter().enumerate() {
-                    ui.selectable_value(&mut app.ui.visual_style, i as u8, *s);
+                    ui.selectable_value(&mut app.ui.visual_style, i as u8, crate::i18n::tr_label(s));
                 }
             });
             ui.end_row();
-            ui.label("Grid");
+            ui.label(crate::i18n::tr_label("Grid"));
             ui.checkbox(&mut app.ui.show_grid, "");
             ui.end_row();
-            ui.label("Ground shadow");
+            ui.label(crate::i18n::tr_label("Ground shadow"));
             ui.checkbox(&mut app.ui.ground_shadow, "");
             ui.end_row();
-            ui.label("Perspective view");
+            ui.label(crate::i18n::tr_label("Perspective view"));
             ui.checkbox(&mut app.ui.perspective, "");
             ui.end_row();
             ui.label(app.tr("ui.anti_aliasing"));
@@ -904,7 +1027,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             });
             ui.end_row();
             note(ui, app.tr("settings.msaa_applies_on_restart"));
-            ui.label("Renderer");
+            ui.label(crate::i18n::tr_label("Renderer"));
             ui.label(match (&app.viewport.gpu, &app.help.gpu) {
                 (Some(_), Some(g)) => format!("GPU: {g}"),
                 (Some(_), None) => "GPU".to_string(),
@@ -913,7 +1036,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.end_row();
         }
         5 => {
-            ui.label("Project face edges into new sketches");
+            ui.label(crate::i18n::tr_label("Project face edges into new sketches"));
             let mut auto = app.session.auto_project;
             if ui.checkbox(&mut auto, "").changed() {
                 let _ = app.run("sketch.auto_project", json!({ "value": auto }));
@@ -921,7 +1044,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             ui.end_row();
         }
         _ => {
-            ui.label("Click selects whole bodies");
+            ui.label(crate::i18n::tr_label("Click selects whole bodies"));
             ui.checkbox(&mut app.ui.pick_bodies, "");
             ui.end_row();
         }
@@ -994,6 +1117,9 @@ pub fn set(app: &mut SolveApp, p: &serde_json::Value) -> Result<serde_json::Valu
     }
     if !(0.5..=2.5).contains(&new.ui_scale) || !(0.25..=4.0).contains(&new.look_at_speed) {
         return Err("`ui_scale` must be 0.5…2.5 and `look_at_speed` 0.25…4".into());
+    }
+    if MiddleDoubleClick::parse(&new.middle_double_click).is_none() {
+        return Err("`middle_double_click` must be home, fit or off".into());
     }
     if new.theme != app.preferences.theme && new.theme != "system" {
         app.ui.dark = new.theme == "dark";
@@ -1090,6 +1216,50 @@ mod tests {
         assert_eq!(parse_length_mm("abc", inch), None);
         assert_eq!(parse_length_mm("", inch), None);
         assert_eq!(parse_length_mm("1e400", 1.0), None);
+    }
+
+    #[test]
+    fn navigator_picker_preserves_axes_and_follows_preferences_transactions() {
+        let old: Prefs = serde_json::from_value(json!({"nav":"solidworks"})).unwrap();
+        assert_eq!(old.navigator_style, NavigatorStyle::Axes);
+        let mut h = crate::scenario::Harness::new();
+        assert!(crate::scenario::handle_at("axis_view:z").is_some());
+        assert!(crate::scenario::handle_at("navigation_cube:front").is_none());
+        let camera = h.app.cam;
+        let design = h.app.session.doc.to_json();
+        let nav = h.app.preferences.nav.clone();
+        h.call("ui.prefs", json!({"open":"Navigation"}));
+        let picker = crate::scenario::rect_of("prefs:navigator").unwrap().center();
+        h.call("ui.click", json!({"x":picker.x,"y":picker.y}));
+        let cube = crate::scenario::rect_of("prefs:navigator:Cube").unwrap().center();
+        assert!(crate::scenario::rect_of("prefs:navigator:Signed axes").is_some());
+        h.call("ui.click", json!({"x":cube.x,"y":cube.y}));
+        assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Cube);
+        assert!(crate::scenario::handle_at("navigation_cube:front").is_some());
+        assert_eq!(h.app.preferences.nav, nav);
+        assert_eq!(h.app.cam, camera);
+        assert_eq!(h.app.session.doc.to_json(), design);
+        let mut restored = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        restored.load_prefs(&h.app.prefs());
+        assert_eq!(restored.preferences.navigator_style, NavigatorStyle::Cube);
+        let before = h.app.preferences.clone();
+        assert!(control(&mut h.app, &json!({"navigator_style":"unknown", "nav":"solidworks"})).is_err());
+        assert_eq!(h.app.preferences, before, "invalid settings must fail atomically");
+        h.call("ui.prefs", json!({"button":"cancel"}));
+        assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Axes);
+        assert!(crate::scenario::handle_at("navigation_cube:front").is_none());
+        h.call("ui.prefs", json!({"open":"Navigation","navigator_style":"cube"}));
+        h.call("ui.prefs", json!({"button":"apply"}));
+        h.call("ui.prefs", json!({"button":"defaults"}));
+        assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Axes);
+        h.call("ui.prefs", json!({"button":"cancel"}));
+        assert_eq!(h.app.preferences.navigator_style, NavigatorStyle::Cube);
+        h.call("ui.prefs", json!({"navigator_style":"axes", "look_at_anim":false}));
+        h.call("ui.view", json!({"view":"front"}));
+        let axis = crate::scenario::handle_at("axis_view:-y").unwrap();
+        h.call("ui.click", json!({"x":axis.x,"y":axis.y}));
+        assert!(h.app.cam.back().dist(Vec3::Y) < 1e-6, "original axes retain click-again reversal");
+        assert_eq!(h.app.session.doc.to_json(), design);
     }
 
     #[test]
@@ -1258,8 +1428,11 @@ mod tests {
         assert_eq!(app.tr("ui.extrude"), "Extrude");
 
         // Switch language to Japanese
-        set(&mut app, &json!({"language": "ja"})).unwrap();
+        set(&mut app, &json!({"language": "ja", "timeline_left": true})).unwrap();
+        app.preferences.timeline_left_height = 275.0;
+        app.preferences.timeline_left_browser_collapsed = true;
         assert_eq!(app.preferences.language, "ja");
+        assert!(app.preferences.timeline_left);
         assert_eq!(app.tr("ui.preferences"), "環境設定");
         assert_eq!(app.tr("ui.extrude"), "押し出し");
 
@@ -1267,6 +1440,9 @@ mod tests {
         let mut other = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
         other.load_prefs(&app.prefs());
         assert_eq!(other.preferences.language, "ja");
+        assert!(other.preferences.timeline_left);
+        assert_eq!(other.preferences.timeline_left_height, 275.0);
+        assert!(other.preferences.timeline_left_browser_collapsed);
         assert_eq!(other.tr("ui.preferences"), "環境設定");
     }
 
@@ -1319,6 +1495,31 @@ mod tests {
         assert!(s.distance(at) < 2.0, "{s:?}");
     }
 
+    /// A drag that starts over empty space turns around the visible geometry's centre, not a
+    /// point far off to the side; with nothing visible it turns around the view's centre.
+    #[test]
+    fn orbiting_from_empty_space_turns_around_the_visible_geometry() {
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        app.run("solid.box", json!({"length": 40, "width": 40, "height": 40})).unwrap();
+        app.preferences.orbit_cursor = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        app.fit_view();
+        let corner = egui::pos2(10.0, 10.0);
+        let proj = crate::viewport::projection(&app, rect);
+        let hits = crate::viewport::pick(&app, &proj, corner);
+        use crate::viewport::Hit;
+        assert!(!hits.iter().any(|h| matches!(h, Hit::Face { .. } | Hit::Edge { .. } | Hit::Vertex { .. })), "the corner is empty space");
+        let centre = crate::viewport::view_bounds(&app).center();
+        orbit(&mut app, rect, 40.0, 25.0, Some(corner));
+        assert_eq!(app.viewport.orbit_pivot, Some(centre));
+
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        app.preferences.orbit_cursor = true;
+        app.cam.target = solidcraft_engine::geom::Vec3::new(5.0, -3.0, 2.0);
+        orbit(&mut app, rect, 40.0, 25.0, Some(corner));
+        assert_eq!(app.viewport.orbit_pivot, Some(solidcraft_engine::geom::Vec3::new(5.0, -3.0, 2.0)));
+    }
+
     /// The Y up preference turns the view: the camera's up axis follows it, startup included.
     #[test]
     fn up_axis_preference_turns_the_view() {
@@ -1335,5 +1536,59 @@ mod tests {
         app.preferences.up_axis = "z".into();
         apply(&mut app, &ctx);
         assert_eq!(app.cam.up, UpAxis::Z);
+    }
+}
+
+#[cfg(test)]
+mod ui_scale_regression_tests {
+    use super::*;
+    use egui::{Event, Modifiers, PointerButton, pos2};
+
+    #[test]
+    fn desktop_zoom_shortcuts_update_and_persist_the_scale_preference() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.key", json!({"key":"Minus","cmd":true}));
+        assert!((h.app.preferences.ui_scale - 0.9).abs() < 1e-4);
+        assert!((h.ctx.zoom_factor() - 0.9).abs() < 1e-4);
+        h.frames(12);
+        assert!((h.ctx.zoom_factor() - 0.9).abs() < 1e-4, "must not flash back to the old preference");
+        h.step(&json!({"restart":"close"})).unwrap();
+        assert!((h.app.preferences.ui_scale - 0.9).abs() < 1e-4);
+        h.call("ui.key", json!({"key":"Equals","cmd":true}));
+        assert!((h.ctx.zoom_factor() - 1.0).abs() < 1e-4);
+        h.call("ui.key", json!({"key":"Plus","cmd":true}));
+        assert!((h.ctx.zoom_factor() - 1.1).abs() < 1e-4);
+        h.call("ui.key", json!({"key":"0","cmd":true}));
+        assert!((h.ctx.zoom_factor() - 1.0).abs() < 1e-4);
+        h.call("ui.prefs", json!({"ui_scale":0.5}));
+        h.call("ui.key", json!({"key":"Minus","cmd":true}));
+        assert_eq!(h.app.preferences.ui_scale, 0.5);
+        h.call("ui.prefs", json!({"ui_scale":2.5}));
+        h.call("ui.key", json!({"key":"Plus","cmd":true}));
+        assert_eq!(h.app.preferences.ui_scale, 2.5);
+    }
+
+    #[test]
+    fn dragging_the_scale_slider_keeps_its_window_still_until_release() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.prefs", json!({"open":"General"}));
+        let window = crate::scenario::rect_of("prefs:window").unwrap();
+        let slider = crate::scenario::rect_of("prefs:scale").unwrap();
+        let a = pos2(slider.left() + 20.0, slider.center().y);
+        let b = pos2(slider.left() + 90.0, slider.center().y);
+        h.app.synthetic.push(Event::PointerMoved(a));
+        h.app.synthetic.push(Event::PointerButton { pos: a, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.frames(3);
+        h.app.synthetic.push(Event::PointerMoved(b));
+        h.frames(4);
+        assert_ne!(h.app.preferences.ui_scale, 1.0, "the slider changes its value during the drag");
+        assert_eq!(h.ctx.zoom_factor(), 1.0, "layout must remain stable until release");
+        assert_eq!(crate::scenario::rect_of("prefs:window").unwrap(), window);
+        h.app.synthetic.push(Event::PointerButton { pos: b, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        h.frames(5);
+        assert!((h.ctx.zoom_factor() - h.app.preferences.ui_scale).abs() < 1e-4);
+        h.call("ui.prefs", json!({"button":"cancel"}));
+        assert_eq!(h.app.preferences.ui_scale, 1.0, "Cancel restores the original scale");
+        assert_eq!(h.ctx.zoom_factor(), 1.0);
     }
 }

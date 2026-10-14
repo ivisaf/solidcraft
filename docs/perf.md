@@ -1,5 +1,70 @@
 # Design loading
 
+## STEP import: shells and item solids without copies (2026-10-13)
+
+A file that lists one product definition many times (a bolt used 70 times, a panel in several
+assemblies) is imported item by item, and every item's B-rep was deep copied twice before it was
+handed on: once by the caller of `Solid::try_new`, which clones the shells so that the failure
+path still has them, and once by the reader's own cache, which kept the solid for a later item
+that might list the same definition.
+
+`read_item` now runs those four checks (non-empty, connected, closed, no singular vertices) on
+borrowed shells, so a shell that passes is moved into the solid instead of cloned. The reader
+keeps each prepared solid in an `Arc`, and an item counts as *once* when one representation
+lists it and exactly one product-definition walk reaches it: that item's solid is moved out of
+the cache with `Arc::try_unwrap` instead of copied, because no later item can ask for it. The
+walk follows `MAPPED_ITEM` targets too, so an item reached through a mapping in another product's
+node is still converted once - a second conversion would repeat that item's warnings. A file
+whose walk exceeds the work budget (`MAX_CLOSURE_WORK`, 65 536 nodes) falls back wholesale to
+the copying path, as does any file with component occurrences, which walks a definition again per
+instance.
+
+Nothing observable changed. Fifteen fixtures (primitives, a void, a fillet, a revolve, colours,
+centimetre units, 70 duplicates of one definition, a broken file with mappings, a two-instance
+assembly and an expanded one; 99 bodies) give the same import dump - name, path, closed flag,
+file faces, face origin, topology and merged counts, bounding box, volume, area, centroid, paint,
+warnings and tree - apart from the per-feature milliseconds, and all fifteen STEP in/out round
+trips are byte-identical.
+
+Two generated flat STEP files, timed like the table above (same binary pair, no other work
+running); four alternating runs each, two for the 31 MB file:
+
+| File | Baseline peak RSS | Patched peak RSS | Import |
+|---|---:|---:|---:|
+| 2500 boxes, 9.5 MB | 150.1 MB | 145.9 MB | 1.81 s → 1.74 s |
+| 2500 filleted boxes, 31 MB | 428 MB | 433 MB | 70.3 s → 71.0 s |
+
+The first row's ranges do not overlap (150.0-150.6 MB against 145.0-146.0 MB), and the saving is
+the shell copy that is no longer made for every item. The second file's runs land between 422 MB
+and 444 MB either way, so two runs each do not resolve it: there the conversion of the geometry
+dominates the per-item copy. An item that keeps every conversion - an assembly, or a file over the
+work budget - is unchanged.
+
+## Display tessellation plans (#303, 2026-10-12)
+
+`Body::display_mesh` meshes from a `TessPlan` (`crates/kernel/src/tess`): every edge is
+sampled once and both faces use those nodes exactly (watertight by construction); planar
+faces are a constrained Delaunay triangulation of their edge nodes alone; faces bounded by
+their parameter box are structured grids zipped to the edge nodes; other four-cornered faces
+are Coons grids; only genuinely trimmed curved faces (holes, more than four corners) use
+spade's constrained Delaunay with sag and Ruppert refinement. A body the planner cannot
+handle is meshed by truck-meshalgo as before, which also still meshes for modelling
+(booleans, measure, provenance). Evaluating a plan (surface points and normals) runs on the
+CPU (`TessPlan::evaluate`) or in a compute shader (`solidcraft-gpu`).
+
+Release build, Apple M4 Max, medians of five. 400-hole plate (200 × 200 × 5 mm, 806
+faces), `cargo test --release -p solidcraft-gpu bench_plate -- --ignored --nocapture`:
+
+| Tolerance | Reference mesher | Plan | CPU evaluation | GPU evaluation | Triangles (reference / plan) |
+|---|---:|---:|---:|---:|---:|
+| 0.3 mm | 23.3 ms | 11.9 ms | 1.1 ms | 1.1 ms | 20,812 / 20,812 |
+| 0.03 mm | 54.2 ms | 31.6 ms | 2.5 ms | 1.9 ms | 76,812 / 52,812 |
+| 0.006 mm | 118.9 ms | 65.1 ms | 5.3 ms | 3.1 ms | 302,412 / 104,012 |
+
+Planning (edge sampling, parameter projection, triangulation) dominates; evaluation is a
+few milliseconds either way, so GPU evaluation saves little until planning is cheaper. The
+GPU timing includes upload and read-back.
+
 ## Parallel STEP body preparation (2026-10-12)
 
 Profiling an original 48-cylinder STEP fixture before changing the importer measured
@@ -52,6 +117,209 @@ different worker counts: exact display meshes, measures, body/face source identi
 names, colours/opacity, units, rotated assembly placements, duplicates and partial failures
 across the batch boundary. The public analytic/FreeCAD reference suite also checks STEP
 export/import; its current results are reported in docs/oracle.md.
+## Design storage: container and binary payloads (#303, phase one)
+
+Design containers avoid formatting/parsing imported mesh coordinates as JSON numbers.
+The metadata serializer replaces embedded fields before creating JSON values, without
+cloning the full document or duplicating its schema. Binary coordinates retain `f64`
+precision, indices retain `u32`, and SHA-256 deduplicates identical payloads. The reader
+checks archive budgets, CRCs, hashes, exact lengths, finite coordinates and index bounds.
+
+Reproduce the storage measurements with an optimized `ci` IO test executable:
+
+```sh
+cargo test -p solidcraft-io --profile ci benchmark_ -- --ignored --nocapture --test-threads=1
+```
+
+The benchmarks generate an original 100,000-vertex/100,000-triangle mesh and a STEP
+containing 512 disjoint 10 mm boxes. Fixtures are written under `CARGO_TARGET_DIR`
+(or the crate's `target` directory). Each compares nine encoding/decoding samples;
+atomic-save samples include encoding, temporary-file flush, replacement and `.bak`
+creation and alternate JSON/container ordering. Documents are compared after decoding.
+These are storage measurements, separate from timeline evaluation or first-frame latency.
+
+On Windows x64, based on upstream `e6e0a7e` before STEP parallelism (#312), three
+consecutive optimized runs without concurrent compilation gave
+the following medians of the three nine-sample medians (milliseconds, fast mode):
+
+| Fixture / operation | JSON | Container |
+|---|---:|---:|
+| Mesh size, bytes | 15,139,115 | 3,600,828 |
+| Mesh encode | 23.336 | 6.094 |
+| Mesh decode | 57.175 | 2.962 |
+| Mesh atomic save | 52.924 | 14.856 |
+| STEP size, bytes | 1,998,793 | 1,950,056 |
+| STEP encode | 1.507 | 1.473 |
+| STEP decode | 1.479 | 1.318 |
+| STEP atomic save | 7.213 | 7.087 |
+
+Three alternating fresh-process `solidcraft-cli bench-open` runs of each STEP encoding
+returned the same 512 bodies and 6,144 triangles. Median read-plus-parse was 2.274 ms
+for JSON and 2.151 ms for the container; median evaluation was 218.559/236.915 ms and
+display meshing 203.160/197.790 ms respectively. Geometry dominates and these variable
+results do not establish an end-to-end STEP opening improvement. Fresh processes do
+not imply a cold operating-system file cache, and these are not desktop first-frame times.
+
+Fast mode stores STEP and mesh payloads directly. Explicit `"compression":"compact"`
+compresses them at Deflate level one; it is a space/CPU tradeoff. In the initial
+512-box STEP experiment, compression reduced 1,998,793 JSON bytes to 578,659 package
+bytes but increased median encoding from 1.68 to 5.02 ms and decoding from 1.76 to
+4.18 ms. That regression is why compression is not the default. PNG/JPEG are stored
+directly in either policy; small parametric metadata uses Deflate level one.
+
+Plain JSON remains a supported Save As/export format; `.json` saves keep JSON and
+scripts may explicitly select either format. The CLI detects packages before attempting
+JSON parsing. Desktop/browser recovery and browser downloads also use the container.
+See [the versioned container format](design-container.md) for layout and bounds.
+
+This phase does not restore evaluated B-reps, skip STEP import, or make cold geometry
+rebuilds instant. A matching cache key is not enough to trust unvalidated geometry.
+The native B-rep increment described below supplies provisional display, not editable
+session restoration. It is separate from #287's import parallelism.
+
+## Opt-in mesh preview measurements (#303, phase one)
+
+The phase-one desktop implementation can show an experimental saved picture while the file worker rebuilds geometry.
+It requires an explicit `preview: true` engine Save/Save As call. Ordinary saves omit
+display meshes to avoid the measured overhead; these measurements predate native B-rep caching.
+The cache contains only already warm evaluated display meshes, capped at 8 MiB, 1,024
+bodies and 100,000 triangles. Larger or cold models save without it. Cached geometry is
+never used for editing, measurements or picking. Source/document fingerprints and
+payload validation reject stale or malformed caches; cancellation and document/revision
+checks prevent a background result from replacing newer work.
+
+The cached picture is prepared on the file worker from the same file snapshot as the
+normal Open command. It adds work before reconstruction, rather than bypassing it, so
+measure preview readiness and full editing readiness separately. Cached display also
+adds file size and save work; the storage-only results above exclude that optional data.
+
+For an engine-level save benchmark, first generate the original 512-box STEP fixture
+with the ignored IO benchmark, then run the warmed-session benchmark:
+
+```sh
+cargo test --workspace --profile ci benchmark_step_storage -- --ignored --nocapture --test-threads=1
+cargo test --workspace --profile ci benchmark_warm_design_save_with_preview -- --ignored --nocapture --test-threads=1
+```
+
+Set `CARGO_TARGET_DIR` to the workspace's absolute target directory in both commands.
+The engine benchmark alternates nine JSON/container atomic saves, includes the optional
+display cache, and verifies both preview decoding and authoritative document identity.
+Three runs on Windows, with no concurrent build or test suite, measured median atomic
+JSON saves of 7.679/7.610/7.630 ms and container-with-preview saves of
+10.319/10.633/10.541 ms. Preview decoding took 0.964/0.961/1.130 ms; the container
+was 2,510,490 bytes. This optional preview costs save time on this STEP fixture.
+An actual desktop sensor-enclosure opening on e8a8e0f prepared its saved picture in
+24.320 ms; geometry reconstruction, display warmup and thumbnail preparation took
+8,913.212 ms. The same preview experiment is now explicitly opt-in; full geometry
+readiness still requires reconstruction.
+For actual desktop opening phases, launch with `SOLIDCRAFT_PROFILE_OPEN=1`: `ready_ms`
+reports saved-picture preparation, while the normal phase log reports reconstruction,
+display warmup and thumbnail completion. Neither log measures the exact GPU first frame.
+
+## Native cache opening (#303)
+
+The portable native B-rep cache is opt-in with `cache: true` on warm container
+saves, without duplicating display meshes. Ordinary saves and browser downloads
+default to `cache: false`: the measurements below do not justify imposing the
+additional save time and file size on every design. Desktop Open reads metadata and
+optional geometry through a seekable file, produces a bounded provisional picture,
+then resolves original sources and reconstructs the complete session before editing.
+This improves the opportunity for early display, not the cost of authoritative feature
+evaluation. An absent, invalid or incompatible cache uses the original reconstruction.
+Browser OPFS/downloads share the format; browser opening still rebuilds synchronously.
+
+The reproducible engine benchmarks separate atomic saving, provisional mesh readiness,
+reconstruction and final display-mesh readiness:
+
+```sh
+cargo test -p solidcraft-io --profile ci benchmark_step_storage -- --ignored --nocapture --test-threads=1
+cargo test -p solidcraft-engine --profile ci benchmark_native_cache_save -- --ignored --nocapture --test-threads=1
+cargo test -p solidcraft-engine --profile ci benchmark_native_cache_open -- --ignored --nocapture --test-threads=1
+```
+
+Use an absolute `CARGO_TARGET_DIR`. The save benchmark defaults to the generated
+512-box STEP document and accepts `SOLIDCRAFT_BENCH_FILE` for another public design.
+It alternates nine saves of each encoding, including flush/replacement/backup, and
+verifies document identity and native-cache presence. It never times initial fixture
+evaluation as save work. Open runs once per process; `SOLIDCRAFT_BENCH_ENCODING`
+selects 0=JSON, 1=container without cache, 2=native cache, 3=compact native cache.
+Changing only `cache/key.json`'s application version provides a cache-miss control.
+Fresh processes do not imply a cold operating-system file cache. The engine callback
+time is provisional mesh readiness, not a rendered desktop frame; use the desktop
+profile log and actual screenshots to check the saved picture and completed model.
+
+Measured 2026-10-13 on Windows 11, Ryzen AI MAX+ 395 (16 cores/32 threads), `ci`
+profile, with the neutral codec revision `75381fa`, envelope `SCBREP03`, producer
+`solidcraft-truck-adapter/2`, and opening integration revision `3243422` on upstream `2880525`
+(0.6.0). These replace the earlier prototype measurements. They compare encodings
+on the same code and do not attribute upstream modelling improvements to the cache.
+Runs started after local builds and the complete CI suite finished; ordinary
+desktop activity remained. Save values are medians of nine alternating atomic
+saves. Open values are medians of five fresh processes per encoding, alternating
+forward/reverse order. Memory is each process's peak working set from Windows
+`GetProcessMemoryInfo`, sampled every 10 ms, then the median across those five
+processes; it excludes a desktop window/GPU.
+
+The original STEP fixture is a 32 by 16 array of 10 mm cubes, 12 mm apart, exported
+by SolidCraft: 512 bodies and 6,144 final triangles. Its JSON embeds about 2 MB of
+STEP. Every encoding reopens without feature errors and with those same counts.
+
+| STEP encoding | Bytes | Atomic save, ms |
+|---|---:|---:|
+| JSON | 1,998,826 | 12.616 |
+| Container, no cache | 1,950,084 | 10.516 |
+| Native cache, fast | 4,694,035 | 47.755 |
+| Native cache, compact | 837,067 | 44.015 |
+
+| STEP encoding | Provisional mesh, ms | Reconstructed, ms | Final meshes, ms | Peak working set, MiB |
+|---|---:|---:|---:|---:|
+| JSON | none | 175.842 | 748.911 | 40.102 |
+| Container, no cache | none | 175.885 | 722.306 | 40.504 |
+| Native cache, fast | 62.099 | 228.794 | 747.976 | 40.883 |
+| Native cache, compact | 65.981 | 235.403 | 762.120 | 40.918 |
+| Native cache miss | none | 169.039 | 647.617 | 40.453 |
+
+The public `examples/acceptance/sensor_enclosure.json` script, saved as a JSON
+design, has 21 features, two bodies and 4,364 final triangles on this revision.
+
+| Sensor enclosure encoding | Bytes | Atomic save, ms |
+|---|---:|---:|
+| JSON | 52,281 | 5.243 |
+| Container, no cache | 5,545 | 4.969 |
+| Native cache, fast | 379,095 | 12.646 |
+| Native cache, compact | 72,603 | 14.111 |
+
+| Sensor enclosure encoding | Provisional mesh, ms | Reconstructed, ms | Final meshes, ms | Peak working set, MiB |
+|---|---:|---:|---:|---:|
+| JSON | none | 3,979.063 | 3,984.593 | 70.438 |
+| Container, no cache | none | 4,038.127 | 4,042.006 | 71.789 |
+| Native cache, fast | 241.541 | 4,269.124 | 4,274.272 | 70.465 |
+| Native cache, compact | 236.739 | 4,271.254 | 4,275.159 | 70.148 |
+| Native cache miss | none | 4,136.517 | 4,140.903 | 69.941 |
+
+Native display is available earlier, at the cost of encoding, file size and work
+before reconstruction. It does not make the full design editable earlier, and
+these results do not establish a memory reduction. Final-mesh readiness varied
+from 611 to 856 ms for STEP and 3.84 to 4.60 s for the enclosure; small differences
+in full-opening medians should not be read as modelling speedups. Compact storage
+reduces this STEP example's size and atomic-save time, but costs slightly more save
+time on the enclosure. The default `cache: false` retains the phase-one save path;
+`compression: "compact"` is an explicit space/CPU choice. Larger or unsupported
+geometry can exceed the documented budgets and reopen without a provisional image.
+
+A separate desktop check used a fresh 0.6.0 application process for each enclosure
+encoding, with no local compilation or test suite running. The native cache's
+provisional picture was prepared at 429 ms and captured visibly during opening;
+the completed model was adopted in 6.48 s. JSON had no provisional picture and
+completed in 6.08 s. These are single visual checks, not repeated timing medians;
+the worker reported 6.10/5.66 s respectively, and external observations include
+UI scheduling and screenshot requests. During native opening, 94 control-channel
+inspections had a median round trip of 20.8 ms and a maximum of 106.5 ms (JSON:
+95 inspections, 20.3/36.9 ms). The provisional picture is explicitly labelled as
+being checked before editing; the final frame shows the rebuilt Case and Lid and
+their editable feature timeline. This demonstrates early feedback, not faster
+completion of feature evaluation or a worst-case UI-latency guarantee.
+
 ## Analytic extrusion source preparation
 
 New-body extrusion certificates now prepare the sketch's bounded analytic segments once
@@ -235,7 +503,7 @@ each body is identified by the evaluation that produced it (bodies a feature pas
 unchanged keep their identity). The same feature on the same inputs is never evaluated twice:
 setting a value back, undo, redo, a preview followed by the same command, and the repeated
 evaluations while a script builds the design all reuse earlier results. The cache is shared by a
-model and its copies (previews, scratch sessions) and keeps the last 4096 results.
+model and its copies (previews, scratch sessions), and keeps the last 4096 results within 64 MiB.
 
 An edit still recomputes the edited feature and every later feature whose starting model
 changed; in these parts every later feature works on the edited body, so early edits recompute
@@ -246,6 +514,87 @@ can still recompute (oracle 61, 62): solving the sketch moves its points by roun
 its inputs are not exactly the old ones. Oracle 59's first parameter edit fails (a recipe
 expression the bench's `* 1.02` can't scale) and is left out.
 
+
+## Prism pairs, body measurements and the evaluation cache budget (2026-10-13)
+
+A design whose features repeat one shape (a hole pattern, a plate cut by many tools, a part built
+by one growing body) pays several per-feature costs that a rebuild was paying again and again.
+
+**A body's size is measured once, not once per call.** Every kernel tolerance is a fraction of
+the body's bounding-box diagonal, and `Body::size()` walked every vertex of the solid to work it
+out. `Body::new` already reads those vertices to orient the body, so it keeps the diagonal it
+measured there; a body built by hand, or a mesh body, still measures once.
+
+**The same volume is not measured twice.** A boolean measures both operands' volumes to bound its
+result, and the body it returns becomes the next feature's operand, so a timeline of *n* cuts
+meshed every intermediate body twice. `Body::volume_at(tol)` keeps the last measurement for the
+solid, shared by its clones (they share the solid), and the bounds ask at the same tolerance every
+time.
+
+**A prism pair is decided in 2D before either operand is meshed.** The general boolean builds a
+refined mesh of both operands before it can decide anything, and that mesh is most of its cost: a
+pattern, or a sketch with several profiles, rebuilds the whole target's mesh once per tool. A
+plate and a tool through it are prisms along one direction, which `prism::prism_boolean` decides
+exactly from their 2D sections - and that route ran *after* the meshes. A cut or an intersection
+now asks it first and returns without building them. A pair the route cannot answer takes the old
+path unchanged, meshes and all; a union still asks after the sampled shortcut. One answer is sent
+back to that shortcut on purpose: when the 2D route returns one of its operands (a tool that
+misses its target, or covers it whole), the sampled path returns that very body, so an untouched
+body keeps its identity in the timeline (`ops::prism_fast_path_tests`).
+
+**A placement reads its orientation from its matrix.** Placing a body (a pattern instance, an
+aligned copy) used to mesh the whole copy to decide which way its faces point and to count the
+faces its coarse mesh misses. A rigid placement leaves both as they were; a mirrored one (a
+negative determinant) turns the solid inside out. Both are now read from the matrix, so only the
+geometry is transformed.
+
+**The evaluation cache is bounded by the bytes it keeps.** It held the last 4096 results, and a
+result is as big as the model it holds, so a long editing session kept every superseded state:
+nothing dropped the entries nothing referred to any more. It now also holds at most 64 MiB, oldest
+first, and always keeps the newest result, so a single evaluation is never thrown away in the same
+breath.
+
+Release `solidcraft-cli`, `eval <design> --quiet`, wall time of the whole process and peak RSS
+from `/usr/bin/time -v`, alternating the baseline and patched binaries, median of 12 runs each
+(8 for the 400-hole plate and the vent plate), no other build or test running (Fedora Linux, AMD
+Ryzen 7 5700X, 8 cores / 16 threads, 32 GB):
+
+| Design | Baseline | Patched | Change | Baseline peak RSS | Patched peak RSS |
+|---|---:|---:|---:|---:|---:|
+| 400 × 400 × 6 mm box, one sketch with 100 circles cut through it | 1.24 s | 0.83 s | -33% | 151 MB | 119 MB |
+| The same plate with 400 circles in the sketch | 5.67 s | 4.04 s | -29% | 556 MB | 481 MB |
+| Vent plate, a 10 × 8 pattern of one cut | 0.10 s | 0.08 s | -20% | 22 MB | 22 MB |
+| 14 × 14 pattern of a filleted box (196 copies) | 6.70 s | 6.52 s | -2.6% | 67 MB | 67 MB |
+| 60 sketches, 60 extrudes into one growing body | 8.80 s | 8.88 s | +0.9% | 225 MB | 225 MB |
+| `examples/acceptance/sensor_enclosure.json` | 3.81 s | 3.30 s | -13% | 198 MB | 196 MB |
+
+The hole plates are what the prism route is for: one boolean whose tool is a prism with 100 or 400
+sections, in a sketch with that many circles, so the tool's mesh alone is what the route saves.
+A variant of the patched tree with the route asked in the old order - after the operands' meshes -
+timed the 100-hole plate at 1.27 s and 157 MB (range 1.22-1.30 s), the baseline's own numbers
+(1.25 s and 156 MB over the same runs, range 1.21-1.33 s). The two plate rows, and the peak they
+lose, are the prism route.
+
+The last three designs are the other side: their booleans are not that case. The 196-copy design
+and the 60-sketch design are within 2.6% and 0.9% with overlapping ranges. The sensor enclosure's
+medians differ by 13%, but its runs land anywhere between 3.0 s and 5.0 s and the two ranges
+overlap (3.01-4.97 s against 3.00-4.89 s), so its row is not a result either way and is left as
+measured. The body measurements, the placement and the cache budget are not what these rows
+measure: they stop work the corpus repeats too rarely to see (a hidden vertex walk, an operand
+meshed twice for one number, an orientation mesh per placement, a cache with no byte bound).
+
+No model changed. The evaluation dump of 21 designs (10 to 400 circles in a plate, 16 × 16 to
+31 × 31 box grids with and without fillets, 2500-body grids, assemblies of 40 to 500 bodies, 30 and
+60 sketches, a 196-instance pattern, the bundled sample and the sensor enclosure) is the same model
+before and after - bodies, volumes, areas, centres, bounding boxes, topology counts and warnings -
+apart from the per-feature milliseconds. The
+kernel's test suite passes, including four new tests for the prism route and its identity rule.
+
+Reproduce after compiling a release build, without other builds running: time
+`target/release/solidcraft-cli eval <design> --quiet` with `/usr/bin/time -v`, alternating the
+baseline and patched binaries, and compare the middle of the runs. The corpus (20 generated designs:
+hole plates, box grids, assemblies, many-sketch parts) and the measuring scripts are in
+https://github.com/sahenjp/solidcraft-perf under `perf/`.
 
 ## Desktop loading and recent thumbnails (2026-10-10)
 
@@ -333,3 +682,50 @@ eliminated. A live frame's held solve was already cheap: the seed places the str
 returns at once. Of a live strip frame, the seed reads the constraints in about 0.15 ms, so a
 per-gesture cache of that reading is not worth its invalidation (its signs depend on the
 reference positions, which change every step).
+
+## Portable thumbnail save cost (#303)
+
+Portable thumbnail generation requires explicit `cache: true`. Ordinary saves and
+browser downloads default to `cache: false`, so they incur none of the thumbnail
+work or added bytes measured below.
+
+Measured 2026-10-13 on the same Windows machine and `ci` profile as above, but
+with **SolidCraft 0.7.0** on both sides: `d3d215b` before the thumbnail change and
+thumbnail revision `e180cdc` after it. These measurements precede the integration
+of upstream `9f88537`; later geometry changes are not included in these timings.
+A preserved executable of the baseline
+and the new executable ran the existing `benchmark_native_cache_save` on the same
+STEP and sensor documents. Three paired batches alternated before/after order;
+each batch performed nine alternating atomic saves per encoding. The values below
+are medians of the three batch medians, not a percentile of all individual saves.
+No compilation, test suite or desktop model was running during these measurements.
+
+| 512-cube STEP encoding | Before PNG (ms) | After PNG (ms) | Container bytes before → after |
+|---|---:|---:|---:|
+| Plain JSON | 10.334 | 9.676 | 1,998,826 → 1,998,826 |
+| Container, `cache: false` | 8.850 | 9.013 | 1,950,084 → 1,950,084 |
+| Native cache, fast | 45.323 | 53.473 | 4,694,035 → 4,720,385 |
+| Native cache, compact | 42.739 | 48.643 | 837,067 → 863,417 |
+
+The PNG itself is 25,916 bytes; its key and ZIP records bring the increase to
+26,350 bytes. Fast-cache batch medians ranged from 41.585–47.779 ms before and
+53.212–56.556 ms after. Compact ranged from 36.672–43.040 ms before and
+47.688–51.724 ms after. The approximately 8 ms fast-save increase is a measured
+cost on this example, not a general latency bound. JSON bytes and document/source
+blob bytes were compared across both implementations and remained identical.
+
+The sensor enclosure deliberately receives **no portable PNG**: its projected
+triangle boxes total 4,293,457 supersampled pixels, above the four-million work
+budget. The native fast container remains 379,099 bytes. Its save batch medians
+are 14.714 ms before (12.187–14.956) and 13.728 ms after (13.439–14.648); these
+vary within the observed run ranges and do not establish a speedup. Home retains
+its existing thumbnail-generation fallback for this case. A small triangle count
+alone does not guarantee eligibility, because large overlapping faces cost more.
+
+Actual desktop check: copy the STEP container to a new public temporary path,
+start SolidCraft 0.7.0 with that path in Recent and an empty local thumbnail cache,
+and show Home without opening the design. The portable picture was ready in one
+observed 47.6 ms check; no local PNG was created and the active document remained
+empty. The screenshot shows the transferred file's picture while built-in sample
+pictures are still loading. This is one functional visual check, not a first-frame
+benchmark. The separate counting-reader regression proves source-blob deferral.

@@ -29,7 +29,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sketch.create", "Create Sketch", create_sketch)
         .at("SOLID", "CREATE")
         .icon("sketch")
-        .params("plane: XY|XZ|YZ | construction plane name or id | {origin, x_dir, y_dir} | {face: [world x,y,z], body?: exact world body, index?: face index, path?: complete occurrence ids, fixed?: bool}; new face attachments require a unique certified source, fixed:true explicitly freezes the selected plane; offset?: expr, project_edges?: bool, name?"),
+        .params("plane: XY|XZ|YZ | construction plane name or id | {origin, x_dir, y_dir} | {face: [world x,y,z], body?: exact world body, index?: face index, path?: complete occurrence ids, fixed?: bool}; new face attachments require a unique certified source (a flat face of a sheet metal body attaches to its panel instead, in the flat pattern's coordinates), fixed:true explicitly freezes the selected plane; offset?: expr, project_edges?: bool, name?"),
     CommandSpec::new("sketch.edit", "Edit Sketch", edit_sketch).noundo().icon("sketch").params("sketch: id or name"),
     CommandSpec::new("sketch.finish", "Finish Sketch", finish_sketch).at("SKETCH", "FINISH SKETCH").icon("finish").enabled(in_sketch).noundo(),
     CommandSpec::new("sketch.line", "Line", draw_line)
@@ -106,7 +106,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!("p0, p1: overall ends, width", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.point", "Point", draw_point).at("SKETCH", "CREATE").icon("point").enabled(in_sketch).params(concat!("point: [x,y], id?", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.dimension", "Sketch Dimension", dimension).at("SKETCH", "CREATE").icon("dimension").key("D").enabled(in_sketch).params(
-        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. Returns measured in unit (mm or deg)",
+        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. Returns measured in unit (mm or deg)",
     ),
     CommandSpec::new("sketch.constraint.horizontal_vertical", "Horizontal/Vertical", c_horizontal_vertical)
         .at("SKETCH", "CONSTRAINTS")
@@ -117,12 +117,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_coincident")
         .enabled(in_sketch)
-        .params("a, b: points, a point and a curve, or two distinct lines (joins their closest endpoints)"),
+        .params("a, b: points, a point and a curve or sketch axis (x / y: the sketch's own axes, unless a curve has that id; an axis becomes a linked construction line on it, reported in created), or two distinct lines (joins their closest endpoints)"),
     CommandSpec::new("sketch.constraint.tangent", "Tangent", c_tangent)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_tangent")
         .enabled(in_sketch)
-        .params("a, b: curves"),
+        .params("a, b: curves or sketch axes (x / y: the sketch's own axes, unless a curve has that id; an axis becomes a linked construction line on it, reported in created)"),
     CommandSpec::new("sketch.constraint.equal", "Equal", c_equal)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_equal")
@@ -132,12 +132,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_parallel")
         .enabled(in_sketch)
-        .params("a, b: lines"),
+        .params("a, b: lines or sketch axes (x / y: the sketch's own axes, unless a curve has that id; an axis becomes a linked construction line on it, reported in created)"),
     CommandSpec::new("sketch.constraint.perpendicular", "Perpendicular", c_perpendicular)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_perpendicular")
         .enabled(in_sketch)
-        .params("a, b: lines"),
+        .params("a, b: lines or sketch axes (x / y: the sketch's own axes, unless a curve has that id; an axis becomes a linked construction line on it, reported in created)"),
     CommandSpec::new("sketch.constraint.fix", "Fix/UnFix", c_fix)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_fix")
@@ -157,12 +157,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_collinear")
         .enabled(in_sketch)
-        .params("a, b: lines"),
+        .params("a, b: lines or sketch axes (x / y: the sketch's own axes, unless a curve has that id; an axis becomes a linked construction line on it, reported in created)"),
     CommandSpec::new("sketch.constraint.symmetry", "Symmetry", c_symmetry)
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_symmetry")
         .enabled(in_sketch)
-        .params("a, b: points, line: symmetry line"),
+        .params("a, b: two points or two curves (lines mirror their ends, circles/arcs their centres); line: symmetry line id, or x / y for the sketch's own axes (a curve with that id wins; an axis becomes a linked construction line on it, reported in created)"),
     CommandSpec::new("sketch.construction", "Normal/Construction", construction)
         .at("SKETCH", "CREATE")
         .icon("construction")
@@ -183,7 +183,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .enabled(in_sketch)
         .params("dimension: constraint id or parameter name; at: [x,y] text centre (sketch coordinates) | reset: true (default place)"),
     CommandSpec::new("sketch.options", "Sketch Palette Options", sketch_options).icon("sketch").params(
-        "sketch?: id|name (default active); any of show_profile, show_points, show_dimensions, show_constraints, show_projected, grid, snap, slice, sketch_3d: bool. Returns them all",
+        "sketch?: id|name (default active); any of show_profile, show_points, show_dimensions, show_constraints, show_projected, show_construction, grid, snap, slice, sketch_3d: bool. Returns them all",
     ),
     CommandSpec::new("sketch.chain", "Chain", chain_cmd)
         .enabled(in_sketch)
@@ -294,7 +294,7 @@ pub(super) fn edit_solved<T>(
             let unsolved = sk.clone();
             #[cfg(test)]
             solve_counts::record(Analysis::Full);
-            let rep = doc.solve_sketch(&vals, &mut sk, &stored)?;
+            let rep = doc.solve_sketch(&vals, &mut sk, &stored, None)?;
             Some(settle(strict, rep, &mut sk, unsolved)?)
         }
     };
@@ -336,7 +336,7 @@ pub(super) fn counted_solve(
 pub(super) fn solve_current(sk: &mut Sketch, doc: &solidcraft_doc::Document) -> Result<SolveReport> {
     let stored = sk.driving_values();
     let (values, _) = doc.param_values();
-    Ok(doc.solve_sketch(&values, sk, &stored)?)
+    Ok(doc.solve_sketch(&values, sk, &stored, None)?)
 }
 
 /// Solves run on this thread by [`counted_solve`] and the edit's own solve: (all of them, those
@@ -401,6 +401,7 @@ pub(super) fn draw(
         let first = sk.points.len();
         let (curves, mut cons) = f(sk, doc)?;
         cons.extend(connect_points(sk, first, p)?);
+        drop_implied_axes(sk, &mut cons);
         Ok((curves, cons))
     })
 }
@@ -452,6 +453,22 @@ pub(super) fn req_parg(sk: &Sketch, p: &Value, k: &str, cmd: &str) -> Result<PAr
 pub(super) fn curve_ref(sk: &Sketch, v: Option<&Value>, cmd: &str, what: &str) -> Result<usize> {
     let id = v.and_then(Value::as_str).ok_or_else(|| bad(cmd, format!("`{what}` must be a curve id")))?;
     sk.curve_index(id).ok_or_else(|| bad(cmd, format!("unknown sketch curve `{id}`")))
+}
+
+/// A line a constraint refers to: a curve id, or `x` / `y` for the sketch's own axes (a curve
+/// with that id wins). An axis becomes the sketch's linked construction line on it
+/// ([`Sketch::sketch_axis_line`]), added on first use and reported in `created`.
+pub(super) fn line_or_axis_ref(sk: &mut Sketch, v: Option<&Value>, cmd: &str, what: &str) -> Result<usize> {
+    let id = v.and_then(Value::as_str).ok_or_else(|| bad(cmd, format!("`{what}` must be a curve id, or x / y for a sketch axis")))?;
+    curve_or_axis(sk, id)?.ok_or_else(|| bad(cmd, format!("unknown sketch curve `{id}` (x and y name the sketch's own axes)")))
+}
+
+/// Curve `id`, or the line of sketch axis `id` (see [`line_or_axis_ref`]); `None` when neither.
+fn curve_or_axis(sk: &mut Sketch, id: &str) -> Result<Option<usize>> {
+    match sk.curve_index(id) {
+        Some(c) => Ok(Some(c)),
+        None => Ok(sk.sketch_axis_line(id)?),
+    }
 }
 
 pub(super) fn point_ref(sk: &Sketch, v: Option<&Value>, cmd: &str, what: &str) -> Result<usize> {
@@ -646,6 +663,8 @@ fn create_sketch_with_plane(s: &mut Session, p: &Value, plane: PlaneRef, interna
     let attachment = s.doc.feature(id).and_then(|feature| match &feature.kind {
         FeatureKind::Sketch { plane, .. } => Some(if face::anchor(plane).is_some() {
             "exact_face"
+        } else if solidcraft_doc::sheet::plane_sheet_face(plane).is_some() {
+            "sheet_face"
         } else if internal_body.is_some() {
             "internal_legacy_face"
         } else {
@@ -803,6 +822,74 @@ fn rect_constraints(sk: &mut Sketch, l: &[usize]) -> Result<Vec<String>> {
     Ok(cons)
 }
 
+/// Whether line `l` being horizontal (`horizontal`) or vertical already follows from another
+/// constraint than `own`: its ends coincide with the ends of a line constrained the same way (a
+/// side two rectangles share), or with two points constrained level (or plumb).
+fn axis_implied(sk: &Sketch, l: usize, horizontal: bool, own: &str) -> bool {
+    let Some(CurveKind::Line { a, b }) = sk.curves.get(l).map(|c| &c.kind) else { return false };
+    let (a, b) = (*a, *b);
+    // Coincident points as one (union-find over the coincident constraints).
+    let mut parent: Vec<usize> = (0..sk.points.len()).collect();
+    let root = |parent: &[usize], mut i: usize| {
+        for _ in 0..parent.len() {
+            match parent.get(i) {
+                Some(&up) if up != i => i = up,
+                _ => break,
+            }
+        }
+        i
+    };
+    for c in &sk.constraints {
+        if let ConstraintKind::Coincident { p, q } = c.kind {
+            let (rp, rq) = (root(&parent, p), root(&parent, q));
+            if rp != rq
+                && let Some(slot) = parent.get_mut(rp)
+            {
+                *slot = rq;
+            }
+        }
+    }
+    let (ra, rb) = (root(&parent, a), root(&parent, b));
+    sk.constraints.iter().filter(|c| c.id != own).any(|c| {
+        let ends = match (&c.kind, horizontal) {
+            (ConstraintKind::Horizontal { l: m }, true) | (ConstraintKind::Vertical { l: m }, false) if *m != l => {
+                match sk.curves.get(*m).map(|c| &c.kind) {
+                    Some(CurveKind::Line { a, b }) => Some((*a, *b)),
+                    _ => None,
+                }
+            }
+            (ConstraintKind::HorizontalPoints { p, q }, true) | (ConstraintKind::VerticalPoints { p, q }, false) => Some((*p, *q)),
+            _ => None,
+        };
+        ends.is_some_and(|(p, q)| {
+            let (rp, rq) = (root(&parent, p), root(&parent, q));
+            rp != rq && ((rp, rq) == (ra, rb) || (rp, rq) == (rb, ra))
+        })
+    })
+}
+
+/// Drawing adds horizontal/vertical only where it is not already implied: a rectangle drawn
+/// onto another's side shares that side's direction through the two coincident corners, so a
+/// second "vertical" there would only be redundant. Drops such constraints among `cons` (the
+/// drawing's own) from the sketch and the list.
+fn drop_implied_axes(sk: &mut Sketch, cons: &mut Vec<String>) {
+    let mut dropped = Vec::new();
+    for id in cons.iter() {
+        let axis = sk.constraints.iter().find(|c| &c.id == id).and_then(|c| match c.kind {
+            ConstraintKind::Horizontal { l } => Some((l, true)),
+            ConstraintKind::Vertical { l } => Some((l, false)),
+            _ => None,
+        });
+        if let Some((l, horizontal)) = axis
+            && axis_implied(sk, l, horizontal, id)
+        {
+            sk.constraints.retain(|c| &c.id != id);
+            dropped.push(id.clone());
+        }
+    }
+    cons.retain(|id| !dropped.contains(id));
+}
+
 /// Which side and corner of an axis-aligned rectangle is which, from its lines and corner
 /// points as `polygon_lines` made them (counter-clockwise from the bottom-left corner), so a
 /// caller can dimension it without inspecting the sketch first.
@@ -837,6 +924,7 @@ fn rect_two_point(s: &mut Session, p: &Value) -> Result<Value> {
         let mut cons = rect_constraints(sk, &l)?;
         mark_construction(sk, &l, p);
         cons.extend(connect_points(sk, first, p)?);
+        drop_implied_axes(sk, &mut cons);
         Ok(((ids_of(sk, &l), cons), rect_names(sk, &l, &pts)))
     })?;
     Ok(rect_result(out, names, info))
@@ -869,6 +957,7 @@ fn rect_center(s: &mut Session, p: &Value) -> Result<Value> {
         }
         mark_construction(sk, &l, p);
         cons.extend(connect_points(sk, first, p)?);
+        drop_implied_axes(sk, &mut cons);
         Ok(((ids_of(sk, &l), cons), rect_names(sk, &l, &pts)))
     })?;
     Ok(rect_result(out, names, info))
@@ -1154,21 +1243,26 @@ fn draw_point(s: &mut Session, p: &Value) -> Result<Value> {
 // ---------------------------------------------------------------------------------------------
 // Constraints
 
-fn constrain(s: &mut Session, p: &Value, cmd: &str, f: impl FnOnce(&Sketch) -> Result<ConstraintKind>) -> Result<Value> {
+fn constrain(s: &mut Session, p: &Value, cmd: &str, f: impl FnOnce(&mut Sketch) -> Result<ConstraintKind>) -> Result<Value> {
     let mut before = None;
+    let mut residual = None;
     let (id, info) = edit(s, p, cmd, true, |sk, _| {
         let k = f(sk)?;
         let rep = solve(&mut sk.clone());
         before = Some(rep.dof);
         let order = entity_order(sk, p);
         let id = add_c(sk, k)?;
-        if let Some((first, second)) = order {
+        residual = residual_of(sk, &id);
+        // A constraint that already holds needs nothing moved (even when both entities are
+        // fully determined: it is then redundant, see `redundancy`).
+        let holds = residual.is_some_and(|r| r <= solidcraft_sketch::CONSISTENT);
+        if let Some((first, second)) = order.filter(|_| !holds) {
             apply_in_order(sk, &rep, &[first], second, cmd)?;
         }
         Ok(id)
     })?;
-    reject_redundant(before, &info, cmd)?;
-    Ok(json!({"constraint": id, "sketch": info}))
+    let by = redundancy(s, p, cmd, before, &info, residual, &id)?;
+    constraint_result(p, cmd, id, info, by, Value::Null)
 }
 
 /// A sketch entity a constraint is applied to.
@@ -1179,7 +1273,7 @@ pub(super) enum Ent {
 }
 
 fn ent(sk: &Sketch, r: &str) -> Option<Ent> {
-    sk.resolve_point(r).map(Ent::Point).or_else(|| sk.curve_index(r).map(Ent::Curve))
+    sk.resolve_point(r).map(Ent::Point).or_else(|| sk.curve_index(r).or_else(|| sk.sketch_axis_curve(r)).map(Ent::Curve))
 }
 
 /// The entities of a two-entity constraint in the order they were picked (`a` then `b`, or
@@ -1312,16 +1406,77 @@ pub(super) fn dof_now(sk: &Sketch) -> usize {
     solve(&mut sk.clone()).dof
 }
 
-/// A constraint that removes no degree of freedom over-constrains the sketch (Fusion refuses
-/// it); the caller's edit is rolled back by returning the error.
-pub(super) fn reject_redundant(before: Option<usize>, info: &Value, cmd: &str) -> Result<()> {
+/// A constraint just added that removes no degree of freedom (`before` → the edit's `info`) is
+/// redundant or a conflict. Redundant when it held where the sketch was before it was added
+/// (`residual`, see [`solidcraft_sketch::constraint_residual`]): what it asks for is already
+/// implied by other constraints, and the solver satisfies it with them. Returns the
+/// constraints that determine it (as "id (Name)"), or `None` when it removes a degree of
+/// freedom. A conflict is refused; the caller's edit is rolled back by returning the error.
+pub(super) fn redundancy(
+    s: &Session,
+    p: &Value,
+    cmd: &str,
+    before: Option<usize>,
+    info: &Value,
+    residual: Option<f64>,
+    cid: &str,
+) -> Result<Option<Vec<String>>> {
     let after = info.get("dof").and_then(Value::as_u64).map(|d| d as usize);
-    if let (Some(b), Some(a)) = (before, after)
-        && a >= b
-    {
-        return Err(bad(cmd, "that would over-constrain the sketch (it is already determined by other constraints)"));
+    let (Some(b), Some(a)) = (before, after) else { return Ok(None) };
+    if a < b {
+        return Ok(None);
+    }
+    if !residual.is_some_and(|r| r <= solidcraft_sketch::CONSISTENT) {
+        return Err(bad(cmd, "that would over-constrain the sketch (it conflicts with what the other constraints already determine)"));
+    }
+    Ok(Some(determined_by(s, p, cmd, cid)))
+}
+
+/// The constraints that already determine constraint `cid` of the target sketch, as
+/// "id (Name)".
+fn determined_by(s: &Session, p: &Value, cmd: &str, cid: &str) -> Vec<String> {
+    let Some(sk) = target_sketch(s, p, cmd).ok().and_then(|id| s.doc.sketch(id).ok()) else { return Vec::new() };
+    let Some(ci) = sk.constraints.iter().position(|c| c.id == cid) else { return Vec::new() };
+    solidcraft_sketch::determined_by(sk, ci)
+        .into_iter()
+        .filter_map(|k| sk.constraints.get(k))
+        .map(|c| format!("{} ({})", c.id, c.kind.name()))
+        .collect()
+}
+
+/// "k3 (Vertical), k9 (Vertical)", or "other constraints" when they are not known.
+pub(super) fn listed(by: &[String]) -> String {
+    if by.is_empty() { "other constraints".to_string() } else { by.join(", ") }
+}
+
+/// A redundant constraint is kept (and shown as redundant) unless the caller asked for
+/// `if_redundant: "refuse"` (drawing-time inferences, which only add what is not already there).
+pub(super) fn keep_redundant(p: &Value, cmd: &str, by: &[String]) -> Result<()> {
+    if str_(p, "if_redundant").is_some_and(|m| m.eq_ignore_ascii_case("refuse")) {
+        return Err(bad(cmd, format!("that would over-constrain the sketch (it is already determined by {})", listed(by))));
     }
     Ok(())
+}
+
+/// The result of a constraint command: the constraint, and whether it is redundant (and what
+/// determines it).
+pub(super) fn constraint_result(p: &Value, cmd: &str, id: String, info: Value, by: Option<Vec<String>>, extra: Value) -> Result<Value> {
+    let mut out = json!({"constraint": id, "sketch": info});
+    if let Some(by) = by {
+        keep_redundant(p, cmd, &by)?;
+        out["redundant"] = json!(true);
+        out["determined_by"] = json!(by);
+    }
+    if let (Some(o), Value::Object(e)) = (out.as_object_mut(), extra) {
+        o.extend(e);
+    }
+    Ok(out)
+}
+
+/// The residual of the constraint `id` where the sketch is now (see
+/// [`solidcraft_sketch::constraint_residual`]).
+pub(super) fn residual_of(sk: &Sketch, id: &str) -> Option<f64> {
+    sk.constraints.iter().position(|c| c.id == id).and_then(|ci| solidcraft_sketch::constraint_residual(sk, ci))
 }
 
 fn c_horizontal_vertical(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1372,15 +1527,18 @@ fn c_coincident(s: &mut Session, p: &Value) -> Result<Value> {
         }
         let aref = p.get("a").and_then(Value::as_str).unwrap_or_default();
         let bref = p.get("b").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`b` must be a point or curve"))?;
-        // A curve picked first and a point second: the point goes onto the curve.
-        if let (None, Some(c), Some(q)) = (sk.resolve_point(aref), sk.curve_index(aref), sk.resolve_point(bref)) {
+        // A curve (or sketch axis) picked first and a point second: the point goes onto it.
+        if sk.resolve_point(aref).is_none()
+            && let Some(q) = sk.resolve_point(bref)
+            && let Some(c) = curve_or_axis(sk, aref)?
+        {
             return Ok(ConstraintKind::PointOnCurve { p: q, c });
         }
         let a = point_ref(sk, p.get("a"), cmd, "a")?;
         if let Some(b) = sk.resolve_point(bref) {
             return Ok(ConstraintKind::Coincident { p: a, q: b });
         }
-        let c = sk.curve_index(bref).ok_or_else(|| bad(cmd, format!("unknown entity `{bref}`")))?;
+        let c = curve_or_axis(sk, bref)?.ok_or_else(|| bad(cmd, format!("unknown entity `{bref}`")))?;
         Ok(ConstraintKind::PointOnCurve { p: a, c })
     })
 }
@@ -1420,20 +1578,27 @@ fn two_curves(sk: &Sketch, p: &Value, cmd: &str) -> Result<(usize, usize)> {
     Ok((curve_ref(sk, p.get("a"), cmd, "a")?, curve_ref(sk, p.get("b"), cmd, "b")?))
 }
 
+/// Two curves where either may be a sketch axis (`x` / `y`, see [`line_or_axis_ref`]).
+fn two_curves_or_axes(sk: &mut Sketch, p: &Value, cmd: &str) -> Result<(usize, usize)> {
+    Ok((line_or_axis_ref(sk, p.get("a"), cmd, "a")?, line_or_axis_ref(sk, p.get("b"), cmd, "b")?))
+}
+
 fn c_tangent(s: &mut Session, p: &Value) -> Result<Value> {
-    constrain(s, p, "sketch.constraint.tangent", |sk| two_curves(sk, p, "sketch.constraint.tangent").map(|(a, b)| ConstraintKind::Tangent { a, b }))
+    constrain(s, p, "sketch.constraint.tangent", |sk| {
+        two_curves_or_axes(sk, p, "sketch.constraint.tangent").map(|(a, b)| ConstraintKind::Tangent { a, b })
+    })
 }
 fn c_equal(s: &mut Session, p: &Value) -> Result<Value> {
     constrain(s, p, "sketch.constraint.equal", |sk| two_curves(sk, p, "sketch.constraint.equal").map(|(a, b)| ConstraintKind::Equal { a, b }))
 }
 fn c_parallel(s: &mut Session, p: &Value) -> Result<Value> {
     constrain(s, p, "sketch.constraint.parallel", |sk| {
-        two_curves(sk, p, "sketch.constraint.parallel").map(|(a, b)| ConstraintKind::Parallel { a, b })
+        two_curves_or_axes(sk, p, "sketch.constraint.parallel").map(|(a, b)| ConstraintKind::Parallel { a, b })
     })
 }
 fn c_perpendicular(s: &mut Session, p: &Value) -> Result<Value> {
     constrain(s, p, "sketch.constraint.perpendicular", |sk| {
-        two_curves(sk, p, "sketch.constraint.perpendicular").map(|(a, b)| ConstraintKind::Perpendicular { a, b })
+        two_curves_or_axes(sk, p, "sketch.constraint.perpendicular").map(|(a, b)| ConstraintKind::Perpendicular { a, b })
     })
 }
 fn c_concentric(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1443,7 +1608,7 @@ fn c_concentric(s: &mut Session, p: &Value) -> Result<Value> {
 }
 fn c_collinear(s: &mut Session, p: &Value) -> Result<Value> {
     constrain(s, p, "sketch.constraint.collinear", |sk| {
-        two_curves(sk, p, "sketch.constraint.collinear").map(|(a, b)| ConstraintKind::Collinear { a, b })
+        two_curves_or_axes(sk, p, "sketch.constraint.collinear").map(|(a, b)| ConstraintKind::Collinear { a, b })
     })
 }
 fn c_midpoint(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1455,7 +1620,7 @@ fn c_midpoint(s: &mut Session, p: &Value) -> Result<Value> {
 fn c_symmetry(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.constraint.symmetry";
     let (ids, info) = edit(s, p, cmd, true, |sk, _| {
-        let l = curve_ref(sk, p.get("line"), cmd, "line")?;
+        let l = line_or_axis_ref(sk, p.get("line"), cmd, "line")?;
         let ra = p.get("a").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`a` must be a point or curve"))?;
         let rb = p.get("b").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`b` must be a point or curve"))?;
         let rep = solve(&mut sk.clone());
@@ -1582,6 +1747,8 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
     let text_at = p.get("text_at").and_then(vec2);
     let driven = bool_(p, "driven").unwrap_or(false);
     let mut before = None;
+    let (mut residual, mut new_id) = (None, String::new());
+    let start = s.doc.clone();
     let ((param, kind_name, current), info) = edit(s, p, cmd, true, |sk, doc| {
         before = Some(dof_now(sk));
         let ent = |r: &str| -> Result<(Option<usize>, Option<usize>)> {
@@ -1738,8 +1905,13 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
         {
             (k, cur) = (ka, ca);
         }
+        // How far the value is from what the geometry measures now: zero for a dimension that
+        // only restates what the sketch already has.
+        let want = vals.get(&pname).and_then(|v| v.to_kind(if is_angle { Kind::Angle } else { Kind::Length }).ok());
+        residual = want.map(|w| (w - cur).abs()).filter(|r| r.is_finite());
         let name = k.name();
         let id = sk.add_constraint(k, Some(pname.clone()))?;
+        new_id = id.clone();
         place_text(sk, &id, text_at);
         Ok((pname, name, measured(is_angle, cur)))
     })?;
@@ -1748,8 +1920,28 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
     if driven {
         return Ok(json!({"param": Value::Null, "driven": true, "type": kind_name, "measured": current.0, "unit": current.1, "sketch": info}));
     }
-    if reject_redundant(before, &info, cmd).is_err() {
-        return Err(bad(cmd, "that dimension would over-constrain the sketch; add it as a driven (reference) dimension with driven: true"));
+    // A dimension the sketch already determines cannot drive it: it is refused, or with
+    // `if_redundant: "driven"` placed as a driven (reference) dimension instead.
+    let by = redundancy(s, p, cmd, before, &info, residual, &new_id)
+        .map_err(|_| bad(cmd, "that dimension conflicts with the sketch: other constraints already determine it with a different value"))?;
+    if let Some(by) = by {
+        if str_(p, "if_redundant").is_some_and(|m| m.eq_ignore_ascii_case("driven")) {
+            s.doc = start;
+            let mut q = p.clone();
+            q["driven"] = json!(true);
+            if let Some(o) = q.as_object_mut() {
+                o.remove("if_redundant");
+                o.remove("value");
+            }
+            let mut out = dimension(s, &q)?;
+            out["redundant"] = json!(true);
+            out["determined_by"] = json!(by);
+            return Ok(out);
+        }
+        return Err(bad(
+            cmd,
+            format!("that dimension is already determined by {}; add it as a driven (reference) dimension with driven: true", listed(&by)),
+        ));
     }
     let v = s.doc.param(&param).map(|p| p.expr.clone()).unwrap_or_default();
     Ok(json!({"param": param, "type": kind_name, "expression": v, "measured": current.0, "unit": current.1, "sketch": info}))
@@ -1999,6 +2191,11 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
     let (d, rep) = edit_solved(s, id, false, |sk, doc| {
         let r = p.get("entity").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`entity` must be a sketch point or curve"))?;
         let e = ent(sk, r).ok_or_else(|| bad(cmd, format!("unknown sketch entity `{r}`")))?;
+        if let Some(link) = super::sketch_create::text_link(sk, r).map(str::to_owned) {
+            let moving = sk.link_points(&link).into_iter().filter_map(|i| sk.point(i).map(|p| (i, p))).collect();
+            super::sketch_create::move_text(sk, &link, to - from, 0.0, Vec2::ZERO, false)?;
+            return Ok((drag::Dragged { reached: 1.0, moving }, Left::Unsolved));
+        }
         // The held solves work on the dimensions' current values (a solved step applies them).
         doc.apply_dimension_values(&doc.param_values().0, sk)?;
         let (d, left) = drag_entity(sk, e, from, to, live);
@@ -2055,6 +2252,7 @@ fn options_json(v: &solidcraft_sketch::SketchView) -> Value {
         "show_dimensions": !v.hide_dimensions,
         "show_constraints": !v.hide_constraints,
         "show_projected": !v.hide_projected,
+        "show_construction": !v.hide_construction,
         "grid": !v.hide_grid,
         "snap": !v.no_snap,
         "slice": v.slice,
@@ -2064,7 +2262,18 @@ fn options_json(v: &solidcraft_sketch::SketchView) -> Value {
 
 fn sketch_options(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.options";
-    let keys = ["show_profile", "show_points", "show_dimensions", "show_constraints", "show_projected", "grid", "snap", "slice", "sketch_3d"];
+    let keys = [
+        "show_profile",
+        "show_points",
+        "show_dimensions",
+        "show_constraints",
+        "show_projected",
+        "show_construction",
+        "grid",
+        "snap",
+        "slice",
+        "sketch_3d",
+    ];
     if let Some(o) = p.as_object()
         && let Some(k) = o.keys().find(|k| *k != "sketch" && !keys.contains(&k.as_str()))
     {
@@ -2087,6 +2296,7 @@ fn sketch_options(s: &mut Session, p: &Value) -> Result<Value> {
         put("show_dimensions", &mut v.hide_dimensions, true);
         put("show_constraints", &mut v.hide_constraints, true);
         put("show_projected", &mut v.hide_projected, true);
+        put("show_construction", &mut v.hide_construction, true);
         put("grid", &mut v.hide_grid, true);
         put("snap", &mut v.no_snap, true);
         put("slice", &mut v.slice, false);
@@ -2120,8 +2330,14 @@ mod rect_tests;
 mod ux_tests;
 
 #[cfg(test)]
+#[path = "sketch_axis_ref_tests.rs"]
+mod axis_ref_tests;
+#[cfg(test)]
 #[path = "sketch_drag_live_tests.rs"]
 mod drag_live_tests;
 #[cfg(test)]
 #[path = "sketch_ids_tests.rs"]
 mod ids_tests;
+#[cfg(test)]
+#[path = "sketch_redundant_tests.rs"]
+mod redundant_tests;

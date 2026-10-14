@@ -1,11 +1,20 @@
-//! File formats. Designs are saved as JSON (`.solidcraft`): the parametric document only, the
-//! model is recomputed on load. Bodies export as STL (binary or ASCII), OBJ, STEP and 3MF; STEP
+//! File formats. Designs use JSON or versioned containers (`.solidcraft`); the authoritative
+//! document rebuilds on load and optional display caches remain provisional. Bodies export
+//! as STL (binary or ASCII), OBJ, STEP and 3MF; STEP
 //! files import as a base feature (see [`step_import_feature`]), 3MF and STL files as mesh bodies
 //! (see [`mesh_import_feature`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod design;
+mod design_metadata;
 mod dxf;
+pub use design::{
+    DesignCompression, DesignContainerReader, DesignGeometry, DesignPreview, THUMBNAIL_SIZE, is_design_container, read_design_file,
+    read_design_geometry, read_design_preview, read_design_thumbnail, read_design_thumbnail_file, write_design_container,
+    write_design_container_with_cache, write_design_container_with_compression, write_design_container_with_preview,
+    write_design_container_with_thumbnail,
+};
 mod legacy_dir;
 pub mod safe_write;
 mod sketch2d;
@@ -14,7 +23,7 @@ mod threemf;
 pub mod vfs;
 
 pub use dxf::{read_dxf, write_dxf};
-pub use legacy_dir::adopt_legacy_dir;
+pub use legacy_dir::{APP_ID, LEGACY_APP_ID, adopt_legacy_dir, legacy_flatpak_path};
 pub use safe_write::{backup_path, write_atomic};
 pub use sketch2d::{Geom2, MAX_DRAWING_BYTES};
 pub use svg::read_svg;
@@ -35,7 +44,10 @@ pub const DESIGN_EXTS: [&str; 2] = [DESIGN_EXT, LEGACY_DESIGN_EXT];
 
 /// Is this a design file name (`.solidcraft`, or the legacy extension), any case?
 pub fn is_design_path(path: &str) -> bool {
-    std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| DESIGN_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| DESIGN_EXTS.iter().chain(["json"].iter()).any(|x| e.eq_ignore_ascii_case(x)))
 }
 /// Largest design file we read.
 pub const MAX_DESIGN_BYTES: usize = 256 << 20;
@@ -185,6 +197,10 @@ pub enum Format {
     Step,
     Iges,
     ThreeMf,
+    /// 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis
+    /// tools (docs/formats/3mf-face-tags.md). Chosen by name only; a
+    /// `.3mf` path alone means [`Format::ThreeMf`].
+    ThreeMfTagged,
     Design,
 }
 
@@ -199,6 +215,7 @@ impl Format {
             "step" | "stp" => Format::Step,
             "igs" | "iges" => Format::Iges,
             "3mf" => Format::ThreeMf,
+            "3mf-tagged" => Format::ThreeMfTagged,
             "solidcraft" | "solvecraft" | "json" => Format::Design,
             _ => return Err(IoError::Format(ext)),
         })
@@ -208,6 +225,11 @@ impl Format {
 /// Fine export mesh for a body (chord tolerance 2e-4 of its size).
 pub fn export_mesh(b: &solidcraft_kernel::Body) -> Result<Mesh> {
     Ok(b.tessellate((b.size() * 2e-4).max(1e-3))?)
+}
+
+/// Distance within which an exported mesh's vertices are welded (STL and 3MF alike).
+fn weld_eps(b: &solidcraft_kernel::Body) -> f64 {
+    (b.size() * 1e-6).max(1e-7)
 }
 
 /// Binary STL of several meshes (one solid).
@@ -280,13 +302,22 @@ pub fn export(state: &ModelState, bodies: &[String], format: Format, name: &str)
         return Err(IoError::Empty);
     }
     Ok(match format {
-        Format::StlBinary | Format::StlAscii | Format::Obj => {
+        Format::StlBinary | Format::StlAscii => {
+            // Each body welded on its own (as for 3MF), so shared vertices are written identically
+            // and the file is closed where faces meet.
+            let meshes: Vec<Mesh> = sel
+                .iter()
+                .map(|b| {
+                    let m = export_mesh(&b.body)?;
+                    let (positions, triangles) = weld(&m.positions, &m.triangles, weld_eps(&b.body));
+                    Ok(Mesh { positions, triangles, ..Mesh::default() })
+                })
+                .collect::<Result<_>>()?;
+            if format == Format::StlBinary { stl_binary(&meshes, name) } else { stl_ascii(&meshes, name).into_bytes() }
+        }
+        Format::Obj => {
             let meshes: Vec<(String, Mesh)> = sel.iter().map(|b| Ok((b.name.clone(), export_mesh(&b.body)?))).collect::<Result<_>>()?;
-            match format {
-                Format::StlBinary => stl_binary(&meshes.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), name),
-                Format::StlAscii => stl_ascii(&meshes.into_iter().map(|(_, m)| m).collect::<Vec<_>>(), name).into_bytes(),
-                _ => obj(&meshes).into_bytes(),
-            }
+            obj(&meshes).into_bytes()
         }
         Format::Step => {
             let bs: Vec<solidcraft_kernel::ExportBody> =
@@ -300,31 +331,44 @@ pub fn export(state: &ModelState, bodies: &[String], format: Format, name: &str)
             let header = solidcraft_kernel::StepHeader { file_name: format!("{name}.igs"), ..Default::default() };
             solidcraft_kernel::iges_export_bodies(&bs, &header)?.into_bytes()
         }
-        Format::ThreeMf => {
-            let objs: Vec<MeshObject> = sel
-                .iter()
-                .map(|b| {
-                    let m = export_mesh(&b.body)?;
-                    let eps = (b.body.size() * 1e-6).max(1e-7);
-                    // Faces with colours of their own tag their triangles.
-                    let paint = b.body.paint();
-                    let mut looks = Vec::new();
-                    let mut by_face = std::collections::HashMap::new();
-                    for f in paint.map(|p| p.faces.as_slice()).unwrap_or_default() {
-                        looks.push((f.color, 1.0 - f.opacity));
-                        by_face.insert(f.face, looks.len() as u32);
-                    }
-                    let tags: Vec<u32> = m.tri_face.iter().map(|f| by_face.get(&(*f as usize)).copied().unwrap_or(0)).collect();
-                    let (positions, triangles, tri_looks) = threemf::weld_tagged(&m.positions, &m.triangles, &tags, eps);
-                    let tri_looks = if looks.is_empty() { Vec::new() } else { tri_looks };
-                    let transparency = 1.0 - paint.map(|p| p.opacity).unwrap_or(1.0);
-                    Ok(MeshObject { name: b.name.clone(), positions, triangles, color: b.body.color(), transparency, looks, tri_looks })
-                })
-                .collect::<Result<_>>()?;
+        Format::ThreeMf | Format::ThreeMfTagged => {
+            let objs: Vec<MeshObject> = sel.iter().map(|b| mesh_object(b, format == Format::ThreeMfTagged)).collect::<Result<_>>()?;
             write_3mf(&objs)?
         }
         Format::Design => return Err(IoError::Format("solidcraft (save the document instead)".into())),
     })
+}
+
+/// A body as a 3MF mesh: welded watertight (T-junctions split), coloured, and with `tagged`
+/// each triangle keeps the B-rep face it came from.
+fn mesh_object(b: &solidcraft_doc::ModelBody, tagged: bool) -> Result<MeshObject> {
+    let m = export_mesh(&b.body)?;
+    let eps = weld_eps(&b.body);
+    // Faces with colours of their own tag their triangles.
+    let paint = b.body.paint();
+    let mut looks = Vec::new();
+    let mut by_face = std::collections::HashMap::new();
+    for f in paint.map(|p| p.faces.as_slice()).unwrap_or_default() {
+        looks.push((f.color, 1.0 - f.opacity));
+        by_face.insert(f.face, looks.len() as u32);
+    }
+    // Weld with each triangle's own index as its tag: the pieces of a split triangle keep it,
+    // and its colour and face follow from it.
+    let n = u32::try_from(m.triangles.len()).map_err(|_| IoError::Invalid("mesh too large".into()))?;
+    let (positions, triangles, origin) = threemf::weld_tagged(&m.positions, &m.triangles, &(0..n).collect::<Vec<_>>(), eps);
+    let face_of = |t: &u32| m.tri_face.get(*t as usize).copied().unwrap_or(0);
+    let tri_looks =
+        if looks.is_empty() { Vec::new() } else { origin.iter().map(|t| by_face.get(&(face_of(t) as usize)).copied().unwrap_or(0)).collect() };
+    let (tri_faces, faces) = if tagged {
+        let tri_faces: Vec<u32> = origin.iter().map(face_of).collect();
+        let most = tri_faces.iter().max().map_or(0, |f| f.saturating_add(1));
+        let faces = u32::try_from(b.body.face_count()).unwrap_or(u32::MAX).max(most);
+        (tri_faces, faces)
+    } else {
+        (Vec::new(), 0)
+    };
+    let transparency = 1.0 - paint.map(|p| p.opacity).unwrap_or(1.0);
+    Ok(MeshObject { name: b.name.clone(), positions, triangles, color: b.body.color(), transparency, looks, tri_looks, tri_faces, faces })
 }
 
 /// STEP assembly of a design with components: a product per component holding its bodies in
@@ -358,6 +402,9 @@ pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<V
 pub fn read_design(bytes: &[u8]) -> Result<Document> {
     if bytes.len() > MAX_DESIGN_BYTES {
         return Err(IoError::Invalid("design file too large".into()));
+    }
+    if is_design_container(bytes) {
+        return design::read(bytes);
     }
     let s = std::str::from_utf8(bytes).map_err(|_| IoError::Invalid("design file is not UTF-8 JSON".into()))?;
     Ok(Document::from_json(s)?)
@@ -551,6 +598,16 @@ mod tests {
         assert_eq!(f.body_names, ["Body1"]);
         assert_eq!(f.body_names.len(), 1);
         assert!(matches!(&f.kind, FeatureKind::Import { file, .. } if file == "My Part.step"));
+        let mut imported = Document::new("Imported STEP round trip");
+        imported.add_feature(f.kind, None).unwrap();
+        let packaged = read_design(&write_design_container(&imported).unwrap()).unwrap();
+        assert_eq!(packaged, imported);
+        let mut rebuilt = Model::new();
+        rebuilt.evaluate(&packaged);
+        assert!(rebuilt.results.iter().all(|r| r.error.is_none()));
+        let state = rebuilt.state();
+        assert_eq!(state.bodies.len(), 1);
+        assert!((solidcraft_kernel::measure(&state.bodies[0].body).unwrap().volume - 6000.0).abs() < 1e-6);
         assert!(step_import_feature(b"ISO-10303-21;", "x.step").is_err());
         assert!(step_import_feature(&[0xff, 0xfe, 0x00], "x.step").is_err());
         assert!(Format::from_name("a.dwg").is_err());
@@ -655,5 +712,81 @@ mod tests {
         assert!(mesh_import_feature(b"PK", "x.3mf").is_err());
         assert!(mesh_import_feature(&[0u8; 84], "x.stl").is_err());
         assert!(is_mesh_path("a.3MF") && is_mesh_path("b.stl") && !is_mesh_path("c.step"));
+    }
+
+    /// Face-tagged 3MF: every triangle carries its B-rep face, every coordinate is the
+    /// tessellation's own `f64`, the bytes are deterministic, and the package stays plain 3MF.
+    #[test]
+    fn tagged_threemf_carries_faces_exactly() {
+        use std::io::Read;
+        let mut doc = Document::new("t");
+        doc.add_feature(
+            FeatureKind::Box {
+                corner: point_expr(Vec3::new(0.1, -0.3, 1.0 / 3.0)),
+                length: "40".into(),
+                width: "30".into(),
+                height: "10".into(),
+                operation: Operation::NewBody,
+            },
+            None,
+        )
+        .unwrap();
+        doc.add_feature(
+            FeatureKind::Fillet {
+                edges: vec![Vec3::new(0.1, -0.3, 5.0 + 1.0 / 3.0)],
+                radius: "4".into(),
+                body: None,
+                style: Default::default(),
+                fit: Default::default(),
+            },
+            None,
+        )
+        .unwrap();
+        let mut m = Model::new();
+        m.evaluate(&doc);
+        let st = m.state();
+        let body = &st.bodies[0].body;
+        let faces = body.face_count();
+        assert_eq!(faces, 7);
+        let bytes = export(&st, &[], Format::ThreeMfTagged, "t").unwrap();
+        assert_eq!(bytes, export(&st, &[], Format::ThreeMfTagged, "t").unwrap(), "deterministic bytes");
+        assert_eq!(Format::from_name("3mf-tagged").unwrap(), Format::ThreeMfTagged);
+        assert_eq!(Format::from_name("part.3mf").unwrap(), Format::ThreeMf);
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_slice())).unwrap();
+        let mut xml = String::new();
+        zip.by_name("3D/3dmodel.model").unwrap().read_to_string(&mut xml).unwrap();
+        assert!(xml.contains(&format!("xmlns:ft=\"{}\"", threemf::FACE_TAGS_NS)), "{}", &xml[..400]);
+        assert!(xml.contains(&format!("ft:faces=\"{faces}\"")));
+        let tris: Vec<&str> = xml.lines().filter(|l| l.trim_start().starts_with("<triangle ")).collect();
+        assert!(!tris.is_empty() && tris.iter().all(|l| l.contains(" ft:face=\"")));
+        let mut seen: Vec<usize> =
+            tris.iter().map(|l| l.split("ft:face=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().parse().unwrap()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, (0..faces).collect::<Vec<_>>(), "every face is tagged");
+        // Coordinates are the tessellation's own values, bit for bit.
+        let exact: std::collections::HashSet<u64> =
+            export_mesh(body).unwrap().positions.iter().flat_map(|p| [p.x, p.y, p.z]).map(|v| (v + 0.0).to_bits()).collect();
+        let attr = |l: &str, k: &str| l.split(&format!(" {k}=\"")).nth(1).and_then(|r| r.split('"').next()).unwrap().parse::<f64>().unwrap();
+        for l in xml.lines().filter(|l| l.trim_start().starts_with("<vertex ")) {
+            for k in ["x", "y", "z"] {
+                assert!(exact.contains(&attr(l, k).to_bits()), "{l}");
+            }
+        }
+        // Any 3MF reader opens it: SolidCraft's own ignores the tags and gets a closed mesh.
+        let f = mesh_import_feature(&bytes, "tagged.3mf").unwrap();
+        let mut d2 = Document::new("m");
+        let id = d2.add_feature(f.kind, Some(&f.name)).unwrap();
+        let mut m2 = Model::new();
+        m2.evaluate(&d2);
+        assert!(m2.result(id).unwrap().error.is_none());
+        assert!(m2.state().bodies[0].body.is_closed_mesh());
+        // The plain export is unchanged: no tags.
+        let plain = export(&st, &[], Format::ThreeMf, "t").unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(plain.as_slice())).unwrap();
+        let mut xml = String::new();
+        zip.by_name("3D/3dmodel.model").unwrap().read_to_string(&mut xml).unwrap();
+        assert!(!xml.contains("ft:"));
     }
 }

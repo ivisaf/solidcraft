@@ -145,29 +145,34 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context, at: Pos2) {
     .scroll([false, true])
     .show(ctx, |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        ui.strong(format!("Redefine Sketch Plane: {name}"));
-        ui.separator();
+        // The wrapped notes below fill the width anyway, so the band may too.
+        let width = ui.available_width();
+        crate::frame::heading(ui, crate::frame::Level::Title, width, |ui| ui.strong(format!("Redefine Sketch Plane: {name}")));
         let saved_plane = match &status {
             FaceAttachmentStatus::Healthy { plane, target, path } => {
                 ui.label(format!("Attached to {} / {}", target.body, path_label(app, path)));
                 Some(*plane)
             }
             FaceAttachmentStatus::Lost { message, repair_plane } => {
-                ui.label(RichText::new("Face attachment lost").color(t.error));
+                ui.label(RichText::new(crate::i18n::tr_label("Face attachment lost")).color(t.error));
                 ui.label(message);
                 if repair_plane.is_some() {
-                    ui.label("The dashed sketch is a saved plane guide. Select a new face to repair the attachment.");
+                    ui.label(crate::i18n::tr_label("The dashed sketch is a saved plane guide. Select a new face to repair the attachment."));
                 } else {
-                    ui.label("The saved author occurrence is missing. Select a valid author placement before rebinding.");
+                    ui.label(crate::i18n::tr_label("The saved author occurrence is missing. Select a valid author placement before rebinding."));
                 }
                 *repair_plane
             }
             FaceAttachmentStatus::Legacy { plane } => {
-                ui.label("Legacy face attachment. Rebinding to a certified face creates an exact attachment.");
+                ui.label(crate::i18n::tr_label("Legacy face attachment. Rebinding to a certified face creates an exact attachment."));
+                *plane
+            }
+            FaceAttachmentStatus::Sheet { plane } => {
+                ui.label("Attached to a flat face of a sheet metal body; it follows that panel when the sheet changes.");
                 *plane
             }
             FaceAttachmentStatus::Fixed { plane } => {
-                ui.label("Sketch plane has no body-face attachment.");
+                ui.label(crate::i18n::tr_label("Sketch plane has no body-face attachment."));
                 *plane
             }
         };
@@ -175,7 +180,7 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context, at: Pos2) {
         if matches!(&status, FaceAttachmentStatus::Lost { repair_plane: None, .. }) {
             let author = app.session.doc.feature(sketch).map(|feature| feature.component);
             let available = author == Some(app.session.active_component);
-            if ui.add_enabled(available, egui::Button::new("Use active author placement")).clicked() {
+            if ui.add_enabled(available, egui::Button::new(crate::i18n::tr_label("Use active author placement"))).clicked() {
                 draft.author_path = Some(app.session.active_occurrence_path.clone().unwrap_or_default());
                 draft.error = None;
             }
@@ -183,7 +188,7 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context, at: Pos2) {
                 ui.label(format!("Author placement: {}", path_label(app, path)));
             }
         }
-        ui.label("Choose a new plane. Sketch geometry and dimensions stay unchanged in its two-dimensional coordinates.");
+        ui.label(crate::i18n::tr_label("Choose a new plane. Sketch geometry and dimensions stay unchanged in its two-dimensional coordinates."));
         ui.horizontal_wrapped(|ui| {
             for plane in ["XY", "XZ", "YZ"] {
                 if ui.button(format!("Use {plane} plane")).clicked() {
@@ -196,20 +201,20 @@ pub fn panel(app: &mut SolveApp, ctx: &egui::Context, at: Pos2) {
                 draft.choose(json!(feature.name), feature.name.clone());
             }
         }
-        if ui.add_enabled(selected.is_some(), egui::Button::new("Reattach selected face")).clicked()
+        if ui.add_enabled(selected.is_some(), egui::Button::new(crate::i18n::tr_label("Reattach selected face"))).clicked()
             && let Some(selection @ Sel::Face { .. }) = &selected
             && let Some(plane) = face_plane(app, selection)
         {
             let label = face_label(app, selection);
             draft.choose(plane, label);
         }
-        if ui.add_enabled(saved_plane.is_some(), egui::Button::new("Use saved fixed plane")).clicked()
+        if ui.add_enabled(saved_plane.is_some(), egui::Button::new(crate::i18n::tr_label("Use saved fixed plane"))).clicked()
             && let Some(plane) = saved_plane
             && let Err(error) = draft.choose_saved_fixed(app, plane)
         {
             draft.error = Some(error);
         }
-        if ui.add_enabled(selected.is_some(), egui::Button::new("Use selected face as fixed plane")).clicked()
+        if ui.add_enabled(selected.is_some(), egui::Button::new(crate::i18n::tr_label("Use selected face as fixed plane"))).clicked()
             && let Some(selection) = &selected
             && let Some(mut plane) = face_plane(app, selection)
         {

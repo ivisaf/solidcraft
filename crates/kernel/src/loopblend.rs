@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use solidcraft_geom::Vec3;
 use truck_modeling::{self as mt, builder};
 
+use crate::blend::too_large;
 use crate::body::{Solid, from_p3, p3, v3};
 use crate::record::Rebuild;
 use crate::{KernelError, Result};
@@ -356,7 +357,7 @@ fn build(
         }
         let p = joint_point(i).ok_or_else(|| unsupported("degenerate loop joint"))?;
         if !crate::blend::extension_fits(f, p, *q, size * 1e-7) {
-            return Err(crate::blend::too_large("the blend is larger than the neighbouring faces"));
+            return Err(too_large("the blend is larger than the neighbouring faces"));
         }
     }
     // The offset arcs must not turn inside out; an arc of exactly the blend's radius shrinks
@@ -371,12 +372,12 @@ fn build(
                     *x = true;
                 }
             } else if toward && a.dist(c) <= r + tol {
-                return Err(crate::blend::too_large("the blend is larger than a corner radius"));
+                return Err(too_large("the blend is larger than a corner radius"));
             }
         }
     }
     if collapsed.iter().all(|x| *x) {
-        return Err(crate::blend::too_large("the blend is larger than a corner radius"));
+        return Err(too_large("the blend is larger than a corner radius"));
     }
     let mut va: Vec<mt::Vertex> = pa.iter().map(|p| builder::vertex(p3(*p))).collect();
     // A collapsed piece starts and ends at one vertex.
@@ -546,11 +547,7 @@ fn build(
                 let along = (from_p3(other.point()) - from_p3(v.point())).dot(target - from_p3(v.point()));
                 let reach = (target - from_p3(v.point())).len2();
                 if along <= reach + tol {
-                    return Err(crate::blend::too_large(if face_side {
-                        "the blend is longer than the next edge"
-                    } else {
-                        "the blend is taller than the walls"
-                    }));
+                    return Err(too_large(if face_side { "the blend is longer than the next edge" } else { "the blend is taller than the walls" }));
                 }
                 let nb = if face_side { va.get(i) } else { vb.get(i) }.ok_or_else(|| KernelError::Failed("joint".into()))?;
                 let slot = seam_ends.entry(e.id()).or_insert_with(|| (e.absolute_clone(), None, None));
@@ -566,7 +563,7 @@ fn build(
         let a = a.unwrap_or_else(|| e.absolute_front().clone());
         let b = b.unwrap_or_else(|| e.absolute_back().clone());
         if from_p3(a.point()).dist(from_p3(b.point())) < tol * 10.0 {
-            return Err(crate::blend::too_large("the blend is longer than the next edge"));
+            return Err(too_large("the blend is longer than the next edge"));
         }
         seam_subst.insert(id, builder::line(&a, &b));
     }

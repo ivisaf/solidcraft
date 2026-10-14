@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use solidcraft_geom::Vec3;
 use truck_modeling::{self as mt, builder};
 
-use crate::blend::{plane_normal, unsupported, vtx};
+use crate::blend::{plane_normal, too_large, unsupported, vtx};
 use crate::body::{Body, Solid, p3, v3};
 use crate::{KernelError, Result, guard};
 
@@ -331,7 +331,7 @@ fn build(cur: &Body, sel_pts: &[(Vec3, f64)], round: bool) -> Result<Body> {
             let check_extension = |q: Vec3, fi: usize| -> Result<Vec3> {
                 let face = faces.get(fi).ok_or_else(|| KernelError::Failed("face".into()))?;
                 if !crate::blend::extension_fits(face, v, q, size * 1e-7) {
-                    return Err(unsupported("a fillet larger than the faces next to it"));
+                    return Err(too_large("a fillet larger than the faces next to it"));
                 }
                 Ok(q)
             };
@@ -465,7 +465,7 @@ fn build(cur: &Body, sel_pts: &[(Vec3, f64)], round: bool) -> Result<Body> {
             let (pa, pb) = (vtx(&a), vtx(&b));
             let orig = vtx(e.absolute_back()) - vtx(e.absolute_front());
             if (pb - pa).dot(orig) <= size * 1e-9 * orig.len() {
-                return Err(unsupported("a fillet larger than the faces next to it"));
+                return Err(too_large("a fillet larger than the faces next to it"));
             }
             let x = builder::line(&a, &b);
             lines.insert((e.id(), f), x.clone());

@@ -57,30 +57,30 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let dir = app.autosave.as_ref().map(|a| a.dir.clone()).or_else(recovery::default_dir);
     let mut act: Option<(Entry, bool)> = None;
     let mut later = false;
-    crate::frame::window(ctx, RichText::new("Recover unsaved design?").strong().size(13.0), crate::frame::Width::Normal)
+    crate::frame::window(ctx, RichText::new(crate::i18n::tr_label("Recover unsaved design?")).strong().size(13.0), crate::frame::Width::Normal)
         .collapsible(false)
         .resizable(false)
         .min_width(420.0)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
-            ui.label("SolidCraft closed before these designs were saved. Their last autosave can be opened.");
+            ui.label(crate::i18n::tr_label("SolidCraft closed before these designs were saved. Their last autosave can be opened."));
             ui.add_space(6.0);
             for e in app.recoverable.iter().take(20) {
                 ui.label(RichText::new(&e.name).strong());
                 let file = e.path.clone().unwrap_or_else(|| "never saved".into());
                 ui.label(RichText::new(format!("{file} · {} features · autosaved {}", e.features, ago(e.saved_at))).small().weak());
                 ui.horizontal(|ui| {
-                    if ui.button("Recover").clicked() {
+                    if ui.button(crate::i18n::tr_label("Recover")).clicked() {
                         act = Some((e.clone(), true));
                     }
-                    if ui.button("Discard").clicked() {
+                    if ui.button(crate::i18n::tr_label("Discard")).clicked() {
                         act = Some((e.clone(), false));
                     }
                 });
                 ui.separator();
             }
             ui.horizontal(|ui| {
-                if ui.button("Later").on_hover_text("Keep them; ask again next launch").clicked() {
+                if ui.button(crate::i18n::tr_label("Later")).on_hover_text("Keep them; ask again next launch").clicked() {
                     later = true;
                 }
             });
@@ -94,14 +94,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 app.recoverable.insert(0, e);
                 return;
             }
-            if app.run("doc.recover", json!({"id": e.id, "dir": dir_s})).is_ok() {
-                // Ours now: autosave it under this app's entry before the old entry goes.
-                let kept = app.autosave.as_mut().map(|a| a.save(&app.session));
-                if let Some(Ok(_)) = kept {
-                    let _ = app.run("doc.recovery_discard", json!({"id": e.id, "dir": dir_s}));
-                }
-                app.set_status(format!("recovered {}: save it to keep it", e.name), false);
-            }
+            // Rebuilt off the window thread like any other file; once it is in, it is
+            // autosaved under this app's entry before the old entry goes.
+            let kind = crate::file_load::Kind::Recover { id: e.id.clone(), dir: dir_s };
+            let _ = crate::file_load::begin_request(app, crate::file_load::Request::new(&e.name, kind));
         } else {
             let _ = app.run("doc.recovery_discard", json!({"id": e.id, "dir": dir_s}));
         }

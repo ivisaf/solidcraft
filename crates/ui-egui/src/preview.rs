@@ -41,8 +41,11 @@ pub struct Built {
     pub error: Option<String>,
     /// Extent of what the preview shows (the view's depth range must cover it).
     pub bounds: Aabb3,
-    /// The radius a fillet used when it reduced one too large for its edges (`fit: reduce`).
-    pub applied: Option<f64>,
+    /// The smallest and largest radius a fillet used when it reduced one too large for its edges
+    /// (`fit: reduce`).
+    pub applied: Option<(f64, f64)>,
+    /// The radius spline of each edge a fillet tapered (`fit: taper`), with a point on the edge.
+    pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
 }
 
 type Job = Result<Built, String>;
@@ -52,6 +55,8 @@ pub struct PreviewState {
     /// Key of the commands whose result (or error) is shown.
     shown_key: Option<u64>,
     running: Option<(u64, Receiver<Job>)>,
+    /// Inputs of an in-flight joint preview, excluding only its driven values.
+    running_motion_key: Option<u64>,
     /// Bodies the preview stands in for (hidden in the model scene).
     pub replaced: Vec<String>,
     /// The preview scene for the GPU and its key (changes whenever the scene does).
@@ -68,16 +73,20 @@ pub struct PreviewState {
     /// Time the last preview took (ms), for `ui.inspect`.
     pub ms: f64,
     started: f64,
-    /// The radius the previewed fillet used when it reduced the one asked for.
-    pub applied: Option<f64>,
+    /// The smallest and largest radius the previewed fillet used when it reduced the one asked for.
+    pub applied: Option<(f64, f64)>,
+    /// The radius splines the previewed fillet tapered its edges with.
+    pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
 }
 
 impl PreviewState {
     fn clear(&mut self) {
         self.running = None;
+        self.running_motion_key = None;
         self.shown_key = None;
         self.error = None;
         self.applied = None;
+        self.tapered.clear();
         self.busy = false;
         if self.active || !self.replaced.is_empty() {
             self.active = false;
@@ -104,18 +113,20 @@ impl PreviewState {
                 self.active = true;
                 self.error = b.error;
                 self.applied = b.applied;
+                self.tapered = b.tapered;
                 self.set_scene(b.scene);
             }
             Err(e) => {
                 self.error = Some(e);
                 self.applied = None;
+                self.tapered.clear();
             }
         }
     }
 
     /// Errors validate only the current inputs. Keep the last good geometry while
     /// computing new inputs, but never let an obsolete result block their Apply.
-    fn poll(&mut self, key: u64) {
+    fn poll(&mut self, key: u64, motion_key: Option<u64>) {
         if self.shown_key != Some(key) {
             self.error = None;
         }
@@ -128,12 +139,44 @@ impl PreviewState {
             };
             if let Some(job) = job {
                 self.running = None;
-                if k == key {
+                let intermediate = motion_key.is_some() && self.running_motion_key == motion_key && matches!(&job, Ok(b) if b.error.is_none());
+                self.running_motion_key = None;
+                // A held slider or animation may advance faster than the worker. Show
+                // completed poses from the same joint setup, then compute the latest.
+                // Errors and results from different setups still require an exact key.
+                if k == key || intermediate {
                     self.apply(k, job);
                 }
             }
         }
     }
+}
+
+/// Joint motion can stream successful intermediate poses while values change. Include
+/// every other input, the document revision and colours so a different joint, changed
+/// limits, feature dialog or document cannot reuse an obsolete pose.
+fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
+    if !cmds.iter().any(|(c, p)| c == "joint.drive" || c == "joint.create" && p.get("values").is_some())
+        || !cmds.iter().all(|(c, _)| matches!(c.as_str(), "joint.drive" | "joint.create" | "joint.as_built" | "joint.edit" | "joint.limits"))
+    {
+        return None;
+    }
+    let mut setup = cmds.to_vec();
+    for (command, params) in &mut setup {
+        if matches!(command.as_str(), "joint.drive" | "joint.create")
+            && let Some(p) = params.as_object_mut()
+        {
+            p.remove("values");
+            if command == "joint.drive" {
+                p.remove("value");
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&setup).ok()?.hash(&mut h);
+    revision.hash(&mut h);
+    format!("{colors:?}").hash(&mut h);
+    Some(h.finish())
 }
 
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
@@ -158,10 +201,12 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     app.session.revision.hash(&mut h);
     format!("{colors:?}").hash(&mut h);
     let key = h.finish();
+    let motion_key = motion_key(&cmds, app.session.revision, colors);
     let pv = &mut app.preview;
-    pv.poll(key);
+    pv.poll(key, motion_key);
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
+        pv.running_motion_key = motion_key;
         let scratch = app.session.scratch();
         spawn(&mut app.preview, key, scratch, cmds, colors);
     }
@@ -229,7 +274,11 @@ pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
             let p = real.map_err(|e| e.to_string())?;
             let mut b = guard(&|| build(&p.before, &p.after, colors))?;
             b.bounds = state_bounds(&p.after);
-            b.applied = p.after.fitted_radii().find(|(id, _)| p.before.fitted_radius(*id).is_none()).map(|(_, r)| r);
+            // The radius a previewed fillet used when it reduced the one asked for (a new
+            // fillet or an edited one: the feature the replies name).
+            let features = || p.replies.iter().filter_map(|r| r.get("feature").and_then(Value::as_u64));
+            b.applied = features().find_map(|id| p.after.fitted_range(id));
+            b.tapered = features().find_map(|id| p.after.tapered(id)).map(<[_]>::to_vec).unwrap_or_default();
             Ok(b)
         }
     }
@@ -266,7 +315,7 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
             }
         }
     }
-    Built { scene: sc, replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None }
+    Built { scene: sc, replaced: Vec::new(), error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
 }
 
 /// The same commands making a new body instead of joining, cutting or intersecting, and the
@@ -274,7 +323,13 @@ fn build_tool(before: &ModelState, after: &ModelState, c: Colors, op: &str) -> B
 fn as_new_body(cmds: &[(String, Value)]) -> Option<(Vec<(String, Value)>, String)> {
     let mut out = cmds.to_vec();
     let mut changed: Option<String> = None;
-    for (_, p) in &mut out {
+    for (command, p) in &mut out {
+        let inner = p.get("command").and_then(Value::as_str).map(str::to_string);
+        // A combine's operation is between bodies that already exist: it has no new-body form
+        // (and no tool body of its own to show).
+        if inner.as_deref().unwrap_or(command.as_str()) == "solid.combine" {
+            continue;
+        }
         let p = if p.get("command").is_some() { p.get_mut("params")? } else { p };
         if let Some(op) = p.get_mut("operation")
             && let Some(o) = op.as_str().filter(|o| *o != "new").map(str::to_string)
@@ -320,7 +375,10 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             continue;
         }
         let nf = am.tri_face.iter().max().map_or(0, |m| *m as usize + 1);
-        let added: Vec<bool> = (0..nf).map(|f| old.as_ref().is_none_or(|bm| face_is_new(&am, f, bm))).collect();
+        let added: Vec<bool> = match &old {
+            Some(bm) => new_faces(&am, nf, bm),
+            None => vec![true; nf],
+        };
         // Material removed from a body (a hole, a pocket): its new faces also show through the
         // body in the cut colour, so the cut is seen from any side.
         let cut = old.as_ref().is_some_and(|bm| am.measure().volume < bm.measure().volume - 1e-6);
@@ -367,37 +425,114 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
             replaced.push(b.name.clone());
         }
     }
-    Built { scene: sc, replaced, error: None, bounds: Aabb3::EMPTY, applied: None }
+    Built { scene: sc, replaced, error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
 }
 
-/// Is face `f` of `m` new surface, i.e. not on the old mesh? Decided by a vote of points on it
-/// (triangle centroids spread over the face).
-fn face_is_new(m: &Mesh, f: usize, old: &Mesh) -> bool {
-    let cents: Vec<Vec3> = m
-        .triangles
+/// Which of the `nf` faces of `m` are new surface, i.e. not on the old mesh? Each is decided by
+/// a vote of points on it (triangle centroids spread over the face). One pass over `m`'s
+/// triangles gathers the centroids, and the old mesh is indexed once, so the cost stays
+/// near-linear however many faces there are (a modeled thread has thousands).
+fn new_faces(m: &Mesh, nf: usize, old: &Mesh) -> Vec<bool> {
+    let mut cents: Vec<Vec<Vec3>> = vec![Vec::new(); nf];
+    for (t, f) in m.triangles.iter().zip(&m.tri_face) {
+        if let (Some(face), Some([a, b, c])) = (cents.get_mut(*f as usize), m.tri(t)) {
+            face.push((a + b + c) / 3.0);
+        }
+    }
+    let index = SurfaceIndex::new(old);
+    cents
         .iter()
-        .zip(&m.tri_face)
-        .filter(|(_, tf)| **tf as usize == f)
-        .filter_map(|(t, _)| m.tri(t))
-        .map(|[a, b, c]| (a + b + c) / 3.0)
-        .collect();
-    if cents.is_empty() {
-        return true;
-    }
-    let step = cents.len().div_ceil(9);
-    let samples: Vec<&Vec3> = cents.iter().step_by(step.max(1)).collect();
-    let off = samples.iter().filter(|p| !on_surface(old, ***p)).count();
-    off * 3 > samples.len()
+        .map(|cents| {
+            let Some(index) = &index else { return true };
+            if cents.is_empty() {
+                return true;
+            }
+            let step = cents.len().div_ceil(9);
+            let samples: Vec<&Vec3> = cents.iter().step_by(step.max(1)).collect();
+            let off = samples.iter().filter(|p| !index.contains(***p)).count();
+            off * 3 > samples.len()
+        })
+        .collect()
 }
 
-/// Does `p` lie on the surface of mesh `m` (within its tessellation tolerance)?
-fn on_surface(m: &Mesh, p: Vec3) -> bool {
-    let bb = m.bounds();
-    let tol = (bb.diagonal() * 2e-3).max(1e-4);
-    if bb.is_empty() {
-        return false;
+/// The triangles of a mesh in a uniform grid, to ask whether a point lies on the surface (within
+/// its tessellation tolerance) by looking only at the triangles near it.
+struct SurfaceIndex {
+    tris: Vec<[Vec3; 3]>,
+    tol: f64,
+    lo: [f64; 3],
+    cell: [f64; 3],
+    res: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl SurfaceIndex {
+    /// Most triangle-in-cell entries the grid may hold; a coarser grid is used beyond it.
+    const BUDGET: usize = 4_000_000;
+
+    /// None for a mesh with no surface.
+    fn new(m: &Mesh) -> Option<SurfaceIndex> {
+        let bb = m.bounds();
+        if bb.is_empty() {
+            return None;
+        }
+        let tol = (bb.diagonal() * 2e-3).max(1e-4);
+        let tris: Vec<[Vec3; 3]> = m.triangles.iter().filter_map(|t| m.tri(t)).collect();
+        let lo = [bb.min.x - tol, bb.min.y - tol, bb.min.z - tol];
+        let ext = [bb.max.x - bb.min.x + 2.0 * tol, bb.max.y - bb.min.y + 2.0 * tol, bb.max.z - bb.min.z + 2.0 * tol];
+        let mut res = ((tris.len() as f64).cbrt().round() as usize).clamp(1, 48);
+        loop {
+            let cell = [ext[0] / res as f64, ext[1] / res as f64, ext[2] / res as f64];
+            let mut index = SurfaceIndex { tris: Vec::new(), tol, lo, cell, res, cells: vec![Vec::new(); res * res * res] };
+            let mut entries = 0usize;
+            'fill: for (i, t) in tris.iter().enumerate() {
+                let (a, b) = index.range(t);
+                for x in a[0]..=b[0] {
+                    for y in a[1]..=b[1] {
+                        for z in a[2]..=b[2] {
+                            entries += 1;
+                            if entries > Self::BUDGET && res > 1 {
+                                break 'fill;
+                            }
+                            if let Some(c) = index.cells.get_mut((x * res + y) * res + z) {
+                                c.push(i as u32);
+                            }
+                        }
+                    }
+                }
+            }
+            if entries <= Self::BUDGET || res == 1 {
+                index.tris = tris;
+                return Some(index);
+            }
+            res /= 2;
+        }
     }
-    m.triangles.iter().filter_map(|t| m.tri(t)).any(|[a, b, c]| point_triangle_dist(p, a, b, c) < tol)
+
+    fn cell_of(&self, v: f64, axis: usize) -> usize {
+        let (lo, cell) = (self.lo.get(axis).copied().unwrap_or(0.0), self.cell.get(axis).copied().unwrap_or(1.0));
+        let k = ((v - lo) / cell).floor();
+        if k.is_finite() { (k.max(0.0) as usize).min(self.res - 1) } else { 0 }
+    }
+
+    /// The cells (inclusive corners) a triangle, grown by the tolerance, touches.
+    fn range(&self, t: &[Vec3; 3]) -> ([usize; 3], [usize; 3]) {
+        let (mut a, mut b) = ([0; 3], [0; 3]);
+        for axis in 0..3 {
+            let c = t.map(|p| [p.x, p.y, p.z][axis]);
+            let (lo, hi) = (c[0].min(c[1]).min(c[2]) - self.tol, c[0].max(c[1]).max(c[2]) + self.tol);
+            a[axis] = self.cell_of(lo, axis);
+            b[axis] = self.cell_of(hi, axis);
+        }
+        (a, b)
+    }
+
+    /// Does `p` lie on the surface?
+    fn contains(&self, p: Vec3) -> bool {
+        let (x, y, z) = (self.cell_of(p.x, 0), self.cell_of(p.y, 1), self.cell_of(p.z, 2));
+        let Some(cell) = self.cells.get((x * self.res + y) * self.res + z) else { return false };
+        cell.iter().filter_map(|i| self.tris.get(*i as usize)).any(|[a, b, c]| point_triangle_dist(p, *a, *b, *c) < self.tol)
+    }
 }
 
 pub fn point_triangle_dist(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f64 {
@@ -430,14 +565,14 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((1, rx));
-        pv.poll(2);
+        pv.poll(2, None);
         assert!(pv.error.is_none(), "the corrected inputs can Apply while their preview computes");
         assert!(pv.running.is_some());
         assert!(pv.active);
         assert_eq!(pv.replaced, ["Turn"]);
         assert_eq!(pv.key, 9, "the last good geometry stays visible");
         tx.send(Err("unknown_angle".into())).unwrap();
-        pv.poll(2);
+        pv.poll(2, None);
         assert!(pv.error.is_none(), "a late obsolete result cannot disable Apply again");
         assert!(pv.running.is_none());
         assert_eq!(pv.shown_key, Some(1));
@@ -446,11 +581,113 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((2, rx));
         tx.send(Err("current invalid expression".into())).unwrap();
-        pv.poll(2);
+        pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"));
         assert_eq!(pv.shown_key, Some(2));
-        pv.poll(2);
+        pv.poll(2, None);
         assert_eq!(pv.error.as_deref(), Some("current invalid expression"), "current errors still prevent invalid Apply");
+    }
+
+    fn pose() -> Built {
+        Built { scene: GpuScene::default(), replaced: vec!["Lid".into()], error: None, bounds: Aabb3::EMPTY, applied: None, tapered: Vec::new() }
+    }
+
+    /// The worker completes while the slider is still held or Play keeps advancing.
+    /// Intermediate successful poses must reach the viewport, and the final value
+    /// must still be computed rather than treating that intermediate pose as current.
+    #[test]
+    fn joint_motion_shows_completed_poses_while_inputs_keep_advancing() {
+        let mut pv = PreviewState::default();
+        for (running, wanted) in [(1, 2), (2, 3), (3, 4)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            pv.running = Some((running, rx));
+            pv.running_motion_key = Some(42);
+            pv.poll(wanted, Some(42));
+            assert!(pv.running.is_some());
+            tx.send(Ok(pose())).unwrap();
+            pv.poll(wanted, Some(42));
+            assert!(pv.active, "motion should be visible before input stops");
+            assert_eq!(pv.replaced, ["Lid"]);
+            assert_eq!(pv.key, running, "every completed pose reaches the scene");
+            assert_eq!(pv.shown_key, Some(running));
+            assert_ne!(pv.shown_key, Some(wanted), "the latest pose still needs a job");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        pv.running = Some((4, rx));
+        pv.running_motion_key = Some(42);
+        tx.send(Ok(pose())).unwrap();
+        pv.poll(4, Some(42));
+        assert_eq!(pv.shown_key, Some(4), "release catches up to the exact final pose");
+        assert!(pv.running.is_none());
+    }
+
+    #[test]
+    fn intermediate_motion_rejects_other_setups_and_obsolete_errors() {
+        for (context, job) in [
+            (None, Ok(pose())),
+            (Some(43), Ok(pose())),
+            (Some(42), Err("old invalid value".into())),
+            (Some(42), Ok(Built { error: Some("old tool preview error".into()), ..pose() })),
+        ] {
+            let mut pv = PreviewState { running_motion_key: Some(42), ..PreviewState::default() };
+            let (tx, rx) = std::sync::mpsc::channel();
+            pv.running = Some((1, rx));
+            tx.send(job).unwrap();
+            pv.poll(2, context);
+            assert!(!pv.active);
+            assert!(pv.error.is_none(), "obsolete errors must not block Apply");
+            assert!(pv.running.is_none());
+        }
+    }
+
+    #[test]
+    fn motion_context_changes_only_when_the_joint_setup_changes() {
+        let commands = |angle| {
+            vec![
+                ("joint.edit".into(), json!({"joint": 1, "flip": true})),
+                ("joint.limits".into(), json!({"joint": 1, "min": "-135 deg", "max": "0 deg"})),
+                ("joint.drive".into(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        let key = motion_key(&commands("-30 deg"), 7, colors());
+        assert!(key.is_some());
+        assert_eq!(key, motion_key(&commands("-60 deg"), 7, colors()));
+        assert_ne!(key, motion_key(&commands("-60 deg"), 8, colors()));
+        let mut different = commands("-60 deg");
+        different[2].1["joint"] = json!(2);
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        different = commands("-60 deg");
+        different[1].1["min"] = json!("-90 deg");
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        different = commands("-60 deg");
+        different[0].1["flip"] = json!(false);
+        assert_ne!(key, motion_key(&different, 7, colors()));
+        let mut other_colors = colors();
+        other_colors.body = [9, 9, 9, 255];
+        assert_ne!(key, motion_key(&commands("-60 deg"), 7, other_colors));
+        assert!(motion_key(&[("solid.extrude".into(), json!({"distance": 10}))], 7, colors()).is_none());
+        for command in ["joint.create", "joint.drive"] {
+            assert_eq!(
+                motion_key(&[(command.into(), json!({"joint": 1, "values": [0]}))], 7, colors()),
+                motion_key(&[(command.into(), json!({"joint": 1, "values": [90]}))], 7, colors()),
+            );
+        }
+    }
+
+    /// Combine previews its result (cut, join or intersect between existing bodies) without an
+    /// error, so its dialog's OK is enabled. Before, the preview also tried the command as a new
+    /// body, which a combine has no form of, and always reported "operation must be join, cut or
+    /// intersect".
+    #[test]
+    fn combine_previews_its_result_without_an_error() {
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 20, "body_name": "Cube"})).unwrap();
+        s.execute("solid.cylinder", &json!({"base": [10, 10, -5], "diameter": 6, "height": 30, "body_name": "Pin"})).unwrap();
+        for op in ["cut", "join", "intersect"] {
+            let cmd = ("solid.combine".to_string(), json!({"target": "Cube", "tools": ["Pin"], "operation": op, "keep_tools": false}));
+            let built = compute(&s, &[cmd], colors()).unwrap_or_else(|e| panic!("{op}: {e}"));
+            assert!(built.error.is_none(), "{op}: {:?}", built.error);
+        }
     }
 
     fn count(bytes: &[u8], stride: usize, col: [u8; 4]) -> usize {
@@ -481,6 +718,59 @@ mod tests {
             s.execute(id, &p).unwrap();
         }
         s
+    }
+
+    /// The surface test the preview used to run per face against every triangle.
+    fn brute_force_on_surface(m: &Mesh, p: Vec3) -> bool {
+        let bb = m.bounds();
+        let tol = (bb.diagonal() * 2e-3).max(1e-4);
+        m.triangles.iter().filter_map(|t| m.tri(t)).any(|[a, b, c]| point_triangle_dist(p, a, b, c) < tol)
+    }
+
+    /// A flat sheet of `n × n` squares, two triangles and one face each, lifted by `z`.
+    fn sheet(n: usize, z: f64) -> Mesh {
+        let mut m = Mesh::default();
+        for i in 0..=n {
+            for j in 0..=n {
+                m.positions.push(Vec3::new(i as f64, j as f64, z));
+                m.normals.push(Vec3::Z);
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let a = (i * (n + 1) + j) as u32;
+                let (b, c, d) = (a + 1, a + n as u32 + 1, a + n as u32 + 2);
+                m.triangles.extend([[a, c, d], [a, d, b]]);
+                m.tri_face.extend([(i * n + j) as u32; 2]);
+            }
+        }
+        m
+    }
+
+    /// The grid answers as a scan of every triangle does, inside, beside and far from the mesh.
+    #[test]
+    fn surface_index_matches_a_scan() {
+        let m = sheet(12, 0.0);
+        let index = SurfaceIndex::new(&m).unwrap();
+        for k in 0..2000 {
+            let f = k as f64;
+            let p = Vec3::new((f * 0.37).rem_euclid(15.0) - 1.5, (f * 0.61).rem_euclid(15.0) - 1.5, ((f * 0.13).rem_euclid(1.0) - 0.5) * 0.05);
+            assert_eq!(index.contains(p), brute_force_on_surface(&m, p), "{p:?}");
+        }
+        assert!(SurfaceIndex::new(&Mesh::default()).is_none());
+    }
+
+    /// Thousands of faces (a modeled thread's) are classified at once, not face by face against
+    /// every triangle: filleting beside a thread froze the app for minutes.
+    #[test]
+    fn many_faces_are_classified_quickly() {
+        let started = std::time::Instant::now();
+        let n = 120;
+        let (old, same, lifted) = (sheet(n, 0.0), sheet(n, 0.0), sheet(n, 5.0));
+        let nf = n * n;
+        assert!(new_faces(&same, nf, &old).iter().all(|new| !new), "faces on the old surface are not new");
+        assert!(new_faces(&lifted, nf, &old).iter().all(|new| *new), "faces off the old surface are new");
+        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
     }
 
     /// A fillet preview stands in for the body: the round face is new, the rest is kept, and the
