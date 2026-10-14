@@ -216,9 +216,18 @@ fn operations_from_picked_faces_take_their_heights_from_the_model() {
     let contour = run(&mut s, "cam.op.contour", with(json!({"faces": [{"body": "Body1", "point": [5, 5, 0]}], "stepdown": 3})));
     close(contour["lowest_z"].as_f64().unwrap(), -10.0, 1e-9);
     close(contour["cut_length"].as_f64().unwrap(), 4.0 * (200.0 + 6.0 * std::f64::consts::PI) + 12.0, 1e-3);
+    // A round opening too big for the drill is a pocket's, not a hole: a 16 mm counterbore in the top face.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Bore"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [52, 30], "radius": 8}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Bore", "distance": 2, "direction": "negative", "operation": "cut"}));
     // Its one round hole is drilled from the top through the plate: 2 → −10.
     let drill = run(&mut s, "cam.op.drill", json!({"faces": [{"point": [5, 5, 0]}], "tool": 2, "spindle_rpm": 3000, "feed": 150}));
     close(drill["cut_length"].as_f64().unwrap(), 12.0, 1e-9);
+    let big = json!({"number": 3, "kind": "drill", "diameter": 3});
+    run(&mut s, "cam.tool.define", big);
+    let small = s.execute("cam.op.drill", &json!({"faces": [{"point": [5, 5, 0]}], "tool": 3, "spindle_rpm": 3000, "feed": 150}));
+    assert!(small.unwrap_err().to_string().contains("no round holes a 3 mm drill can make"));
     let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
     assert!(gcode.contains("G0 X5 Y35\n"), "{gcode}");
 

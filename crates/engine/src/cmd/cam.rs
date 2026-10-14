@@ -755,12 +755,12 @@ fn outline(geom: &[LinkGeom]) -> std::result::Result<Region2, String> {
     Ok(Region2 { outer, holes: loops })
 }
 
-/// The centre of a loop that is one circle.
-fn circle_centre(lp: &Loop2) -> Option<Vec2> {
+/// The centre and radius of a loop that is one circle.
+fn round_hole(lp: &Loop2) -> Option<(Vec2, f64)> {
     let Some(Seg2::Arc { center, radius, .. }) = lp.segs.first().copied() else { return None };
     let same = |s: &Seg2| matches!(*s, Seg2::Arc { center: c, radius: r, .. } if c.dist(center) <= 1e-6 && (r - radius).abs() <= 1e-6);
     let turned: f64 = lp.segs.iter().map(|s| if let Seg2::Arc { sweep, .. } = s { sweep.abs() } else { 0.0 }).sum();
-    (lp.segs.iter().all(same) && (turned - std::f64::consts::TAU).abs() < 1e-6).then_some(center)
+    (lp.segs.iter().all(same) && (turned - std::f64::consts::TAU).abs() < 1e-6).then_some((center, radius))
 }
 
 /// Where an operation cuts, in its setup's work coordinates.
@@ -923,14 +923,16 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         }
         CamOperationKind::Drill { peck, dwell } => {
             let peck = peck.as_ref().map(|e| len("peck", e)).transpose()?;
-            // A sketch's profiles are the holes; a picked face's round inner loops are.
+            // A sketch's profiles are the holes; a picked face's round inner loops are, those a
+            // drill of this size can make (not the round opening of a pocket in the face).
+            let fits = |r: f64| 2.0 * r <= tool.diameter * 1.1 + 1e-9;
             let points: Vec<Vec2> = if picked {
-                regions.iter().flat_map(|r| r.holes.iter().filter_map(circle_centre)).collect()
+                regions.iter().flat_map(|r| r.holes.iter().filter_map(round_hole)).filter(|(_, r)| fits(*r)).map(|(c, _)| c).collect()
             } else {
                 regions.iter().map(|r| r.outer.centroid()).collect()
             };
             if points.is_empty() {
-                return Err(fail("the picked faces have no round holes to drill".into()));
+                return Err(fail(format!("the picked faces have no round holes a {} mm drill can make", tool.diameter)));
             }
             cam::drill(&points, tool, &DrillParams { peck, dwell: *dwell }, &cut)
         }

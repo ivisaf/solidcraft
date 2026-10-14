@@ -1379,6 +1379,8 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 ui.end_row();
             }
         });
+        // Room under the last row for the sideways scroll bar, which would otherwise cover it.
+        ui.add_space(ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_outer_margin + 4.0);
     });
 }
 
