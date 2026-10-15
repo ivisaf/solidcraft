@@ -660,11 +660,12 @@ fn toolbar_pins_removes_reorders_and_keeps_its_layout() {
 }
 
 #[test]
-fn the_workspace_menu_lists_design_and_greys_the_rest() {
+fn the_workspace_menu_lists_design_and_render_and_greys_future_workspaces() {
     let app = sample_app();
     let items = context_menu::items(&app, &Target::Workspace);
     assert!(find(&items, "Design").enabled);
-    assert!(!find(&items, "Render").enabled && find(&items, "Render").shortcut == "coming later");
+    assert!(find(&items, "Render").enabled);
+    assert!(!find(&items, "Animation").enabled);
     assert!(!items.iter().any(|i| i.label.contains("Generative")));
 }
 

@@ -640,6 +640,38 @@ fn a_notch_whose_arc_ends_on_a_grid_border_refolds() {
     assert!((folded - refolded - notch * 2.0).abs() < 0.01, "refolded: {refolded}, {} less", folded - refolded);
 }
 
+/// An inside flange on a 100 x 60 plate (2 mm sheet, R 1, K 0.5) closes at every whole-degree
+/// turn of the plate. The flange's setback trims the plate at corners rounded to the nanometre,
+/// and the bend zone's corners beside them are not, so the two copies of a corner differ by a
+/// fraction of a nanometre. At 62° the trimmed corner lies on a border of the 1e-6 mm grid the
+/// sew finds vertices on (x = 100 cos 62° - 3 sin 62° = 44.2983135); its copies fell on either
+/// side, and the flange failed ("sew: the faces do not close"). The sew's weld of edge ends a
+/// hair apart joins them.
+#[test]
+fn an_inside_flange_on_a_turned_plate_closes_at_every_turn() {
+    // The plate less the 3 mm setback, a quarter annulus (radii 1 and 3) and a 17 mm leg, 100 long.
+    let want = 100.0 * 57.0 * 2.0 + PI * 2.0 * 100.0 + 17.0 * 2.0 * 100.0;
+    let mut failed = Vec::new();
+    for k in 0..90 {
+        let turn = (k as f64).to_radians();
+        let at = |x: f64, y: f64| [x * turn.cos() - y * turn.sin(), x * turn.sin() + y * turn.cos()];
+        let mut s = Session::default();
+        run(&mut s, "sheet.manage_rules", json!({"name": "R", "thickness": "2 mm", "k_factor": "0.5", "bend_radius": "1 mm", "active": true}));
+        run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Outline"}));
+        run(&mut s, "sketch.line", json!({"points": [at(0.0, 0.0), at(100.0, 0.0), at(100.0, 60.0), at(0.0, 60.0)], "closed": true}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "sheet.flange", json!({"sketch": "Outline"}));
+        let [x, y] = at(50.0, 0.0);
+        let flange = json!({"edges": [[x, y, 2]], "height": 20, "angle": 90, "radius": 1, "position": "inside"});
+        if let Err(e) = s.execute("sheet.flange", &flange) {
+            failed.push(format!("{k}°: {e}"));
+            continue;
+        }
+        assert!(rel(volume(&mut s), want) < 1e-4, "{k}°: {} vs {want}", volume(&mut s));
+    }
+    assert!(failed.is_empty(), "{} of 90 turns: {failed:?}", failed.len());
+}
+
 /// A sketch line across a 100 x 60 plate's top face at x = 40.
 fn fold_line(s: &mut Session) {
     run(s, "sketch.create", json!({"plane": "XY", "offset": 2.5, "name": "FoldLine"}));

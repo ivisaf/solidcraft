@@ -57,11 +57,14 @@ pub struct ScalarLook {
     pub opacity: f64,
 }
 impl ScalarLook {
-    pub fn from_look(look: &Look) -> Self {
-        Self { name: look.name.clone(), color: look.color, opacity: look.opacity }
+    pub fn from_look(look: &Look) -> Result<Self> {
+        if look.pbr.is_some() {
+            return Err(invalid("scalar catalog v1 cannot preserve PBR parameters; export refused"));
+        }
+        Ok(Self { name: look.name.clone(), color: look.color, opacity: look.opacity })
     }
     pub fn to_look(&self) -> Look {
-        Look { name: self.name.clone(), color: self.color, opacity: self.opacity }
+        Look { name: self.name.clone(), color: self.color, opacity: self.opacity, pbr: None }
     }
     fn validate(&self) -> Result<()> {
         if !text(&self.name, 128) || !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
@@ -80,8 +83,12 @@ pub struct ScalarMaterial {
     pub appearance: Option<ScalarLook>,
 }
 impl ScalarMaterial {
-    pub fn from_material(material: &UserMaterial) -> Self {
-        Self { name: material.name.clone(), density_g_cm3: material.density, appearance: material.appearance.as_ref().map(ScalarLook::from_look) }
+    pub fn from_material(material: &UserMaterial) -> Result<Self> {
+        Ok(Self {
+            name: material.name.clone(),
+            density_g_cm3: material.density,
+            appearance: material.appearance.as_ref().map(ScalarLook::from_look).transpose()?,
+        })
     }
     pub fn to_material(&self, name: String) -> UserMaterial {
         UserMaterial { name, density: self.density_g_cm3, appearance: self.appearance.as_ref().map(ScalarLook::to_look) }
@@ -266,12 +273,12 @@ impl Catalog {
             Ok(())
         };
         for look in doc.appearances.bodies.values().chain(doc.appearances.components.values()).chain(doc.appearances.faces.iter().map(|f| &f.look)) {
-            insert(Definition::Appearance(ScalarLook::from_look(look)))?;
+            insert(Definition::Appearance(ScalarLook::from_look(look)?))?;
         }
         for material in &doc.user_materials {
-            insert(Definition::Material(ScalarMaterial::from_material(material)))?;
+            insert(Definition::Material(ScalarMaterial::from_material(material)?))?;
             if let Some(look) = &material.appearance {
-                insert(Definition::Appearance(ScalarLook::from_look(look)))?;
+                insert(Definition::Appearance(ScalarLook::from_look(look)?))?;
             }
         }
         let out = Self { format: FORMAT.into(), id: id.into(), name: name.into(), entries: entries.into_values().collect() };

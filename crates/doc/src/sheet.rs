@@ -19,6 +19,7 @@ use crate::{DocError, Document, IDENTITY, Mat, Result, apply_point, apply_vector
 #[path = "sheet_convert.rs"]
 mod convert;
 pub use convert::{bend_edge_names, convert_body};
+pub(crate) use convert::{outline_loop, round_wall};
 
 // Bound the aggregate geometry, including sampled curves and intermediate clipping pieces.
 // These are work limits, never geometry truncation: a larger input returns a useful error.
@@ -446,6 +447,10 @@ pub struct SheetFlange {
     /// instead of a rectangle `leg` long.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shape: Option<Vec<Vec2>>,
+    /// A converted face's panel as drawn: `shape` with arcs where the face's edges are round
+    /// (flat coordinates, counter-clockwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact: Option<Loop2>,
     /// Which feature made it: `F<feature>.<k>` (persistent edge names).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
@@ -842,6 +847,9 @@ impl SheetBody {
 
     /// Flat region of a flange's panel.
     pub fn panel(&self, f: &SheetFlange) -> Region2 {
+        if let Some(lp) = &f.exact {
+            return Region2 { outer: lp.ccw(), holes: Vec::new() };
+        }
         if let Some(sh) = &f.shape {
             return Region2 { outer: Loop2::polygon(sh).ccw(), holes: Vec::new() };
         }
@@ -2167,6 +2175,7 @@ impl SheetBody {
                 radius,
                 leg: leg.max(0.0),
                 shape: None,
+                exact: None,
                 tag: String::new(),
                 ext: (0.0, 0.0),
                 slope: (0.0, 0.0),
@@ -2899,6 +2908,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         });
         Ok(self.flanges.len() - 1)
@@ -3033,6 +3043,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         };
         let ba = self.allowance(&probe);
@@ -3097,6 +3108,7 @@ impl SheetBody {
             Some(j) => {
                 if let Some(f) = self.flanges.get_mut(j) {
                     f.shape = Some(ccw(fixed_part.clone()));
+                    f.exact = None;
                 }
             }
         }
@@ -3113,6 +3125,7 @@ impl SheetBody {
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: Some(ccw(moving)),
+            exact: None,
             tag: String::new(),
         });
         let i = self.flanges.len() - 1;
@@ -3238,6 +3251,7 @@ impl SheetBody {
             Some(j) => {
                 if let Some(f) = self.flanges.get_mut(j) {
                     f.shape = Some(ccw(fixed));
+                    f.exact = None;
                 }
             }
         }
@@ -3256,6 +3270,7 @@ impl SheetBody {
                 slope: (0.0, 0.0),
                 tear: (false, false),
                 shape: Some(ccw(moving)),
+                exact: None,
                 tag: String::new(),
             });
         }
@@ -4055,6 +4070,7 @@ pub fn contour_flange(body: &str, rule: &str, rv: &RuleValues, plane: &Plane, pt
             slope: (0.0, 0.0),
             tear: (false, false),
             shape: None,
+            exact: None,
             tag: String::new(),
         };
         let ba = sheet.allowance(&f);

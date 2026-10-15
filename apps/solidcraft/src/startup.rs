@@ -110,6 +110,68 @@ pub fn pick_cpu_adapter(adapters: &[eframe::wgpu::Adapter], surface: Option<&efr
         })
 }
 
+/// `WGPU_BACKEND`: when set, wgpu picks the backends from it and the order below is not used.
+pub const WGPU_BACKEND_ENV: &str = "WGPU_BACKEND";
+
+/// The graphics backends to start with, or `None` to leave it to wgpu (`WGPU_BACKEND`, or all
+/// the backends it was built with).
+///
+/// On Windows, D3D12 comes first, then Vulkan, then OpenGL, and only the first one with a
+/// hardware adapter is started at all. wgpu would otherwise start Vulkan, D3D12 and OpenGL
+/// together and prefer Vulkan, and starting Vulkan loads every installed Vulkan driver: Intel's
+/// (`igvk64.dll`) crashed SolidCraft at startup that way, inside the driver, before anything
+/// could be reported. D3D12 is Windows' own graphics API, the one its drivers are tested with.
+/// `has_hardware(backends)` says whether those backends have an adapter that isn't software
+/// (it is only asked about the backends being tried, one at a time).
+///
+/// - `WGPU_BACKEND` set (`env_set`): `None`, whatever it says wins.
+/// - The software renderer (`cpu`, safe mode): D3D12 alone on Windows (WARP); `None` elsewhere.
+/// - `preference` (`graphics.json`'s `backend`: `dx12`, `vulkan`, `gl` or a comma list; `auto`
+///   or empty for the order above): those backends, on any system.
+/// - Elsewhere than Windows: `None`.
+/// - No hardware adapter at all: D3D12 (WARP, Windows' software renderer).
+pub fn choose_backends(
+    windows: bool,
+    env_set: bool,
+    cpu: bool,
+    preference: Option<&str>,
+    mut has_hardware: impl FnMut(eframe::wgpu::Backends) -> bool,
+) -> Option<eframe::wgpu::Backends> {
+    use eframe::wgpu::Backends;
+    if env_set {
+        return None;
+    }
+    if cpu {
+        return windows.then_some(Backends::DX12);
+    }
+    if let Some(p) = preference.map(str::trim).filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("auto")) {
+        let chosen = Backends::from_comma_list(p);
+        if !chosen.is_empty() {
+            return Some(chosen);
+        }
+        log::warn!("graphics: unknown backend preference `{p}`; using the default order");
+    }
+    if !windows {
+        return None;
+    }
+    Some(WINDOWS_ORDER.into_iter().find(|b| has_hardware(*b)).unwrap_or(Backends::DX12))
+}
+
+/// The order backends are tried in on Windows.
+pub const WINDOWS_ORDER: [eframe::wgpu::Backends; 3] = [eframe::wgpu::Backends::DX12, eframe::wgpu::Backends::VULKAN, eframe::wgpu::Backends::GL];
+
+/// Whether `backends` (started on their own, nothing else) have a hardware adapter.
+pub fn has_hardware_adapter(backends: eframe::wgpu::Backends) -> bool {
+    let mut desc = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = backends;
+    desc.flags = eframe::wgpu::InstanceFlags::from_build_config().with_env();
+    let instance = eframe::wgpu::Instance::new(desc);
+    let adapters = pollster::block_on(instance.enumerate_adapters(backends));
+    let found: Vec<String> = adapters.iter().map(|a| format!("{} ({:?})", a.get_info().name, a.get_info().device_type)).collect();
+    log::info!("graphics: {backends:?} adapters: {found:?}");
+    adapters.iter().any(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
+}
+
 /// The message shown when no window could be opened at all.
 pub fn no_window_message(error: &str, settings: Option<&Path>) -> String {
     let folder = settings.map(|d| d.display().to_string()).unwrap_or_else(|| "the SolidCraft settings folder".into());
@@ -180,6 +242,65 @@ mod tests {
         std::fs::write(d.join(MARKER), "zz").unwrap();
         assert_eq!(begin(&d), 0);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn windows_starts_d3d12_first_and_vulkan_only_when_d3d12_has_no_gpu() {
+        use eframe::wgpu::Backends;
+        let probe = |with: &'static [Backends]| {
+            move |b: Backends| {
+                assert!(b == Backends::DX12 || b == Backends::VULKAN || b == Backends::GL, "one backend at a time: {b:?}");
+                with.contains(&b)
+            }
+        };
+        // D3D12 works: Vulkan and OpenGL are never even asked about (starting Vulkan loads
+        // its drivers, which is what crashed).
+        let mut asked = Vec::new();
+        let chosen = choose_backends(true, false, false, None, |b| {
+            asked.push(b);
+            b == Backends::DX12
+        });
+        assert_eq!(chosen, Some(Backends::DX12));
+        assert_eq!(asked, [Backends::DX12]);
+        // Everything works: still D3D12 alone.
+        assert_eq!(choose_backends(true, false, false, None, probe(&[Backends::DX12, Backends::VULKAN, Backends::GL])), Some(Backends::DX12));
+        // No D3D12 hardware adapter: Vulkan, else OpenGL, else D3D12's software adapter (WARP).
+        assert_eq!(choose_backends(true, false, false, None, probe(&[Backends::VULKAN, Backends::GL])), Some(Backends::VULKAN));
+        assert_eq!(choose_backends(true, false, false, None, probe(&[Backends::GL])), Some(Backends::GL));
+        assert_eq!(choose_backends(true, false, false, None, probe(&[])), Some(Backends::DX12));
+        // `auto` and blanks are the default order.
+        assert_eq!(choose_backends(true, false, false, Some(" auto "), probe(&[Backends::DX12])), Some(Backends::DX12));
+        assert_eq!(choose_backends(true, false, false, Some(""), probe(&[Backends::GL])), Some(Backends::GL));
+    }
+
+    #[test]
+    fn wgpu_backend_the_preference_and_the_software_renderer_override_the_order() {
+        use eframe::wgpu::Backends;
+        let never = |b: Backends| -> bool { panic!("no probing expected, asked about {b:?}") };
+        // WGPU_BACKEND: wgpu reads it itself, nothing is probed.
+        assert_eq!(choose_backends(true, true, false, Some("gl"), never), None);
+        assert_eq!(choose_backends(true, true, true, None, never), None);
+        // The software renderer (safe mode, the retry): WARP through D3D12 alone, never Vulkan.
+        assert_eq!(choose_backends(true, false, true, Some("vulkan"), never), Some(Backends::DX12));
+        assert_eq!(choose_backends(false, false, true, None, never), None);
+        // The preference, on any system, without probing.
+        assert_eq!(choose_backends(true, false, false, Some("vulkan"), never), Some(Backends::VULKAN));
+        assert_eq!(choose_backends(true, false, false, Some("GL"), never), Some(Backends::GL));
+        assert_eq!(choose_backends(true, false, false, Some("dx12,vulkan"), never), Some(Backends::DX12 | Backends::VULKAN));
+        assert_eq!(choose_backends(false, false, false, Some("vulkan"), never), Some(Backends::VULKAN));
+        // An unknown preference is the default order.
+        assert_eq!(choose_backends(true, false, false, Some("glide"), |b| b == Backends::DX12), Some(Backends::DX12));
+        // Elsewhere: wgpu's own choice.
+        assert_eq!(choose_backends(false, false, false, None, never), None);
+        assert_eq!(choose_backends(false, false, false, Some("auto"), never), None);
+    }
+
+    #[test]
+    fn probing_a_backend_alone_never_panics() {
+        // Whatever this machine has (often nothing): an answer, not a crash.
+        for b in WINDOWS_ORDER {
+            let _ = has_hardware_adapter(b);
+        }
     }
 
     #[test]

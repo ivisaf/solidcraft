@@ -19,6 +19,8 @@
 #[path = "../../../assets/icons/app/shared/source/app_icon.rs"]
 mod app_icon;
 mod control_server;
+#[cfg(target_os = "windows")]
+mod native_crash;
 #[cfg(target_os = "macos")]
 mod open_documents;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -32,14 +34,24 @@ struct App {
     solve: SolveApp,
     /// The settings folder whose start marker the first frame clears (`startup::started`).
     starting: Option<std::path::PathBuf>,
+    /// Frames begun; the second one means the first was drawn (startup is over).
+    frames: u32,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     space_mouse: space_mouse::SpaceMouse,
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(dir) = self.starting.take() {
-            startup::started(&dir);
+        if self.frames < 2 {
+            self.frames += 1;
+            // A second frame right away, which means the first was presented: the app is up.
+            ctx.request_repaint();
+            if self.frames == 2 {
+                solidcraft_engine::crash::phase(solidcraft_engine::crash::RUNNING);
+                if let Some(dir) = self.starting.take() {
+                    startup::started(&dir);
+                }
+            }
         }
         // The design on screen is the one whose commands a crash report replays.
         self.solve.session.crash_journal = solidcraft_engine::crash::enabled();
@@ -276,11 +288,19 @@ fn adopt_settings(
     Ok(())
 }
 
+/// `graphics.json`, read before the window opens.
+fn graphics() -> Option<serde_json::Value> {
+    graphics_path().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+}
+
+/// The graphics backend preference (`graphics.json`'s `backend`: `auto`, `dx12`, `vulkan`, `gl`).
+fn backend_preference() -> Option<String> {
+    graphics().and_then(|v| v.get("backend").and_then(serde_json::Value::as_str).map(str::to_string))
+}
+
 /// Anti-aliasing samples from Preferences (4 when unset).
 fn msaa() -> u16 {
-    graphics_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    graphics()
         .and_then(|v| v.get("msaa").and_then(serde_json::Value::as_u64))
         .and_then(|m| u16::try_from(m).ok())
         .filter(|m| [1, 2, 4, 8].contains(m))
@@ -384,6 +404,12 @@ fn main() -> eframe::Result {
             solidcraft_engine::crash::install(dir, build)
         })
         .unwrap_or_default();
+    // A crash in native code (a graphics driver) says where it happened: the exception and the
+    // module on Windows, and on every system the startup step the app was in.
+    #[cfg(target_os = "windows")]
+    native_crash::install();
+    eframe::egui_wgpu::set_startup_hook(startup_step);
+    solidcraft_engine::crash::phase("window");
     let options = eframe::NativeOptions {
         viewport: app_viewport()?,
         depth_buffer: DEPTH_BITS,
@@ -399,7 +425,7 @@ fn main() -> eframe::Result {
             settings.as_ref().map(|d| d.join("app.ron"))
         },
         persist_window: !safe_mode,
-        wgpu_options: wgpu_options(cpu_renderer),
+        wgpu_options: wgpu_options(cpu_renderer, if safe_mode { None } else { backend_preference() }.as_deref()),
         ..Default::default()
     };
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -427,8 +453,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             created_in_app.store(true, std::sync::atomic::Ordering::SeqCst);
+            solidcraft_engine::crash::phase("app setup");
             solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
             let mut app = SolveApp::new(Session::default(), services(cc));
+            app.apply_off_thread = Some(solidcraft_ui_egui::dialogs::APPLY_AT_ONCE);
             app.custom_titlebar = CUSTOM_TITLEBAR;
             app.integrated_titlebar = cfg!(target_os = "macos");
             app.cpu_meshing = safe_mode;
@@ -437,7 +465,12 @@ fn main() -> eframe::Result {
             }
             if let Some(rs) = &cc.wgpu_render_state {
                 eprintln!("SolidCraft graphics: {:?}, MSAA {}x (requested {}x)", rs.adapter.get_info().backend, rs.msaa_samples, samples);
+                solidcraft_engine::crash::phase("viewport pipelines (shader compile)");
                 app.set_wgpu(rs, DEPTH_BITS, STENCIL_BITS, rs.msaa_samples);
+                // The graphics driver is loaded now; it may have put its own exception filter
+                // in front of ours.
+                #[cfg(target_os = "windows")]
+                native_crash::reinstall();
                 // A saved anti-aliasing the device can't do: back to the default, with a notice.
                 solidcraft_ui_egui::prefs::check_msaa(&mut app, u32::from(samples));
                 let info = rs.adapter.get_info();
@@ -467,6 +500,11 @@ fn main() -> eframe::Result {
             for f in &files {
                 app.open_path_async(f);
             }
+            // No file and no sample: the empty design takes Units of new designs (#1205).
+            // An opened file and the sample part keep the units they were saved or built with.
+            if files.is_empty() && !sample {
+                solidcraft_ui_egui::prefs::apply_new_design(&mut app);
+            }
             // No design given: the start page (not when driven over the control channel, whose
             // clients expect the design view; `ui.home` shows it there).
             if files.is_empty() && !sample && control_port.is_none() {
@@ -489,9 +527,11 @@ fn main() -> eframe::Result {
             }
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
+            solidcraft_engine::crash::phase("first frame");
             Ok(Box::new(App {
                 solve: app,
                 starting,
+                frames: 0,
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 space_mouse,
             }))
@@ -504,11 +544,29 @@ fn main() -> eframe::Result {
     }
 }
 
-/// The renderer settings: with `cpu`, the software adapter (WARP, lavapipe, llvmpipe).
-fn wgpu_options(cpu: bool) -> eframe::egui_wgpu::WgpuConfiguration {
+/// egui-wgpu is about to start a step of getting the graphics device and the window's surface up:
+/// the crash journal keeps it, and the adapter once it is picked.
+fn startup_step(step: &'static str, detail: &str) {
+    if step == eframe::egui_wgpu::STEP_ADAPTER_CHOSEN {
+        solidcraft_engine::crash::set_environment(&format!("Renderer: {detail}"));
+    }
+    solidcraft_engine::crash::phase(step);
+}
+
+/// The renderer settings: with `cpu`, the software adapter (WARP, lavapipe, llvmpipe). The
+/// backends come from `startup::choose_backends` (on Windows D3D12 first, and only the backend
+/// in use is started); `preference` is `graphics.json`'s `backend`.
+fn wgpu_options(cpu: bool, preference: Option<&str>) -> eframe::egui_wgpu::WgpuConfiguration {
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
-    if cpu && let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
-        setup.native_adapter_selector = Some(std::sync::Arc::new(startup::pick_cpu_adapter));
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
+        let env_set = std::env::var(startup::WGPU_BACKEND_ENV).is_ok_and(|v| !v.trim().is_empty());
+        if let Some(backends) = startup::choose_backends(cfg!(target_os = "windows"), env_set, cpu, preference, startup::has_hardware_adapter) {
+            eprintln!("SolidCraft graphics: starting {backends:?}");
+            setup.instance_descriptor.backends = backends;
+        }
+        if cpu {
+            setup.native_adapter_selector = Some(std::sync::Arc::new(startup::pick_cpu_adapter));
+        }
     }
     options
 }

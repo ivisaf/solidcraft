@@ -19,6 +19,8 @@ pub(crate) fn icon_of(k: &FeatureKind) -> &'static str {
         FeatureKind::SurfaceSweep { .. } => "surface_sweep",
         FeatureKind::SurfaceLoft { .. } => "surface_loft",
         FeatureKind::SurfaceOffset { .. } => "surface_offset",
+        FeatureKind::SurfaceRuled { .. } => "ruled",
+        FeatureKind::SurfaceUntrim { .. } => "untrim",
         FeatureKind::Revolve { .. } => "revolve",
         FeatureKind::Fillet { .. } => "fillet",
         FeatureKind::Chamfer { .. } => "chamfer",
@@ -114,6 +116,35 @@ pub(crate) fn clipboard_buttons(app: &mut SolveApp, ui: &mut egui::Ui, id: u64) 
     }
     if ui.add_enabled(!app.session.clipboard.is_empty(), egui::Button::new(crate::i18n::tr_label("Paste"))).clicked() {
         let _ = app.run("timeline.paste", json!({}));
+        ui.close();
+    }
+}
+
+/// What a feature's error or warning mark says, as its tooltip shows it (name and type, then
+/// the error and the warning), for the clipboard. `None` when it has neither.
+pub(crate) fn feature_message(app: &SolveApp, id: u64) -> Option<String> {
+    let result = app.session.model.result(id)?;
+    if result.error.is_none() && result.warning.is_none() {
+        return None;
+    }
+    let feature = app.session.doc.features.iter().find(|f| f.id == id)?;
+    let mut text = format!("{}  ({})", feature.name, feature.kind.type_name());
+    if let Some(error) = &result.error {
+        text.push_str(&format!("\nError: {error}"));
+    }
+    if let Some(warning) = &result.warning {
+        text.push_str(&format!("\nWarning: {warning}"));
+    }
+    Some(text)
+}
+
+/// Copy Error Message (or Copy Warning Message) in the menu of a feature that has one.
+pub(crate) fn message_button(app: &SolveApp, ui: &mut egui::Ui, id: u64) {
+    let Some(text) = feature_message(app, id) else { return };
+    let failed = app.session.model.result(id).is_some_and(|r| r.error.is_some());
+    let label = if failed { "Copy Error Message" } else { "Copy Warning Message" };
+    if ui.button(crate::i18n::tr_label(label)).clicked() {
+        ui.ctx().copy_text(text);
         ui.close();
     }
 }
@@ -242,6 +273,10 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
                     if *suppressed {
                         p.line_segment([br.left_bottom() + vec2(4.0, -4.0), br.right_top() + vec2(-4.0, 4.0)], Stroke::new(1.5, t.text_dim));
                     }
+                    // A failed feature has a mark of its own, not only its colour (#972).
+                    if err.is_some() {
+                        icons::paint(&p, Rect::from_min_size(br.right_top() - vec2(10.0, 0.0), vec2(10.0, 10.0)), "error", t.panel, t.error, t.error);
+                    }
                     if warn.is_some() && err.is_none() {
                         icons::paint(
                             &p,
@@ -319,6 +354,7 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
                         }
                         ui.separator();
                         clipboard_buttons(app, ui, *id);
+                        message_button(app, ui, *id);
                         ui.separator();
                         if ui.button("Delete").clicked() {
                             delete_feature(app, *id);
@@ -443,6 +479,37 @@ mod tests {
             assert_eq!(h.app.session.doc.features.len(), 4, "left: {left}");
             let bodies: Vec<String> = h.app.session.model.state().bodies.iter().map(|b| b.name.clone()).collect();
             assert_eq!(bodies, ["One", "Two", "One (copy)", "Two (copy)"], "left: {left}");
+        }
+    }
+
+    /// A feature with a warning mark offers Copy Warning Message, which copies what its tooltip
+    /// says; a feature with nothing to report doesn't offer it. In both timelines.
+    #[test]
+    fn the_feature_menu_copies_a_warning_message() {
+        for left in [false, true] {
+            let mut h = two_boxes(left);
+            // Too large for the box: reduced to what fits, which the feature's warning says.
+            h.app.run("solid.fillet", json!({"edges": [[5, 0, 10]], "radius": 20, "fit": "reduce", "body": "One"})).unwrap();
+            h.frames(4);
+            let id = h.app.session.doc.features.last().map(|f| f.id).unwrap();
+            let name = h.app.session.doc.features.last().map(|f| f.name.clone()).unwrap();
+            let warning = h.app.session.model.result(id).and_then(|r| r.warning.clone()).unwrap();
+            h.step(&json!({"click": {"handle": "timeline:First"}, "button": "right"})).unwrap();
+            assert!(h.widget("Copy Warning Message").is_none(), "left: {left}");
+            h.step(&json!({"key": "Escape"})).unwrap();
+            h.step(&json!({"click": {"handle": format!("timeline:{name}")}, "button": "right"})).unwrap();
+            let [x, y] = h.widget("Copy Warning Message").unwrap();
+            let (request, _reply) = crate::control::ControlRequest::new("ui.click", json!({"x": x, "y": y}));
+            crate::control::handle(&mut h.app, &h.ctx, &request);
+            let mut copied = Vec::new();
+            for _ in 0..8 {
+                h.frame();
+                copied.extend(h.output.commands.iter().filter_map(|c| match c {
+                    egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                    _ => None,
+                }));
+            }
+            assert!(copied.iter().any(|t| t.starts_with(&name) && t.contains(&format!("Warning: {warning}"))), "left: {left}: {copied:?}");
         }
     }
 

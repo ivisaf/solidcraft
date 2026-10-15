@@ -465,6 +465,9 @@ mod web {
                             app.session.mark_saved();
                         }
                         if !query().contains("sample") {
+                            // The empty design takes Units of new designs (#1205). The sample
+                            // part is built in millimetres and is left that way.
+                            solidcraft_ui_egui::prefs::apply_new_design(&mut app);
                             let rev = app.session.revision;
                             app.home.show(rev);
                         }

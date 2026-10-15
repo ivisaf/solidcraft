@@ -141,7 +141,7 @@ const GOLDEN_REFS: &str = include_str!("feature_walk_tests/golden_refs.txt");
 
 #[test]
 fn input_sketches_lists_every_variant_with_a_sketch_field() {
-    let src = include_str!("document.rs");
+    let src = include_str!("document.rs").replace("\r\n", "\n");
     let body = src.split("pub enum FeatureKind {").nth(1).and_then(|s| s.split("\n}\n").next()).unwrap();
     let mut with_sketch = Vec::new();
     let mut variant = String::new();

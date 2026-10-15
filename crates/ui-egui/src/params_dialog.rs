@@ -18,6 +18,8 @@ use crate::SolveApp;
 use crate::theme::Tokens;
 
 const UNITS: [&str; 9] = ["mm", "cm", "m", "in", "ft", "deg", "rad", "", "um"];
+/// The expression a new parameter row starts with.
+const NEW_EXPR: &str = "10 mm";
 
 /// Dialog state (what is being typed; the parameters themselves live in the document).
 #[derive(Default)]
@@ -41,7 +43,7 @@ pub struct ParamsDialog {
 
 impl ParamsDialog {
     pub fn new() -> Self {
-        ParamsDialog { new_expr: "10 mm".into(), ..Default::default() }
+        ParamsDialog { new_expr: NEW_EXPR.into(), ..Default::default() }
     }
     /// The command the live preview should run (a valid expression being edited).
     pub fn preview_commands(&self) -> Option<Vec<(String, Value)>> {
@@ -240,17 +242,18 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
                             d.error = app.run("parameters.rename", json!({"name": old, "new_name": new})).err();
                         }
                         d.renaming = None;
-                    } else {
+                    } else if !resp.has_focus() {
+                        // Only take focus once: requesting it every frame resets the text box's
+                        // focus lock, so arrow keys would move focus away and end the rename.
                         resp.request_focus();
                     }
                 }
                 _ => {
                     let name = if r.source == "user" { RichText::new(&r.name) } else { RichText::new(&r.name).color(t.text_dim) };
-                    if ui
-                        .add(egui::Label::new(name).sense(egui::Sense::click()))
-                        .on_hover_text(crate::i18n::tr_label("Double-click to rename"))
-                        .double_clicked()
-                    {
+                    let resp =
+                        ui.add(egui::Label::new(name).sense(egui::Sense::click())).on_hover_text(crate::i18n::tr_label("Double-click to rename"));
+                    crate::scenario::publish_handle(&format!("param:name:{}", r.name), resp.rect.center());
+                    if resp.double_clicked() {
                         d.renaming = Some((r.name.clone(), r.name.clone()));
                     }
                 }
@@ -324,11 +327,8 @@ fn table(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog, rows: &[&R
             }
             // Delete (user parameters; refused while used, the message says by what).
             if r.source == "user" {
-                if ui
-                    .add(egui::Button::new(RichText::new("Delete").small().color(t.text_dim)).frame(false))
-                    .on_hover_text(crate::i18n::tr_label("Delete this parameter"))
-                    .clicked()
-                {
+                // Outlined on hover like the expression and comment fields; the label says what it does.
+                if ui.add(egui::Button::new(RichText::new("Delete").small().color(t.text_dim)).frame_when_inactive(false)).clicked() {
                     d.error = app.run("parameters.delete", json!({"name": r.name})).err();
                 }
             } else {
@@ -407,6 +407,7 @@ fn add_row(app: &mut SolveApp, ui: &mut egui::Ui, d: &mut ParamsDialog) {
             match app.run("parameters.add", p) {
                 Ok(_) => {
                     d.new_name.clear();
+                    d.new_expr = NEW_EXPR.into();
                     d.new_comment.clear();
                     d.error = None;
                     name.request_focus();

@@ -205,6 +205,7 @@ impl FeatureKind {
     /// Map the feature's world geometry (points, directions, explicit planes) by `m`.
     pub fn transform_geometry(&mut self, m: &Mat) {
         use crate::feature_geometry::Geo;
+        use crate::walk::Walk;
         self.walk_geometry_mut(&mut |g| match g {
             Geo::Pick(p) | Geo::Pos(p) => *p = apply_point(m, *p),
             Geo::Dir(v) => *v = apply_vector(m, *v),

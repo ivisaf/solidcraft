@@ -799,13 +799,11 @@ pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
     Some(if flip { -n } else { n })
 }
 
-/// Bend line colours: up and down (legible on either theme).
+/// Bend line colours: up and down (theme tokens, legible on either theme and in every colour
+/// vision mode).
 fn bend_colors() -> (Color32, Color32) {
-    if crate::theme::is_dark() {
-        (Color32::from_rgb(110, 200, 120), Color32::from_rgb(240, 150, 80))
-    } else {
-        (Color32::from_rgb(30, 140, 50), Color32::from_rgb(200, 90, 20))
-    }
+    let t = crate::theme::Tokens::get();
+    (t.bend_up, t.bend_down)
 }
 
 /// The flat pattern view: the outline, cut-outs and bend lines (up and down in their colours)

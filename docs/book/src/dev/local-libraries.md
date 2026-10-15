@@ -24,6 +24,14 @@ unless **Replace existing library file** is explicitly selected. Export is a sna
 the design definitions, not an automatic merge with entries in an existing catalog.
 Editing a copied look/material uses the normal commands and does not edit its source.
 
+The combined render integration uses main's merged #1127 asynchronous picker.
+Model edits and tab changes wait for its answer while drawing/resizing continues.
+Overwrite consent is captured before opening; export snapshots the design when
+`library.export` runs after choosing the destination. Document identity is checked,
+and an old library answer cannot replace another Appearance editor. Cancellation
+does not read or write a library. The earlier #1114 candidate is no longer a runtime
+dependency of the refreshed consumer.
+
 The desktop panel applies appearances. Physical-material import/assignment is available
 through `library.apply`; imported definitions also appear in the existing material list.
 The browser can export a library through the existing download service. Interactive local
@@ -123,3 +131,8 @@ The copied design remains independent after successful assignment, undo/redo and
 reopening. This library has no dependency on the pending render stack and does not change
 the document format. User-visible evidence and actual native/wasm results are recorded in the PR;
 geometry/robustness checks remain separate and no reference baseline is weakened.
+
+The opaque PBR consumer makes v1 export fail explicitly when any body, component,
+face or material-default appearance contains PBR parameters. Neither overwrite consent
+nor an existing output file permits a lossy downgrade; use the richer transport
+when available. Scalar catalog imports still select the scalar response explicitly.

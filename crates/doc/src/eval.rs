@@ -30,10 +30,10 @@ pub struct ModelBody {
     mesh: Arc<OnceLock<Arc<Mesh>>>,
     /// The display plan (none when the body has no plan: a mesh body, or one the planner
     /// refuses), shared like the mesh. A GPU viewport draws it.
-    plan: Arc<OnceLock<Option<Arc<TessPlan>>>>,
+    plan: Arc<[OnceLock<Option<Arc<TessPlan>>>; 4]>,
     /// The plan evaluated on the CPU (none without a plan), shared like the mesh: the triangles a
     /// GPU viewport draws, so a highlight over a face lies exactly on it.
-    plan_mesh: Arc<OnceLock<Option<Arc<Mesh>>>>,
+    plan_mesh: Arc<[OnceLock<Option<Arc<Mesh>>>; 4]>,
     /// Identity of this body's content for the evaluation cache: the key of the evaluation
     /// that produced it (kept while later features pass it through unchanged).
     key: u64,
@@ -61,8 +61,8 @@ impl ModelBody {
             body,
             feature,
             mesh: Arc::new(OnceLock::new()),
-            plan: Arc::new(OnceLock::new()),
-            plan_mesh: Arc::new(OnceLock::new()),
+            plan: Arc::new(Default::default()),
+            plan_mesh: Arc::new(Default::default()),
             key: 0,
             names: Default::default(),
             made: Default::default(),
@@ -88,11 +88,19 @@ impl ModelBody {
             .clone()
     }
 
-    /// The display plan of this body (the same tolerance and angle as [`ModelBody::mesh`]), made
-    /// once; `None` when the body has no plan (a mesh body, or one the planner refuses).
+    /// The display plan of this body at the viewport's display quality
+    /// ([`crate::display_quality::current`]; at Normal, the same tolerance and angle as
+    /// [`ModelBody::mesh`]), made once per level; `None` when the body has no plan (a mesh body,
+    /// or one the planner refuses).
     pub fn display_plan(&self) -> Option<Arc<TessPlan>> {
+        self.display_plan_at(crate::display_quality::current())
+    }
+
+    /// The display plan at a given display quality, made once per level.
+    pub fn display_plan_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<TessPlan>> {
         self.plan
-            .get_or_init(|| match self.body.display_plan_angular(self.display_tol(), kernel::DISPLAY_ANGLE) {
+            .get(q.index())?
+            .get_or_init(|| match self.body.display_plan_angular(q.chord(self.body.size()), q.angle()) {
                 Ok(plan) => Some(Arc::new(plan)),
                 Err(e) => {
                     log::debug!("{}: no display plan ({e})", self.name);
@@ -102,12 +110,20 @@ impl ModelBody {
             .clone()
     }
 
-    /// The display plan's mesh, evaluated on the CPU once: the same triangles a GPU viewport
-    /// evaluates and draws for this body. Highlights over a face drawn from the plan use it, since
-    /// the reference mesh ([`ModelBody::mesh`]) triangulates the face differently and the two
-    /// would fight at equal depth. `None` when the body has no plan.
+    /// The display plan's mesh, evaluated on the CPU once per level: the same triangles a GPU
+    /// viewport evaluates and draws for this body. Highlights over a face drawn from the plan use
+    /// it, since the reference mesh ([`ModelBody::mesh`]) triangulates the face differently and
+    /// the two would fight at equal depth. `None` when the body has no plan.
     pub fn plan_mesh(&self) -> Option<Arc<Mesh>> {
-        self.plan_mesh.get_or_init(|| self.display_plan().and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new)).clone()
+        self.plan_mesh_at(crate::display_quality::current())
+    }
+
+    /// The display plan's mesh at a given display quality.
+    pub fn plan_mesh_at(&self, q: crate::display_quality::DisplayQuality) -> Option<Arc<Mesh>> {
+        self.plan_mesh
+            .get(q.index())?
+            .get_or_init(|| self.display_plan_at(q).and_then(|plan| self.body.display_mesh_of(&plan).ok()).map(Arc::new))
+            .clone()
     }
 
     /// The display mesh's chord tolerance: 1/1000 of the body's size.
@@ -1219,6 +1235,8 @@ impl Model {
                         }
                     }
                     state = Arc::new(next);
+                    // A window opening the design can show what is built so far.
+                    watched.offer(i + 1, doc, &state);
                     None
                 }
                 Err(e) => Some(e.to_string().trim_start_matches("the operation failed: ").to_string()),
@@ -1277,6 +1295,17 @@ fn val(vals: &BTreeMap<String, Value>, e: &str, k: Kind) -> Result<f64> {
         return v.to_kind_in(k, expr::Defaults { len: scale, ..expr::Defaults::default() });
     }
     Document::eval_in(vals, e, k)
+}
+
+/// A loft builds each section from its outline alone, so a section with a hole (a ring) is
+/// refused rather than lofted as if it were filled.
+fn refuse_loft_holes(r: &Region2) -> Result<()> {
+    if r.holes.is_empty() {
+        return Ok(());
+    }
+    Err(DocError::Invalid(
+        "not supported yet: a loft section with a hole; loft the outline and the hole as two bodies and cut one from the other".into(),
+    ))
 }
 
 pub fn select_profiles(ss: &SolvedSketch, sel: &ProfileSel) -> Result<Vec<Region2>> {
@@ -2654,6 +2683,8 @@ fn feature_tools_with_constructor(
                 ];
                 // How far a tool grows past its profile at either end, at most.
                 let mut growth: f64 = 0.0;
+                // A face of the targets in the profile's plane (the same for every profile).
+                let on_face = matches!(operation, Operation::Join | Operation::Cut) && face_level_at(st, &ss.plane, from, targets);
                 let tools: Vec<Traced> = regions
                     .iter()
                     .map(|r| {
@@ -2667,12 +2698,7 @@ fn feature_tools_with_constructor(
                         // A start that can't run on (the profile hangs over the face's edge):
                         // the sides stand straight for a hair first, so the boolean can push the
                         // face the tool stands on into the body.
-                        let foot = if a >= 0.0 && matches!(operation, Operation::Join | Operation::Cut) && face_level_at(st, &ss.plane, from, targets)
-                        {
-                            TAPER_FOOT.min((b - a) * 0.01)
-                        } else {
-                            0.0
-                        };
+                        let foot = if a >= 0.0 && on_face { TAPER_FOOT.min((b - a) * 0.01) } else { 0.0 };
                         let body = kernel::extrude_tapered_between(&start_plane, r, a, b, foot, sign, taper)?;
                         growth = growth.max(a.abs().max(b.abs()) * taper.tan().abs());
                         Ok(crate::lineage::ProfileRoles { sketch: Some(&ss), region: Some(r), caps: caps.clone() }.tool(body, None))
@@ -2951,6 +2977,7 @@ fn feature_tools_with_constructor(
             let ss = st.sketch(prof.sketch).ok_or_else(|| DocError::Unknown(format!("sketch {}", prof.sketch)))?;
             let regions = solidcraft_sketch::merge_regions(&select_profiles(ss, &prof.profiles)?);
             let [r] = &regions[..] else { return Err(DocError::Invalid("each loft section must be one profile".into())) };
+            refuse_loft_holes(r)?;
             let ps = st.sketch(pt.sketch).ok_or_else(|| DocError::Unknown(format!("sketch {}", pt.sketch)))?;
             let id = pt.point.as_deref().unwrap_or_default();
             let q = ps.sketch.points.iter().find(|p| p.id == id).ok_or_else(|| DocError::Unknown(format!("point `{id}` in {}", ps.name)))?;
@@ -3006,6 +3033,7 @@ fn feature_tools_with_constructor(
                     .ok_or_else(|| DocError::Unknown(format!("sketch {} (it must come earlier in the timeline)", sec.sketch)))?;
                 let regions = solidcraft_sketch::merge_regions(&select_profiles(ss, &sec.profiles)?);
                 let [r] = &regions[..] else { return Err(DocError::Invalid("each loft section must be one profile".into())) };
+                refuse_loft_holes(r)?;
                 secs.push((ss.plane, r.outer.clone()));
                 sketches.push(ss);
             }
@@ -3279,7 +3307,11 @@ pub(crate) fn extent_sides(vals: &BTreeMap<String, Value>, extent: &crate::Exten
         (Some(d2), _) => (-val(vals, d2, Kind::Length)?, d),
         (None, crate::Direction::Positive) => (0.0, d),
         (None, crate::Direction::Negative) => (-d, 0.0),
-        (None, crate::Direction::Symmetric) => (-d, d),
+        (None, crate::Direction::Symmetric) => {
+            // Through All is a reach computed from target bodies, not an entered total.
+            let half = if extent.through_all { d } else { extent.convention.symmetric_half_distance(d) };
+            (-half, half)
+        }
     })
 }
 
@@ -3926,7 +3958,9 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
         | FeatureKind::SurfaceRevolve { .. }
         | FeatureKind::SurfaceSweep { .. }
         | FeatureKind::SurfaceLoft { .. }
-        | FeatureKind::SurfaceOffset { .. } => surface::eval(doc, vals, f, st),
+        | FeatureKind::SurfaceOffset { .. }
+        | FeatureKind::SurfaceRuled { .. }
+        | FeatureKind::SurfaceUntrim { .. } => surface::eval(doc, vals, f, st),
         FeatureKind::Emboss { .. }
         | FeatureKind::Rib { .. }
         | FeatureKind::ReplaceFace { .. }

@@ -168,7 +168,16 @@ unstitch
   remap_bodies: body
 reverse_normal
   remap_bodies: body
+surface_untrim
+  remap_bodies: face.body
 surface_extend
+  remap_bodies: body
+surface_extend_to_plane
+  remap_refs: up_to.plane.base.base.name
+  remap_bodies: body
+surface_extend_to_face
+  remap_bodies: body, up_to.face.body
+surface_ruled
   remap_bodies: body
 surface_trim
   remap_refs: plane.base.base.name

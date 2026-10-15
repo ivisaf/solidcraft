@@ -38,10 +38,14 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SHEET METAL", "CREATE")
         .icon("convert_sheet")
         .params(
-            "body; face: [x,y,z] on its large flat face (a plate of even thickness); rule?; \
+            "body; face: [x,y,z] on its large flat face (a plate of even thickness; recesses in one face up to half the thickness deep, \
+             such as an engraved label, become pockets of the sheet), or that face's name from model.faces; rule?; \
              bends?: [[x,y,z] on sharp edges] (a solid or a shelled body: `face` is the fixed face and the flat faces reached from it \
              across these edges become the sheet; a shell keeps its thickness, a solid takes the rule's inward; \
-             edges between two of those faces that are no bends are cut open with the rule's gap)",
+             edges between two of those faces that are no bends are cut open with the rule's gap; \
+             a point in the middle of a chamfer between two faces, or on a bend modelled with its radius (a cylinder between \
+             two flat faces tangent to it, either skin), makes it one bend of the rule's radius at their virtual sharp; \
+             the faces' holes become cut-outs and their engravings, up to half the thickness deep, pockets)",
         ),
     CommandSpec::new("sheet.manage_rules", "Sheet Metal Rules", rules).at("SHEET METAL", "MODIFY").icon("sheet_rules").params(
         "name (new or existing); thickness?, k_factor?, bend_radius?, relief_width?, relief_depth?, corner_relief?, hem_gap?, gap? (expressions; `Thickness` is the rule's; \
@@ -60,7 +64,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         ),
     CommandSpec::new("sheet.export_dxf", "Export Flat Pattern as DXF", export_dxf)
         .noundo()
-        .params("body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those) → DXF (AutoCAD 2000, mm): OUTLINE, BEND_UP and BEND_DOWN (centre lines) layers"),
+        .params("body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those) → DXF (AutoCAD 2000, mm): OUTLINE, BEND_UP and BEND_DOWN (centre lines) layers, and pockets on POCKET_<BOTTOM|TOP|INTERNAL>_Z<from>_TO_<to>_MM"),
     CommandSpec::new("sheet.export_bend_table", "Export Bend Table", export_bend_table)
         .noundo()
         .params("body?, format?: csv|json (default csv), path? → bend table in mm and degrees, including rule and flat centre-line coordinates; a bend that cut-outs split has a row for each piece"),
@@ -297,7 +301,8 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
     if s.model.state().body(&body).is_none() {
         return Err(bad(cmd, format!("no body `{body}`")));
     }
-    let face = p.get("face").and_then(vec3).ok_or_else(|| bad(cmd, "`face` must be a point [x, y, z] on the plate's face"))?;
+    let face = p.get("face").ok_or_else(|| bad(cmd, "`face` must be a point [x, y, z] on the plate's face, or its name from model.faces"))?;
+    let face = super::face::face_ref(s, face, Some(&body), cmd)?;
     // With bend edges, a solid or shelled body; without, a plate.
     let bends = match p.get("bends") {
         None | Some(Value::Null) => Vec::new(),

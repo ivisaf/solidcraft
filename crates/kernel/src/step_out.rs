@@ -41,6 +41,8 @@ pub struct StepHeader {
     pub time_stamp: String,
     pub author: String,
     pub organization: String,
+    /// FILE_DESCRIPTION text; `SolidCraft model` when empty.
+    pub description: String,
 }
 
 /// Entities whose identity is topological: never merged even when their text is equal.
@@ -1531,7 +1533,8 @@ fn products_text(products: &[ExportProduct], root: usize, header: &StepHeader, m
 
     let mut s = String::new();
     s.push_str("ISO-10303-21;\nHEADER;\n");
-    s.push_str("FILE_DESCRIPTION(('SolidCraft model'),'2;1');\n");
+    let description = if header.description.is_empty() { "SolidCraft model" } else { header.description.as_str() };
+    let _ = writeln!(s, "FILE_DESCRIPTION(({}),'2;1');", string(description));
     let _ = writeln!(
         s,
         "FILE_NAME({},{},({}),({}),'SolidCraft','SolidCraft','');",

@@ -123,3 +123,34 @@ fn design_export_deduplicates_exact_looks_and_keeps_physical_properties_distinct
     assert_eq!(library, Catalog::decode(&library.encode().unwrap()).unwrap());
     assert!(Catalog::from_document(&Document::default(), "user.test", "Test", Provenance { license: String::new(), ..Default::default() }).is_err());
 }
+
+#[test]
+fn scalar_export_refuses_pbr_in_every_design_owned_appearance_location() {
+    use solidcraft_doc::{appearance::FaceLook, pbr_appearance::PbrParameters};
+    let mut look = ScalarLook { name: "Original PBR specimen".into(), color: [180, 120, 70], opacity: 1.0 }.to_look();
+    look.pbr = Some(PbrParameters::new(1.0, 0.3, 1.5).unwrap());
+    for location in 0..4 {
+        let mut doc = Document::default();
+        match location {
+            0 => {
+                doc.appearances.bodies.insert("Specimen".into(), look.clone());
+            }
+            1 => {
+                doc.appearances.components.insert(1, look.clone());
+            }
+            2 => doc.appearances.faces.push(FaceLook {
+                body: "Specimen".into(),
+                point: Default::default(),
+                look: look.clone(),
+                name: None,
+                strict_name: false,
+                certificate: None,
+            }),
+            _ => doc.user_materials.push(UserMaterial { name: "Original material".into(), density: 1.2, appearance: Some(look.clone()) }),
+        }
+        let before = doc.clone();
+        let error = Catalog::from_document(&doc, "user.test", "Test", Provenance::default()).unwrap_err();
+        assert!(error.to_string().contains("cannot preserve PBR"));
+        assert_eq!(doc, before);
+    }
+}

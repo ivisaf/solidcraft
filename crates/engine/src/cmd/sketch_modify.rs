@@ -46,7 +46,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .enabled(in_sketch)
         .params(concat!(
             "curves: [ids], distance: number in mm or length expression (creates an editable dimension; positive = left of the chain, or toward `side`), side?: [x,y], chain?: bool (default true: the connected chain); ",
-            "direction?: one_side|symmetric (default one_side) or symmetric?: bool (the same distance each way, as for `solid.extrude`; no `side`, whose job it takes over), ",
+            "direction?: one_side|symmetric (default one_side) or symmetric?: bool (the same distance each way; no `side`, whose job it takes over), ",
             "distance2?: positive length expression (Two Sides: an independent distance the other way, as for `solid.extrude`). Each side is its own offset association, listed in `sides`; flip?: bool reverses the primary side; `param`/`param2` name the driving dimensions",
             created_doc!()
         )),
@@ -479,6 +479,55 @@ fn uses(c: &Curve, p: usize) -> bool {
 // ---------------------------------------------------------------------------------------------
 // Corners: fillet and chamfer
 
+/// A corner drawn as two curves whose ends are separate points held together by a Coincident
+/// constraint (a line drawn to where an arc starts, #1208) becomes one shared point, so it can be
+/// rounded or cut like a corner drawn through one point. Only a partner held by nothing but that
+/// constraint is welded; anything else is left as it is.
+fn weld_corner(sk: &mut Sketch, p: &Value) {
+    let ends = |sk: &Sketch, c: usize| match sk.curves.get(c).map(|c| &c.kind) {
+        Some(CurveKind::Line { a, b }) | Some(CurveKind::Arc { a, b, .. }) => Some([*a, *b]),
+        _ => None,
+    };
+    let q = if let Some(r) = str_(p, "point") {
+        sk.resolve_point(r)
+    } else {
+        let curve = |k: &str| str_(p, k).and_then(|i| sk.curve_index(i)).and_then(|c| ends(sk, c));
+        let (Some(ea), Some(eb)) = (curve("a"), curve("b")) else { return };
+        if ea.iter().any(|x| eb.contains(x)) {
+            return;
+        }
+        // The end of `a` held coincident with an end of `b`.
+        ea.into_iter().find(|x| {
+            sk.constraints
+                .iter()
+                .any(|k| matches!(k.kind, ConstraintKind::Coincident { p, q } if (p == *x && eb.contains(&q)) || (q == *x && eb.contains(&p))))
+        })
+    };
+    let Some(mut q) = q else { return };
+    // Each pass welds one partner; a pass removes a constraint, so this ends.
+    for _ in 0..sk.constraints.len() {
+        let partner = sk.constraints.iter().enumerate().find_map(|(i, k)| {
+            let o = match k.kind {
+                ConstraintKind::Coincident { p, q: r } if p == q && r != q => r,
+                ConstraintKind::Coincident { p, q: r } if r == q && p != q => p,
+                _ => return None,
+            };
+            let held_elsewhere = sk.constraints.iter().enumerate().any(|(j, k)| j != i && k.kind.refers_to_point(o));
+            let linked = (0..sk.curves.len()).any(|c| sk.is_linked_curve(c) && sk.curves.get(c).is_some_and(|x| x.kind.uses(o)));
+            (o != 0 && !held_elsewhere && !linked).then_some((i, o))
+        });
+        let Some((i, o)) = partner else { return };
+        for c in sk.curves.iter_mut() {
+            c.kind.map_points(&|x| if x == o { q } else { x });
+        }
+        sk.constraints.remove(i);
+        sk.remove_points(&[o]);
+        if o < q {
+            q -= 1;
+        }
+    }
+}
+
 /// A corner of two lines: (line a, line b, corner point, far end of a, far end of b).
 fn corner(sk: &Sketch, p: &Value, cmd: &str) -> Result<(usize, usize, usize, usize, usize)> {
     let ends = |l: usize| match sk.curves.get(l).map(|c| &c.kind) {
@@ -488,9 +537,13 @@ fn corner(sk: &Sketch, p: &Value, cmd: &str) -> Result<(usize, usize, usize, usi
     let (la, lb) = if let Some(r) = str_(p, "point") {
         let q = sk.resolve_point(r).ok_or_else(|| bad(cmd, format!("unknown point `{r}`")))?;
         let lines: Vec<usize> = (0..sk.curves.len()).filter(|i| ends(*i).is_some_and(|(a, b)| a == q || b == q) && !sk.is_linked_curve(*i)).collect();
-        match lines[..] {
+        // A construction line ending there too (a diagonal that centres something) is not one of
+        // the corner's sides: it keeps its end on the virtual sharp corner (#1026).
+        let sides: Vec<usize> =
+            if lines.len() == 2 { lines } else { lines.into_iter().filter(|i| sk.curves.get(*i).is_some_and(|c| !c.construction)).collect() };
+        match sides[..] {
             [a, b] => (a, b),
-            _ => return Err(bad(cmd, "the corner must join exactly two lines")),
+            _ => return Err(bad(cmd, "the corner must join exactly two lines (or give the two lines as `a` and `b`)")),
         }
     } else {
         let a = str_(p, "a").and_then(|i| sk.curve_index(i)).ok_or_else(|| bad(cmd, "`a` must be a line"))?;
@@ -649,6 +702,7 @@ fn kept_json(kept: Vec<CornerKept>) -> (Vec<String>, Vec<String>) {
 /// Round one corner (`point` or `a`, `b`) with an arc of radius `r` tangent to both curves:
 /// the arc, the tangent constraints and what became of the corner point.
 fn fillet_corner(sk: &mut Sketch, p: &Value, r: f64, cmd: &str) -> Result<(usize, Vec<String>, CornerKept)> {
+    weld_corner(sk, p);
     let (la, lb, c, fa, fb) = match corner(sk, p, cmd) {
         Ok(x) => x,
         // Not two lines: a corner with an arc.
@@ -757,6 +811,7 @@ fn round_corner(sk: &mut Sketch, p: &Value, r: f64, cmd: &str) -> Result<Option<
 
 fn chamfer(s: &mut Session, p: &Value, cmd: &str, dists: impl FnOnce(f64) -> Result<(f64, f64)>) -> Result<Value> {
     let (out, info) = edit(s, p, cmd, false, |sk, _| {
+        weld_corner(sk, p);
         let (la, lb, c, fa, fb) = corner(sk, p, cmd)?;
         let (pc, pa, pb) = (sk.point(c).unwrap_or_default(), sk.point(fa).unwrap_or_default(), sk.point(fb).unwrap_or_default());
         let (u, v) = ((pa - pc).normalized().unwrap_or(Vec2::X), (pb - pc).normalized().unwrap_or(Vec2::Y));
@@ -937,7 +992,7 @@ struct Side {
 }
 
 /// The signed distances an offset runs at. One side is the distance as given. `symmetric` is the
-/// same distance each way, as `direction: symmetric` means for `solid.extrude`. `distance2` is an
+/// same distance each way. `distance2` is an
 /// independent distance the other way, as `distance2` means for `solid.extrude`. The primary side
 /// comes first, so a one-sided caller reads the same first entry it always did.
 fn offset_runs(d: f64, symmetric: bool, distance2: Option<f64>) -> Vec<f64> {
@@ -1204,7 +1259,7 @@ fn offset(s: &mut Session, p: &Value) -> Result<Value> {
     let d0 = if bool_(p, "flip").unwrap_or(false) { -value } else { value };
     let side = p.get("side").and_then(vec2);
     let use_chain = bool_(p, "chain").unwrap_or(true);
-    // Both sides at once. The words keep the meaning `solid.extrude` gives them: `symmetric` is
+    // Both sides at once: `symmetric` is
     // one distance applied each way, `distance2` is an independent distance the other way.
     let symmetric = match str_(p, "direction").map(str::to_ascii_lowercase).as_deref() {
         None | Some("positive") | Some("one_side") => bool_(p, "symmetric").unwrap_or(false),

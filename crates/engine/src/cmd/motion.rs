@@ -10,7 +10,7 @@ use solidcraft_geom::Vec3;
 use solidcraft_kernel::Body;
 
 use super::CommandSpec;
-use super::joints::{joint_id, occurrence_id, resolve_holding, value};
+use super::joints::{cannot_move, joint_id, named_values, occurrence_id, resolve_holding, value};
 use crate::params::{bad, bool_, str_, vec3};
 use crate::{EngineError, Result, Session};
 
@@ -37,8 +37,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         "name?; study? (edit an existing one); steps? (timeline length, default 100); keys: [{joint, index?, points: [[step, value], …]}] \
          (values: degrees for angles, mm for distances, or expressions)",
     ),
-    CommandSpec::new("motion.play", "Play Motion Study", play)
-        .params("study: id|name; step (0…steps) — sets the joints to the study's values there (contact sets stop them) → positions"),
+    CommandSpec::new("motion.play", "Play Motion Study", play).params(
+        "study: id|name; step (0…steps) — sets the joints to the study's values there (contact sets stop them); quiet?: bool \
+         (positions of only the occurrences that moved) → values: [{joint, values: [{name, value, unit}]}], positions, moved: whether \
+         any occurrence moved, unmoved: [{joint, name, reason}] (keyed joints that can move nothing, such as a chain joined to \
+         nothing grounded)",
+    ),
     CommandSpec::new("motion.export", "Export Motion Study", export)
         .noundo()
         .params("study; samples? (default steps + 1); path? (.json or .csv) → occurrence positions per step (the design is not changed)"),
@@ -258,8 +262,9 @@ fn closest(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Vec3 {
 
 /// Set joint values, stopping short where contact sets would collide or a closed loop could no
 /// longer close: the values are moved from where they are toward `want` as far as they go. The
-/// `given` values (joint, index) are driven; in a closed loop the others follow.
-fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)], given: &BTreeSet<(u64, usize)>) -> Result<Value> {
+/// `given` values (joint, index) are driven; in a closed loop the others follow. Returns the
+/// answer and the last solve.
+fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)], given: &BTreeSet<(u64, usize)>) -> Result<(Value, joints::Solution)> {
     let baseline = s.doc.clone();
     let start: Vec<(u64, Vec<f64>)> =
         want.iter().map(|(id, _)| (*id, s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| j.values.clone()).unwrap_or_default())).collect();
@@ -347,15 +352,16 @@ fn drive_with_contact(s: &mut Session, want: &[(u64, Vec<f64>)], given: &BTreeSe
     }
     let values: Vec<Value> = want
         .iter()
-        .map(|(id, _)| json!({"joint": id, "values": s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| j.values.clone())}))
+        .map(|(id, _)| json!({"joint": id, "values": s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| named_values(j, &j.values))}))
         .collect();
-    Ok(json!({"values": values, "stopped_by_contact": stopped, "stopped_by_loop": stopped_by_loop, "conflicts": sol.conflicts.len()}))
+    let out = json!({"values": values, "stopped_by_contact": stopped, "stopped_by_loop": stopped_by_loop, "conflicts": sol.conflicts.len()});
+    Ok((out, sol))
 }
 
 /// Drive one joint (joint.drive), honouring contact sets.
 pub fn drive_joint(s: &mut Session, id: u64, q: Vec<f64>, given: usize) -> Result<Value> {
     let given = (0..given.min(q.len())).map(|i| (id, i)).collect();
-    drive_with_contact(s, &[(id, q)], &given)
+    Ok(drive_with_contact(s, &[(id, q)], &given)?.0)
 }
 
 fn enable_sets(s: &mut Session, p: &Value) -> Result<Value> {
@@ -556,8 +562,14 @@ fn keyed(m: &MotionStudy) -> BTreeSet<(u64, usize)> {
 }
 
 /// Where each occurrence is: (name, world transform).
-fn positions(s: &Session) -> Vec<(String, Mat)> {
+pub(super) fn positions(s: &Session) -> Vec<(String, Mat)> {
     s.doc.occurrences.iter().map(|o| (o.name.clone(), joints::occurrence_world(&s.doc, o.id))).collect()
+}
+
+/// The occurrences placed differently `after` than `before` ([`positions`] of one design, so in
+/// the same order even where two share a name).
+pub(super) fn moved<'a>(before: &'a [(String, Mat)], after: &'a [(String, Mat)]) -> impl Iterator<Item = &'a (String, Mat)> {
+    after.iter().zip(before).filter(|((_, a), (_, b))| a.iter().flatten().zip(b.iter().flatten()).any(|(x, y)| (x - y).abs() > 1e-9)).map(|(a, _)| a)
 }
 
 fn pose_json(m: &Mat) -> Value {
@@ -570,8 +582,22 @@ fn play(s: &mut Session, p: &Value) -> Result<Value> {
     let m = s.doc.assembly.studies.get(i).cloned().ok_or_else(|| bad(cmd, "study"))?;
     let step = p.get("step").and_then(Value::as_f64).filter(|x| x.is_finite()).ok_or_else(|| bad(cmd, "`step` must be a number"))?;
     let want = values_at(s, &m, step.clamp(0.0, f64::from(m.steps)));
-    let mut out = drive_with_contact(s, &want, &keyed(&m))?;
-    out["positions"] = positions(s).iter().map(|(n, t)| json!({"occurrence": n, "pose": pose_json(t)})).collect();
+    let before = positions(s);
+    let (mut out, sol) = drive_with_contact(s, &want, &keyed(&m))?;
+    let after = positions(s);
+    let moved: Vec<&(String, Mat)> = moved(&before, &after).collect();
+    out["moved"] = json!(!moved.is_empty());
+    let shown: Vec<&(String, Mat)> = if bool_(p, "quiet").unwrap_or(false) { moved } else { after.iter().collect() };
+    out["positions"] = shown.iter().map(|(n, t)| json!({"occurrence": n, "pose": pose_json(t)})).collect();
+    let joints: BTreeSet<u64> = m.keys.iter().map(|k| k.joint).collect();
+    out["unmoved"] = joints
+        .iter()
+        .filter_map(|id| {
+            let (why, _) = cannot_move(s, &sol, *id)?;
+            let name = s.doc.assembly.joints.iter().find(|j| j.id == *id).map(|j| j.name.clone());
+            Some(json!({"joint": id, "name": name, "reason": why}))
+        })
+        .collect();
     Ok(out)
 }
 
@@ -589,7 +615,7 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     for k in 0..samples {
         let step = f64::from(m.steps) * k as f64 / (samples - 1) as f64;
         let want = values_at(&t, &m, step);
-        let r = drive_with_contact(&mut t, &want, &keyed(&m))?;
+        let (r, _) = drive_with_contact(&mut t, &want, &keyed(&m))?;
         rows.push(json!({
             "step": step,
             "stopped_by_contact": r["stopped_by_contact"],

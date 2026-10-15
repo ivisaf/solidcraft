@@ -6,7 +6,7 @@
 //! - `{"start": "solid.extrude"}`: a toolbar click; `{"key": "E", "shift"?, "cmd"?}`; `{"text": "20"}`
 //! - `{"widget": "Revolute", "near"?: "Type"}`: click a dialog field, choice or button by its
 //!   text (with `near`: the one in that label's row)
-//! - `{"click": AT, "double"?, "shift"?, "ctrl"?, "button"?}`, `{"move": AT}`,
+//! - `{"click": AT, "double"?, "shift"?, "ctrl"?, "button"?}`, `{"move": AT, "shift"?, "alt"?, "ctrl"?, "cmd"?}`,
 //!   `{"hold": AT, "frames"?}` (press and hold still: Select Other),
 //!   `{"drag": [AT, AT], "shift"?, "ctrl"?, "steps"?}` where AT is `[x, y]` (screen), `{"world": [x,y,z]}`
 //!   or `{"sketch": [x,y]}` (the sketch being edited)
@@ -399,7 +399,7 @@ impl Harness {
                 )
             } else if let Some(at) = s.get("move") {
                 let [x, y] = self.at(at)?;
-                self.call("ui.move", json!({"x": x, "y": y}))
+                self.call("ui.move", json!({"x": x, "y": y,"shift":flag("shift"),"alt":flag("alt"),"ctrl":flag("ctrl"),"cmd":flag("cmd")}))
             } else if let Some(d) = s.get("drag") {
                 let [x0, y0] = self.at(d.get(0).unwrap_or(&Value::Null))?;
                 let [x1, y1] = self.at(d.get(1).unwrap_or(&Value::Null))?;

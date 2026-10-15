@@ -1281,11 +1281,7 @@ fn docked_panel(
 ) -> (bool, Option<egui::Rect>) {
     use crate::frame::{DIALOG_WIDE_MAX_W, Width};
     let t = Tokens::get();
-    let frame = egui::Frame::window(&ctx.global_style())
-        .fill(t.dialog_bg)
-        .stroke(Stroke::new(1.0, t.dialog_border))
-        .corner_radius(egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 })
-        .shadow(egui::Shadow { offset: [-2, 2], blur: 8, spread: 0, color: egui::Color32::from_black_alpha(40) });
+    let frame = crate::frame::dock_frame(ctx, crate::frame::Side::Right);
     let margin = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
     let mut keep = true;
     let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), dock.anchor, dock.max_height, Width::Wide)

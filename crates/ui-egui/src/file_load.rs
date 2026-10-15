@@ -39,20 +39,29 @@ pub struct Request {
     pub reply: Option<Sender<ControlResponse>>,
     /// The folders that caller's agent may use: the worker reads the file inside them.
     pub scope: Option<solidcraft_engine::io::vfs::PathScope>,
+    /// What that caller asked of a STEP import besides its path (`up`, `names`): the command
+    /// gets them as given.
+    pub options: serde_json::Map<String, Value>,
 }
 
 impl Request {
     pub fn new(path: &str, kind: Kind) -> Self {
-        Request { path: path.into(), kind, reply: None, scope: None }
+        Request { path: path.into(), kind, reply: None, scope: None, options: Default::default() }
     }
     fn insert(&self) -> bool {
         self.kind == Kind::Insert
     }
+    /// The command's parameters: the path and the caller's import options.
+    fn params(&self) -> Value {
+        let mut params = self.options.clone();
+        params.insert("path".into(), json!(self.path));
+        Value::Object(params)
+    }
     fn command(&self) -> (&'static str, Value) {
         match &self.kind {
-            Kind::Open => ("doc.open", json!({"path": self.path})),
+            Kind::Open => ("doc.open", self.params()),
             Kind::Insert if solidcraft_engine::io::is_mesh_path(&self.path) => ("file.insert_mesh", json!({"path": self.path})),
-            Kind::Insert => ("file.insert_step", json!({"path": self.path})),
+            Kind::Insert => ("file.insert_step", self.params()),
             Kind::Recover { id, dir } => ("doc.recover", json!({"id": id, "dir": dir})),
         }
     }
@@ -82,6 +91,10 @@ struct Running {
     progress: Arc<Progress>,
     preview_rx: Option<Receiver<egui::ColorImage>>,
     preview: Option<egui::TextureHandle>,
+    /// Pictures of the model as far as it is built (the picture, features built).
+    partial_rx: Option<Receiver<(egui::ColorImage, usize)>>,
+    /// The picture shown is of the first this many features (`None`: the saved preview).
+    built: Option<usize>,
 }
 
 impl Running {
@@ -181,7 +194,8 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
         Some("file.insert_step" | "file.insert_mesh") => Kind::Insert,
         _ => return Some(req),
     };
-    let Some(path) = req.params.get("params").and_then(|p| p.get("path")).and_then(Value::as_str) else { return Some(req) };
+    let params = req.params.get("params");
+    let Some(path) = params.and_then(|p| p.get("path")).and_then(Value::as_str) else { return Some(req) };
     let scope = match crate::control::request_scope(app, &req.params) {
         Ok(scope) => scope,
         Err(e) => {
@@ -189,7 +203,8 @@ pub fn control(app: &mut SolveApp, req: crate::control::ControlRequest) -> Optio
             return None;
         }
     };
-    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope });
+    let options = ["up", "names"].iter().filter_map(|k| Some((k.to_string(), params?.get(*k).filter(|v| !v.is_null())?.clone()))).collect();
+    let _ = begin_request(app, Request { path: path.into(), kind, reply: Some(req.reply.clone()), scope, options });
     None
 }
 
@@ -249,6 +264,36 @@ fn start(app: &mut SolveApp) {
     let (command, params) = request.command();
     let scope = request.scope.clone();
     let thumbnail = request.kind == Kind::Open;
+    // While a design rebuilds, a picture of what is built so far (a large design takes a while).
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let partial_rx = (command == "doc.open" || command == "doc.recover").then(|| {
+        progress.want_partial();
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel();
+        let (watch, finished) = (progress.clone(), finished.clone());
+        let _ = std::thread::Builder::new().name("file-load-picture".into()).spawn(move || {
+            let stop = || finished.load(Ordering::Relaxed) || watch.is_cancelled();
+            while !stop() {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let Some(partial) = watch.take_partial() else { continue };
+                let began = std::time::Instant::now();
+                let picture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| partial_picture(&partial.world, &stop))).ok().flatten();
+                if solidcraft_engine::geom::env::var_os("PROFILE_OPEN").is_some() {
+                    eprintln!(
+                        "SolidCraft partial picture: features={} bodies={} drawn={} ms={:.1}",
+                        partial.features,
+                        partial.world.bodies.len(),
+                        picture.is_some(),
+                        began.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                if let Some(picture) = picture.filter(|_| !stop()) {
+                    let _ = partial_tx.send((picture, partial.features));
+                }
+            }
+        });
+        partial_rx
+    });
+    let worker_finished = finished;
     let spawned = std::thread::Builder::new().name("file-load".into()).spawn(move || {
         let preview_began = std::time::Instant::now();
         if command == "doc.open" {
@@ -270,12 +315,24 @@ fn start(app: &mut SolveApp) {
             compute(scratch, command, &params, scope, thumbnail, &worker_phase, &worker_progress)
         }))
         .unwrap_or_else(|_| Err("the file operation failed; the current design is unchanged".into()));
+        worker_finished.store(true, Ordering::Relaxed);
         let _ = tx.send(result);
     });
     match spawned {
         Ok(_) => {
-            app.file_load.running =
-                Some(Running { request, base, base_revision, before, rx, phase, progress, preview_rx: Some(preview_rx), preview: None })
+            app.file_load.running = Some(Running {
+                request,
+                base,
+                base_revision,
+                before,
+                rx,
+                phase,
+                progress,
+                preview_rx: Some(preview_rx),
+                preview: None,
+                partial_rx,
+                built: None,
+            })
         }
         Err(e) => {
             let e = format!("could not start file operation: {e}");
@@ -283,6 +340,44 @@ fn start(app: &mut SolveApp) {
             app.set_status(e, true);
         }
     }
+}
+
+/// A small picture of the bodies built so far (their display meshes, made here and kept for
+/// the finished model), or `None` when there is nothing to show yet, too much to draw, or the
+/// load ended meanwhile (`stop`).
+#[cfg(not(target_arch = "wasm32"))]
+fn partial_picture(world: &solidcraft_engine::doc::ModelState, stop: &dyn Fn() -> bool) -> Option<egui::ColorImage> {
+    use solidcraft_engine::{
+        geom::Aabb3,
+        render::{Camera, Rgb, Scene, SceneMesh, StandardView},
+    };
+    let mut scene = Scene::default();
+    let mut bounds = Aabb3::EMPTY;
+    let mut triangles = 0usize;
+    for body in &world.bodies {
+        if stop() {
+            return None;
+        }
+        let mesh = body.mesh();
+        triangles += mesh.triangles.len();
+        if triangles > 4_000_000 {
+            return None;
+        }
+        bounds = bounds.union(&mesh.bounds());
+        scene.meshes.push(SceneMesh { mesh, color: Rgb(176, 186, 199), face_colors: Vec::new() });
+    }
+    if bounds.is_empty() {
+        return None;
+    }
+    let mut camera = Camera::default();
+    camera.set_view(StandardView::Iso);
+    camera.fit(&bounds);
+    scene.radius = bounds.diagonal();
+    if stop() || !preview_work_fits(&scene, &camera) {
+        return None;
+    }
+    let canvas = solidcraft_engine::render::render(&scene, &camera, 320, 200);
+    Some(egui::ColorImage::from_rgba_unmultiplied([320, 200], &canvas.rgba))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -429,6 +524,14 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
         if !running.cancelled() && running.matches(&app.session) {
             if let Some(image) = running.preview_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
                 running.preview = Some(ctx.load_texture("opening-preview", image, egui::TextureOptions::LINEAR));
+                running.built = None;
+            }
+            // The model as far as it is built, unless the file's saved picture (all of it) is up.
+            if let Some((image, built)) = running.partial_rx.as_ref().and_then(|rx| rx.try_iter().last())
+                && (running.preview.is_none() || running.built.is_some())
+            {
+                running.preview = Some(ctx.load_texture("opening-preview", image, egui::TextureOptions::LINEAR));
+                running.built = Some(built);
             }
         } else {
             running.preview = None;
@@ -458,7 +561,8 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
                 }
                 app.home.open = false;
                 app.fit_view();
-                if request.kind == Kind::Open || request.insert() {
+                // A caller that said which way is up has been answered: no offer to stand the part up.
+                if (request.kind == Kind::Open || request.insert()) && !request.options.contains_key("up") {
                     crate::stand_up::offer(app, &request.path, &running.before);
                 }
                 let warnings = made.result.get("warnings").and_then(Value::as_array);
@@ -572,7 +676,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             if let Some(preview) = r.preview.as_ref().filter(|_| !cancelled) {
                 let w = ui.available_width().min(320.0);
                 ui.image((preview.id(), egui::vec2(w, w * 200.0 / 320.0)));
-                ui.label(egui::RichText::new(crate::i18n::tr_label("Saved preview. Geometry is being checked before editing.")).small().weak());
+                let note = match r.built {
+                    Some(built) => format!("Built so far: {built} of {total} features."),
+                    None => crate::i18n::tr_label("Saved preview. Geometry is being checked before editing.").to_string(),
+                };
+                ui.label(egui::RichText::new(note).small().weak());
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -636,6 +744,8 @@ mod tests {
                 progress: Arc::new(Progress::default()),
                 preview_rx: Some(preview_rx),
                 preview: None,
+                partial_rx: None,
+                built: None,
             });
             if change_document {
                 app.session.execute("file.new", &serde_json::json!({"name":"Newer design"})).unwrap();
@@ -698,6 +808,8 @@ mod tests {
             progress: Arc::new(Progress::default()),
             preview_rx: None,
             preview: None,
+            partial_rx: None,
+            built: None,
         });
         tick(&mut app, &egui::Context::default());
         assert!(Arc::ptr_eq(&app.session.doc, &old));
@@ -721,6 +833,8 @@ mod tests {
             progress,
             preview_rx: None,
             preview: None,
+            partial_rx: None,
+            built: None,
         });
         assert!(!app.file_load.busy());
         assert!(app.file_load.running.is_some());
