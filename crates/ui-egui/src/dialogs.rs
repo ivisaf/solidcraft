@@ -108,6 +108,7 @@ pub enum Kind {
     /// Sweep a profile along a path of sketch curves.
     Sweep {
         operation: usize,
+        opts: crate::dialogs_sweep::SweepOpts,
     },
     /// A construction plane offset from a plane.
     OffsetPlane {
@@ -192,6 +193,9 @@ pub enum Kind {
     Measure {
         result: Option<Value>,
         of: Vec<Sel>,
+        /// The measure chosen in the panel (centre, min or max); `None` follows the result's
+        /// own default (centre where a round item gives one).
+        show: Option<Shown>,
     },
     /// Move bodies by a distance along X, Y and Z.
     /// Move/Copy (see `dialogs_move`): the move type, X/Y/Z distances (Point to Position: the
@@ -253,6 +257,7 @@ pub enum Kind {
     Sheet(crate::dialogs_sheet::Sm),
     /// Surface tools and Split Face (`dialogs_surface`).
     Surface(crate::dialogs_surface::Surf),
+    SaveMesh(crate::dialogs_save_mesh::SaveMesh),
     /// Plastic features (`dialogs_plastic`).
     Plastic(crate::dialogs_plastic::Pl),
     /// Appearance (`dialogs_appearance`).
@@ -526,9 +531,10 @@ impl Dialog {
             "inspect.section" => {
                 Dialog::new(Kind::Section { offset: "0 mm".into(), flip: false }, vec![SelInput::new("Plane", PLANES | PLANAR_FACES, false)])
             }
-            "inspect.measure" => {
-                Dialog::new(Kind::Measure { result: None, of: Vec::new() }, vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES, true)])
-            }
+            "inspect.measure" => Dialog::new(
+                Kind::Measure { result: None, of: Vec::new(), show: None },
+                vec![SelInput::new("Items", FACES | EDGES | selection::VERTICES | selection::CURVES | PROFILES, true)],
+            ),
             "solid.pattern.rectangular" => Dialog::new(
                 Kind::PatternRect { count: "3".into(), spacing: "20 mm".into(), count2: "1".into(), spacing2: "20 mm".into() },
                 vec![
@@ -543,8 +549,8 @@ impl Dialog {
             ),
             "solid.loft" => Dialog::new(Kind::Loft { operation: usize::from(has_bodies) }, vec![SelInput::new("Profiles", PROFILES, true)]),
             "solid.sweep" => Dialog::new(
-                Kind::Sweep { operation: usize::from(has_bodies) },
-                vec![SelInput::new("Profile", PROFILES, true), SelInput::new("Path", CURVES, true)],
+                Kind::Sweep { operation: usize::from(has_bodies), opts: crate::dialogs_sweep::SweepOpts::default() },
+                vec![SelInput::new("Profile", PROFILES, true), SelInput::new("Path", CURVES, true), crate::dialogs_sweep::direction_input()],
             ),
             "solid.move" => Dialog::new(crate::dialogs_move::kind(0), crate::dialogs_move::inputs(0)),
             "solid.hole" => Dialog::new(hole_defaults(), vec![SelInput::new("Face", HOLE_FACES, true)]),
@@ -602,6 +608,7 @@ impl Dialog {
                 let (kind, inputs) = crate::dialogs_assembly::start(app, id)
                     .or_else(|| crate::dialogs_sheet::start(app, id))
                     .or_else(|| crate::dialogs_surface::start(app, id))
+                    .or_else(|| crate::dialogs_save_mesh::start(app, id))
                     .or_else(|| crate::dialogs_plastic::start(app, id))
                     .or_else(|| crate::dialogs_appearance::start(app, id))
                     .or_else(|| crate::dialogs_motion::start(app, id))
@@ -1371,6 +1378,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Assembly(k) => k.title(),
         Kind::Sheet(k) => k.title(),
         Kind::Surface(k) => k.title(),
+        Kind::SaveMesh(_) => "SAVE AS MESH",
         Kind::Plastic(k) => k.title(),
         Kind::Appearance(_) => "APPEARANCE",
         Kind::Motion(k) => k.title(),
@@ -1675,7 +1683,7 @@ fn input_rows(d: &mut Dialog, ui: &mut egui::Ui, s: &Session) {
 /// Width limits of a docked dialog: shrink-wrapped to its content within these.
 use crate::frame::{DIALOG_MAX_W, DIALOG_MIN_W, DIALOG_WIDE_MAX_W};
 /// Width of value fields and choice boxes in a dialog.
-const FIELD_W: f32 = 124.0;
+pub(crate) const FIELD_W: f32 = 124.0;
 
 /// Find the Boundary Fill cells again when the tool bodies changed (keeping the choices of
 /// cells that are still there).
@@ -1741,7 +1749,7 @@ pub(crate) fn fill_cells(st: &solidcraft_engine::doc::ModelState, tools: &[Strin
 /// Measure again when the picked items changed.
 fn update_measure(app: &SolveApp, d: &mut Dialog) {
     let items: Vec<Sel> = sels(d, 0).to_vec();
-    if let Kind::Measure { result, of } = &mut d.kind
+    if let Kind::Measure { result, of, .. } = &mut d.kind
         && *of != items
     {
         *result = if items.is_empty() { None } else { Some(app.session.measure_items(&items)) };
@@ -1753,8 +1761,39 @@ fn fmt_mm(app: &SolveApp, v: &Value) -> String {
     v.as_f64().map(|x| crate::prefs::show_mm(app, x, 1)).unwrap_or_default()
 }
 
+/// Which distance of a pair the Measure panel shows (and the canvas draws).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shown {
+    /// Centre to centre, or from a round item's axis.
+    Centre,
+    /// Closest points.
+    Min,
+    /// Farthest points.
+    Max,
+}
+
+fn vec3_of(v: &Value) -> Option<Vec3> {
+    let a = v.as_array()?;
+    Some(Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?))
+}
+
+/// The distance shown for a measured pair: which one, its value and its two ends. The chosen
+/// one when the result has it, otherwise the result's default (centre, else the closest).
+pub(crate) fn shown_distance(r: &Value, show: Option<Shown>) -> Option<(Shown, f64, Vec3, Vec3)> {
+    let get = |which: Shown| -> Option<(Shown, f64, Vec3, Vec3)> {
+        let (d, from, to) = match which {
+            Shown::Centre => ("center_distance", "center_from", "center_to"),
+            Shown::Min => ("distance_mm", "from", "to"),
+            Shown::Max => ("max", "max_from", "max_to"),
+        };
+        Some((which, r.get(d)?.as_f64()?, vec3_of(r.get(from)?)?, vec3_of(r.get(to)?)?))
+    };
+    let default = if r.get("measure").and_then(Value::as_str) == Some("center") { Shown::Centre } else { Shown::Min };
+    show.and_then(get).or_else(|| get(default)).or_else(|| get(Shown::Min))
+}
+
 /// The measurement in the dialog.
-fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>) {
+fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>, show: &mut Option<Shown>) {
     let t = Tokens::get();
     let Some(r) = r else {
         ui.label("");
@@ -1768,33 +1807,74 @@ fn measure_rows(app: &SolveApp, ui: &mut egui::Ui, r: Option<&Value>) {
         ui.end_row();
         return;
     }
+    let mm = |v: &Value| fmt_mm(app, v);
     for (i, it) in r["items"].as_array().into_iter().flatten().enumerate() {
-        let what = match it["type"].as_str() {
-            Some("edge") => format!("Length  {}", fmt_mm(app, &it["length_mm"])),
-            Some("face") => format!("Area  {}", crate::prefs::show_mm(app, it["area_mm2"].as_f64().unwrap_or(0.0), 2)),
-            Some("vertex") => {
-                let p = &it["position"];
-                format!("At  {}, {}, {}", fmt_mm(app, &p[0]), fmt_mm(app, &p[1]), fmt_mm(app, &p[2]))
+        // Round items: Ø first, then R, then the length (circumference, or the arc's length
+        // and angle).
+        let mut lines: Vec<String> = Vec::new();
+        if it.get("diameter").is_some() {
+            lines.push(format!("Ø  {}", mm(&it["diameter"])));
+            lines.push(format!("R  {}", mm(&it["radius"])));
+            if it.get("circumference").is_some() {
+                lines.push(format!("{}  {}", tr("Circumference"), mm(&it["circumference"])));
+            } else if let Some(a) = it["angle_deg"].as_f64() {
+                lines.push(format!("{}  {}", tr("Arc length"), mm(&it["arc_length"])));
+                lines.push(format!("{}  {a:.2}°", crate::i18n::tr_label("Angle")));
             }
-            _ => String::new(),
-        };
-        ui.label(format!("Item {}", i + 1));
-        ui.label(what);
-        ui.end_row();
-    }
-    if r.get("distance_mm").is_some() {
-        ui.label(RichText::new(tr("Distance")).strong());
-        ui.label(RichText::new(fmt_mm(app, &r["distance_mm"])).strong());
-        ui.end_row();
-        let d = &r["delta"];
-        for (k, l) in ["ΔX", "ΔY", "ΔZ"].iter().enumerate() {
-            ui.label(*l);
-            ui.label(crate::prefs::show_mm(app, d[k].as_f64().unwrap_or(0.0).abs(), 1));
+        }
+        if let Some(sl) = it.get("slot") {
+            lines.push(format!("{}  {}", tr("Slot width"), mm(&sl["width"])));
+            lines.push(format!("{}  {}", tr("Centre to centre"), mm(&sl["center_distance"])));
+            lines.push(format!("{}  {}", tr("Overall length"), mm(&sl["overall_length"])));
+        }
+        let round = it.get("diameter").is_some();
+        match it["type"].as_str() {
+            Some("edge" | "sketch_curve") if !round => lines.push(format!("{}  {}", tr("Length"), mm(&it["length_mm"]))),
+            Some("face" | "profile") => {
+                lines.push(format!("{}  {}", tr("Area"), crate::prefs::show_mm(app, it["area_mm2"].as_f64().unwrap_or(0.0), 2)))
+            }
+            Some("vertex" | "sketch_point") => {
+                let p = &it["position"];
+                lines.push(format!("At  {}, {}, {}", mm(&p[0]), mm(&p[1]), mm(&p[2])));
+            }
+            _ => {}
+        }
+        for (k, line) in lines.into_iter().enumerate() {
+            ui.label(if k == 0 { format!("Item {}", i + 1) } else { String::new() });
+            ui.label(line);
             ui.end_row();
         }
     }
-    if let Some(a) = r["angle_deg"].as_f64() {
-        ui.label(RichText::new(tr("Angle")).strong());
+    if let Some((now, d, a, b)) = shown_distance(r, *show) {
+        if r.get("center_distance").is_some() {
+            // Centre, min and max all listed; the chosen one is drawn and broken into ΔX/Y/Z.
+            for (which, label, key) in
+                [(Shown::Centre, "Centre to centre", "center_distance"), (Shown::Min, "Min", "distance_mm"), (Shown::Max, "Max", "max")]
+            {
+                let Some(v) = r.get(key).filter(|v| v.is_number()) else { continue };
+                if ui.radio(now == which, tr(label)).clicked() {
+                    *show = Some(which);
+                }
+                let text = RichText::new(mm(v));
+                ui.label(if now == which { text.strong() } else { text });
+                ui.end_row();
+            }
+        } else {
+            ui.label(RichText::new(crate::i18n::tr_label("Distance")).strong());
+            ui.label(RichText::new(crate::prefs::show_mm(app, d, 1)).strong());
+            ui.end_row();
+        }
+        let delta = b - a;
+        for (l, v) in [("ΔX", delta.x), ("ΔY", delta.y), ("ΔZ", delta.z)] {
+            ui.label(l);
+            ui.label(crate::prefs::show_mm(app, v.abs(), 1));
+            ui.end_row();
+        }
+    }
+    if let Some(a) = r["angle_deg"].as_f64()
+        && r["items"].as_array().is_some_and(|v| v.len() == 2)
+    {
+        ui.label(RichText::new(crate::i18n::tr_label("Angle")).strong());
         ui.label(RichText::new(format!("{a:.3}°")).strong());
         ui.end_row();
     }
@@ -1914,7 +1994,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let horizontal_frame = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
     // OK is offered once the inputs make a feature.
     let has_ok = !matches!(d.kind, Kind::Sketch | Kind::Params { .. } | Kind::Measure { .. });
-    let valid = !has_ok || !d.previews() || (built.unwrap_or_else(|| apply_commands(app, &d).is_ok()) && app.preview.error.is_none());
+    let valid = match &d.kind {
+        Kind::SaveMesh(_) => crate::dialogs_save_mesh::ready(&d.inputs),
+        _ => !has_ok || !d.previews() || (built.unwrap_or_else(|| apply_commands(app, &d).is_ok()) && app.preview.error.is_none()),
+    };
     let width = if wide { crate::frame::Width::Wide } else { crate::frame::Width::Normal };
     let wkey = egui::Id::new(("sc_dialog_w", wide));
     let response = crate::frame::docked_on(
@@ -2291,8 +2374,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             for (k, (t, r)) in mids.iter_mut().enumerate() {
                                 row_label(ui, "Mid Radius");
                                 ui.horizontal(|ui| {
-                                    ui.add(egui::DragValue::new(t).speed(0.01).range(0.01..=0.99).fixed_decimals(2))
-                                        .on_hover_text(tr("Position along the edge, 0 at the start end, 1 at the other"));
+                                    ui.add(
+                                        egui::DragValue::new(t)
+                                            .speed(0.01)
+                                            .range(0.01..=0.99)
+                                            .fixed_decimals(2)
+                                            .custom_parser(crate::prefs::parse_number),
+                                    )
+                                    .on_hover_text(tr("Position along the edge, 0 at the start end, 1 at the other"));
                                     enter |= field(ui, r);
                                     if ui.small_button("×").on_hover_text(tr("Remove this point")).clicked() {
                                         remove = Some(k);
@@ -2366,7 +2455,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         d.extra.insert("combine".into(), json!(op == 1));
                         ui.end_row();
                     }
-                    Kind::Measure { result, .. } => measure_rows(app, ui, result.as_ref()),
+                    Kind::Measure { result, show, .. } => measure_rows(app, ui, result.as_ref(), show),
                     Kind::OffsetPlane { offset } => {
                         row_label(ui, "Distance");
                         enter |= field(ui, offset);
@@ -2531,7 +2620,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         combo(ui, "lf_op", &OP_LABELS, operation);
                         ui.end_row();
                     }
-                    Kind::Sweep { operation } => {
+                    Kind::Sweep { operation, opts } => {
+                        enter |= crate::dialogs_sweep::rows(ui, opts, "sw");
                         row_label(ui, "Operation");
                         combo(ui, "sw_op", &OP_LABELS, operation);
                         ui.end_row();
@@ -2670,6 +2760,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     Kind::Sheet(k) => enter |= crate::dialogs_sheet::rows(app, ui, k, &mut d.inputs),
                     Kind::Surface(k) => enter |= crate::dialogs_surface::rows(ui, k),
                     Kind::SketchModify(k) => enter |= crate::sketch_modify_ui::rows(ui, k),
+                    Kind::SaveMesh(k) => enter |= crate::dialogs_save_mesh::rows(app, ui, k),
                     Kind::Plastic(k) => enter |= crate::dialogs_plastic::rows(app, ui, k, &d.inputs),
                     Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
                     Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
@@ -2729,7 +2820,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                 egui::Spinner::new().size(14.0).paint_at(ui, sr);
                 sresp.on_hover_text(tr("Updating the preview"));
             }
-            let raw_label = if matches!(d.kind, Kind::ConfirmDelete { .. }) { "Delete" } else { "OK" };
+            let raw_label = match &d.kind {
+                Kind::ConfirmDelete { .. } => "Delete",
+                Kind::SaveMesh(k) => crate::dialogs_save_mesh::button(k),
+                _ => "OK",
+            };
             let label = tr(raw_label);
             let raw_close = if matches!(d.kind, Kind::Params { .. } | Kind::Measure { .. }) { "Close" } else { "Cancel" };
             let close = tr(raw_close);
@@ -3171,6 +3266,10 @@ fn sels(d: &Dialog, i: usize) -> &[Sel] {
 }
 
 pub(crate) fn run_dialog(app: &mut SolveApp, d: &Dialog) -> Result<(), String> {
+    // Saving asks for a file name first; `Err("")` is the user backing out of that.
+    if let Kind::SaveMesh(k) = &d.kind {
+        return crate::dialogs_save_mesh::run(app, k, &d.inputs);
+    }
     let commands = apply_commands(app, d)?;
     if let Some((_, marker)) = d.editing {
         // Record the actual pre-edit timeline state in the command's undo snapshot.
@@ -3378,8 +3477,10 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 out.push(("solid.extrude".to_string(), with(json!({"sketch": sketch, "profiles": idx}))));
             }
             // Each planar body face extrudes on its own.
-            for p in face_points(0) {
-                out.push(("solid.extrude".to_string(), with(json!({ "face": p }))));
+            for pick in sels(d, 0) {
+                if let Sel::Face { body, point, .. } = pick {
+                    out.push(("solid.extrude".to_string(), with(json!({"face": pt(*point), "face_body": body}))));
+                }
             }
             return Ok(out);
         }
@@ -3533,16 +3634,15 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let sections: Vec<Value> = sections.into_iter().map(|(sk, v)| json!({"sketch": sk, "profiles": v})).collect();
             ("solid.loft", json!({"sections": sections, "operation": OPS.get(*operation).copied().unwrap_or("new")}))
         }
-        Kind::Sweep { operation } => {
+        Kind::Sweep { operation, opts } => {
             need(0, "a profile")?;
             need(1, "the path")?;
             let (sketch, idx) = profiles();
             let path: Vec<String> = sels(d, 1).iter().filter_map(|x| if let Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect();
             let path_sketch = curves_sketch(app, &path, sketch.as_u64()).ok_or("the path curves must be in one sketch")?;
-            (
-                "solid.sweep",
-                json!({"sketch": sketch, "profiles": idx, "path_sketch": path_sketch, "path": path, "operation": OPS.get(*operation).copied().unwrap_or("new")}),
-            )
+            let mut p = json!({"sketch": sketch, "profiles": idx, "path_sketch": path_sketch, "path": path, "operation": OPS.get(*operation).copied().unwrap_or("new")});
+            crate::dialogs_sweep::params(app, opts, sels(d, 2).first(), &mut p)?;
+            ("solid.sweep", p)
         }
         Kind::OffsetPlane { offset } => {
             need(0, "a plane")?;
@@ -3862,6 +3962,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::Sheet(k) => return crate::dialogs_sheet::commands(app, k, &d.inputs, &d.extra),
         Kind::Surface(k) => return crate::dialogs_surface::commands(app, k, &d.inputs, &d.extra),
         Kind::SketchModify(k) => return crate::sketch_modify_ui::commands(app, k, &d.inputs, &d.extra),
+        Kind::SaveMesh(k) => return crate::dialogs_save_mesh::commands(k, &d.inputs),
         Kind::Plastic(k) => return crate::dialogs_plastic::commands(app, k, &d.inputs, &d.extra),
         Kind::Appearance(k) => return Ok(crate::dialogs_appearance::commands(k, &d.inputs)),
         Kind::Motion(k) => return crate::dialogs_motion::commands(app, k, &d.inputs),
@@ -4598,9 +4699,13 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             }
             d
         }
-        FeatureKind::Sweep { sketch, profiles, path, operation, targets, .. } => {
+        FeatureKind::Sweep { sketch, profiles, path, operation, targets, orientation, twist, scale, .. } => {
             let mut d = start("solid.sweep")?;
-            d.kind = Kind::Sweep { operation: op_index(operation) };
+            let (opts, direction) = crate::dialogs_sweep::SweepOpts::of(orientation, twist, scale, &feature_frame(s, f.component));
+            d.kind = Kind::Sweep { operation: op_index(operation), opts };
+            if let Some(inp) = d.inputs.get_mut(2) {
+                inp.items = direction.into_iter().collect();
+            }
             let items = st.sketch(*sketch).map(|ss| profile_indices(ss, profiles)).unwrap_or_default();
             if let Some(inp) = d.inputs.get_mut(0) {
                 inp.items = items.into_iter().map(|index| Sel::Profile { sketch: *sketch, index }).collect();

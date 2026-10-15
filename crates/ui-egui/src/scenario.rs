@@ -112,11 +112,12 @@ fn with_dir(v: Value, dir: &str) -> Value {
     }
 }
 
-/// A fresh folder for one scenario's files.
+/// A fresh folder for one scenario's files, under the temporary folder spelled with long names
+/// (a short 8.3 `TEMP` would trip the short-name refusal before the scope checks the scenarios test).
 fn scratch_dir() -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static N: AtomicUsize = AtomicUsize::new(0);
-    let d = std::env::temp_dir().join(format!("solidcraft-scenario-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let d = solidcraft_engine::io::vfs::temp_dir().join(format!("solidcraft-scenario-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::create_dir_all(&d);
     d
 }

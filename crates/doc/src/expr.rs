@@ -237,6 +237,8 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
     let at = |i: usize| cs.get(i).map(|x| x.0).unwrap_or(s.len());
     let mut i = 0;
     let mut out = Vec::new();
+    // Parentheses open at this point: a comma outside them can only be a decimal comma.
+    let mut depth = 0usize;
     while let Some(&(_, c)) = cs.get(i) {
         if c.is_whitespace() {
             i += 1;
@@ -244,6 +246,17 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
             let st = i;
             while cs.get(i).is_some_and(|(_, c)| c.is_ascii_digit() || *c == '.') {
                 i += 1;
+            }
+            // A decimal comma (`2,5 mm`, as typed with a numeric keypad in many locales, #1347):
+            // a comma between digits, in a number with no point, outside any parentheses (inside
+            // them a comma separates a function's arguments: `max(1,2)`).
+            let digit = |k: usize| cs.get(k).is_some_and(|(_, c)| c.is_ascii_digit());
+            let has_point = cs.get(st..i).is_some_and(|ds| ds.iter().any(|(_, c)| *c == '.'));
+            if depth == 0 && !has_point && digit(i.wrapping_sub(1)) && cs.get(i).is_some_and(|(_, c)| *c == ',') && digit(i + 1) {
+                i += 1;
+                while digit(i) {
+                    i += 1;
+                }
             }
             // Exponent: 1e-3 (but not `2em`).
             if cs.get(i).is_some_and(|(_, c)| *c == 'e' || *c == 'E') {
@@ -257,7 +270,7 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
                 }
             }
             let t = s.get(at(st)..at(i)).unwrap_or_default();
-            let v: f64 = t.parse().map_err(|_| DocError::Expr(format!("bad number `{t}`")))?;
+            let v: f64 = t.replace(',', ".").parse().map_err(|_| DocError::Expr(format!("bad number `{t}`")))?;
             out.push((Tok::Num(v), at(st), at(i)));
         } else if c.is_alphabetic() || c == '_' || c == 'µ' {
             let st = i;
@@ -282,6 +295,11 @@ fn lex_spans(s: &str) -> Result<Vec<(Tok, usize, usize)>, DocError> {
             out.push((Tok::Op(','), at(i), at(i + 1)));
             i += 1;
         } else if "+-*/^(),%".contains(c) {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
             out.push((Tok::Op(c), at(i), at(i + 1)));
             i += 1;
         } else {
@@ -817,6 +835,25 @@ mod tests {
 
     fn def(n: &str, e: &str, u: &str) -> ParamDef {
         ParamDef { name: n.into(), expr: e.into(), unit: u.into() }
+    }
+
+    #[test]
+    fn a_decimal_comma_outside_parentheses() {
+        // #1347: a comma between digits is a decimal comma where it cannot separate arguments.
+        assert_eq!(ev("2,5", Kind::Unitless).unwrap(), 2.5);
+        assert_eq!(ev("2,5 mm", Kind::Length).unwrap(), 2.5);
+        assert_eq!(ev("12,75mm + 0,25", Kind::Length).unwrap(), 13.0);
+        assert_eq!(ev("width / 2,5", Kind::Length).unwrap(), 16.0);
+        assert!((ev("1,5e3 mm", Kind::Length).unwrap() - 1500.0).abs() < 1e-9);
+        assert!((ev("22,5 deg", Kind::Angle).unwrap() - 22.5f64.to_radians()).abs() < 1e-12);
+        // Inside parentheses a comma still separates a function's arguments.
+        assert_eq!(ev("max(1,2)", Kind::Unitless).unwrap(), 2.0);
+        assert_eq!(ev("max(1 mm, 3, 2)", Kind::Length).unwrap(), 3.0);
+        assert_eq!(ev("(2,5)", Kind::Unitless).ok(), None, "a comma inside parentheses is not a decimal comma");
+        // Not between two digits, or a second comma: still an error.
+        for bad in ["2,", ",5", "2 ,5", "2, 5", "1,5,3", "1.5,3"] {
+            assert!(ev(bad, Kind::Unitless).is_err(), "{bad}");
+        }
     }
 
     #[test]

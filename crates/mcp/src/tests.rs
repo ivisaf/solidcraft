@@ -214,7 +214,7 @@ fn open_stands_a_y_up_step_file_up() {
     assert_eq!(r["features"], 1, "{r}");
     assert!((height(&mut s) - 5.0).abs() < 1e-6, "as written");
     let r = tool(&mut s, "open", json!({"path": step, "up": "y", "names": "product"}));
-    assert_eq!(r["features"], 2, "the import and the turn: {r}");
+    assert_eq!(r["features"], 1, "the import, its component turned: {r}");
     assert!((height(&mut s) - 40.0).abs() < 1e-6, "Y became Z");
 
     for args in [json!({"path": step, "up": "x"}), json!({"path": step, "names": "label"}), json!({"path": step, "up": 1})] {
@@ -1372,4 +1372,22 @@ fn tool_annotations_tell_the_whole_truth() {
         assert_eq!(hints(name), (false, false, false), "{name}");
     }
     assert!(tools.iter().all(|t| t["annotations"]["readOnlyHint"].is_boolean()), "every tool is annotated");
+}
+
+/// `measure` with `items` (#1392): a sketch circle's diameter and radius, and two circles'
+/// centre-to-centre with the closest and farthest distances.
+#[test]
+fn measure_items_gives_diameters_and_centre_distances() {
+    let mut s = server();
+    tool(&mut s, "execute", json!({"command": "sketch.create", "params": {"plane": "XY"}}));
+    let a = tool(&mut s, "execute", json!({"command": "sketch.circle.center", "params": {"center": [0, 0], "radius": 3}}));
+    let b = tool(&mut s, "execute", json!({"command": "sketch.circle.center", "params": {"center": [30, 40], "radius": 2}}));
+    let id = |r: &Value| r["curves"][0].as_str().or(r["result"]["curves"][0].as_str()).unwrap().to_string();
+    let (a, b) = (id(&a), id(&b));
+    let one = tool(&mut s, "measure", json!({"items": [{"type": "sketch_curve", "id": a}]}));
+    assert_eq!((one["diameter"].as_f64(), one["radius"].as_f64()), (Some(6.0), Some(3.0)), "{one}");
+    let two = tool(&mut s, "measure", json!({"items": [{"type": "sketch_curve", "id": a}, {"type": "sketch_curve", "id": b}]}));
+    assert!((two["center_distance"].as_f64().unwrap() - 50.0).abs() < 1e-9, "{two}");
+    assert!((two["min"].as_f64().unwrap() - 45.0).abs() < 1e-9 && (two["max"].as_f64().unwrap() - 55.0).abs() < 1e-9, "{two}");
+    assert!(two["distance_mm"].is_number() && two["from"].is_array(), "{two}");
 }

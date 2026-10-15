@@ -1551,7 +1551,7 @@ fn flat_dxf_preserves_exact_cutout_entities() {
         outer: Loop2 { segs: vec![Seg2::Arc { center: Vec2::new(40.0, 30.0), radius: 5.0, start: -PI, sweep: -2.0 * PI }] },
         holes: Vec::new(),
     }];
-    let dxf = super::flat_dxf(&sh, super::DxfCurves::Exact).unwrap();
+    let dxf = super::flat_dxf(&sh, &super::DxfOptions::default()).unwrap();
     assert_eq!(dxf.matches("0\nCIRCLE\n").count(), 1, "{dxf}");
     assert!(!dxf.contains("0\nARC\n"), "a full circle must not become a zero-length ARC");
     let read = solidcraft_io::read_dxf(&dxf).unwrap();
@@ -1563,7 +1563,7 @@ fn flat_dxf_preserves_exact_cutout_entities() {
             Seg2::Arc { center: Vec2::new(20.0, 10.0), radius: 10.0, start: 0.0, sweep: PI },
         ],
     };
-    let dxf = super::flat_dxf(&sh, super::DxfCurves::Exact).unwrap();
+    let dxf = super::flat_dxf(&sh, &super::DxfOptions::default()).unwrap();
     assert_eq!(dxf.matches("0\nLINE\n").count(), 5, "four outline lines and one exact cutout line");
     assert_eq!(dxf.matches("0\nARC\n").count(), 1);
     assert!(dxf.contains(" 50\n0.0\n 51\n180.0\n"), "{dxf}");
@@ -2001,7 +2001,9 @@ fn dxf_outline_only(text: &str) -> String {
     for end in 1..=pairs.len() {
         if end == pairs.len() || pairs.get(end).is_some_and(|p| p.0 == "0") {
             let entity = &pairs[start..end];
-            if entity.first().is_some_and(|p| matches!(p.1, "LINE" | "ARC" | "CIRCLE")) && entity.iter().any(|p| p.0 == "8" && p.1 == "OUTLINE") {
+            if entity.first().is_some_and(|p| matches!(p.1, "LINE" | "ARC" | "CIRCLE"))
+                && entity.iter().any(|p| p.0 == "8" && matches!(p.1, "OUTLINE" | "CUT"))
+            {
                 for (code, value) in entity {
                     out.push_str(&format!("{code}\n{value}\n"));
                 }
@@ -4144,4 +4146,150 @@ fn perforate_supports_a_square_pattern_and_refuses_impossible_values() {
     ] {
         assert!(s.execute("sheet.perforate", &bad).is_err(), "{bad} must be refused");
     }
+}
+
+/// A 100 x 60 tray with one 45° flange 40 high on its y = 0 edge (2.5 mm, R 2.5, K 0.44), and on
+/// it a return 10 high when asked. Returns the far edge of the last panel in the flat pattern:
+/// the base starts at the setback s = (t + R)·tan 22.5°, each bend's zone is (π/4)·(R + K·t) long,
+/// and a panel h high is h − s long, or h − 2s with a return on its far edge.
+fn tray_with_a_45_degree_flange(s: &mut Session, with_return: bool) -> f64 {
+    base(s, 100.0, 60.0);
+    run(s, "sheet.flange", json!({"edges": [[50, 0, 2.5]], "height": 40, "angle": 45}));
+    let (setback, ba) = (5.0 * (PI / 8.0).tan(), PI / 4.0 * (2.5 + 0.44 * 2.5));
+    if with_return {
+        run(s, "sheet.flange", json!({"edges": [[50, -27.5, 26.5]], "height": 10, "angle": 45}));
+        return setback - ba - (40.0 - 2.0 * setback) - ba - (10.0 - setback);
+    }
+    setback - ba - (40.0 - setback)
+}
+
+/// A point on that flange's inside face, the plane y + z = 2.5·√2 (tangent to the bend's inside
+/// radius, 2.5 about y = 5·tan 22.5°, z = 5).
+const FLANGE_FACE: [f64; 3] = [50.0, 2.5 * std::f64::consts::SQRT_2 - 15.0, 15.0];
+
+fn last_warning(s: &Session) -> String {
+    s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default()
+}
+
+fn parted_note(area: f64, at: [f64; 2]) -> String {
+    format!("1 piece of `Body1` is no longer joined to its base ({area:.2} mm², near ({:.1}, {:.1}) in the flat pattern); it is kept", at[0], at[1])
+}
+
+fn flat_pieces(s: &Session) -> Vec<f64> {
+    s.model.state().sheets[0].flat_regions().unwrap().iter().map(solidcraft_geom::Region2::area).collect()
+}
+
+#[test]
+fn a_cut_that_parts_a_flange_from_the_base_keeps_it_and_says_so_folded_or_flat() {
+    // A slot across the flange beside its bend (flat y −3 to −1.5) leaves the flange's panel past
+    // it, with any return on it, joined to nothing: 100 × (−3 − far). Cut on the folded flange's
+    // face or in the unfolded sheet, the piece stays, and the cut names it in its reply and on the
+    // timeline, with the middle of the piece in the flat pattern.
+    for (with_return, unfolded) in [(false, false), (false, true), (true, false), (true, true)] {
+        let what = format!("return {with_return}, unfolded {unfolded}");
+        let mut s = Session::default();
+        let far = tray_with_a_45_degree_flange(&mut s, with_return);
+        let out = if unfolded {
+            run(&mut s, "sheet.unfold", json!({}));
+            rectangle_tool(&mut s, "Slot", [-5.0, -3.0], [105.0, -1.5]);
+            run(&mut s, "solid.extrude", json!({"sketch": "Slot", "through_all": true, "direction": "symmetric", "operation": "cut"}))
+        } else {
+            run(&mut s, "sketch.create", json!({"plane": {"face": FLANGE_FACE}, "name": "Slot"}));
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-5, -3], "p1": [105, -1.5]}));
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "solid.extrude", json!({"sketch": "Slot", "through_all": true, "direction": "negative", "operation": "cut"}))
+        };
+        let note = parted_note(100.0 * (-3.0 - far), [50.0, (far - 3.0) / 2.0]);
+        assert!(last_warning(&s).contains(&note), "{what}: {}", last_warning(&s));
+        assert_eq!(out["warning"], json!(last_warning(&s)), "{what}: {out}");
+        // Both pieces stay, folded and flat: the base with its bend left, and the flange.
+        let pieces = flat_pieces(&s);
+        assert!(pieces.len() == 2 && pieces.iter().any(|a| (a - 100.0 * (-3.0 - far)).abs() < 1e-6), "{what}: {pieces:?}");
+        for command in if unfolded { ["sheet.refold", "sheet.unfold"] } else { ["sheet.unfold", "sheet.refold"] } {
+            run(&mut s, command, json!({}));
+            assert_eq!(flat(&mut s)["outline"].as_array().map(Vec::len), Some(2), "{what} {command}");
+            assert_eq!(flat_pieces(&s), pieces, "{what} {command}");
+            if command == "sheet.unfold" {
+                assert!((volume(&mut s) - pieces.iter().sum::<f64>() * 2.5).abs() < 1e-3, "{what}: {}", volume(&mut s));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ring_over_a_flanges_edge_names_the_piece_of_its_inside_on_the_flange_but_not_an_island() {
+    // A ring Ø16 / Ø10 cut on the folded flange's face, centred on its far edge: the half of its
+    // inside on the flange (π·5²/2, its centroid 4·5/3π inside the edge) has nothing round it,
+    // and is named. Centred on the flange, its inside is an island, and nothing is named.
+    for (y, named) in [(None, true), (Some(-20.0), false)] {
+        let mut s = Session::default();
+        let far = tray_with_a_45_degree_flange(&mut s, false);
+        let y = y.unwrap_or(far);
+        run(&mut s, "sketch.create", json!({"plane": {"face": FLANGE_FACE}, "name": "Ring"}));
+        run(&mut s, "sketch.circle.center", json!({"center": [50, y], "diameter": 16}));
+        run(&mut s, "sketch.circle.center", json!({"center": [50, y], "diameter": 10}));
+        run(&mut s, "sketch.finish", json!({}));
+        let out = run(
+            &mut s,
+            "solid.extrude",
+            json!({"sketch": "Ring", "profiles": [{"point": [56.5, y]}], "through_all": true, "direction": "negative", "operation": "cut"}),
+        );
+        let warning = out["warning"].as_str().unwrap_or_default().to_string();
+        let note = parted_note(12.5 * PI, [50.0, far + 20.0 / (3.0 * PI)]);
+        assert_eq!(warning.contains(&note), named, "{y}: {warning}");
+        assert!(named || !warning.contains("no longer joined"), "{y}: {warning}");
+        assert_eq!(flat_pieces(&s).len(), 2, "{y}");
+    }
+}
+
+#[test]
+fn cuts_that_split_a_sheet_or_cut_it_beside_the_base_name_only_the_pieces_they_part() {
+    // Unfolded, a strip across tray and flange leaves two pieces that each keep their part of
+    // the base: nothing to name. A box over the smaller piece's base and bend then leaves its
+    // flange panel, 26 × (−3 − far), named; a hole in the base after it names nothing again.
+    let mut s = Session::default();
+    let far = tray_with_a_45_degree_flange(&mut s, false);
+    run(&mut s, "sheet.unfold", json!({}));
+    rectangle_tool(&mut s, "Strip", [70.0, -60.0], [74.0, 70.0]);
+    let out = run(&mut s, "solid.extrude", json!({"sketch": "Strip", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert!(out["warning"].is_null() && last_warning(&s).is_empty(), "{out}");
+    rectangle_tool(&mut s, "Box", [72.0, -3.0], [101.0, 61.0]);
+    let out = run(&mut s, "solid.extrude", json!({"sketch": "Box", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert_eq!(out["warning"], json!(parted_note(26.0 * (-3.0 - far), [87.0, (far - 3.0) / 2.0])), "{out}");
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Hole"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [30, 30], "diameter": 8}));
+    run(&mut s, "sketch.finish", json!({}));
+    let out = run(&mut s, "solid.extrude", json!({"sketch": "Hole", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert!(out["warning"].is_null(), "{out}");
+    run(&mut s, "sheet.refold", json!({}));
+    assert_eq!(flat(&mut s)["outline"].as_array().map(Vec::len), Some(2));
+    // Folded, a slot across the base beside the bend leaves the flange with a strip of the base;
+    // a plain plate cut in two halves. Neither names anything.
+    let mut s = Session::default();
+    tray_with_a_45_degree_flange(&mut s, false);
+    rectangle_tool(&mut s, "Slot", [-5.0, 3.0], [105.0, 6.0]);
+    let out = run(&mut s, "solid.extrude", json!({"sketch": "Slot", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert!(out["warning"].is_null() && flat_pieces(&s).len() == 2, "{out}");
+    let mut s = Session::default();
+    base(&mut s, 100.0, 60.0);
+    rectangle_tool(&mut s, "Strip", [45.0, -5.0], [55.0, 65.0]);
+    let out = run(&mut s, "solid.extrude", json!({"sketch": "Strip", "through_all": true, "direction": "symmetric", "operation": "cut"}));
+    assert!(out["warning"].is_null() && flat_pieces(&s).len() == 2, "{out}");
+}
+
+#[test]
+fn a_hole_that_parts_a_flange_from_the_base_names_it() {
+    // A 10 x 60 plate with a 90° flange 40 high on its y = 0 edge: the flange's panel runs from
+    // flat y = 5 − BA (world z = 5) for 35 mm. A Ø12 hole drilled into it at z = 15 (flat
+    // y = 5 − BA − 10) takes its whole width, and leaves the 25 mm below the hole's centre less
+    // the half disc there: 10 × 25 − ∫ √(36 − u²) du over |u| ≤ 5 = 250 − (5√11 + 36·asin(5/6)).
+    let mut s = Session::default();
+    base(&mut s, 10.0, 60.0);
+    run(&mut s, "sheet.flange", json!({"edges": [[5, 0, 2.5]], "height": 40}));
+    let out = run(&mut s, "solid.hole", json!({"position": [5, 0, 15], "diameter": 12}));
+    let area = 250.0 - (5.0 * 11f64.sqrt() + 36.0 * (5.0f64 / 6.0).asin());
+    let warning = out["warning"].as_str().unwrap_or_default();
+    assert!(warning.starts_with(&format!("1 piece of `Body1` is no longer joined to its base ({area:.2} mm², near (5.0, ")), "{warning}");
+    assert_eq!(out["warning"], json!(last_warning(&s)));
+    assert_eq!(flat_pieces(&s).len(), 2);
 }

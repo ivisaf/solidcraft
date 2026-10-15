@@ -10,6 +10,24 @@ use crate::dialogs::{Dialog, Kind, apply_commands};
 use crate::{Services, SolveApp};
 
 #[test]
+fn a_face_extrude_keeps_the_picked_body_when_faces_coincide() {
+    let mut app = app_with(json!([
+        {"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Other"}},
+        {"command":"solid.box","params":{"length":40,"width":30,"height":20,"body_name":"Wall"}}
+    ]));
+    let before = app.session.model.state();
+    let pick = Sel::Face { body: "Wall".into(), index: 2, point: Vec3::new(40.0, 15.0, 10.0) };
+    let d = start(&mut app, vec![pick], "solid.extrude");
+    let (command, params) = apply_commands(&app, &d).unwrap().remove(0);
+    assert_eq!(params["face_body"], json!("Wall"));
+    app.session.execute(&command, &params).unwrap();
+    let after = app.session.model.state();
+    assert_eq!(after.bodies.len(), 2);
+    assert!(after.body("Other").unwrap().body.same(&before.body("Other").unwrap().body));
+    assert!(after.body("Wall").unwrap().body.contains(Vec3::new(49.0, 15.0, 10.0)));
+}
+
+#[test]
 fn path_plane_click_retains_source_and_previews_then_edits_in_place() {
     let mut h = crate::scenario::Harness::new();
     let source = h.app.run("sketch.create", json!({"plane":"XY","name":"Bridge"})).unwrap()["sketch"].as_u64().unwrap();

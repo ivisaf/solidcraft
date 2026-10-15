@@ -863,15 +863,20 @@ pub(super) fn face_cap(faces: usize) -> usize {
 /// tolerance is still halved while it turns more than the deflection's angle.
 fn bounded_polyline<C: PolylineableCurve>(curve: &C, range: (f64, f64), d: Deflection) -> PolylineCurve {
     let (tol, turn2) = (d.chord, d.turn2());
-    let mut out = vec![curve.subs(range.0)];
+    // A sample that does not evaluate (an intersection curve whose projection fails): an interval
+    // end falls back to the curve's approximation so the polyline stays finite; an interior probe
+    // is NaN, which counts as flat.
+    let end = |t: f64| curve.try_subs(t).unwrap_or_else(|| curve.approx_subs(t));
+    let probe = |t: f64| curve.try_subs(t).unwrap_or(Point3::new(f64::NAN, f64::NAN, f64::NAN));
+    let mut out = vec![end(range.0)];
     let mut stack: Vec<(f64, f64, usize)> = vec![(range.0, range.1, 0)];
     while let Some((a, b, depth)) = stack.pop() {
-        let (pa, pb) = (curve.subs(a), curve.subs(b));
+        let (pa, pb) = (end(a), end(b));
         let t = a + (b - a) * 0.4729;
         let chord = pa + (pb - pa) * 0.4729;
-        let d2 = curve.subs(t).distance2(chord);
+        let d2 = probe(t).distance2(chord);
         let tm = 0.5 * (a + b);
-        let dm = curve.subs(tm).distance2(pa.midpoint(pb));
+        let dm = probe(tm).distance2(pa.midpoint(pb));
         let flat = !(d2 >= tol * tol || dm >= tol * tol);
         let flat = flat && !d.turns(turn2, d2.max(dm), pa.distance2(pb));
         if flat || depth >= 24 || out.len() + stack.len() >= MAX_EDGE_POINTS {

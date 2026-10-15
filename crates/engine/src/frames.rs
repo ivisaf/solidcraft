@@ -45,7 +45,7 @@ use K::*;
 /// The parameters each command takes in world coordinates.
 fn table(id: &str) -> &'static [(&'static str, K)] {
     match id {
-        "solid.extrude" => &[("face", Pick), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)],
+        "solid.extrude" => &[("face", Pick), ("face_body", Body), ("from", Make), ("to", Make), ("targets", Body), ("participants", Body)],
         "solid.revolve" => &[("face", Pick), ("axis", Axis), ("to", Make), ("targets", Body), ("participants", Body)],
         "solid.box" | "solid.sphere" => &[("corner", Make), ("center", Make)],
         "solid.cylinder" | "solid.coil" | "solid.torus" => &[("base", Make), ("center", Make), ("axis", Dir)],
@@ -390,7 +390,7 @@ pub fn to_local(s: &Session, id: &str, params: &Value) -> Option<Value> {
         command_frames.sketch = frame;
     }
     let mut m = Mapper { s, f: command_frames, first: None, changed: false, here: false };
-    let body = obj.get("body").and_then(Value::as_str).map(str::to_string);
+    let body = obj.get("body").or_else(|| obj.get("face_body")).and_then(Value::as_str).map(str::to_string);
     let mut out: Map<String, Value> = obj.clone();
     // Picks first: their frame turns the directions.
     for pass in [true, false] {

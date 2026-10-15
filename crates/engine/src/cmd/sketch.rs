@@ -167,7 +167,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("SKETCH", "CONSTRAINTS")
         .icon("c_symmetry")
         .enabled(in_sketch)
-        .params("a, b: two points or two curves (lines mirror their ends, circles/arcs their centres); line: symmetry line id, or x / y for the sketch's own axes (a curve with that id wins; an axis becomes a linked construction line on it, reported in created)"),
+        .params("a, b: two points or two curves (lines mirror their ends, circles/arcs their centres); line: symmetry line id, or x / y for the sketch's own axes (a curve with that id wins; an axis becomes a linked construction line on it, reported in created); or point (or a point id as line, \"origin\" too): symmetric about that point, each pair joined by a construction line it is the midpoint of"),
     CommandSpec::new("sketch.construction", "Normal/Construction", construction)
         .at("SKETCH", "CREATE")
         .icon("construction")
@@ -1676,9 +1676,38 @@ fn c_midpoint(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(ConstraintKind::Midpoint { p: point_ref(sk, p.get("point"), cmd, "point")?, l: curve_ref(sk, p.get("line"), cmd, "line")? })
     })
 }
+/// The centre of a symmetry about a point (#1075): `point`, or `line` naming a point rather than
+/// a curve or a sketch axis (the origin picked as the third entity).
+fn symmetry_center(sk: &Sketch, p: &Value, cmd: &str) -> Result<Option<usize>> {
+    if let Some(r) = p.get("point") {
+        return point_ref(sk, Some(r), cmd, "point").map(Some);
+    }
+    let Some(id) = p.get("line").and_then(Value::as_str) else { return Ok(None) };
+    if sk.curve_index(id).is_some() || matches!(id, "x" | "y") {
+        return Ok(None);
+    }
+    Ok(sk.resolve_point(id))
+}
+
+/// Points `a` and `b` symmetric about point `c`: a construction line from `a` to `b` with `c`
+/// at its midpoint.
+fn symmetric_about_point(sk: &mut Sketch, a: usize, b: usize, c: usize, cmd: &str) -> Result<String> {
+    if a == b || a == c || b == c {
+        return Err(bad(cmd, "symmetry about a point needs two other points"));
+    }
+    let l = sk.add_line_pts(a, b, None)?;
+    if let Some(cu) = sk.curves.get_mut(l) {
+        cu.construction = true;
+    }
+    add_c(sk, ConstraintKind::Midpoint { p: c, l })
+}
+
 fn c_symmetry(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.constraint.symmetry";
     let (ids, info) = edit(s, p, cmd, true, |sk, _| {
+        if let Some(c) = symmetry_center(sk, p, cmd)? {
+            return symmetry_about_point(sk, p, c, cmd);
+        }
         let l = line_or_axis_ref(sk, p.get("line"), cmd, "line")?;
         let ra = p.get("a").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`a` must be a point or curve"))?;
         let rb = p.get("b").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`b` must be a point or curve"))?;
@@ -1714,6 +1743,52 @@ fn c_symmetry(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(out)
     })?;
     Ok(json!({"constraints": ids, "sketch": info}))
+}
+
+/// Symmetry about point `c`: two points, two circles/arcs (their centres, and equal radii) or two
+/// lines (each end with the end of the other line nearest its mirror image). The constraints
+/// (the construction lines show in the response's `created`).
+fn symmetry_about_point(sk: &mut Sketch, p: &Value, c: usize, cmd: &str) -> Result<Vec<String>> {
+    let ra = p.get("a").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`a` must be a point or curve"))?;
+    let rb = p.get("b").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`b` must be a point or curve"))?;
+    let rep = solve(&mut sk.clone());
+    let order = ent(sk, ra).zip(ent(sk, rb));
+    let pairs: Vec<(usize, usize)> = match (sk.resolve_point(ra), sk.resolve_point(rb)) {
+        (Some(a), Some(b)) => vec![(a, b)],
+        _ => {
+            let ca = sk.curve_index(ra).ok_or_else(|| bad(cmd, format!("unknown entity `{ra}`")))?;
+            let cb = sk.curve_index(rb).ok_or_else(|| bad(cmd, format!("unknown entity `{rb}`")))?;
+            match (sk.curves.get(ca).map(|x| x.kind.clone()), sk.curves.get(cb).map(|x| x.kind.clone())) {
+                (Some(CurveKind::Line { a: a0, b: a1 }), Some(CurveKind::Line { a: b0, b: b1 })) => {
+                    let pc = sk.point(c).unwrap_or_default();
+                    let mirror = |i: usize| pc * 2.0 - sk.point(i).unwrap_or_default();
+                    let near = |i: usize, j: usize| mirror(i).dist(sk.point(j).unwrap_or_default());
+                    if near(a0, b0) + near(a1, b1) <= near(a0, b1) + near(a1, b0) { vec![(a0, b0), (a1, b1)] } else { vec![(a0, b1), (a1, b0)] }
+                }
+                (Some(_), Some(_)) => {
+                    let pa = round_center(sk, ca).ok_or_else(|| bad(cmd, "symmetry needs two lines or two circles/arcs"))?;
+                    let pb = round_center(sk, cb).ok_or_else(|| bad(cmd, "symmetry needs two lines or two circles/arcs"))?;
+                    let mut out = symmetry_pairs(sk, &[(pa, pb)], c, cmd)?;
+                    out.push(add_c(sk, ConstraintKind::Equal { a: ca, b: cb })?);
+                    if let Some((a, b)) = order {
+                        apply_in_order(sk, &rep, &[a, Ent::Point(c)], b, cmd)?;
+                    }
+                    return Ok(out);
+                }
+                _ => return Err(bad(cmd, "symmetry needs two points or two curves")),
+            }
+        }
+    };
+    let out = symmetry_pairs(sk, &pairs, c, cmd)?;
+    // The first entity and the centre stay; the second mirrors onto it.
+    if let Some((a, b)) = order {
+        apply_in_order(sk, &rep, &[a, Ent::Point(c)], b, cmd)?;
+    }
+    Ok(out)
+}
+
+fn symmetry_pairs(sk: &mut Sketch, pairs: &[(usize, usize)], c: usize, cmd: &str) -> Result<Vec<String>> {
+    pairs.iter().map(|(a, b)| symmetric_about_point(sk, *a, *b, c, cmd)).collect()
 }
 
 fn round_center(sk: &Sketch, c: usize) -> Option<usize> {
@@ -2411,3 +2486,6 @@ mod ids_tests;
 #[cfg(test)]
 #[path = "sketch_redundant_tests.rs"]
 mod redundant_tests;
+#[cfg(test)]
+#[path = "sketch_symmetry_point_tests.rs"]
+mod symmetry_point_tests;

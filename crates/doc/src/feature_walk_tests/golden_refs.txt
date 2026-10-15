@@ -67,6 +67,10 @@ sweep
   sketches: [1, 2]
   remap_refs: path_sketch, sketch
   remap_bodies: targets[0]
+sweep_options
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+  remap_bodies: targets[0]
 shell
   remap_bodies: body
 draft
@@ -157,6 +161,9 @@ surface_revolve
   sketches: [1]
   remap_refs: sketch
 surface_sweep
+  sketches: [1, 2]
+  remap_refs: path_sketch, sketch
+surface_sweep_options
   sketches: [1, 2]
   remap_refs: path_sketch, sketch
 surface_loft

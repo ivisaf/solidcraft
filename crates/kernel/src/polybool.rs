@@ -356,6 +356,11 @@ pub fn faceted_boolean(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Optio
     // whether the pieces' boundaries come out consistent: try a few tolerances, and take the
     // first whose result is watertight and agrees with the complementary boolean (A − B and
     // A ∩ B add up to A; A ∪ B is A plus B less A ∩ B).
+    // The BSP takes each list's first polygon as its splitting plane. Facets in sweep order
+    // (a thread's groove, turn after turn) make every splitter cut nothing, so the tree is as
+    // deep as the list is long: quadratic time and memory, and a long thread ran out of depth
+    // (#1250). The same lists in a fixed shuffled order give a shallow tree.
+    let (pa, pb) = (shuffled(pa), shuffled(pb));
     let (va, vb) = (polys_volume(&pa), polys_volume(&pb));
     let mut last = KernelError::Failed("faceted boolean".into());
     for rel in [1e-8, 1e-7, 3e-8, 1e-9, 3e-7] {
@@ -381,6 +386,23 @@ pub fn faceted_boolean(a: &Body, b: &Mesh, op: BoolOp, tol: f64) -> Result<Optio
         }
     }
     Err(last)
+}
+
+/// `polys` in a fixed pseudo-random order (the same every run, so results are reproducible).
+fn shuffled(mut polys: Vec<Poly>) -> Vec<Poly> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ polys.len() as u64;
+    let mut next = || {
+        // SplitMix64.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..polys.len()).rev() {
+        polys.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    polys
 }
 
 /// Boolean of two all-planar bodies.

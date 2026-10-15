@@ -16,21 +16,23 @@ Opening a STEP or IGES file creates a design with the file's bodies as a base fe
 inserting one adds them to the current design. Later features build on them. Mesh bodies render,
 measure, move and export, but solid features need B-rep bodies.
 
-For closed mechanical meshes with a constant cross-section, use **Mesh → Modify →
-Convert Mesh**. Select the mesh body and set the fitting tolerance. The conversion
-rebuilds planar faces and circular through-walls, replacing the mesh with a solid
-that accepts solid modeling operations. The imported triangles remain embedded
-upstream: changing their scale, undoing the conversion or reopening the design
-rebuilds the result through the timeline. Double-click the conversion to edit its
-tolerance or source body.
+Every imported file (STEP, IGES, 3MF, STL or OBJ) comes in as a new component named after the
+file, so its bodies never mix with yours. A STEP assembly keeps its structure: its parts and
+sub-assemblies become nested components, and a part used several times is one component with an
+occurrence for each place. The imported assembly is rigid: moving its component moves everything,
+and its parts don't move on their own. Right-click the component and choose **Unlock Contents** to
+joint the parts one by one. Undo removes a whole import in one step.
 
-The tolerance bounds circular reconstruction against the original chords. Coarse
-polygons remain polygons when rounding would exceed it. Open/nonmanifold meshes,
-tapers, stepped parts and organic scans are refused by this first reconstruction
-method; it does not silently substitute a faceted solid. Conversion currently
-accepts at most 50,000 triangles and a bounded number of boundary segments.
+**File → Save as mesh…** (also on the Mesh tab under Modify, and in the right-click menu of a
+body) saves the selected bodies as STL, 3MF or 3MF with face tags (below). With **Send to slicer** ticked, it writes the file to
+a temporary folder and opens it in the chosen slicer instead of asking for a file name. The slicer
+list shows the slicers found on the computer with their icons; **Custom…** adds any other program
+to the top of the list (kept between runs; hover an entry you added and press Delete to remove it).
 
-**File → Export 3MF with Face Tags** (`file.export` with `format: "3mf-tagged"`) writes an
+Closed mechanical meshes with a constant cross-section can be rebuilt as solids with the
+`mesh.convert` command (command palette, scripts and the control channel).
+
+**File → Save as mesh…** with the format **3MF with face tags** (`file.export` or `file.save_mesh` with `format: "3mf-tagged"`) writes an
 ordinary 3MF in which every triangle also names the B-rep face it lies on and every coordinate
 is the tessellation's own double-precision value. Meshing and analysis tools can use the tags to
 keep a model's faces (for loads, boundary conditions or feature edges); other 3MF readers ignore

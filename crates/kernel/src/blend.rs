@@ -2122,6 +2122,21 @@ fn chamfer_built(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
             Err(_) => {}
         }
     }
+    // A curved blend follows the whole tangent chain. Give it all picks together so
+    // picks on that chain are consumed once, rather than chamfering its new rails again.
+    if tools.is_err() && edges.len() > 1 {
+        let solid = cur.deep_copy();
+        let ids = edge_ids(&cur, &solid, edges)?;
+        let all = Body::unique_edges(&solid);
+        let same_chain = ids
+            .first()
+            .and_then(|id| all.iter().find(|e| e.id() == *id))
+            .and_then(|e| smooth_chain(&solid, e))
+            .is_some_and(|chain| ids.len() > 1 && ids.iter().all(|id| chain.contains(id)));
+        if same_chain && let Ok(result) = blend(&cur, edges, distance, Shape::Flat, "chamfer") {
+            return Ok(result);
+        }
+    }
     let start = cur.clone();
     let one_by_one = || -> Result<Body> {
         let mut cur = start.clone();

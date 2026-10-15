@@ -116,7 +116,13 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             (at, normal.or(dir.map(|d| -d)))
         }
         Kind::Section { .. } | Kind::OffsetPlane { .. } | Kind::OffsetFaces { .. } => (at, normal),
-        // Fillet radii, chamfer distances and shell thickness grow into the body.
+        // Fillet radii and chamfer distances grow the way `blend_grow_dir` gives (into the body
+        // on an outside edge, into the open corner on an inside one); shell thickness grows into
+        // the body.
+        Kind::Fillet { .. } if matches!(first, Sel::Edge { .. }) => {
+            let Sel::Edge { body, index, .. } = first else { return None };
+            (at, st.body(body).and_then(|b| blend_grow_dir(&b.mesh(), *index, at)))
+        }
         Kind::Fillet { .. } | Kind::Shell { .. } => (at, normal.map(|n| -n)),
         Kind::Sheet(_) => (at, crate::dialogs_sheet::arrow(app, d).or(normal)),
         Kind::Plastic(_) => (at, normal),
@@ -178,23 +184,46 @@ fn reference_height(app: &SolveApp, d: &Dialog, label: &str, plane: &solidcraft_
     Some(solidcraft_engine::doc::object_height(&app.session.world_state(), plane, centre, p))
 }
 
-/// The outward direction between the two faces at an edge (a fillet's radius arrow points the
-/// other way, into the body).
-fn edge_bisector(m: &Mesh, index: usize, p: Vec3) -> Option<Vec3> {
+/// The two faces at an edge, near `p`: for each, the normal and centroid of its triangle nearest
+/// `p`.
+fn edge_sides(m: &Mesh, index: usize, p: Vec3) -> Option<Vec<(Vec3, Vec3)>> {
     let faces = m.edge_faces.get(index)?;
-    let mut sum = Vec3::ZERO;
-    for f in faces {
-        let n = m
-            .triangles
-            .iter()
-            .zip(&m.tri_face)
-            .filter(|(_, tf)| *tf == f)
-            .filter_map(|(t, _)| m.tri(t))
-            .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(p).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(p)))
-            .and_then(|[a, b, c]| (b - a).cross(c - a).normalized())?;
-        sum += n;
-    }
-    sum.normalized()
+    faces
+        .iter()
+        .map(|f| {
+            m.triangles
+                .iter()
+                .zip(&m.tri_face)
+                .filter(|(_, tf)| *tf == f)
+                .filter_map(|(t, _)| m.tri(t))
+                .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(p).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(p)))
+                .and_then(|[a, b, c]| Some(((b - a).cross(c - a).normalized()?, (a + b + c) / 3.0)))
+        })
+        .collect()
+}
+
+/// The outward direction between the two faces at an edge: the mean of their normals.
+fn edge_bisector(m: &Mesh, index: usize, p: Vec3) -> Option<Vec3> {
+    edge_sides(m, index, p)?.iter().fold(Vec3::ZERO, |sum, (n, _)| sum + *n).normalized()
+}
+
+/// Whether the edge is an inside (concave) one: each face near it lies in front of the other's
+/// plane, where on an outside edge it lies behind. Only the offset across the edge counts, since
+/// each normal is square to the edge.
+fn edge_concave(m: &Mesh, index: usize, p: Vec3) -> Option<bool> {
+    let sides = edge_sides(m, index, p)?;
+    let [(n1, c1), (n2, c2)] = sides.as_slice() else { return None };
+    let s = (*c1 - p).dot(*n2) + (*c2 - p).dot(*n1);
+    Some(s > 0.0)
+}
+
+/// The direction a fillet's radius or a chamfer's distance grows from an edge, along the bisector
+/// of its faces: into the body on an outside edge, where the blend takes material away, and out
+/// into the open corner on an inside edge, where it adds material (#1384). Dragging along it
+/// increases the value either way.
+pub(crate) fn blend_grow_dir(m: &Mesh, index: usize, p: Vec3) -> Option<Vec3> {
+    let n = edge_bisector(m, index, p)?;
+    Some(if edge_concave(m, index, p).unwrap_or(false) { n } else { -n })
 }
 
 /// Whether a dynamically registered canvas handle owns this point before navigation.
@@ -220,8 +249,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         app.dialog = Some(d);
         return;
     }
-    if let Kind::Measure { result: Some(r), .. } = &d.kind {
-        measure_line(app, painter, proj, r);
+    if let Kind::Measure { result: Some(r), show, .. } = &d.kind {
+        measure_line(app, painter, proj, r, *show);
         app.dialog = Some(d);
         return;
     }
@@ -498,17 +527,12 @@ fn drag_arrow(
 ) -> Option<Pos2> {
     let t = Tokens::get();
     let min = 40.0 * 2.0 * half_height / f64::from(proj.rect.height().max(1.0));
-    let shown = if l.abs() < min { min * if l < 0.0 { -1.0 } else { 1.0 } } else { l };
-    let ts = proj.to_screen(base + n * shown)?;
-    crate::scenario::publish_handle(if id == egui::Id::new("sc_manipulator") { "arrow" } else { "arrow2" }, ts);
+    let tip = |length: f64| {
+        let shown = if length.abs() < min { min * if length < 0.0 { -1.0 } else { 1.0 } } else { length };
+        proj.to_screen(base + n * shown)
+    };
+    let mut ts = tip(l)?;
     let r = ui.interact(egui::Rect::from_center_size(ts, vec2(20.0, 20.0)), id, egui::Sense::drag());
-    let hot = r.hovered() || r.dragged();
-    let col = if hot { t.accent } else { t.manipulator };
-    arrow(painter, bs, ts, col);
-    if hot {
-        painter.circle_stroke(ts, 8.0, Stroke::new(1.5, col));
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-    }
     if r.dragged()
         && let Some(p) = r.interact_pointer_pos()
         && let Some(v) = along(proj, p, base, n)
@@ -520,6 +544,17 @@ fn drag_arrow(
             v = v.max(if free { 1e-3 } else { step });
         }
         *value = format_len(v);
+        ts = tip(v)?;
+    }
+    // Paint the value just read from this frame's pointer, including the value box anchor.
+    // Using the old distance here made both trail the drag by another frame.
+    crate::scenario::publish_handle(if id == egui::Id::new("sc_manipulator") { "arrow" } else { "arrow2" }, ts);
+    let hot = r.hovered() || r.dragged();
+    let col = if hot { t.accent } else { t.manipulator };
+    arrow(painter, bs, ts, col);
+    if hot {
+        painter.circle_stroke(ts, 8.0, Stroke::new(1.5, col));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
     }
     Some(ts)
 }
@@ -609,8 +644,9 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
             let (spline, start) = law.as_ref()?;
             let other = if start.dist(*a) <= start.dist(*b) { *b } else { *a };
             let mid = *start + (other - *start) * 0.5;
-            // Into the body, between the two faces (the edge is straight between planar faces).
-            let n = -edge_bisector(mesh, *index, mid)?;
+            // Between the two faces, the way this edge's radius grows: into the body on an outside
+            // edge, into the corner on an inside one (the edge is straight between planar faces).
+            let n = blend_grow_dir(mesh, *index, mid)?;
             let curve = (0..=48)
                 .filter_map(|k| {
                     let u = f64::from(k) / 48.0;
@@ -728,14 +764,11 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
     true
 }
 
-/// The measured distance: a line between the closest points with its length.
-fn measure_line(app: &SolveApp, painter: &egui::Painter, proj: &Proj, r: &serde_json::Value) {
+/// The measured distance: a line between the ends of the shown measure (the centres for
+/// centre to centre, the closest or farthest points) with its length.
+fn measure_line(app: &SolveApp, painter: &egui::Painter, proj: &Proj, r: &serde_json::Value, show: Option<crate::dialogs::Shown>) {
     let t = Tokens::get();
-    let p = |k: &str| -> Option<Vec3> {
-        let a = r.get(k)?.as_array()?;
-        Some(Vec3::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?))
-    };
-    let (Some(a), Some(b), Some(d)) = (p("from"), p("to"), r.get("distance_mm").and_then(|v| v.as_f64())) else { return };
+    let Some((_, d, a, b)) = crate::dialogs::shown_distance(r, show) else { return };
     let (Some(sa), Some(sb)) = (proj.to_screen(a), proj.to_screen(b)) else { return };
     painter.line_segment([sa, sb], Stroke::new(2.0, t.manipulator));
     for s in [sa, sb] {

@@ -25,7 +25,7 @@ pub enum Surf {
         symmetric: bool,
         axis: Option<Value>,
     },
-    Sweep,
+    Sweep(crate::dialogs_sweep::SweepOpts),
     Loft,
     Patch,
     Unstitch,
@@ -43,9 +43,6 @@ pub enum Surf {
         round: bool,
     },
     Stitch {
-        tolerance: String,
-    },
-    ConvertMesh {
         tolerance: String,
     },
     Thicken {
@@ -71,7 +68,7 @@ impl Surf {
         match self {
             Surf::Extrude { .. } => "SURFACE EXTRUDE",
             Surf::Revolve { .. } => "SURFACE REVOLVE",
-            Surf::Sweep => "SURFACE SWEEP",
+            Surf::Sweep(_) => "SURFACE SWEEP",
             Surf::Loft => "SURFACE LOFT",
             Surf::Patch => "PATCH",
             Surf::Unstitch => "UNSTITCH",
@@ -79,7 +76,6 @@ impl Surf {
             Surf::Offset { .. } => "OFFSET SURFACE",
             Surf::Ruled { .. } => "RULED SURFACE",
             Surf::Stitch { .. } => "STITCH",
-            Surf::ConvertMesh { .. } => "CONVERT MESH",
             Surf::Thicken { .. } => "THICKEN",
             Surf::Extend { .. } => "EXTEND",
             Surf::Trim => "TRIM",
@@ -114,7 +110,11 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
     match k {
         Surf::Extrude { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true)],
         Surf::Revolve { .. } => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true), SelInput::new("Axis", AXES, false)],
-        Surf::Sweep => vec![SelInput::new("Profiles or curves", PROFILES | CURVES, true), SelInput::new("Path", CURVES, true)],
+        Surf::Sweep(_) => vec![
+            SelInput::new("Profiles or curves", PROFILES | CURVES, true),
+            SelInput::new("Path", CURVES, true),
+            crate::dialogs_sweep::direction_input(),
+        ],
         Surf::Loft => vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true)],
         Surf::Patch => vec![SelInput::new("Boundary", PROFILES | EDGES, true)],
         Surf::Unstitch => vec![SelInput::new("Body, or faces to take out", BODIES | FACES, true)],
@@ -124,7 +124,6 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
             vec![SelInput::new("Edges", EDGES, true), SelInput::new("Reference face", FACES, false), SelInput::new("Direction", AXES | EDGES, false)]
         }
         Surf::Stitch { .. } => vec![SelInput::new("Surfaces", BODIES, true)],
-        Surf::ConvertMesh { .. } => vec![SelInput::new("Mesh body", BODIES, false)],
         Surf::Thicken { .. } => vec![SelInput::new("Surfaces", BODIES, true)],
         Surf::Extend { .. } => vec![SelInput::new("Edges", EDGES, true)],
         Surf::Trim => vec![
@@ -142,7 +141,7 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     let k = match id {
         "surface.extrude" => Surf::Extrude { distance: "10 mm".into(), direction: 0 },
         "surface.revolve" => Surf::Revolve { angle: "360 deg".into(), symmetric: false, axis: None },
-        "surface.sweep" => Surf::Sweep,
+        "surface.sweep" => Surf::Sweep(crate::dialogs_sweep::SweepOpts::default()),
         "surface.loft" => Surf::Loft,
         "surface.patch" => Surf::Patch,
         "surface.unstitch" => Surf::Unstitch,
@@ -150,7 +149,6 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "surface.offset" => Surf::Offset { distance: "2 mm".into(), chain: false },
         "surface.ruled" => Surf::Ruled { distance: "10 mm".into(), mode: 0, angle: "5 deg".into(), flip: false, round: false },
         "surface.stitch" => Surf::Stitch { tolerance: String::new() },
-        "mesh.convert" => Surf::ConvertMesh { tolerance: "0.05 mm".into() },
         "surface.thicken" => Surf::Thicken { thickness: "2 mm".into(), symmetric: false, operation: 0 },
         "surface.extend" => Surf::Extend { distance: "10 mm".into() },
         "surface.trim" => Surf::Trim,
@@ -166,7 +164,7 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
 pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
     let mut enter = false;
     match k {
-        Surf::Stitch { tolerance } | Surf::ConvertMesh { tolerance } => {
+        Surf::Stitch { tolerance } => {
             row_label(ui, "Tolerance");
             let r = ui.add(egui::TextEdit::singleline(tolerance).hint_text("tight"));
             crate::params_dialog::complete(ui, &r, tolerance);
@@ -249,7 +247,8 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             ui.checkbox(in_place, "");
             ui.end_row();
         }
-        Surf::Patch | Surf::Trim | Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal | Surf::Sweep | Surf::Loft => {}
+        Surf::Sweep(opts) => enter |= crate::dialogs_sweep::rows(ui, opts, "ss"),
+        Surf::Patch | Surf::Trim | Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal | Surf::Loft => {}
     }
     enter
 }
@@ -351,7 +350,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             }
             ("surface.revolve", p)
         }
-        Surf::Sweep => {
+        Surf::Sweep(opts) => {
             need(0, "profiles or curves to sweep")?;
             need(1, "the path")?;
             let mut p = sheet_picks(app, items(inputs, 0))?;
@@ -360,6 +359,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             p["path_sketch"] =
                 json!(crate::dialogs::curves_sketch(app, &path, p["sketch"].as_u64()).ok_or("the path curves must be in one other sketch")?);
             p["path"] = json!(path);
+            crate::dialogs_sweep::params(app, opts, items(inputs, 2).first(), &mut p)?;
             ("surface.sweep", p)
         }
         Surf::Loft => {
@@ -468,11 +468,6 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
                 p["tolerance"] = json!(tolerance);
             }
             ("surface.stitch", p)
-        }
-        Surf::ConvertMesh { tolerance } => {
-            need(0, "a closed mesh body")?;
-            let body = bodies(inputs, 0).into_iter().next().ok_or("select a mesh body")?;
-            ("mesh.convert", json!({"body":body,"tolerance":tolerance}))
         }
         Surf::Thicken { thickness, symmetric, operation } => {
             need(0, "the surfaces to thicken")?;
@@ -589,10 +584,17 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             }
             return Some((Kind::Surface(k), ins, extra));
         }
-        FeatureKind::SurfaceSweep { sketch, profiles, curves, path, .. } => (
-            Surf::Sweep,
-            vec![sheet_sels(app, *sketch, profiles.as_ref(), curves), path.iter().map(|id| Sel::SketchCurve { id: id.clone() }).collect()],
-        ),
+        FeatureKind::SurfaceSweep { sketch, profiles, curves, path, orientation, twist, scale, .. } => {
+            let (opts, direction) = crate::dialogs_sweep::SweepOpts::of(orientation, twist, scale, frame);
+            (
+                Surf::Sweep(opts),
+                vec![
+                    sheet_sels(app, *sketch, profiles.as_ref(), curves),
+                    path.iter().map(|id| Sel::SketchCurve { id: id.clone() }).collect(),
+                    direction.into_iter().collect(),
+                ],
+            )
+        }
         FeatureKind::SurfaceLoft { sections } => {
             (Surf::Loft, vec![sections.iter().flat_map(|sec| sheet_sels(app, sec.sketch, sec.profiles.as_ref(), &sec.curves)).collect()])
         }
@@ -661,9 +663,6 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             Surf::Stitch { tolerance: if tolerance.trim() == "0" { String::new() } else { tolerance.clone() } },
             vec![bodies.iter().map(|n| Sel::Body { name: n.clone() }).collect()],
         ),
-        FeatureKind::MeshConvert { body, tolerance } => {
-            (Surf::ConvertMesh { tolerance: tolerance.clone() }, vec![vec![Sel::Body { name: body.clone() }]])
-        }
         FeatureKind::Thicken { bodies, thickness, symmetric, operation, .. } => (
             Surf::Thicken { thickness: thickness.clone(), symmetric: *symmetric, operation: op_index(operation) },
             vec![bodies.iter().map(|n| Sel::Body { name: n.clone() }).collect()],

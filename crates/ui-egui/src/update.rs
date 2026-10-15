@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use egui::{Color32, FontId, RichText, text::LayoutJob};
+use egui::{FontId, RichText, text::LayoutJob};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -714,34 +714,10 @@ pub fn take_launch(app: &mut SolveApp) -> Option<(PathBuf, Vec<String>)> {
 
 // ---- user interface ---------------------------------------------------------------------------
 
-/// The application bar's Update button, right of `right`; returns its rect (None: not shown).
-pub fn button(app: &mut SolveApp, ui: &mut egui::Ui, right: f32, top: f32, labeled: bool) -> Option<egui::Rect> {
+/// The application bar's Update button, at the right of `span`; returns its rect (None: not shown).
+pub fn button(app: &mut SolveApp, ui: &mut egui::Ui, span: egui::Rect, labeled: bool) -> Option<egui::Rect> {
     offered(app)?;
-    let t = Tokens::get();
-    let text = crate::i18n::tr("update.button");
-    let width = if labeled {
-        30.0 + ui.fonts_mut(|f| f.layout_no_wrap(text.to_string(), FontId::proportional(13.0), Color32::WHITE).size().x) + 10.0
-    } else {
-        28.0
-    };
-    let rect = egui::Rect::from_min_size(egui::pos2(right - width, top), egui::vec2(width, 26.0));
-    let response = ui.interact(rect, ui.id().with("sc_update_button"), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
-    crate::scenario::publish_handle("titlebar:update", rect.center());
-    let fill = if response.hovered() || response.has_focus() { t.hover } else { t.app_bar };
-    ui.painter().rect_filled(rect, 4.0, fill);
-    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0, t.accent), egui::StrokeKind::Inside);
-    let icon = egui::Rect::from_center_size(egui::pos2(rect.left() + 14.0, rect.center().y), egui::vec2(18.0, 18.0));
-    crate::icons::paint(ui.painter(), icon, "update", t.accent, t.accent, t.app_bar);
-    if labeled {
-        ui.painter().text(
-            egui::pos2(rect.left() + 29.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            text,
-            FontId::proportional(13.0),
-            t.app_bar_text,
-        );
-    }
+    let (rect, response) = crate::toolbar::offer_button(ui, span, labeled, crate::i18n::tr("update.button"), "update", "titlebar:update")?;
     let version = app.updater.release.as_ref().map(|r| r.version().to_string()).unwrap_or_default();
     if response.on_hover_text(crate::i18n::format("update.button_tip", &[("version", &version)])).clicked() {
         app.updater.open = !app.updater.open;

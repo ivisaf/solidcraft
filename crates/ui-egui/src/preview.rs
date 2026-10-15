@@ -71,8 +71,8 @@ pub struct PreviewState {
     running: Option<(u64, Receiver<Job>)>,
     /// The running job builds a tool alone (for a join, cut or intersect).
     running_tool: bool,
-    /// Inputs of an in-flight joint preview, excluding only its driven values.
-    running_motion_key: Option<u64>,
+    /// Inputs of a joint or distance preview, excluding only its driven values.
+    running_stream_key: Option<u64>,
     /// Bodies the preview stands in for (hidden in the model scene).
     pub replaced: Vec<String>,
     /// The preview scene for the GPU and its key (changes whenever the scene does).
@@ -102,7 +102,7 @@ impl PreviewState {
     fn clear(&mut self) {
         self.running = None;
         self.running_tool = false;
-        self.running_motion_key = None;
+        self.running_stream_key = None;
         self.shown_key = None;
         self.error = None;
         self.applied = None;
@@ -152,7 +152,7 @@ impl PreviewState {
 
     /// Errors validate only the current inputs. Keep the last good geometry while
     /// computing new inputs, but never let an obsolete result block their Apply.
-    fn poll(&mut self, key: u64, motion_key: Option<u64>) {
+    fn poll(&mut self, key: u64, stream_key: Option<u64>) {
         if self.shown_key != Some(key) {
             self.sketches.clear();
             self.error = None;
@@ -167,11 +167,11 @@ impl PreviewState {
             if let Some(job) = job {
                 self.running = None;
                 let good = matches!(&job, Ok(b) if b.error.is_none());
-                let intermediate = good && (self.running_tool || motion_key.is_some() && self.running_motion_key == motion_key);
-                self.running_motion_key = None;
+                let intermediate = good && (self.running_tool || stream_key.is_some() && self.running_stream_key == stream_key);
+                self.running_stream_key = None;
                 self.running_tool = false;
                 // A held slider, a dragged arrow or an animation may advance faster than the
-                // worker. Show completed poses from the same joint setup, and tools built for
+                // worker. Show completed joint/distance results from the same setup, and tools built for
                 // inputs since changed, then compute the latest. Errors still require an exact
                 // key.
                 if k == key || intermediate {
@@ -209,6 +209,41 @@ fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option
     Some(h.finish())
 }
 
+/// Tool previews already stream in `poll`. New-body extrusions and face offsets instead
+/// build their full result; allow successful intermediate distances only within the same
+/// setup. Preserve selections, feature identity, extent mode, revision and colours. The
+/// exact job key still ensures the latest distance is computed and errors never go stale.
+fn stream_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
+    if let Some(key) = motion_key(cmds, revision, colors) {
+        return Some(key);
+    }
+    if cmds.is_empty() || as_new_body(cmds).is_some() {
+        return None;
+    }
+    let mut setup = cmds.to_vec();
+    for (command, params) in &mut setup {
+        let (command, params) = if command == "timeline.redefine" {
+            let command = params.get("command")?.as_str()?.to_string();
+            (command, params.get_mut("params")?)
+        } else {
+            (command.clone(), params)
+        };
+        let fields: &[&str] = match command.as_str() {
+            "solid.extrude" => &["distance", "distance2", "to_offset"],
+            "solid.offset_face" => &["distance"],
+            _ => return None,
+        };
+        let params = params.as_object_mut()?;
+        for field in fields {
+            // Keep presence: changing extent mode must not reuse the old result.
+            if let Some(value) = params.get_mut(*field) {
+                *value = Value::Null;
+            }
+        }
+    }
+    Some(job_key(&setup, revision, colors))
+}
+
 /// Keep the preview in step with the open dialog: start a computation when its inputs changed,
 /// take finished results. Called once per frame.
 pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
@@ -227,13 +262,13 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     };
     let colors = Colors::from_tokens(&Tokens::get());
     let key = job_key(&cmds, app.session.revision, colors);
-    let motion_key = motion_key(&cmds, app.session.revision, colors);
+    let stream_key = stream_key(&cmds, app.session.revision, colors);
     let tool = as_new_body(&cmds).is_some();
     let pv = &mut app.preview;
-    pv.poll(key, motion_key);
+    pv.poll(key, stream_key);
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
-        pv.running_motion_key = motion_key;
+        pv.running_stream_key = stream_key;
         let scratch = app.session.scratch();
         spawn(&mut app.preview, key, scratch, cmds, colors, tool);
     }
@@ -720,7 +755,7 @@ mod tests {
         for (running, wanted) in [(1, 2), (2, 3), (3, 4)] {
             let (tx, rx) = std::sync::mpsc::channel();
             pv.running = Some((running, rx));
-            pv.running_motion_key = Some(42);
+            pv.running_stream_key = Some(42);
             pv.poll(wanted, Some(42));
             assert!(pv.running.is_some());
             tx.send(Ok(pose())).unwrap();
@@ -733,7 +768,7 @@ mod tests {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         pv.running = Some((4, rx));
-        pv.running_motion_key = Some(42);
+        pv.running_stream_key = Some(42);
         tx.send(Ok(pose())).unwrap();
         pv.poll(4, Some(42));
         assert_eq!(pv.shown_key, Some(4), "release catches up to the exact final pose");
@@ -748,7 +783,7 @@ mod tests {
             (Some(42), Err("old invalid value".into())),
             (Some(42), Ok(Built { error: Some("old tool preview error".into()), ..pose() })),
         ] {
-            let mut pv = PreviewState { running_motion_key: Some(42), ..PreviewState::default() };
+            let mut pv = PreviewState { running_stream_key: Some(42), ..PreviewState::default() };
             let (tx, rx) = std::sync::mpsc::channel();
             pv.running = Some((1, rx));
             tx.send(job).unwrap();
@@ -997,3 +1032,7 @@ mod tests {
         assert!(pv.error.is_none() && pv.shown_key == Some(1), "an old error is dropped");
     }
 }
+
+#[cfg(test)]
+#[path = "preview_drag_tests.rs"]
+mod drag_tests;

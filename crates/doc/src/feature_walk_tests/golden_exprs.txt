@@ -136,6 +136,11 @@ thread
   expressions: thread.length
 loft
 sweep
+sweep_options
+  inputs:
+    Twist = sweep.twist (Angle)
+    Scale = sweep.scale (Unitless)
+  expressions: sweep.twist, sweep.scale
 shell
   inputs:
     Thickness = shell.thickness (Length)
@@ -317,6 +322,11 @@ surface_revolve
     Angle 2 = srev.angle2 (Angle)
   expressions: srev.angle, srev.angle2
 surface_sweep
+surface_sweep_options
+  inputs:
+    Twist = surface_sweep.twist (Angle)
+    Scale = surface_sweep.scale (Unitless)
+  expressions: surface_sweep.twist, surface_sweep.scale
 surface_loft
 surface_offset
   inputs:

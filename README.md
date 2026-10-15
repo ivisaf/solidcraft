@@ -130,7 +130,7 @@ rebuild with no errors, replayed here at 2× speed.
   IGES 5.3 (manifold solid B-reps with names and colours), 3MF, STL (binary/ASCII) and OBJ, and
   assemblies with joints as URDF for robot simulators (docs/urdf.md);
   3MF, STL and OBJ import as mesh bodies (they render, measure, move and export; solid features
-  need B-rep bodies). Convert Mesh reconstructs supported closed constant-section parts
+  need B-rep bodies). The `mesh.convert` command reconstructs supported closed constant-section parts
   as parametric solids with planar and circular cylindrical faces;
   STEP import (AP203/AP214/AP242 solids, assemblies, units, names, colours) and IGES import
   (manifold solid B-reps, or trimmed and bounded surfaces sewn into solids) as a base feature

@@ -525,6 +525,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             access: None,
             outline: false,
             eye: [eye.x as f32, eye.y as f32, eye.z as f32, if camera.fov > 0.0 { 1.0 } else { 0.0 }],
+            ssaa: 1.0,
         };
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, callback));
         Ok(())

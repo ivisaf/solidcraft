@@ -262,6 +262,26 @@ pub struct ThinWall {
     pub thickness2: Option<String>,
 }
 
+/// How a swept profile turns as it follows its path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOrientation {
+    /// Square to the path, turning with it (a rotation-minimising frame).
+    #[default]
+    Perpendicular,
+    /// As drawn: the profile moves along the path without turning.
+    Parallel,
+    /// Square to the path, its turn about the path fixed by this direction (in the feature's
+    /// frame): the direction's projection onto the profile stays where it was at the start.
+    Direction(#[walk(dir)] Vec3),
+}
+
+impl SweepOrientation {
+    pub fn is_perpendicular(&self) -> bool {
+        *self == SweepOrientation::Perpendicular
+    }
+}
+
 /// Where a thin wall lies against its curves. A closed loop's inside is the area it encloses;
 /// an open chain's is the side it bends toward (a straight one's, the left of its first
 /// curve as drawn).
@@ -701,6 +721,17 @@ pub enum FeatureKind {
         #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        /// How the profile turns along the path (default: perpendicular to it).
+        #[serde(default, skip_serializing_if = "SweepOrientation::is_perpendicular")]
+        orientation: SweepOrientation,
+        /// Angle the profile turns about the path over its length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Twist")]
+        twist: Option<String>,
+        /// The profile's scale at the end of the path (linear along its length).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Scale")]
+        scale: Option<String>,
         #[serde(default)]
         operation: Operation,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1327,6 +1358,17 @@ pub enum FeatureKind {
         #[walk(sketch)]
         path_sketch: u64,
         path: Vec<String>,
+        /// How the profile turns along the path (default: perpendicular to it).
+        #[serde(default, skip_serializing_if = "SweepOrientation::is_perpendicular")]
+        orientation: SweepOrientation,
+        /// Angle the profile turns about the path over its length.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(angle = "Twist")]
+        twist: Option<String>,
+        /// The profile's scale at the end of the path (linear along its length).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[walk(unitless = "Scale")]
+        scale: Option<String>,
     },
     /// A surface body lofted through sections in order, each one open or closed chain of
     /// sketch curves: walls only, no caps.
@@ -1433,6 +1475,11 @@ pub enum FeatureKind {
         /// The file's product/assembly tree, kept for components.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         components: Vec<solidcraft_kernel::StepNode>,
+        /// The file's bodies (by index) this feature does not build: later instances of a part
+        /// the file places more than once, shown by the other occurrences of that part's
+        /// component (#1386). Empty in designs from before format 22: every body is built.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        skip: Vec<u64>,
     },
     /// Rebuild an upstream constant-section mesh with analytic planar/cylindrical faces.
     MeshConvert {

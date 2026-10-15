@@ -450,6 +450,7 @@ fn shifted(s: &SnapPt, x: f64, y: f64) -> Value {
 pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [SelInput], active: &mut usize) -> bool {
     let t = Tokens::get();
     let mut enter = false;
+    let problem = joint_problem(app, k, inputs);
     match k {
         Asm::NewComponent { name, activate } => {
             row_label(ui, "Name");
@@ -464,6 +465,20 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
             // As-built: two components picked, the position comes next.
             if f.as_built && *active == 0 && inputs.first().is_some_and(|i| i.items.len() >= 2) {
                 *active = 1;
+            }
+            // Picks that make no joint say why, under them, and offer the way out (#1239).
+            if let Some((why, bodies)) = problem {
+                row_label(ui, "");
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(RichText::new(why).color(t.warning)).wrap());
+                    if !bodies.is_empty()
+                        && ui.button(crate::i18n::tr("cmd.component_from_bodies")).on_hover_text(crate::i18n::tr("joint.from_bodies_hint")).clicked()
+                    {
+                        // A refusal shows on the status line; the picks stay either way.
+                        let _ = app.run("component.from_bodies", json!({ "bodies": bodies }));
+                    }
+                });
+                ui.end_row();
             }
             row_label(ui, "Motion");
             ui.label("");
@@ -729,6 +744,42 @@ fn sel_items(inputs: &[SelInput], i: usize) -> &[Sel] {
     inputs.get(i).map(|x| x.items.as_slice()).unwrap_or(&[])
 }
 
+/// The body a pick is on.
+fn body_of(sel: &Sel) -> Option<&str> {
+    match sel {
+        Sel::Face { body, .. } | Sel::Edge { body, .. } | Sel::Vertex { body, .. } => Some(body),
+        Sel::Body { name } => Some(name),
+        _ => None,
+    }
+}
+
+/// Why the Joint dialog's picks, all in, make no joint: without it the preview and OK just go
+/// quiet, and no option seems to do anything (#1239). With it, the bodies Create Components from
+/// Bodies would part (none when that would not help). The usual case is every pick on one
+/// component: a STEP file with several parts often brings them as bodies of one component.
+fn joint_problem(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Option<(String, Vec<String>)> {
+    let Asm::Joint(f) = k else { return None };
+    let picks: Vec<&Sel> =
+        if f.as_built { sel_items(inputs, 0).iter().collect() } else { (0..2).filter_map(|i| sel_items(inputs, i).first()).collect() };
+    if f.editing.is_some() || picks.len() < 2 {
+        return None;
+    }
+    let mut bodies: Vec<String> = Vec::new();
+    for b in picks.iter().filter_map(|p| body_of(p)) {
+        if !bodies.iter().any(|x| x == b) {
+            bodies.push(b.to_string());
+        }
+    }
+    let occs: Vec<Option<u64>> = bodies.iter().map(|b| occurrence_of_body(&app.session, b)).collect();
+    if occs.first().is_some_and(|first| first.is_some() && occs.iter().all(|o| o == first)) {
+        return Some(match bodies.as_slice() {
+            [body] => (crate::i18n::format("joint.one_body", &[("body", body.as_str())]), Vec::new()),
+            _ => (crate::i18n::format("joint.one_component", &[("bodies", &bodies.join(", "))]), bodies),
+        });
+    }
+    commands(app, k, inputs).err().map(|e| (e, Vec::new()))
+}
+
 /// The occurrences of picked bodies (deduplicated, in pick order).
 fn occurrences(s: &Session, items: &[Sel]) -> Vec<u64> {
     let mut out = Vec::new();
@@ -827,8 +878,9 @@ pub fn commands(app: &SolveApp, k: &Asm, inputs: &[SelInput]) -> Result<Vec<(Str
         Asm::MotionLink { a, b, ia, ib, ratio, offset } => {
             let js = &s.doc.assembly.joints;
             let (Some(ja), Some(jb)) = (js.get(*a), js.get(*b)) else { return Err("needs two joints".into()) };
-            let num = |e: &str| eval(e, ValueKind::Unitless);
-            cmd("joint.motion_link", json!({"a": ja.id, "b": jb.id, "ia": ia, "ib": ib, "ratio": num(ratio)?, "offset": num(offset)?}))
+            // The offset as typed: the engine reads it in Joint 2's units (deg or mm).
+            let ratio = eval(ratio, ValueKind::Unitless)?;
+            cmd("joint.motion_link", json!({"a": ja.id, "b": jb.id, "ia": ia, "ib": ib, "ratio": ratio, "offset": offset.trim()}))
         }
         // The check runs from its Compute button; OK only closes.
         Asm::Interference { .. } => Vec::new(),

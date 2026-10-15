@@ -307,6 +307,7 @@ mod blend_fit;
 mod boolean_diagnostics;
 mod component_frames;
 mod curved_seam_round;
+mod import_component;
 mod large_step_import;
 mod loft_cut;
 mod loft_ring;
@@ -769,6 +770,9 @@ fn hostile_params_never_panic() {
         "filter",
         "kind",
         "prefix",
+        "orientation",
+        "twist",
+        "scale",
     ];
     // Commands are independent; worker threads take them one at a time (their costs vary a lot).
     let ids: Vec<&str> = command_specs()
@@ -1054,7 +1058,9 @@ fn join_onto_a_finely_faceted_import() {
     let prism = volume(&mut s);
 
     let mut d = Session::default();
-    run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    // The import is a component (#1386): the pin is made in it to join its body.
+    let r = run(&mut d, "file.insert_step", json!({"path": p.to_string_lossy()}));
+    run(&mut d, "component.activate", json!({"component": r["component"]}));
     run(&mut d, "sketch.create", json!({"plane": "XY", "name": "Pin"}));
     run(&mut d, "sketch.rectangle.two_point", json!({"p0": [-5, -5], "p1": [5, 5]}));
     run(&mut d, "sketch.finish", json!({}));
@@ -2341,6 +2347,27 @@ fn booleans_stay_in_their_component() {
     run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 10, "operation": "cut", "participants": ["ABox", "BBox"]}));
     assert!((vol(&mut s, "BBox") - (2000.0 - 8.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "BBox"));
     assert!(s.execute("solid.extrude", &json!({"sketch": "Slot", "distance": 1, "operation": "cut", "participants": ["Nope"]})).is_err());
+}
+
+/// #1234: a cut sketched in the root, where there is no body, through a body in each of two
+/// components cuts both (the root has nothing of its own to cut). A cut in a component with a
+/// body of its own still stays there (`booleans_stay_in_their_component`).
+#[test]
+fn a_cut_from_a_component_without_bodies_cuts_the_parts_it_meets() {
+    let mut s = Session::default();
+    for (name, x) in [("A", 0), ("B", 30)] {
+        run(&mut s, "component.activate", json!({"component": "root"}));
+        run(&mut s, "component.create", json!({"name": name}));
+        run(&mut s, "solid.box", json!({"length": 20, "width": 10, "height": 10, "corner": [x, 0, 0], "body_name": format!("{name}Box")}));
+    }
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Slot"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 2], "p1": [40, 8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Slot", "distance": 10, "operation": "cut"}));
+    let vol = |s: &mut Session, b: &str| run(s, "inspect.measure", json!({"bodies": [b]}))["total"]["volume_mm3"].as_f64().unwrap_or(0.0);
+    assert!((vol(&mut s, "ABox") - (2000.0 - 10.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "ABox"));
+    assert!((vol(&mut s, "BBox") - (2000.0 - 10.0 * 6.0 * 10.0)).abs() < 1e-6, "{}", vol(&mut s, "BBox"));
 }
 
 /// A unit-less parameter used as a length means the design's units.

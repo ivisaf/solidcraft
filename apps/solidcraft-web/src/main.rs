@@ -2,12 +2,14 @@
 //!
 //! Runs the same [`solidcraft_ui_egui::SolveApp`] as the desktop app through eframe's web runner
 //! (wgpu: WebGPU where available, WebGL2 otherwise). Build with `trunk build --release` from this
-//! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2, `?sample` opens the
-//! sample part.
+//! directory (output in `dist/web`). URL flags: `?webgl` forces WebGL2 (remembered until
+//! `?webgpu`), `?sample` opens the sample part.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_arch = "wasm32")]
 mod files;
+#[cfg(target_arch = "wasm32")]
+mod install;
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -398,6 +400,29 @@ mod web {
         web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
     }
 
+    /// Where `?webgl` is remembered. The installed app starts from its manifest's start URL, which
+    /// has no query, so the choice has to outlive the page it was made on.
+    const WEBGL_KEY: &str = "solidcraft.webgl";
+
+    /// Render with WebGL2: asked for now (`?webgl`, remembered) or before (until `?webgpu`).
+    fn webgl() -> bool {
+        let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
+        let q = query();
+        if q.contains("webgl") {
+            if let Some(s) = &storage {
+                let _ = s.set_item(WEBGL_KEY, "1");
+            }
+            return true;
+        }
+        if q.contains("webgpu") {
+            if let Some(s) = &storage {
+                let _ = s.remove_item(WEBGL_KEY);
+            }
+            return false;
+        }
+        storage.and_then(|s| s.get_item(WEBGL_KEY).ok().flatten()).is_some()
+    }
+
     /// Fetch font bytes asynchronously through the browser.
     async fn fetch_font_bytes(url: &str) -> Result<Vec<u8>, String> {
         let window = web_sys::window().ok_or("no window")?;
@@ -422,7 +447,7 @@ mod web {
                 return;
             };
             let mut options = eframe::WebOptions { depth_buffer: DEPTH_BITS, ..Default::default() };
-            if query().contains("webgl")
+            if webgl()
                 && let eframe::egui_wgpu::WgpuSetup::CreateNew(create) = &mut options.wgpu_options.wgpu_setup
             {
                 create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
@@ -447,6 +472,7 @@ mod web {
                                 let design = exts.contains(&solidcraft_engine::io::DESIGN_EXT);
                                 Box::pin(std::future::ready(Some(format!("{}{name}", if design { files::OPFS } else { files::DOWNLOADS }))))
                             })),
+                            install_app: Some(crate::install::service(&cc.egui_ctx)),
                             ..Default::default()
                         };
                         let mut app = SolveApp::new(Session::default(), services);

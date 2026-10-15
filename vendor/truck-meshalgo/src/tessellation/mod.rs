@@ -25,12 +25,51 @@ pub fn preview_face<S: RobustMeshableSurface>(surface: &S, loops: &[Vec<Point3>]
     triangulation::preview_face(surface, loops, steps)
 }
 
+/// SolidCraft: sampling a curve that may fail to evaluate. truck's `IntersectionCurve::subs`
+/// unwraps the projection of its leader's point onto both surfaces, which does not converge
+/// everywhere; the mesher samples through this trait so that a failed sample is data, not a panic.
+pub trait TrySubs: ParametricCurve3D {
+    /// The point at `t`, or `None` where the curve does not evaluate.
+    fn try_subs(&self, t: f64) -> Option<Point3> { Some(self.subs(t)) }
+    /// A point near the curve at `t` that always exists (an intersection curve's leader).
+    fn approx_subs(&self, t: f64) -> Point3 { self.subs(t) }
+}
+
+impl TrySubs for truck_geometry::prelude::Line<Point3> {}
+impl TrySubs for truck_geometry::prelude::BSplineCurve<Point3> {}
+impl TrySubs for truck_geometry::prelude::NurbsCurve<Vector4> {}
+impl TrySubs for PolylineCurve {}
+
+impl<C, S> TrySubs for truck_geometry::prelude::IntersectionCurve<C, S>
+where
+    C: ParametricCurve3D,
+    S: ParametricSurface3D + SearchNearestParameter<D2, Point = Point3>,
+{
+    fn try_subs(&self, t: f64) -> Option<Point3> { self.search_triple(t).map(|triple| triple.0) }
+    fn approx_subs(&self, t: f64) -> Point3 { self.leader().subs(t) }
+}
+
+impl TrySubs for truck_modeling::Curve {
+    fn try_subs(&self, t: f64) -> Option<Point3> {
+        match self {
+            truck_modeling::Curve::IntersectionCurve(curve) => TrySubs::try_subs(curve, t),
+            other => Some(other.subs(t)),
+        }
+    }
+    fn approx_subs(&self, t: f64) -> Point3 {
+        match self {
+            truck_modeling::Curve::IntersectionCurve(curve) => TrySubs::approx_subs(curve, t),
+            other => other.subs(t),
+        }
+    }
+}
+
 /// Gathered the traits used in tessellation.
 pub trait PolylineableCurve:
-    ParametricCurve3D + BoundedCurve + ParameterDivision1D<Point = Point3> + Parallelizable {
+    ParametricCurve3D + BoundedCurve + ParameterDivision1D<Point = Point3> + Parallelizable + TrySubs {
 }
 impl<
-        C: ParametricCurve3D + BoundedCurve + ParameterDivision1D<Point = Point3> + Parallelizable,
+        C: ParametricCurve3D + BoundedCurve + ParameterDivision1D<Point = Point3> + Parallelizable + TrySubs,
     > PolylineableCurve for C
 {
 }

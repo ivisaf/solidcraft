@@ -27,6 +27,15 @@ Open the release `.dmg` and drag `SolidCraft.app` onto Applications.
 When updating from a build released under the previous product name, follow the
 [macOS upgrade notes](https://github.com/bherbruck/solidcraft/blob/main/docs/compatibility.md#macos) so you replace it rather than install a second copy.
 
+### Linux AppImage
+
+The first time you open the AppImage it adds a menu entry and icons under `~/.local/share`
+(`applications/ai.storyteller.solidcraft.desktop`, `icons/hicolor`), so the desktop shows the
+right name and icon. It adds nothing if [appimaged](https://github.com/probonopd/go-appimage)
+already made an entry for the file (and removes the entry SolidCraft added before). To
+turn it off for good, create an empty file `~/.local/share/solidcraft/no-desktop-integration`, or
+start the AppImage with `SOLIDCRAFT_NO_DESKTOP_INTEGRATION=1`.
+
 ### Linux Flatpak
 
 Install Flatpak using your distribution's package manager. For an installation that receives
@@ -73,16 +82,25 @@ doesn't update automatically.
 ## Web
 
 The same app runs in the browser: [open SolidCraft on the web](../app/) (`?sample` opens the sample
-part, `?webgl` forces WebGL2 where WebGPU is missing). Designs are saved in the browser's private
-file storage, which needs HTTPS or localhost. Planned worker and tiered-storage integration is
+part, `?webgl` forces WebGL2 where WebGPU is missing or misbehaves; the browser remembers it until
+`?webgpu`, and an app installed from Chrome or Edge starts with it too). Designs are saved in the
+browser's private file storage, which needs HTTPS or localhost.
+Planned worker and tiered-storage integration is
 described in [web-runtime.md](https://github.com/bherbruck/solidcraft/blob/main/docs/web-runtime.md)
 (design; not yet wired in the shipped wasm build).
 
 After the first visit the web app works offline: the browser keeps a copy of it. Online, each
 launch gets the latest published build (the browser downloads it once when it changes); offline,
 when the network doesn't answer within a few seconds, or when a new build can't be downloaded
-whole, the kept copy starts (and the download carries on for the next launch). To build it
-yourself:
+whole, the kept copy starts (and the download carries on for the next launch).
+
+Browsers that can install web apps add **Install app…** to the File menu: it installs SolidCraft
+as an app with its own window and launcher icon, working offline like the page. In Chrome, Edge
+and other Chromium browsers it shows the browser's install prompt, and once SolidCraft is
+installed the item is gone. Safari has no such prompt, so the item shows its steps instead:
+Share › Add to Home Screen on iPhone and iPad, File › Add to Dock on a Mac (Safari 17 or later).
+
+To build it yourself:
 
 ```sh
 rustup target add wasm32-unknown-unknown

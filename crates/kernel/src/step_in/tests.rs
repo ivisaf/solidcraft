@@ -175,16 +175,19 @@ fn parallel_import_does_not_prepare_past_body_budget_with_duplicates_or_mapped_i
         "{HEAD}{}#2000=MANIFOLD_SOLID_BREP('Duplicate',#100);\n#2001=MANIFOLD_SOLID_BREP('First',#100);\n#2002=MANIFOLD_SOLID_BREP('Second',#100);\n#2003=MANIFOLD_SOLID_BREP('Beyond budget',#999999);\n#3000=MAPPED_ITEM('',#999998,#999997);\n#60=SHAPE_REPRESENTATION('',(#2000,#2000,#2001,#3000,#2002,#2003),$);\n{TAIL}",
         cube_entities()
     );
-    let ex = p21::parse(&text).unwrap();
+    let ex = std::sync::Arc::new(p21::parse(&text).unwrap());
     let seed =
         step_import_with_workers(&format!("{HEAD}{}#60=SHAPE_REPRESENTATION('',(#101),$);\n{TAIL}", cube_entities()), 1).unwrap().bodies.remove(0);
     for workers in [1, 8] {
-        let mut reader = Reader::new(&ex, workers);
+        let mut reader = Reader::new(ex.clone(), workers);
         reader.index();
         reader.bodies = vec![seed.clone(); MAX_BODIES - 2];
         reader.node_items.insert(2000);
         let mut out = Vec::new();
         reader.rep_bodies(60, &mt::Matrix4::from_scale(1.0), &[], "Budget", None, &mut out, 0);
+        assert!(reader.solids.is_empty(), "the walk only plans the solids");
+        while reader.convert_next(workers == 1) {}
+        let out = reader.remap(&out);
         assert_eq!(reader.bodies.len(), MAX_BODIES);
         assert_eq!(out, vec![MAX_BODIES - 2, MAX_BODIES - 1]);
         assert_eq!(reader.bodies.last().unwrap().name, "Second");
@@ -598,8 +601,8 @@ fn repeated_items_are_shared_and_one_use_items_are_not() {
     let a = box_solid(Vec3::ZERO, Vec3::new(10.0, 10.0, 10.0)).unwrap();
     let b = box_solid(Vec3::new(20.0, 0.0, 0.0), Vec3::new(30.0, 10.0, 10.0)).unwrap();
     let flat = step_export(&[&a, &b], "test").unwrap();
-    let ex = p21::parse(&flat).unwrap();
-    let mut rd = Reader::new(&ex, 1);
+    let ex = std::sync::Arc::new(p21::parse(&flat).unwrap());
+    let mut rd = Reader::new(ex.clone(), 1);
     rd.index();
     assert_eq!(rd.once.len(), 2, "each solid of a flat file is converted once");
     let imp = step_import(&flat).unwrap();
@@ -609,8 +612,8 @@ fn repeated_items_are_shared_and_one_use_items_are_not() {
     assert!(rel(vol, 2000.0) < 1e-6, "{vol}");
 
     let assembly = two_instance_assembly();
-    let ex = p21::parse(&assembly).unwrap();
-    let mut rd = Reader::new(&ex, 1);
+    let ex = std::sync::Arc::new(p21::parse(&assembly).unwrap());
+    let mut rd = Reader::new(ex.clone(), 1);
     rd.index();
     assert!(rd.once.is_empty(), "an assembly may convert an item again for the second instance");
     let imp = step_import(&assembly).unwrap();

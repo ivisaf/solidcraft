@@ -816,3 +816,40 @@ observed 47.6 ms check; no local PNG was created and the active document remaine
 empty. The screenshot shows the transferred file's picture while built-in sample
 pictures are still loading. This is one functional visual check, not a first-frame
 benchmark. The separate counting-reader regression proves source-blob deferral.
+
+## Extrude drag preview delivery
+
+On macOS with Metal, editing a 15 mm radius cylinder's 10 mm extrusion and dragging its
+arrow upward by 150 screen points (120 input steps, Ctrl held) exposed preview starvation.
+A completed worker result was discarded whenever the pointer had already changed the
+requested distance. The arrow also drew the previous frame's distance.
+
+Main's tool-only preview already delivers intermediate Join/Cut/Intersect geometry. New Body
+extrusions (including feature edits) and Offset Face use full-result previews and still discard
+completed distances during a moving drag. Those paths now accept successful intermediate
+distances from the same setup. Selections, operation, extent mode, feature identity, revision
+and colours remain part of the setup identity. Errors still apply only to the exact requested
+inputs, and the final distance is computed normally. Tool previews and background Apply retain
+their existing paths. The arrow and value-box anchor use the current frame's pointer value.
+
+Release-build control-channel checks against upstream `4dc63810` with the arrow fix alone,
+then with the distance fallback, used the same 150-point, 120-step drags. The cylinder used
+the setup above; planar-face Press Pull (Join) and Offset Face used a 30 × 30 × 10 mm box.
+The samples captured 25–27 distinct requested distances per drag:
+
+| Preview updates before reaching the final distance | Main + arrow fix | With distance fallback |
+|---|---:|---:|
+| Edited New Body extrusion | 0 | 24 |
+| Planar-face Press Pull (Join) | 22 | 24 |
+| Offset Face | 0 | 23 |
+
+Join already streams on main; the small count difference reflects sampling, not a change to
+that path. Applying the fixed New Body extrusion produced the requested 19.585 mm height;
+applying the 11.672 mm face offset produced a 21.672 mm tall box.
+
+These are sampled preview deliveries (`ui.inspect.preview.ms` changes), not every rendered
+frame or a geometry-kernel speed benchmark. With main's preview code unchanged, the New Body,
+edited New Body and Offset Face drag regressions fail while Join passes. With the fallback,
+all six distance-preview regressions pass, covering intermediate geometry, exact final
+convergence, unchanged document/undo, obsolete errors and setup changes. A separate regression
+checks the arrow's position on each held input frame.

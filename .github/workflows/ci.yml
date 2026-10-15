@@ -365,12 +365,15 @@ jobs:
         with:
           key: windows-startup
       - name: Backend order and probing on Windows
-        run: cargo test -p solidcraft --profile ci --locked -- startup::tests native_crash::tests
+        run: cargo test -p solidcraft --profile ci --locked -- startup::tests native_crash::tests native_frame::tests
       - name: Build the app
         run: cargo build -p solidcraft --profile ci --locked
       - name: Start the app under different settings
         shell: pwsh
         run: tools/windows-startup-smoke.ps1 -Exe target/ci/solidcraft.exe
+      - name: Resize border from the first frame
+        shell: pwsh
+        run: tools/windows-resize-smoke.ps1 -Exe target/ci/solidcraft.exe
 
   # Preserve the existing check name for branch protection, including docs-only PRs.
   ci:

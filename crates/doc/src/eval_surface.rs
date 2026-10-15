@@ -176,7 +176,8 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             }
             Ok(())
         }
-        FeatureKind::SurfaceSweep { sketch, profiles, curves, path_sketch, path } => {
+        FeatureKind::SurfaceSweep { sketch, profiles, curves, path_sketch, path, orientation, twist, scale } => {
+            let ctl = crate::eval::sweep_control(vals, orientation, twist, scale)?;
             let ss = st.sketch(*sketch).ok_or_else(|| DocError::Unknown(format!("sketch {sketch} (it must come earlier in the timeline)")))?;
             let ps =
                 st.sketch(*path_sketch).ok_or_else(|| DocError::Unknown(format!("sketch {path_sketch} (it must come earlier in the timeline)")))?;
@@ -195,8 +196,8 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             let pts: Vec<Vec2> = chains.iter().flatten().flat_map(|s| s.polyline(1e-2)).collect();
             let start = ss.plane.to_world(pts.iter().fold(Vec2::default(), |a, p| a + *p) * (1.0 / pts.len().max(1) as f64));
             let body = match path_points(ps, path, start)? {
-                Some(pts) => kernel::sweep_sheet_points(&ss.plane, &chains, &pts)?,
-                None => kernel::sweep_sheet(&ss.plane, &chains, &path_segments(ps, path, start)?)?,
+                Some(pts) => kernel::sweep_sheet_points_with(&ss.plane, &chains, &pts, &ctl)?,
+                None => kernel::sweep_sheet_with(&ss.plane, &chains, &path_segments(ps, path, start)?, &ctl)?,
             };
             let traced = crate::lineage::ChainRoles { sketch: ss, chains: &chains }.tool(body);
             push_sheet(st, f, traced);

@@ -108,6 +108,31 @@ impl LinkSource {
             LinkSource::Text { text, .. } => format!("text \"{}\"", text.chars().take(20).collect::<String>()),
         }
     }
+
+    /// The bodies this source reads geometry from (an intersection reads two).
+    pub fn bodies(&self) -> Vec<&str> {
+        match self {
+            LinkSource::Edge { body, .. }
+            | LinkSource::Face { body, .. }
+            | LinkSource::Body { body }
+            | LinkSource::Vertex { body, .. }
+            | LinkSource::OnSurface { body, .. }
+            | LinkSource::Iso { body, .. }
+            | LinkSource::Spun { body, .. } => vec![body.as_str()],
+            LinkSource::Intersection { a, b } => {
+                let mut bodies = a.bodies();
+                bodies.extend(b.bodies());
+                bodies
+            }
+            LinkSource::SketchCurve { .. }
+            | LinkSource::SketchPoint { .. }
+            | LinkSource::Origin
+            | LinkSource::Axis { .. }
+            | LinkSource::SketchAxis { .. }
+            | LinkSource::Plane { .. }
+            | LinkSource::Text { .. } => Vec::new(),
+        }
+    }
 }
 
 /// Half length of the line a sketch axis link produces.
