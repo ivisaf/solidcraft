@@ -125,3 +125,44 @@ fn face_join_of_a_step_import_keeps_all_32_neighbours_unchanged() {
     let FeatureKind::Extrude { targets, .. } = &s.doc.feature(result["feature"].as_u64().unwrap()).unwrap().kind else { panic!("extrude") };
     assert_eq!(targets, &["Wall"]);
 }
+
+/// #1349: a profile sketched on a body's face joins that body, and leaves alone a neighbour
+/// whose face it lies on too: a rib on the side of a bracket, drawn down over the motor the
+/// bracket sits on, welded the motor in (a join that ran for minutes on the imported motor and
+/// failed). Explicit targets still join both.
+#[test]
+fn join_of_a_profile_sketched_on_a_face_leaves_a_neighbour_it_lies_on() {
+    for targets in [None, Some(json!(["Bracket", "Motor"]))] {
+        let mut s = Session::default();
+        run(&mut s, "solid.box", json!({"length":40,"width":30,"height":20,"body_name":"Motor"}));
+        run(&mut s, "solid.box", json!({"corner":[0,0,20],"length":40,"width":30,"height":5,"body_name":"Bracket"}));
+        let sketch = run(&mut s, "sketch.create", json!({"plane": {"face": [40, 15, 22.5]}}))["sketch"].as_u64().unwrap();
+        let plane = s.model.state().sketch(sketch).unwrap().plane;
+        let at = |y: f64, z: f64| {
+            let p = plane.to_local(Vec3::new(40.0, y, z));
+            json!([p.x, p.y])
+        };
+        // On the bracket's side and down over the motor's.
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": at(5.0, 10.0), "p1": at(25.0, 25.0)}));
+        run(&mut s, "sketch.finish", json!({}));
+        let mut params =
+            json!({"sketch": sketch, "profiles": [{"point": at(15.0, 22.5)}, {"point": at(15.0, 15.0)}], "distance": 1, "operation": "join"});
+        if let Some(t) = &targets {
+            params["targets"] = t.clone();
+        }
+        let result = run(&mut s, "solid.extrude", params);
+        assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+        let state = s.model.state();
+        let volume = |name: &str| solidcraft_kernel::measure(&state.body(name).unwrap().body).unwrap().volume;
+        if targets.is_some() {
+            assert_eq!(state.bodies.len(), 1);
+            assert!((volume("Bracket") - (24_000.0 + 6000.0 + 300.0)).abs() < 1e-6, "{}", volume("Bracket"));
+            continue;
+        }
+        assert_eq!(state.bodies.len(), 2);
+        assert!((volume("Motor") - 24_000.0).abs() < 1e-6, "the motor is untouched");
+        assert!((volume("Bracket") - (6000.0 + 300.0)).abs() < 1e-6, "{}", volume("Bracket"));
+        let FeatureKind::Extrude { targets, .. } = &s.doc.feature(result["feature"].as_u64().unwrap()).unwrap().kind else { panic!("extrude") };
+        assert_eq!(targets, &["Bracket"]);
+    }
+}

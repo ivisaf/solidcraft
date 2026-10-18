@@ -12,11 +12,29 @@ Every import (STEP, IGES, 3MF, STL, OBJ; inserted, dropped, opened as a new desi
 
 A STEP **assembly** keeps its structure: each product under the file's root becomes a component nested under the import's, named after the product, at the place the file gives it. A part (or sub-assembly) the file places more than once becomes **one component with an occurrence per placement**: the Import feature builds the part once and skips the file's later copies (`skip` in the feature, format 22), and the occurrences show it everywhere else. The reply adds `subcomponents` (how many components were made below the import's) and `rigid_joints`.
 
+The Browser reuses body, sketch and construction-plane membership, child lists and resolved placements while the
+camera moves. Large assemblies keep their tree open without resolving every part and
+folder again on each frame. Geometry edits, assembly changes and uncaptured or reverted
+positions refresh those queries; selection, visibility and locking are read live.
+
+Hover picking pauses while the mouse moves the view and resumes when navigation stops.
+A 3D mouse moving the view leaves it on: the pointer hand is free, so preselection and
+clicks keep working while the other hand turns the view. Picking uses the current camera
+and the cached body bounds directly in model order, so finding each body's bounds does not
+scan the assembly again.
+
+Hovering an assembly's Browser row retains its whole-body highlight buffers during
+rotation, panning and zoom; the GPU transforms those buffers with the camera. The
+origin and construction widgets resize independently. Whole-body
+highlight generation scans each mesh once rather than scanning it again for every
+face. Sketch profile feedback still updates its projected curves and lift toward
+the eye as the view changes.
+
 The contents of an imported assembly are **rigid by default**: rigid joints (a rigid group, its glyphs not drawn) hold each part where the file put it in its parent, so moving the import's component moves everything, and an inner part doesn't move on its own; joint degrees of freedom count the whole import as one body. To joint the parts one by one, release them with **Unlock Contents** on the component's browser menu (`component.unlock {component}`), one undo step. Undo takes a whole import away in one step.
 
 Designs saved before imports made components keep their Import where it is (no component is made for it) and rebuild as they did.
 
-Read: manifold solid breps (with voids), faceted breps, shell-based surface models; planes, cylinders, cones, spheres, tori, B-spline and rational B-spline surfaces (with knots, Bézier, uniform, quasi-uniform), surfaces of revolution and linear extrusion, trimmed surfaces; lines, circles, ellipses, B-spline curves, polylines, trimmed/surface/seam curves; length and angle units (SI prefixes, conversion-based units such as inches); product names (body names come from the solid's name, else the product's; `names` below chooses); surface colours; assemblies (next-assembly-usage occurrences placed by item-defined transformations, and mapped items) — the product tree is kept in the feature and becomes the import's components (above). Files are untrusted: sizes, entity counts and nesting are capped and every kernel call is guarded. What cannot be read becomes a warning on the feature (a face left out gives an open body); not read yet: offset surfaces, pcurve-only edges.
+Read: manifold solid breps (with voids), faceted breps, shell-based surface models; planes, cylinders, cones, spheres, tori, B-spline and rational B-spline surfaces (with knots, Bézier, uniform, quasi-uniform), surfaces of revolution and linear extrusion, trimmed surfaces; lines, circles, ellipses, hyperbolas and parabolas (as exact rational curves, which export writes back as exact rational B-splines), B-spline curves, polylines, trimmed/surface/seam curves; length and angle units (SI prefixes, conversion-based units such as inches); product names (body names come from the solid's name, else the product's; `names` below chooses); surface colours; assemblies (next-assembly-usage occurrences placed by item-defined transformations, and mapped items) — the product tree is kept in the feature and becomes the import's components (above). Files are untrusted: sizes, entity counts and nesting are capped and every kernel call is guarded. What cannot be read becomes a warning on the feature (a face left out gives an open body); not read yet: offset surfaces, pcurve-only edges.
 
 ## Files from other CAD systems
 
@@ -39,3 +57,9 @@ display on the resulting body.
 ## IGES
 
 IGES 5.3 files (`.igs`/`.iges`) open, insert and drop the same way: `crates/kernel/src/iges_in.rs` (written from the published specification) restates the file as STEP and the STEP reader reads it, so the feature holds STEP text. Read: manifold solid B-reps (186) with their shells, faces, loops, edge and vertex lists; trimmed (144) and bounded (143) surfaces, and bare B-spline patches, sewn into a solid by their shared edges (an open body when they do not close); lines, circular arcs, ellipses, composite curves, rational B-spline curves; planes (108, 190), cylinders, cones, spheres, tori, rational B-spline surfaces, surfaces of revolution and tabulated cylinders; transformation matrices; units; colours (314 and the predefined numbers); body names (name properties, else labels). Not read yet: ruled and offset surfaces, curves on surfaces given only in parameter space. Export (`file.export` to `.igs`) writes each body as a manifold solid B-rep on the same surfaces a STEP export uses, with its name and colour.
+
+## FreeCAD and Rhino
+
+FreeCAD `.FCStd` and Rhino `.3dm` files open, insert and drop the same way, in the desktop app and the CLI. They are read with [cadmpeg](https://github.com/cadmpeg/cadmpeg) (Apache-2.0, `crates/io/src/native_cad.rs`): cadmpeg detects the format from the bytes, decodes it into its neutral model under resource caps, checks that model and writes it as STEP AP214, which the STEP reader then reads. The feature holds that STEP text, so the design reopens without the original file. The file's solids come in; its feature history, sketches and parameters do not. Losses cadmpeg reports become warnings on the feature, and a file without an importable solid is refused with a message. cadmpeg runs inside the panic guard. How much of a file is read follows cadmpeg's support for that format ([format support](https://github.com/cadmpeg/cadmpeg/blob/main/docs/format-support.md)).
+
+Only codecs for open formats are compiled in: the workspace turns off cadmpeg's default features and enables `fcstd`, `rhino` and `step` (the writer). cadmpeg's codecs for commercial CAD formats are not built, and neither is its `sat` codec, which decodes ShapeManager streams with ACIS as one dialect, so ACIS `.sat`/`.sab` files are not read yet. `crates/io/src/native_cad.rs` is the one place cadmpeg is called; a cadmpeg-based STEP reader could be added there later behind a setting, to compare with the STEP reader above without changing it. The browser app does not read these formats yet: cadmpeg compiles the zstd C library, which the wasm build leaves out.

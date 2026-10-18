@@ -136,11 +136,16 @@ fn map_plane(m: &Mat, p: &Plane) -> Plane {
 fn map_plane_ref(m: &Mat, p: &mut PlaneRef) {
     match p {
         PlaneRef::Custom { plane } => *plane = map_plane(m, plane),
+        PlaneRef::Placed { origin, x_dir, y_dir } => {
+            map_point_expr(m, origin);
+            *x_dir = apply_vector(m, *x_dir);
+            *y_dir = apply_vector(m, *y_dir);
+        }
         PlaneRef::Face { plane, at, .. } => {
             *plane = map_plane(m, plane);
             *at = apply_point(m, *at);
         }
-        PlaneRef::Offset { base, .. } => map_plane_ref(m, base),
+        PlaneRef::Offset { base, .. } | PlaneRef::Flipped { base, .. } => map_plane_ref(m, base),
         PlaneRef::AtAngle { base, axis_origin, axis_dir, .. } => {
             map_plane_ref(m, base);
             *axis_origin = apply_point(m, *axis_origin);
@@ -171,7 +176,7 @@ fn map_geo_ref(m: &Mat, g: &mut crate::construct::GeoRef) {
 /// Map a point given as expressions by `m`: numbers stay numbers; a coordinate that is an
 /// expression stays one (`m · (x, y, z) + t`, written out), so it still follows its parameters.
 pub fn map_point_expr(m: &Mat, p: &mut crate::PointExpr) {
-    let num = |e: &String| e.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let num = |e: &crate::Expr| e.trim().parse::<f64>().ok().filter(|v| v.is_finite());
     if let [Some(x), Some(y), Some(z)] = [num(&p[0]), num(&p[1]), num(&p[2])] {
         *p = crate::point_expr(apply_point(m, Vec3::new(x, y, z)));
         return;
@@ -197,7 +202,7 @@ pub fn map_point_expr(m: &Mat, p: &mut crate::PointExpr) {
         } else if constant.abs() >= 1e-12 {
             e = format!("{e} {} {} mm", if constant < 0.0 { '-' } else { '+' }, constant.abs());
         }
-        *out = e;
+        *out = e.into();
     }
 }
 
@@ -237,6 +242,21 @@ impl Document {
             c = o.parent;
         }
         m
+    }
+
+    /// World transform of one placement of `component`: the occurrence `path` from the root
+    /// (empty for the root itself). `None` when the path no longer leads to that component.
+    pub fn path_transform(&self, component: u64, path: &[u64]) -> Option<Mat> {
+        if path.len() > MAX_PLACEMENT_DEPTH + 1 {
+            return None;
+        }
+        let (mut m, mut c) = (IDENTITY, 0);
+        for id in path {
+            let o = self.occurrences.iter().find(|o| o.id == *id && o.parent == c)?;
+            m = mat_mul(&m, &o.transform);
+            c = o.component;
+        }
+        (c == component).then_some(m)
     }
 
     /// Every placement of each component: (component, occurrence path ids, world transform).

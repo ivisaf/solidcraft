@@ -1038,6 +1038,10 @@ impl Body {
     /// [`Body::tessellate_with`] in which no facet turns more than `angle` radians either
     /// (infinite: the chord tolerance alone).
     fn tessellate_within(&self, tol: f64, angle: f64, refine: bool) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.tessellate_within_untimed(tol, angle, refine))
+    }
+
+    fn tessellate_within_untimed(&self, tol: f64, angle: f64, refine: bool) -> Result<Mesh> {
         let tol = if tol.is_finite() && tol > 0.0 { tol } else { 0.05 };
         let tol = tol.max(self.size() * 1e-6);
         if let Some(m) = &self.mesh {
@@ -1148,6 +1152,10 @@ impl Body {
     }
 
     fn plan_within(&self, tol: f64, angle: Option<f64>) -> Result<solidcraft_geom::tess::TessPlan> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.plan_within_untimed(tol, angle))
+    }
+
+    fn plan_within_untimed(&self, tol: f64, angle: Option<f64>) -> Result<solidcraft_geom::tess::TessPlan> {
         if self.is_mesh() {
             return Err(KernelError::Invalid("a mesh body has no surfaces to tessellate".into()));
         }
@@ -1165,15 +1173,21 @@ impl Body {
     /// (rounds that overlap where a wall is thinner than both, #871). Boundaries that only
     /// touch (at a vertex they share, or within the size's millionth) don't count.
     pub fn crossed_face_loops(&self) -> Result<usize> {
+        Ok(self.crossed_faces()?.len())
+    }
+
+    /// The faces [`Body::crossed_face_loops`] counts, each as the mean of its boundary's
+    /// points: the same for a face an operation carried over unchanged.
+    pub fn crossed_faces(&self) -> Result<Vec<Vec3>> {
         use mt::{BoundedCurve, ParameterDivision1D};
         if self.is_mesh() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         const MAX_SEGMENTS: usize = 20_000;
         let size = self.size();
         let tol = (size * 1e-6).max(1e-9);
         let chord = (size * 1e-3).max(1e-4);
-        let mut crossed = 0;
+        let mut crossed = Vec::new();
         for f in self.solid.face_iter() {
             let mt::Surface::Plane(pl) = f.oriented_surface() else { continue };
             let o = from_p3(pl.origin());
@@ -1226,7 +1240,10 @@ impl Body {
                 loops.iter().enumerate().flat_map(|(l, segs)| segs.iter().map(move |s| (l, s))).collect();
             let bad = all.iter().enumerate().any(|(i, (_, s))| all.iter().skip(i + 1).any(|(_, t)| cross(s, t)));
             if bad {
-                crossed += 1;
+                let ends: Vec<(f64, f64)> = all.iter().map(|(_, s)| s.0).collect();
+                let k = ends.len().max(1) as f64;
+                let (su, sv) = ends.iter().fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
+                crossed.push(o + u * (su / k) + v * (sv / k));
             }
         }
         Ok(crossed)
@@ -1257,6 +1274,10 @@ impl Body {
     /// body's [`Body::display_plan`] (shared edge nodes, structured grids), or the way
     /// [`Body::tessellate`] meshes when no plan can be made.
     pub fn display_mesh(&self, tol: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.display_mesh_untimed(tol))
+    }
+
+    fn display_mesh_untimed(&self, tol: f64) -> Result<Mesh> {
         if self.is_mesh() {
             return self.flagged(self.tessellate(tol)?);
         }
@@ -1276,6 +1297,10 @@ impl Body {
     /// sagitta of a small radius on a large body (a sheet-metal bend, a small hole), which the
     /// tolerance alone leaves as one flat facet.
     pub fn display_mesh_angular(&self, tol: f64, angle: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.display_mesh_angular_untimed(tol, angle))
+    }
+
+    fn display_mesh_angular_untimed(&self, tol: f64, angle: f64) -> Result<Mesh> {
         if self.is_mesh() {
             return self.flagged(self.tessellate(tol)?);
         }
@@ -1291,12 +1316,20 @@ impl Body {
     /// The display mesh of a plan made from this body ([`Body::display_plan`],
     /// [`Body::display_plan_angular`]): evaluated on the CPU, with its edges flagged.
     pub fn display_mesh_of(&self, plan: &solidcraft_geom::tess::TessPlan) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.display_mesh_of_untimed(plan))
+    }
+
+    fn display_mesh_of_untimed(&self, plan: &solidcraft_geom::tess::TessPlan) -> Result<Mesh> {
         self.flagged(plan.evaluate())
     }
 
     /// The reference mesher's angular display mesh: what [`Body::display_mesh_angular`] falls
     /// back to when no plan can be made.
     pub fn reference_display_mesh_angular(&self, tol: f64, angle: f64) -> Result<Mesh> {
+        crate::profile::timed(crate::profile::Kind::Tessellate, || self.reference_display_mesh_angular_untimed(tol, angle))
+    }
+
+    fn reference_display_mesh_angular_untimed(&self, tol: f64, angle: f64) -> Result<Mesh> {
         if let Some((shared, t)) = self.display_of.as_deref()
             && let Some(placed) =
                 shared.mesh.get_or_init(|| shared.original.reference_display_mesh_angular(tol, angle).ok()).as_ref().and_then(|m| placed_mesh(m, t))
@@ -1463,6 +1496,33 @@ impl Body {
         let tol = (self.size().max(other.size()) * 1e-4).max(1e-6);
         let (a, b) = (self.tessellate(tol)?, other.tessellate(tol)?);
         shell_groups::meshes_meet(&a, &b, 2.0 * tol)
+    }
+
+    /// The same contact test for several tools, reusing this unchanged body's
+    /// fine mesh at each required tolerance. No contact threshold is relaxed.
+    pub fn meets_each(&self, others: &[Body]) -> Result<Vec<bool>> {
+        if others.len() > 1024 {
+            return Err(KernelError::Invalid("too many contact tools".into()));
+        }
+        self.require_brep("contact test")?;
+        let size = self.size();
+        let mut meshes = std::collections::HashMap::new();
+        let mut contacts = Vec::with_capacity(others.len());
+        for other in others {
+            other.require_brep("contact test")?;
+            let tol = (size.max(other.size()) * 1e-4).max(1e-6);
+            let key = tol.to_bits();
+            if !meshes.contains_key(&key) {
+                // Bound retained meshes even when hostile inputs request many tolerances.
+                if meshes.len() == 16 {
+                    meshes.clear();
+                }
+                meshes.insert(key, self.tessellate(tol)?);
+            }
+            let mesh = meshes.get(&key).ok_or_else(|| KernelError::Internal("contact mesh disappeared".into()))?;
+            contacts.push(shell_groups::meshes_meet(mesh, &other.tessellate(tol)?, 2.0 * tol)?);
+        }
+        Ok(contacts)
     }
 
     /// A boolean shortcut needs clearance larger than both shell mesh deflections.

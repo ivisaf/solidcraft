@@ -7,6 +7,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod cmd;
 pub mod control_auth;
 pub mod crash;
@@ -21,6 +22,7 @@ pub mod render_jobs;
 pub mod sample;
 mod slicer_icon;
 pub mod slicers;
+pub mod timing;
 pub mod toollib;
 pub mod view;
 
@@ -31,7 +33,7 @@ use serde_json::Value;
 use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
-pub use cmd::{CommandInfo, CommandSpec, auto_operation, command_specs, find_command};
+pub use cmd::{CommandInfo, CommandSpec, auto_operation, command_specs, extrude_reach, find_command};
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
 pub use solidcraft_doc::Visibility;
@@ -157,6 +159,16 @@ pub struct Snapshot {
     pub pending_moves: std::collections::BTreeMap<u64, solidcraft_doc::Mat>,
 }
 
+/// A copy of a session that evaluates commands ahead of it ([`Session::ahead`]).
+pub struct Ahead(Session);
+
+impl Ahead {
+    /// Run `commands` (their results stay in the shared evaluation cache).
+    pub fn evaluate(self, commands: &[(String, Value)]) -> Result<()> {
+        self.0.preview_in_place(commands).map(|_| ())
+    }
+}
+
 /// What some commands would make, evaluated on a scratch copy of a session
 /// ([`Session::preview`]). The session itself is not changed.
 #[derive(Clone, Debug)]
@@ -224,10 +236,15 @@ pub struct Session {
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
     /// Features copied with `timeline.copy` (pasted by `timeline.paste`).
     pub clipboard: Vec<solidcraft_doc::Feature>,
+    /// Sketch geometry copied with `sketch.copy` (pasted by `sketch.paste`).
+    pub sketch_clipboard: Option<cmd::sketch_clipboard::SketchClip>,
     /// Section Analysis: a view cut by a plane (origin, unit normal; the normal side is hidden).
     pub section: Option<(Vec3, Vec3)>,
     /// Surface analysis shading the model (zebra, draft, curvature map).
     pub analysis: Option<SurfaceAnalysis>,
+    /// The seams `inspect.continuity` last measured, for the viewport to shade. View state: not
+    /// part of the design and not an undo step.
+    pub continuity: Vec<ContinuitySeam>,
     /// What is hidden or shown in the view (`browser.visibility`): saved with the design, not an
     /// undo step. A design brings its saved visibility when it opens (`Session::new`).
     pub visibility: Visibility,
@@ -290,6 +307,34 @@ pub enum SurfaceAnalysis {
     Access { dir: Vec3 },
 }
 
+/// One seam measured by `inspect.continuity`, where the viewport shades it: the stations it was
+/// sampled at, in world coordinates, and how it reads. View state only: the design is untouched.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ContinuitySeam {
+    /// The body the seam is an edge of.
+    pub body: String,
+    /// The edge's index in the body's display mesh edge order.
+    pub edge: usize,
+    /// Sample points along the seam, in world coordinates.
+    pub points: Vec<Vec3>,
+    /// The seam's worst verdict along its length.
+    pub verdict: kernel::SeamVerdict,
+}
+
+impl SurfaceAnalysis {
+    /// How a picture shades the faces for this analysis.
+    pub fn mode(self) -> render::AnalysisMode {
+        use render::AnalysisMode as M;
+        match self {
+            SurfaceAnalysis::Zebra { stripes } => M::Zebra { stripes },
+            SurfaceAnalysis::Draft { pull, angle } => M::Draft { pull, angle },
+            SurfaceAnalysis::Curvature { radius } => M::Curvature { radius },
+            SurfaceAnalysis::Environment => M::Environment,
+            SurfaceAnalysis::Access { dir } => M::Access { dir },
+        }
+    }
+}
+
 const MAX_UNDO: usize = 200;
 /// Checkpoints kept (the oldest go first).
 const MAX_CHECKPOINTS: usize = 16;
@@ -328,8 +373,10 @@ impl Session {
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             clipboard: Vec::new(),
+            sketch_clipboard: None,
             section: None,
             analysis: None,
+            continuity: Vec::new(),
             checkpoints: Vec::new(),
             next_checkpoint: 1,
             saved_visibility: visibility.clone(),
@@ -794,8 +841,10 @@ impl Session {
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
             clipboard: self.clipboard.clone(),
+            sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
             analysis: None,
+            continuity: Vec::new(),
             checkpoints: Vec::new(),
             next_checkpoint: 1,
             visibility: self.visibility.clone(),
@@ -870,6 +919,17 @@ impl Session {
         self.scratch().preview_in_place(commands).map(|(after, replies)| Preview { before: visible(self), after: visible(&after), replies })
     }
 
+    /// Run `commands` on a [`Session::scratch`] copy that keeps the undo and redo stacks: what
+    /// they evaluate lands in the evaluation cache the copy shares with this session, so running
+    /// them here afterwards finds it there. For a front end that computes a command which may
+    /// take a while (undo, the history marker moved) off its window thread first.
+    pub fn ahead(&self) -> Ahead {
+        let mut copy = self.scratch();
+        copy.undo.clone_from(&self.undo);
+        copy.redo.clone_from(&self.redo);
+        Ahead(copy)
+    }
+
     fn preview_in_place(mut self, commands: &[(String, Value)]) -> Result<(Self, Vec<Value>)> {
         if commands.is_empty() {
             return Err(EngineError::Other("nothing to preview".into()));
@@ -903,6 +963,18 @@ impl Session {
     /// Run a script: a JSON array of `{"command": id, "params": {...}}` (or an object with a
     /// `commands` array). Stops at the first error. Returns each command's result.
     pub fn run_script(&mut self, script: &Value) -> Result<Vec<Value>> {
+        Ok(self.run_script_with(script, None)?.0)
+    }
+
+    /// [`Session::run_script`], timing each command (#1833): the results and
+    /// `{"timings": [{"index", "command", "ms", "profile"?}], "total_ms"}`, with `profile` the
+    /// kernel's share of each command ([`timing`]).
+    pub fn run_script_timed(&mut self, script: &Value, profile: bool) -> Result<(Vec<Value>, Value)> {
+        let (results, timings) = self.run_script_with(script, Some(profile))?;
+        Ok((results, timings.unwrap_or(Value::Null)))
+    }
+
+    fn run_script_with(&mut self, script: &Value, profile: Option<bool>) -> Result<(Vec<Value>, Option<Value>)> {
         let list = match script {
             Value::Array(a) => a.clone(),
             Value::Object(o) => {
@@ -914,6 +986,8 @@ impl Session {
             return Err(EngineError::Other("script too long".into()));
         }
         let mut out = Vec::new();
+        let mut steps = Vec::new();
+        let clock = timing::Clock::start();
         for (i, c) in list.iter().enumerate() {
             let id = c
                 .get("command")
@@ -921,10 +995,18 @@ impl Session {
                 .and_then(Value::as_str)
                 .ok_or_else(|| EngineError::Other(format!("script step {}: missing `command`", i + 1)))?;
             let p = c.get("params").cloned().unwrap_or(Value::Null);
-            let r = self.execute(id, &p).map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
-            out.push(r);
+            let r = match profile {
+                Some(profile) => {
+                    let (r, step) = timing::time(profile, || self.execute(id, &p));
+                    steps.push(step.to_json(i, id));
+                    r
+                }
+                None => self.execute(id, &p),
+            };
+            out.push(r.map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?);
         }
-        Ok(out)
+        let timings = profile.map(|_| serde_json::json!({"timings": steps, "total_ms": timing::round_ms(clock.ms())}));
+        Ok((out, timings))
     }
 }
 
@@ -938,6 +1020,8 @@ mod delete_face_tests;
 mod derived_units_tests;
 #[cfg(test)]
 mod display_mesh_tests;
+#[cfg(test)]
+mod exact_tool_tests;
 #[cfg(test)]
 mod extent_tests;
 #[cfg(test)]

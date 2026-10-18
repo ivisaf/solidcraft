@@ -43,7 +43,8 @@ use std::sync::mpsc::Sender;
 
 use serde_json::{Value, json};
 use solidcraft_engine::io::vfs;
-use solidcraft_engine::render::{StandardView, render_png};
+use solidcraft_engine::render::StandardView;
+use solidcraft_engine::timing;
 
 use crate::SolveApp;
 
@@ -121,7 +122,9 @@ const MAX_BATCH: usize = 10_000;
 /// bypass.
 const LOADS_A_FILE: [&str; 3] = ["doc.open", "file.insert_step", "file.insert_mesh"];
 
-/// `engine.batch {commands, rollback?}`: the steps in one request, so in one frame (#743). Each
+/// `engine.batch {commands, rollback?, timings?, profile?}`: the steps in one request, so in one
+/// frame (#743). With `timings` the reply adds each step's time and `total_ms`, with `profile`
+/// each step's kernel share too (`solidcraft_engine::timing`, #1833). Each
 /// step runs as `engine.execute` runs it; the first failure stops the batch and, with
 /// `rollback` (the default), the design goes back to its checkpoint. Step failures are part of
 /// the reply; refusals (`engine.batch unavailable: …`) come before anything runs, so the client
@@ -138,26 +141,43 @@ fn batch(app: &mut SolveApp, p: &Value) -> Outcome {
         return err(format!("engine.batch unavailable: step {i} ({c}) loads a file"));
     }
     let rollback = p.get("rollback").and_then(Value::as_bool).unwrap_or(true);
+    let profile = p.get("profile").and_then(Value::as_bool).unwrap_or(false);
+    let timed = profile || p.get("timings").and_then(Value::as_bool).unwrap_or(false);
+    let mut rows = Vec::new();
+    let clock = timing::Clock::start();
     let checkpoint = if rollback { app.run("edit.checkpoint", json!({})).ok().and_then(|v| v["checkpoint"].as_u64()) } else { None };
     let mut results = Vec::with_capacity(steps.len());
     for (i, step) in steps.iter().enumerate() {
-        let r = match command(step) {
+        let (r, took) = timing::time(profile, || match command(step) {
             Some(id) => execute(app, id, step.get("params").cloned().filter(|v| !v.is_null()).unwrap_or(json!({}))),
             None => Err("missing `command`".to_string()),
-        };
+        });
+        if timed {
+            rows.push(took.to_json(i, command(step).unwrap_or_default()));
+        }
         match r {
             Ok(v) => results.push(v),
             Err(e) => {
                 let restored = checkpoint.is_some_and(|id| app.run("edit.restore_checkpoint", json!({"checkpoint": id})).is_ok());
                 let failed = json!({"index": i, "command": command(step), "error": e});
-                return ok(json!({"completed": i, "results": results, "failed": failed, "undone": if restored { i } else { 0 }}));
+                let reply = json!({"completed": i, "results": results, "failed": failed, "undone": if restored { i } else { 0 }});
+                return ok(with_timings(reply, timed, rows, clock.ms()));
             }
         }
     }
     if let Some(id) = checkpoint {
         let _ = app.run("edit.restore_checkpoint", json!({"checkpoint": id, "forget": true}));
     }
-    ok(json!({"completed": results.len(), "results": results, "undone": 0}))
+    ok(with_timings(json!({"completed": results.len(), "results": results, "undone": 0}), timed, rows, clock.ms()))
+}
+
+/// A batch reply with `timings` and `total_ms` when they were asked for.
+fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) -> Value {
+    if timed && let Some(o) = reply.as_object_mut() {
+        o.insert("timings".into(), Value::Array(rows));
+        o.insert("total_ms".into(), json!(timing::round_ms(total_ms)));
+    }
+    reply
 }
 
 /// A request from an MCP server carries the folders its agent may use (`allow_paths`); every
@@ -170,6 +190,37 @@ pub fn request_scope(app: &SolveApp, params: &Value) -> Result<Option<vfs::PathS
     // Plus the app's own recovery folder and, when it is a safe one, the open design's folder.
     let roots = roots.into_iter().chain(solidcraft_engine::recovery::default_dir());
     Ok(Some(vfs::PathScope::new(roots).with_design(app.session.path.as_deref())))
+}
+
+/// What a picture of the view shows: the model as the window shows it (theme and colour vision
+/// mode, the section the viewport shows: an open Section Analysis dialog's preview, a sketch's
+/// Slice), with the grid and the origin's axes as `guides` says.
+pub(crate) fn view_scene(app: &SolveApp, guides: solidcraft_engine::view::Guides) -> solidcraft_engine::render::Scene {
+    solidcraft_engine::view::scene_with_palette_and_guides(
+        &app.session,
+        &app.cam,
+        crate::viewport::section_plane(app),
+        solidcraft_engine::view::world_curve_parts,
+        &crate::viewport::scene_palette(app.ui.dark, app.preferences.color_vision),
+        guides,
+    )
+}
+
+/// The grid and the origin's axes as the window shows them (the Grid and Origin switches).
+pub(crate) fn window_guides(app: &SolveApp) -> solidcraft_engine::view::Guides {
+    solidcraft_engine::view::Guides { grid: app.ui.show_grid && !crate::viewport::active_view(app).hide_grid, axes: app.origin_visible() }
+}
+
+/// A picture of the view as the window shows it, RGBA, drawn on the GPU with the viewport's
+/// pipelines (the renderer the app installs).
+pub(crate) fn view_rgba(app: &SolveApp, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    solidcraft_engine::capture::rgba(&view_scene(app, window_guides(app)), &app.cam, w, h).map(|p| p.rgba)
+}
+
+/// [`view_rgba`] as PNG.
+pub fn view_png(app: &SolveApp, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    let rgba = view_rgba(app, w, h)?;
+    solidcraft_engine::render::png(w as usize, h as usize, rgba).ok_or_else(|| "PNG encoding failed".to_string())
 }
 
 pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
@@ -279,12 +330,13 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         }
         "ui.set" => {
             // What is hidden lives in the session (`browser.visibility`); `ui.set` still sets it.
-            const VIS: [(&str, &str); 5] = [
+            const VIS: [(&str, &str); 6] = [
                 ("hiddenBodies", "hidden_bodies"),
                 ("hiddenOrigin", "hidden_origin"),
                 ("hiddenSketches", "hidden_sketches"),
                 ("shownSketches", "shown_sketches"),
                 ("hiddenJoints", "hidden_joints"),
+                ("hiddenFolders", "hidden_folders"),
             ];
             let mut cur = serde_json::to_value(&app.ui).unwrap_or(json!({}));
             let mut vis = serde_json::to_value(&app.session.visibility).unwrap_or(json!({}));
@@ -340,11 +392,19 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             let Some(id) = s("command") else { return err("missing `command`") };
             // `params`: what the dialog opens on. Refused: nothing starts, or the dialog closes.
             let params = p.get("params").filter(|v| !v.is_null());
-            if params.is_some() && id != "joint.drive" {
-                return err(format!("`{id}` takes no ui.start params yet (joint.drive takes joint, values)"));
+            if params.is_some() && id != "joint.drive" && id != "motion.study" {
+                return err(format!("`{id}` takes no ui.start params yet (joint.drive takes joint, values; motion.study takes study)"));
             }
             app.start(id);
-            if let Some(params) = params {
+            if let Some(params) = params.filter(|_| id == "motion.study") {
+                let Some(crate::dialogs::Kind::Motion(k)) = app.dialog.as_mut().map(|d| &mut d.kind) else {
+                    return err("Motion Study did not open");
+                };
+                if let Err(e) = crate::dialogs_motion::preset(&app.session, k, params) {
+                    crate::dialogs::cancel(app);
+                    return err(e);
+                }
+            } else if let Some(params) = params {
                 if app.tree.capture_prompt.is_some() {
                     return err("Drive Joints waits for the Capture Position question (ui.capture)");
                 }
@@ -641,6 +701,7 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             None => ok(json!({"question": app.tree.capture_prompt, "pending_moves": app.session.pending_moves.len()})),
         },
         "ui.prefs" => wrap(crate::prefs::control(app, p)),
+        "ui.agent_chat" => wrap(crate::agent_chat::control(app, ctx, p)),
         "ui.help" => match s("item") {
             Some(i @ ("about" | "shortcuts" | "report" | "crashes")) => {
                 crate::help::run(app, ctx, i);
@@ -678,31 +739,32 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             _ => Outcome::Screenshot { path: s("path").map(str::to_string) },
         },
         "ui.render" => {
-            let w = f("width").unwrap_or(1280.0).clamp(16.0, 8192.0) as usize;
-            let h = f("height").unwrap_or(800.0).clamp(16.0, 8192.0) as usize;
-            // In the window's theme and colour vision mode, and cut by the section the viewport shows (an open Section
-            // Analysis dialog's preview, a sketch's Slice), not only the committed one.
-            // The grid and the axes as the window shows them (the Grid and Origin switches), unless
-            // the request says: `grid` and `axes` leave them out of the picture or put them in.
+            let w = f("width").unwrap_or(1280.0).clamp(16.0, 8192.0) as u32;
+            let h = f("height").unwrap_or(800.0).clamp(16.0, 8192.0) as u32;
+            // As the window shows it (`view_scene`). The grid and the axes as the window shows
+            // them, unless the request says: `grid` and `axes` leave them out or put them in.
+            let shown = window_guides(app);
             let guides = solidcraft_engine::view::Guides {
-                grid: p.get("grid").and_then(Value::as_bool).unwrap_or(app.ui.show_grid && !crate::viewport::active_view(app).hide_grid),
-                axes: p.get("axes").and_then(Value::as_bool).unwrap_or_else(|| app.origin_visible()),
+                grid: p.get("grid").and_then(Value::as_bool).unwrap_or(shown.grid),
+                axes: p.get("axes").and_then(Value::as_bool).unwrap_or(shown.axes),
             };
-            let scene = solidcraft_engine::view::scene_with_palette_and_guides(
-                &app.session,
-                &app.cam,
-                crate::viewport::section_plane(app),
-                solidcraft_engine::view::world_curve_parts,
-                &crate::viewport::scene_palette(app.ui.dark, app.preferences.color_vision),
-                guides,
-            );
-            let Some(png) = render_png(&scene, &app.cam, w, h) else { return err("render failed") };
+            // A path outside the request's folders is refused before anything is drawn.
+            if let Some(Err(e)) = s("path").map(vfs::check) {
+                return err(e);
+            }
+            let scene = view_scene(app, guides);
+            let png = match solidcraft_engine::capture::png(&scene, &app.cam, w, h) {
+                Ok(png) => png,
+                Err(e) => return err(format!("render failed: {e}")),
+            };
+            // What drew it (gpu, gpu-software or cpu), and the warning a CPU render carries.
+            let (renderer, warning) = (png.renderer, solidcraft_engine::capture::warning(png.renderer));
             match s("path") {
-                Some(path) => match vfs::check(path).and_then(|()| std::fs::write(path, &png)) {
-                    Ok(()) => ok(json!({"path": path, "bytes": png.len()})),
+                Some(path) => match vfs::check(path).and_then(|()| std::fs::write(path, &png.bytes)) {
+                    Ok(()) => ok(json!({"path": path, "bytes": png.bytes.len(), "renderer": renderer, "warning": warning})),
                     Err(e) => err(e),
                 },
-                None => ok(json!({"bytes": png.len()})),
+                None => ok(json!({"bytes": png.bytes.len(), "renderer": renderer, "warning": warning})),
             }
         }
         "app.quit" => {
@@ -933,6 +995,9 @@ mod tests {
     /// or dark.
     #[test]
     fn model_render_is_in_the_windows_theme() {
+        if !crate::gpu::test_picture_renderer() {
+            return;
+        }
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
         let mut app = SolveApp::new(s, Services::default());
@@ -959,6 +1024,9 @@ mod tests {
     /// preview too, not only a committed `inspect.section`.
     #[test]
     fn model_render_shows_the_section_dialog_preview() {
+        if !crate::gpu::test_picture_renderer() {
+            return;
+        }
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
         let mut app = SolveApp::new(s, Services::default());
@@ -998,6 +1066,9 @@ mod tests {
     /// in the request say otherwise for that render.
     #[test]
     fn model_render_follows_the_grid_and_origin_switches_unless_asked() {
+        if !crate::gpu::test_picture_renderer() {
+            return;
+        }
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20, "corner": [10, -15, -10]})).unwrap();
         let mut app = SolveApp::new(s, Services::default());
@@ -1063,6 +1134,28 @@ mod tests {
         assert!(v["result"].get("failed").is_none(), "{v}");
         assert!(frames <= 2, "a batch of 80 steps took {frames} frames");
         assert_eq!(inspect(&mut h)["sketches"].as_array().map(Vec::len), Some(40));
+    }
+
+    /// #1833: `engine.batch` times its steps where they run, the failing one included, with the
+    /// kernel's share when `profile` asks; unasked, the reply is as before.
+    #[test]
+    fn engine_batch_times_its_steps() {
+        let mut h = crate::scenario::Harness::new();
+        let steps = json!([
+            {"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}},
+            {"command": "solid.box", "params": {"length": 4, "width": 4, "height": 30, "operation": "join"}},
+        ]);
+        let v = batch(&mut h, json!({"commands": steps, "profile": true}));
+        let rows = v["result"]["timings"].as_array().cloned().unwrap_or_default();
+        assert_eq!(rows.len(), 2, "{v}");
+        assert_eq!(rows[1]["index"], 1);
+        assert!(rows[1]["profile"]["boolean_ms"].as_f64().is_some_and(|ms| ms > 0.0), "{v}");
+        assert!(v["result"]["total_ms"].as_f64().is_some(), "{v}");
+        let v = batch(&mut h, json!({"timings": true, "commands": [{"command": "NoSuchCommand"}]}));
+        assert_eq!(v["result"]["timings"].as_array().map(Vec::len), Some(1), "{v}");
+        assert!(v["result"]["timings"][0].get("profile").is_none(), "{v}");
+        let v = batch(&mut h, json!({"commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}]}));
+        assert!(v["result"].get("timings").is_none() && v["result"].get("total_ms").is_none(), "{v}");
     }
 
     #[test]
@@ -1230,7 +1323,9 @@ mod tests {
         };
         let export = |p: String| json!({"command": "file.export", "params": {"path": p}});
         assert_eq!(call("engine.execute", export(at(&root, "a.step")), true)["ok"], true);
-        assert_eq!(call("ui.render", json!({"path": at(&root, "a.png"), "width": 32, "height": 32}), true)["ok"], true);
+        if crate::gpu::test_picture_renderer() {
+            assert_eq!(call("ui.render", json!({"path": at(&root, "a.png"), "width": 32, "height": 32}), true)["ok"], true);
+        }
         assert_eq!(call("ui.screenshot", json!({"path": at(&root, "b.png")}), true)["ok"], true);
         for (method, params) in [
             ("engine.execute", export(at(&out, "a.step"))),
@@ -1263,7 +1358,6 @@ mod tests {
         s.execute("component.activate", &json!({"component": "root"})).unwrap();
         let mut h = crate::scenario::Harness::new();
         h.app = SolveApp::new(s, Services::default());
-        h.app.viewport.no_pixels = true;
         h.frames(2);
         let before = h.app.cam;
         // Reading during an animated view change leaves it running (no frames run between).
@@ -1325,7 +1419,6 @@ mod tests {
         }
         // Nothing shown: nothing to fit.
         let mut empty = crate::scenario::Harness::new();
-        empty.app.viewport.no_pixels = true;
         let before = empty.app.cam;
         let r = empty.call("ui.camera", json!({"yaw": 1, "fit": true}));
         assert!(r["ok"] == false && empty.app.cam == before, "{r}");
@@ -1348,7 +1441,6 @@ mod tests {
         s.execute("joint.create", &json!({"type": "slider", "a": at("B", 55), "b": at("C", 55), "flip": true, "name": "Rail"})).unwrap();
         let mut h = crate::scenario::Harness::new();
         h.app = SolveApp::new(s, Services::default());
-        h.app.viewport.no_pixels = true;
         let before = h.app.session.doc.clone();
         let drive = |h: &crate::scenario::Harness| match h.app.dialog.as_ref().map(|d| &d.kind) {
             Some(crate::dialogs::Kind::Assembly(crate::dialogs_assembly::Asm::Drive { joint, values, .. })) => {

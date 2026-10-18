@@ -51,7 +51,47 @@ fn rigid(m: &Mat) -> bool {
     crate::cmd::component::valid_position(m)
 }
 
+/// What an import's file says about its structure.
+#[derive(Clone, Copy)]
+pub(crate) enum Tree<'a> {
+    /// Nothing: every body in the import's component.
+    Flat,
+    /// A STEP file's products and placements.
+    Step(&'a StepImport),
+    /// A mesh file's components (glTF nodes), bodies already in their component's frame
+    /// (checked with [`mesh_plan_fits`] first).
+    Mesh(&'a solidcraft_io::MeshPlan),
+}
+
+/// Can the components of `plan` be made as it says? (Otherwise its bodies are built in place.)
+pub(crate) fn mesh_plan_fits(plan: &solidcraft_io::MeshPlan) -> bool {
+    Plan::of_mesh(plan).is_some()
+}
+
 impl Plan {
+    /// A glTF file's node plan, as it is; `None` when an occurrence can't hold it (a placement
+    /// that isn't rigid, or components out of order), so the caller builds the bodies in place.
+    fn of_mesh(plan: &solidcraft_io::MeshPlan) -> Option<Plan> {
+        let mut made = 0usize;
+        let mut places = Vec::with_capacity(plan.places.len());
+        for p in &plan.places {
+            // Components are made in the order of their first placement, inside one made before.
+            if p.slot > made || p.slot >= plan.slots.len() || p.parent.is_some_and(|q| q >= made || q == p.slot) || !rigid(&p.transform) {
+                return None;
+            }
+            if p.slot == made {
+                made += 1;
+            }
+            places.push(Place { slot: p.slot, parent: p.parent, transform: p.transform });
+        }
+        if plan.bodies.iter().flatten().any(|s| *s >= made) {
+            return None;
+        }
+        let slots = plan.slots.iter().take(made).map(|n| Slot { name: n.clone() }).collect();
+        let bodies = plan.bodies.iter().enumerate().filter_map(|(b, slot)| slot.map(|s| (b, s, IDENTITY))).collect();
+        Some(Plan { slots, places, bodies, skip: Vec::new() })
+    }
+
     fn of(imp: &StepImport) -> Plan {
         let mut plan = Plan::default();
         // One root product is the import's own component; several are components under it.
@@ -200,10 +240,14 @@ pub(crate) fn add_in_component(
     feature_name: &str,
     body_names: Vec<String>,
     name: &str,
-    imp: Option<&StepImport>,
+    tree: Tree<'_>,
 ) -> Result<(u64, Placed)> {
     let (top, top_occ) = new_component(s, name)?;
-    let plan = imp.map(Plan::of).unwrap_or_default();
+    let (plan, imp) = match tree {
+        Tree::Flat => (Plan::default(), None),
+        Tree::Step(imp) => (Plan::of(imp), Some(imp)),
+        Tree::Mesh(m) => (Plan::of_mesh(m).ok_or_else(|| EngineError::Other("import: the file's node tree can't be placed".into()))?, None),
+    };
     // The components, each made at its first placement; the others are further occurrences.
     let mut comps: Vec<u64> = Vec::with_capacity(plan.slots.len());
     let mut first_occ: Vec<Option<u64>> = Vec::with_capacity(plan.slots.len());
@@ -238,6 +282,8 @@ pub(crate) fn add_in_component(
     // The bodies' names, as the feature will give them (checked once it is built).
     let names = match (&kind, imp) {
         (FeatureKind::Import { skip, .. }, Some(imp)) => solidcraft_doc::import_body_names(&s.model.state(), &body_names, imp, skip),
+        // Mesh bodies keep their names unless taken (then they are put right once built).
+        (FeatureKind::MeshImport { .. }, _) => body_names.iter().cloned().map(Some).collect(),
         _ => Vec::new(),
     };
     let id = s.doc_mut().add_feature(kind, Some(feature_name))?;

@@ -1,5 +1,5 @@
-//! Update notifications (docs/updates.md). At start, and at most once a day after that, a
-//! background thread asks GitHub for the latest stable release (`releases/latest`; nightlies and
+//! Update notifications (docs/book/src/guide/updates.md). At every start, and once a day after
+//! that while the app stays open, a background thread asks GitHub for the latest stable release (`releases/latest`; nightlies and
 //! release candidates are never "latest"). When it is newer than this build, an Update button
 //! appears in the application bar beside Report a bug; it opens a small window with the version,
 //! the release notes and Download, Skip this version and Remind me later.
@@ -29,20 +29,30 @@ pub const REPO: &str = "bherbruck/solidcraft";
 pub const LATEST_API: &str = "https://api.github.com/repos/bherbruck/solidcraft/releases/latest";
 /// Where Download goes when no package fits this installation.
 pub const RELEASES_PAGE: &str = "https://github.com/bherbruck/solidcraft/releases/latest";
-/// Release pages and assets must be on GitHub, under this repository.
-const RELEASE_PREFIX: &str = "https://github.com/bherbruck/solidcraft/releases/";
+/// Release pages and assets must be on GitHub, under this repository. The repository is moving
+/// to the `tangency-labs` organisation, so releases may name either owner (the API request stays
+/// on the old name, which GitHub redirects after a transfer).
+const RELEASE_PREFIXES: [&str; 2] = ["https://github.com/bherbruck/solidcraft/releases/", "https://github.com/tangency-labs/solidcraft/releases/"];
 
-/// Automatic checks: at most one a day.
+/// A release page or asset URL: github.com, one of the two owners, exactly `solidcraft`, then
+/// `/releases/` (the trailing slash rules out look-alike names such as `solidcraft-evil`).
+fn is_release_url(url: &str) -> bool {
+    RELEASE_PREFIXES.iter().any(|p| url.starts_with(p))
+}
+
+/// While the app stays open, automatic checks run once a day (every start checks too).
 pub const CHECK_INTERVAL_S: f64 = 24.0 * 3600.0;
 /// Remind me later hides the button for three days.
 pub const REMIND_DELAY_S: f64 = 3.0 * 24.0 * 3600.0;
 /// Check now can't be pressed more often than this (GitHub allows 60 anonymous requests an hour).
 pub const MANUAL_COOLDOWN_S: f64 = 30.0;
-/// After a failed automatic check, try again after this long (an hour), not every start.
+/// After a failed automatic check, the open app tries again after this long (an hour).
 pub const RETRY_AFTER_FAILURE_S: f64 = 3600.0;
 /// Caps on what a release response may hold (it comes from the network).
 const MAX_NOTES: usize = 64 * 1024;
 const MAX_ASSETS: usize = 400;
+/// The room the Update pill's long label leaves for the document tabs.
+const TAB_ROOM: f32 = 300.0;
 /// The Update window's width, and its release notes' wrap width.
 const WINDOW_W: f32 = 460.0;
 const NOTES_W: f32 = WINDOW_W - 30.0;
@@ -134,7 +144,7 @@ pub enum InstallKind {
     Rpm,
     /// The plain `.tar.gz`, unpacked somewhere.
     LinuxTarball,
-    /// Installed by the `.msi` (under Program Files).
+    /// Installed by the `.msi` (under Program Files, or in the folder the installer recorded).
     WindowsMsi,
     /// The portable `.zip`, unpacked somewhere.
     WindowsPortable,
@@ -155,6 +165,9 @@ pub struct Probe<'a> {
     /// The running executable.
     pub exe: Option<PathBuf>,
     pub exists: &'a dyn Fn(&Path) -> bool,
+    /// Where the Windows installer put SolidCraft (`HKLM\Software\SolidCraft`, `InstallDir`): a
+    /// folder chosen in its wizard can be anywhere, not only under Program Files (#1870).
+    pub msi_dir: Option<PathBuf>,
 }
 
 pub fn detect(p: &Probe) -> InstallKind {
@@ -192,7 +205,8 @@ pub fn detect(p: &Probe) -> InstallKind {
         }
         "windows" => {
             let under = |k: &str| env(k).is_some_and(|dir| starts_with_ci(&exe, Path::new(&dir)));
-            if under("ProgramFiles") || under("ProgramW6432") || under("ProgramFiles(x86)") {
+            let installed = p.msi_dir.as_deref().is_some_and(|dir| starts_with_ci(&exe, dir));
+            if installed || under("ProgramFiles") || under("ProgramW6432") || under("ProgramFiles(x86)") {
                 return InstallKind::WindowsMsi;
             }
             if exe.parent().is_some_and(|d| (p.exists)(&d.join("solidcraft-cli.exe"))) {
@@ -230,8 +244,28 @@ pub fn this_install() -> InstallKind {
     {
         let env = |k: &str| std::env::var(k).ok();
         let exists = |p: &Path| p.exists();
-        detect(&Probe { os: std::env::consts::OS, release_build: release_build(), env: &env, exe: std::env::current_exe().ok(), exists: &exists })
+        let msi_dir = msi_install_dir();
+        detect(&Probe {
+            os: std::env::consts::OS,
+            release_build: release_build(),
+            env: &env,
+            exe: std::env::current_exe().ok(),
+            exists: &exists,
+            msi_dir,
+        })
     }
+}
+
+/// The folder the Windows installer recorded (solidcraft.wxs writes it for upgrades), if any.
+#[cfg(windows)]
+fn msi_install_dir() -> Option<PathBuf> {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE).open_subkey(r"Software\SolidCraft").ok()?;
+    key.get_value::<String, _>("InstallDir").ok().map(PathBuf::from)
+}
+
+#[cfg(all(not(windows), not(target_arch = "wasm32")))]
+fn msi_install_dir() -> Option<PathBuf> {
+    None
 }
 
 impl InstallKind {
@@ -356,7 +390,7 @@ impl Release {
             notes.truncate(cut);
             notes.push_str("\n\n…");
         }
-        let page = Some(s("html_url")).filter(|u| u.starts_with(RELEASE_PREFIX)).unwrap_or_else(|| RELEASES_PAGE.to_string());
+        let page = Some(s("html_url")).filter(|u| is_release_url(u)).unwrap_or_else(|| RELEASES_PAGE.to_string());
         let assets = v
             .get("assets")
             .and_then(Value::as_array)
@@ -366,7 +400,7 @@ impl Release {
             .filter_map(|a| {
                 let name = a.get("name")?.as_str()?.to_string();
                 let url = a.get("browser_download_url")?.as_str()?.to_string();
-                url.starts_with(RELEASE_PREFIX).then(|| Asset { name, url, size: a.get("size").and_then(Value::as_u64).unwrap_or(0) })
+                is_release_url(&url).then(|| Asset { name, url, size: a.get("size").and_then(Value::as_u64).unwrap_or(0) })
             })
             .collect();
         Ok(Release {
@@ -407,7 +441,8 @@ impl Release {
 pub struct Memo {
     /// When the last check finished (successfully or not).
     pub last_check: f64,
-    /// The next automatic check: a day after a successful one, an hour after a failed one.
+    /// The next automatic check while the app stays open: a day after a successful one, an hour
+    /// after a failed one. A new start doesn't wait for it.
     pub next_check: f64,
     /// GitHub's rate limit was reached: no request at all before this, not even Check now.
     pub rate_limited_until: f64,
@@ -418,9 +453,13 @@ pub struct Memo {
 }
 
 impl Memo {
-    /// An automatic check is due (a clock set back by more than a day counts as due).
-    pub fn due(&self, now: f64) -> bool {
-        now >= self.rate_limited_until && (now >= self.next_check || self.next_check - now > CHECK_INTERVAL_S)
+    /// An automatic check is due. `launch`: no automatic check has run since SolidCraft started,
+    /// so one is due whatever the daily schedule says (someone who started yesterday's version
+    /// this morning hears about today's release at the next start). GitHub's rate limit always
+    /// holds. A clock set back by more than a day counts as due.
+    pub fn due(&self, now: f64, launch: bool) -> bool {
+        let limited = now < self.rate_limited_until && self.rate_limited_until - now <= CHECK_INTERVAL_S;
+        !limited && (launch || now >= self.next_check || self.next_check - now > CHECK_INTERVAL_S)
     }
 
     /// The Update button shows for `release`.
@@ -484,6 +523,10 @@ pub struct Updater {
     /// The check in flight, and whether Check now started it.
     rx: Option<(Receiver<Result<Release, FetchError>>, bool)>,
     started: bool,
+    /// An automatic check has started since launch (until then one is due at once).
+    launch_checked: bool,
+    /// `SOLIDCRAFT_UPDATE_CHECK=0`: no checks at all.
+    off: bool,
     /// When Check now was last pressed (Unix seconds).
     last_manual: f64,
     /// A release given by `SOLIDCRAFT_UPDATE_FEED` (a file), for tests and screenshots.
@@ -511,10 +554,11 @@ pub fn offered(app: &SolveApp) -> Option<&Release> {
 
 /// Checks may run here: a release build with the host's HTTP client, or a test feed.
 pub fn available(app: &mut SolveApp) -> bool {
-    app.updater.feed.is_some() || (app.services.http_get.is_some() && app.updater.kind().checks())
+    !app.updater.off && (app.updater.feed.is_some() || (app.services.http_get.is_some() && app.updater.kind().checks()))
 }
 
-/// Per frame: the first frame starts a due automatic check; a finished check is collected.
+/// Per frame: the first frame of each launch starts an automatic check, the open app checks
+/// again once a day (an hour after a failure), and a finished check is collected.
 pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     poll_install(app);
     // Quitting to restart or install was cancelled (a "save changes?" answered Cancel).
@@ -527,6 +571,7 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
         {
             install::clean_up_after_update(std::env::current_exe().ok().as_deref());
             if std::env::var("SOLIDCRAFT_UPDATE_CHECK").is_ok_and(|v| v == "0") {
+                app.updater.off = true;
                 return;
             }
             app.updater.feed = std::env::var_os("SOLIDCRAFT_UPDATE_FEED").map(PathBuf::from);
@@ -534,7 +579,9 @@ pub fn tick(app: &mut SolveApp, ctx: &egui::Context) {
     }
     poll(app);
     let now = unix_now();
-    if app.updater.rx.is_none() && app.preferences.check_updates && app.preferences.update.due(now) && available(app) {
+    let launch = !app.updater.launch_checked;
+    if app.updater.rx.is_none() && app.preferences.check_updates && app.preferences.update.due(now, launch) && available(app) {
+        app.updater.launch_checked = true;
         start(app, ctx, false);
     }
 }
@@ -682,8 +729,13 @@ fn poll_install(app: &mut SolveApp) {
     app.updater.job = None;
     match &result {
         Ok(install::Outcome::Installer(program, args)) => {
-            // The installer replaces this program: start it once SolidCraft has closed.
-            app.updater.launch = Some((program.clone(), args.clone()));
+            // The installer replaces this program: start it once SolidCraft has closed. On
+            // Windows the installer is followed by the new version (see install::relaunch_after).
+            app.updater.launch = Some(match std::env::current_exe() {
+                #[cfg(windows)]
+                Ok(exe) => install::relaunch_after(program, args, &exe),
+                _ => (program.clone(), args.clone()),
+            });
             crate::documents::request_quit(app);
         }
         Ok(install::Outcome::Opened(dmg)) => {
@@ -714,11 +766,15 @@ pub fn take_launch(app: &mut SolveApp) -> Option<(PathBuf, Vec<String>)> {
 
 // ---- user interface ---------------------------------------------------------------------------
 
-/// The application bar's Update button, at the right of `span`; returns its rect (None: not shown).
+/// The application bar's Update pill ("Update to 0.14.0"), at the right of `span`: it opens and
+/// closes the Update window. Returns its rect (None: not shown).
 pub fn button(app: &mut SolveApp, ui: &mut egui::Ui, span: egui::Rect, labeled: bool) -> Option<egui::Rect> {
-    offered(app)?;
-    let (rect, response) = crate::toolbar::offer_button(ui, span, labeled, crate::i18n::tr("update.button"), "update", "titlebar:update")?;
-    let version = app.updater.release.as_ref().map(|r| r.version().to_string()).unwrap_or_default();
+    let version = offered(app)?.version().to_string();
+    // "Update to 0.14.0" while the document tabs keep room; a short "Update" when they would be
+    // squeezed; the icon alone in a narrow bar.
+    let full = crate::i18n::format("update.button_version", &[("version", &version)]);
+    let labels = [full.as_str(), crate::i18n::tr("update.button")];
+    let (rect, response) = crate::toolbar::offer_pill(ui, span, labeled, &labels, TAB_ROOM, "update", "titlebar:update")?;
     if response.on_hover_text(crate::i18n::format("update.button_tip", &[("version", &version)])).clicked() {
         app.updater.open = !app.updater.open;
     }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use solidcraft_cam::{Side, Tool};
 use solidcraft_geom::Vec3;
 
-use crate::ProfileSel;
+use crate::{Expr, ProfileSel};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manufacture {
@@ -79,11 +79,11 @@ pub enum Anchor {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StockDef {
     /// Added on each of the four sides.
-    pub side: String,
+    pub side: Expr,
     /// Added above the part (towards the tool).
-    pub top: String,
+    pub top: Expr,
     /// Added below the part.
-    pub bottom: String,
+    pub bottom: Expr,
 }
 
 impl Default for StockDef {
@@ -107,15 +107,15 @@ pub struct CamOperation {
     /// Heights in the setup's Z, as length expressions. One left out follows the geometry:
     /// the sketch plane or picked face, and the picked face's body (see the engine's `cam`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clearance: Option<String>,
+    pub clearance: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retract: Option<String>,
+    pub retract: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top: Option<String>,
+    pub top: Option<Expr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bottom: Option<String>,
+    pub bottom: Option<Expr>,
     /// Depth per pass, as a length expression.
-    pub stepdown: String,
+    pub stepdown: Expr,
     /// Where to cut.
     pub geometry: CamGeometry,
     pub kind: CamOperationKind,
@@ -148,39 +148,39 @@ pub struct FaceRef {
 pub enum CamOperationKind {
     /// Faces the box around its boundary (profiles, faces, the stock or the part).
     Face {
-        stepover: String,
+        stepover: Expr,
         /// The tool stays inside the boundary; otherwise it cuts over it.
         #[serde(default)]
         inside: bool,
         /// How far inside or over the boundary (a length expression); left out: over by the tool's radius, inside by nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        margin: Option<String>,
+        margin: Option<Expr>,
     },
     Contour {
         side: Side,
         climb: bool,
-        stock_to_leave: String,
+        stock_to_leave: Expr,
         /// Steepest descent into each depth pass (an angle expression; 0 plunges).
         #[serde(default = "default_ramp")]
-        ramp_angle: String,
+        ramp_angle: Expr,
     },
     Pocket {
-        stepover: String,
+        stepover: Expr,
         climb: bool,
-        stock_to_leave: String,
+        stock_to_leave: Expr,
         #[serde(default = "default_ramp")]
-        ramp_angle: String,
+        ramp_angle: Expr,
     },
     /// Drills at the centre of each profile.
     Drill {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        peck: Option<String>,
+        peck: Option<Expr>,
         #[serde(default)]
         dwell: f64,
     },
 }
 
-fn default_ramp() -> String {
+fn default_ramp() -> Expr {
     "3 deg".into()
 }
 

@@ -12,8 +12,9 @@ use crate::params::{bad, string_list, vec3};
 use crate::{Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("timeline.copy", "Copy Features", copy).noundo().params("features: [ids or names] (in timeline order on paste)"),
+    CommandSpec::new("timeline.copy", "Copy Features", copy).icon("copy").noundo().params("features: [ids or names] (in timeline order on paste)"),
     CommandSpec::new("timeline.paste", "Paste Features", paste)
+        .icon("paste")
         .params("translate?: [x,y,z] (moves the copies' geometry); the copies go at the marker"),
 ];
 
@@ -45,7 +46,7 @@ fn explicit_planes(p: &mut PlaneRef) {
                 *p = PlaneRef::Custom { plane };
             }
         }
-        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => explicit_planes(base),
+        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => explicit_planes(base),
         _ => {}
     }
 }
@@ -527,6 +528,9 @@ mod tests {
         assert_eq!(def["definition"]["targets"], json!(["Plate (copy)"]), "{def}");
         let st = s.world_state();
         let v = |name: &str| solidcraft_kernel::measure(&st.body(name).unwrap().body).unwrap().volume;
-        assert!((v("Plate") - v("Plate (copy)")).abs() < 1e-6, "each plate carries one spring: {} vs {}", v("Plate"), v("Plate (copy)"));
+        // A spring on the wrong plate is hundreds of mm³ off. The two plates are measured apart
+        // (one moved 50 mm), which the boolean and the measure each round in their own way:
+        // a few 1e-6 mm³ on 5000.
+        assert!((v("Plate") - v("Plate (copy)")).abs() < 1e-8 * v("Plate"), "each plate carries one spring: {} vs {}", v("Plate"), v("Plate (copy)"));
     }
 }

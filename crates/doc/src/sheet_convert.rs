@@ -53,7 +53,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 use solidcraft_geom::{Loop2, Mesh, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_kernel::{Body, FaceSurface, face_surface};
 
-use super::{FlatWork, RuleValues, SheetBody, SheetFlange, base_flange, point_in, polys_cross, signed_area, snap};
+use super::{FlatWork, ReliefOverride, RuleValues, SheetBody, SheetFlange, base_flange, point_in, polys_cross, signed_area, snap};
 use crate::{DocError, ModelBody, Result, apply_point, mat_inverse};
 
 const MAX_BENDS: usize = 1000;
@@ -1002,7 +1002,7 @@ pub fn convert_body(mb: &ModelBody, rule: &str, rv: &RuleValues, face: Vec3, ben
             Err(why) => notes.push(format!("the corner at {} stays cut open: {why}", sh.shown(k.c))),
         }
     }
-    notes.extend(sh.relieve_corners(&corners, &closed));
+    notes.extend(sh.relieve_corners(&corners, &closed, ReliefOverride::default()));
     Ok((sh, notes))
 }
 

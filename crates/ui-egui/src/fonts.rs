@@ -1,9 +1,10 @@
-//! System font loading and fallback setup for multi-language (CJK: Japanese, Chinese, Korean) support.
+//! System font loading and fallback setup for multi-language (CJK: Japanese, Chinese, Korean;
+//! Thai) support.
 //!
-//! The UI's Latin font always comes first; a CJK font (then a Hangul font) is only ever appended as
-//! a fallback, so English text renders exactly as before and only glyphs the Latin font lacks use
-//! the CJK face. The Hangul fallback covers Korean where the CJK font found (Meiryo, Hiragino)
-//! lacks Hangul. The order of the CJK and Chinese faces follows the UI language
+//! The UI's Latin font always comes first; a CJK font (then a Hangul font, then a Thai font) is only
+//! ever appended as a fallback, so English text renders exactly as before and only glyphs the Latin
+//! font lacks use the CJK face. The Hangul fallback covers Korean where the CJK font found (Meiryo,
+//! Hiragino) lacks Hangul; the Thai fallback covers Thai typed in a name or the agent chat (#1902). The order of the CJK and Chinese faces follows the UI language
 //! (see [`fallback_order`]): one face drawing a whole word keeps its glyphs on one baseline.
 
 use std::sync::Arc;
@@ -16,8 +17,39 @@ pub const CJK_FALLBACK: &str = "cjk_fallback";
 /// Chinese falls through to this one per glyph.
 pub const CHINESE_FALLBACK: &str = "chinese_fallback";
 
-/// Name of the Hangul fallback entry in [`egui::FontDefinitions`], last.
+/// Name of the chosen interface font in [`egui::FontDefinitions`], first in the Proportional
+/// family when one is set (#1290).
+pub const UI_FONT: &str = "ui_font";
+
+/// The interface font a preference names (#1290): an installed family, a font file, or the
+/// sketch text's built-in family. `None` for the default (empty) or a font that can't be read.
+pub fn ui_font(name: &str) -> Option<egui::FontData> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let data = solidcraft_engine::sketch::font_data(Some(name)).ok()?;
+    ttf_parser::Face::parse(data.bytes(), data.index).ok()?;
+    let mut font = egui::FontData::from_owned(data.bytes().to_vec());
+    font.index = data.index;
+    Some(font)
+}
+
+/// `fonts` with `font` first in the Proportional family (menus, dialogs, labels); the default
+/// face and the fallbacks stay after it for the glyphs it lacks.
+pub fn with_ui_font(mut fonts: egui::FontDefinitions, font: egui::FontData) -> egui::FontDefinitions {
+    fonts.font_data.insert(UI_FONT.to_owned(), Arc::new(font));
+    let list = fonts.families.entry(egui::FontFamily::Proportional).or_default();
+    list.retain(|entry| entry != UI_FONT);
+    list.insert(0, UI_FONT.to_owned());
+    fonts
+}
+
+/// Name of the Hangul fallback entry in [`egui::FontDefinitions`], after the CJK ones.
 pub const HANGUL_FALLBACK: &str = "hangul_fallback";
+
+/// Name of the Thai fallback entry in [`egui::FontDefinitions`], last (#1902).
+pub const THAI_FALLBACK: &str = "thai_fallback";
 
 /// UI languages whose text needs the CJK font. The web app's bundled font covers Japanese only;
 /// add Chinese or Korean here together with a font that covers them.
@@ -290,6 +322,32 @@ const HANGUL_FONT_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/nanum/NanumGothic.ttf",
 ];
 
+/// Thai fonts, appended last: none of the Latin or CJK faces draw Thai, so without one Thai text
+/// shows as empty boxes (#1902).
+#[cfg(not(target_arch = "wasm32"))]
+const THAI_FONT_CANDIDATES: &[&str] = &[
+    // Windows: Leelawadee UI (Windows 8 and later), Leelawadee, Tahoma
+    "C:\\Windows\\Fonts\\LeelawUI.ttf",
+    "C:\\Windows\\Fonts\\leelawad.ttf",
+    "C:\\Windows\\Fonts\\tahoma.ttf",
+    // macOS: Thonburi, Ayuthaya
+    "/System/Library/Fonts/Thonburi.ttc",
+    "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+    "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+    "/Library/Fonts/Thonburi.ttf",
+    // Linux: Noto Sans Thai, TLWG Loma and Garuda
+    "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/google-noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/google-noto-vf/NotoSansThai[wght].ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansThai-Regular.ttf",
+    "/usr/share/fonts/truetype/tlwg/Loma.ttf",
+    "/usr/share/fonts/opentype/tlwg/Loma.otf",
+    "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
+    "/usr/share/fonts/opentype/tlwg/Garuda.otf",
+    "/usr/share/fonts/tlwg/Loma.otf",
+];
+
 /// Fonts covering simplified Chinese, appended after the CJK fallback so Chinese renders even
 /// when the CJK font found is a Japanese one without simplified characters (Hiragino Gothic,
 /// Meiryo, Yu Gothic).
@@ -436,24 +494,37 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
 /// epaint centres each face's own line height in the row, so glyphs from two faces of very
 /// different height (Meiryo ≈ 2.0 em, Microsoft YaHei ≈ 1.4 em) sit at different heights
 /// inside one word. One face for the whole word keeps them on one baseline.
-pub fn fallback_order(language: &str) -> [&'static str; 3] {
-    if language == "zh" { [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK] } else { [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK] }
+/// Thai comes last whatever the language: no other face draws it.
+pub fn fallback_order(language: &str) -> [&'static str; 4] {
+    if language == "zh" {
+        [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK]
+    } else {
+        [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK]
+    }
 }
 
-/// Configure font definitions with system CJK, Chinese and Hangul fallbacks where available,
-/// ordered for the UI language (see [`fallback_order`]).
+/// Configure font definitions with system CJK, Chinese, Hangul and Thai fallbacks where available,
+/// ordered for the UI language (see [`fallback_order`]), after the interface font `ui_font`
+/// when one is chosen (see [`ui_font`]).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn setup_fonts_for(ctx: &egui::Context, language: &str) {
+pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
     let cjk = find_system_cjk_font();
     let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
     let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+    let thai = THAI_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
     let mut fonts = egui::FontDefinitions::default();
-    let mut found = false;
+    // Set the fonts also when only the interface font changes, so going back to the default
+    // takes the chosen one away.
+    let mut found = !ui_font.trim().is_empty();
+    if let Some(font) = self::ui_font(ui_font) {
+        fonts = with_ui_font(fonts, font);
+    }
     for name in fallback_order(language) {
         let bytes = match name {
             CJK_FALLBACK => cjk.clone(),
             CHINESE_FALLBACK => chinese.clone(),
-            _ => hangul.clone(),
+            HANGUL_FALLBACK => hangul.clone(),
+            _ => thai.clone(),
         };
         if let Some(bytes) = bytes
             && let Some(with_fallback) = with_fallback(fonts.clone(), name, bytes)
@@ -472,7 +543,7 @@ pub fn setup_fonts_for(ctx: &egui::Context, language: &str) {
 /// follows the language, see [`setup_fonts_for`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn setup_fonts(ctx: &egui::Context) {
-    setup_fonts_for(ctx, "en");
+    setup_fonts_for(ctx, "en", "");
 }
 
 /// Find a font covering simplified Chinese in the known candidate paths or by scanning the
@@ -499,7 +570,7 @@ fn find_system_chinese_font() -> Option<Vec<u8>> {
 /// On web, setup_fonts does not perform synchronous disk reads.
 /// Use asynchronous loading through [`solidcraft_web`] or host scripts.
 #[cfg(target_arch = "wasm32")]
-pub fn setup_fonts_for(_ctx: &egui::Context, _language: &str) {}
+pub fn setup_fonts_for(_ctx: &egui::Context, _language: &str, _ui_font: &str) {}
 
 #[cfg(target_arch = "wasm32")]
 pub fn setup_fonts(_ctx: &egui::Context) {}
@@ -507,6 +578,24 @@ pub fn setup_fonts(_ctx: &egui::Context) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_interface_font_comes_first_and_keeps_the_fallbacks() {
+        // #1290: the chosen font leads the Proportional family; the default face stays after it.
+        assert!(ui_font("").is_none());
+        assert!(ui_font("No Such Font 1290").is_none());
+        let font = ui_font(solidcraft_engine::sketch::DEFAULT_FONT_FAMILY).expect("the built-in sketch font reads");
+        let defaults = egui::FontDefinitions::default();
+        let first_default = defaults.families[&egui::FontFamily::Proportional][0].clone();
+        let fonts = with_ui_font(defaults, font.clone());
+        let list = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(list[0], UI_FONT);
+        assert!(list.contains(&first_default), "{list:?}");
+        assert!(!fonts.families[&egui::FontFamily::Monospace].contains(&UI_FONT.to_string()));
+        // Choosing again replaces it rather than adding a second entry.
+        let again = with_ui_font(fonts, font);
+        assert_eq!(again.families[&egui::FontFamily::Proportional].iter().filter(|n| *n == UI_FONT).count(), 1);
+    }
 
     fn latin_font_bytes() -> Vec<u8> {
         let defaults = egui::FontDefinitions::default();
@@ -534,9 +623,13 @@ mod tests {
 
     #[test]
     fn a_chinese_ui_puts_the_chinese_face_before_the_japanese_one() {
-        assert_eq!(fallback_order("zh"), [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK]);
+        assert_eq!(fallback_order("zh"), [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK]);
         for lang in ["en", "ja", "ko", "de"] {
-            assert_eq!(fallback_order(lang), [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK], "{lang} keeps the Japanese font first");
+            assert_eq!(
+                fallback_order(lang),
+                [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK],
+                "{lang} keeps the Japanese font first"
+            );
         }
         let defaults = egui::FontDefinitions::default();
         let mut fonts = defaults.clone();
@@ -546,8 +639,30 @@ mod tests {
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let list = &fonts.families[&family];
             assert_eq!(list.first(), defaults.families[&family].first(), "the Latin UI font stays first");
-            assert_eq!(&list[list.len() - 3..], [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK]);
+            assert_eq!(&list[list.len() - 4..], [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK]);
         }
+    }
+
+    /// Thai typed into the agent chat drew as empty boxes (#1902): every Thai candidate this
+    /// machine has must parse and cover Thai, and the fonts set up must then draw it.
+    #[test]
+    fn a_thai_fallback_draws_thai() {
+        let found: Vec<Vec<u8>> = THAI_FONT_CANDIDATES.iter().filter_map(|path| try_read_font(std::path::Path::new(path))).collect();
+        for bytes in &found {
+            let face = ttf_parser::Face::parse(bytes, 0).unwrap();
+            for c in "สวัสดี".chars() {
+                assert!(face.glyph_index(c).is_some(), "{c:?} is in the Thai font");
+            }
+        }
+        let thai = |fonts: egui::FontDefinitions| {
+            let ctx = egui::Context::default();
+            ctx.set_fonts(fonts);
+            ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+            ctx.fonts_mut(|f| f.has_glyphs(&egui::FontId::proportional(14.0), "สวัสดี"))
+        };
+        assert!(!thai(egui::FontDefinitions::default()), "the built-in faces have no Thai");
+        let Some(bytes) = found.into_iter().next() else { return };
+        assert!(thai(with_fallback(egui::FontDefinitions::default(), THAI_FALLBACK, bytes).unwrap()), "Thai draws with the fallback");
     }
 
     #[test]

@@ -32,14 +32,41 @@ impl Catalog {
 }
 
 static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/en.json")));
-static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json")));
+static CZECH: Catalog = Catalog::new("cs", "Čeština", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/cs.json")));
 static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/de.json")));
+static SPANISH: Catalog = Catalog::new("es", "Español (España)", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/es.json")));
 static FRENCH: Catalog = Catalog::new("fr", "Français", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/fr.json")));
+static GALICIAN: Catalog = Catalog::new("gl", "Galego", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/gl.json")));
+static ITALIAN: Catalog = Catalog::new("it", "Italiano", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/it.json")));
+static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json")));
 static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ko.json")));
+static POLISH: Catalog = Catalog::new("pl", "Polski", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/pl.json")));
+static PORTUGUESE_BR: Catalog =
+    Catalog::new("pt-BR", "Português (Brasil)", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/pt-BR.json")));
 static RUSSIAN: Catalog = Catalog::new("ru", "Русский", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ru.json")));
+static TURKISH: Catalog = Catalog::new("tr", "Türkçe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/tr.json")));
 static UKRAINIAN: Catalog = Catalog::new("uk", "Українська", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/uk.json")));
 static CHINESE: Catalog = Catalog::new("zh", "中文", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json")));
-pub const LOCALES: &[&Catalog] = &[&ENGLISH, &JAPANESE, &GERMAN, &FRENCH, &KOREAN, &RUSSIAN, &UKRAINIAN, &CHINESE];
+/// English first (the fallback), then by language id, one per line so that adding a language
+/// doesn't edit a line another addition edits.
+#[rustfmt::skip]
+pub const LOCALES: &[&Catalog] = &[
+    &ENGLISH,
+    &CZECH,
+    &GERMAN,
+    &SPANISH,
+    &FRENCH,
+    &GALICIAN,
+    &ITALIAN,
+    &JAPANESE,
+    &KOREAN,
+    &POLISH,
+    &PORTUGUESE_BR,
+    &RUSSIAN,
+    &TURKISH,
+    &UKRAINIAN,
+    &CHINESE,
+];
 
 pub fn is_supported(id: &str) -> bool {
     LOCALES.iter().any(|catalog| catalog.id == id)
@@ -168,6 +195,11 @@ impl Drop for LanguageScope {
     }
 }
 
+/// This thread's language, to carry into a worker thread with [`scope`].
+pub fn language() -> &'static str {
+    CURRENT.with(|current| current.get().0.id)
+}
+
 pub fn tr(id: &str) -> &str {
     CURRENT.with(|current| current.get().text(id))
 }
@@ -187,6 +219,15 @@ pub fn tr_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The languages are listed English first, then by id, so adding one doesn't edit the
+    /// line another addition edits.
+    #[test]
+    fn locales_are_listed_english_first_then_by_id() {
+        let ids: Vec<&str> = LOCALES.iter().map(|c| c.id).collect();
+        assert_eq!(ids.first(), Some(&"en"));
+        assert!(ids[1..].is_sorted(), "{ids:?}");
+    }
     use std::collections::BTreeSet;
 
     fn placeholders(text: &str) -> BTreeSet<&str> {
@@ -206,8 +247,8 @@ mod tests {
         ENGLISH.messages().values().map(String::as_str).collect()
     }
 
-    /// Catalogs delivered complete. English is the source catalog; Japanese was completed
-    /// upstream and Chinese lands complete here. German, Korean, Russian, French and Ukrainian
+    /// Catalogs delivered complete. English is the source catalog; Czech, Italian, Japanese and Chinese
+    /// are complete. German, Korean, Russian, French and Ukrainian
     /// are partial (German and Korean predate the coverage guards; Russian, French and Ukrainian
     /// are kept partial so a new label doesn't need more translations), so their gaps fall back
     /// to English and are reported by `cargo xtask i18n` without failing the build, while
@@ -267,6 +308,17 @@ mod tests {
         );
     }
 
+    /// The start page shows each built-in sample's name and description through `label()`, so a
+    /// sample added to the engine without English catalog entries would stay English everywhere.
+    #[test]
+    fn every_sample_name_and_description_is_in_the_english_catalog() {
+        let texts = english_texts();
+        let samples = solidcraft_engine::sample::samples();
+        let missing: Vec<&str> = samples.iter().flat_map(|s| [s.name, s.about]).filter(|text| !texts.contains(text)).collect();
+        assert!(missing.is_empty(), "sample texts absent from en.json: {missing:?}");
+        assert_eq!(Locale::for_language("ja").label("Sample Plate"), "サンプル プレート");
+    }
+
     /// The whole engine registry now reaches the catalogs. Sample command labels from areas that
     /// had no entry at all before (sheet metal, inspect, joints, motion) must resolve to their
     /// translation rather than echo the English source text — `label()` returns its argument when
@@ -274,10 +326,12 @@ mod tests {
     #[test]
     fn newly_catalogued_command_labels_translate() {
         let cases = [
+            ("cs", "Příruba", "Zebra analýza", "Studie pohybu"),
             ("zh", "法兰", "斑马纹分析", "运动研究"),
             ("ja", "フランジ", "ゼブラ解析", "モーション スタディ"),
             ("de", "Flansch", "Zebra-Analyse", "Bewegungsuntersuchung"),
             ("ko", "플랜지", "얼룩말줄무늬 분석", "운동 연구"),
+            ("pl", "Kołnierz", "Analiza zebry", "Badanie ruchu"),
             ("ru", "Фланец", "Зебра-анализ", "Исследование движения"),
             ("fr", "Bord tombé", "Analyse zébrée", "Étude de mouvement"),
             ("uk", "Фланець", "Зебра-аналіз", "Дослідження руху"),
@@ -317,6 +371,7 @@ mod tests {
             include_str!("browser.rs"),
             include_str!("sketch_palette.rs"),
             include_str!("design_properties.rs"),
+            include_str!("home.rs"),
         ] {
             for call in [".tr(\"", "i18n::tr(\"", "i18n::format(\""] {
                 for tail in source.split(call).skip(1) {
@@ -345,6 +400,39 @@ mod tests {
         static PARTIAL: Catalog = Catalog::new("test", "Test", r#"{"ui.preferences":"Prefs"}"#);
         assert_eq!(Locale(&PARTIAL).text("ui.preferences"), "Prefs");
         assert_eq!(Locale(&PARTIAL).text("ui.extrude"), "Extrude");
+    }
+
+    #[test]
+    fn italian_labels_templates_and_names_preserve_technical_values() {
+        assert!(is_supported("it"));
+        let it = Locale::for_language("it");
+        assert_eq!(it.name(), "Italiano");
+        for (source, expected) in [
+            ("Sketch", "Schizzo"),
+            ("Extrude", "Estrusione"),
+            ("Fillet", "Raccordo"),
+            ("Chamfer", "Smusso"),
+            ("Body", "Corpo"),
+            ("New Component", "Nuovo componente"),
+            ("CONSTRAINTS", "VINCOLI"),
+            ("Draft", "Sformo"),
+            ("Counterbore", "Lamatura"),
+            ("Countersink", "Svasatura"),
+        ] {
+            assert_eq!(it.label(source), expected, "{source}");
+        }
+        assert_eq!(it.dynamic("Sketch12"), "Schizzo12");
+        assert_eq!(it.dynamic("Body2"), "Corpo2");
+        assert_eq!(it.dynamic("Component3"), "Componente3");
+        assert_eq!(it.dynamic("Units: mm"), "Unità: mm");
+        assert_eq!(it.dynamic("4 degrees of freedom"), "4 gradi di libertà");
+        assert_eq!(it.given_name("Fillet"), "Fillet");
+        assert_eq!(it.label("solid.extrude"), "solid.extrude");
+        assert_eq!(it.format("document.save_changes", &[("name", "Staffa {v2}")]), "Salvare le modifiche a Staffa {v2}?");
+        assert_eq!(
+            it.format("ui.command_palette_hint", &[("example", "solid.extrude {\"distance\": 20}")]),
+            "Digita un comando, ad es. solid.extrude {\"distance\": 20}  — oppure premi S per cercare"
+        );
     }
 
     /// `label()`'s id fallback (an argument that matches no other entry's English text is
@@ -432,6 +520,18 @@ mod tests {
     }
 
     #[test]
+    fn spanish_catalog_is_registered_and_translates_cad_labels() {
+        let es = Locale::for_language("es");
+        assert_eq!(es.name(), "Español (España)");
+        assert!(is_supported("es"));
+        assert_eq!(es.text("ui.preferences"), "Preferencias");
+        assert_eq!(es.label("Extrude"), "Extruir");
+        assert_eq!(es.label("Fillet"), "Redondeo");
+        assert_eq!(es.dynamic("Sketch1"), "Boceto1");
+        assert_eq!(es.format("document.save_changes", &[("name", "Pieza")]), "¿Guardar los cambios de Pieza?");
+    }
+
+    #[test]
     fn korean_catalog_translates_keys_labels_and_browser_patterns() {
         let ko = Locale::for_language("ko");
         assert_eq!(ko.name(), "한국어");
@@ -494,6 +594,40 @@ mod tests {
         assert_eq!(fr.dynamic("Parameters (5)"), "Paramètres (5)");
         assert_eq!(fr.dynamic("4 degrees of freedom"), "4 degrés de liberté");
         assert_eq!(fr.dynamic("Sketch of bracket"), "Sketch of bracket");
+    }
+
+    #[test]
+    fn turkish_catalog_is_registered_and_translates_keys() {
+        let tr = Locale::for_language("tr");
+        assert_eq!(tr.name(), "Türkçe");
+        assert!(is_supported("tr"));
+        assert_eq!(tr.text("ui.preferences"), "Ayarlar");
+        assert_eq!(tr.format("document.save_changes", &[("name", "My {design}")]), "My {design} içindeki değişiklikler kaydedilsin mi?");
+        assert_eq!(tr.format("dialog.selected_count", &[("count", "2")]), "↖ 2 seçildi");
+        assert_eq!(tr.label("NonExistentKey"), "NonExistentKey");
+    }
+
+    #[test]
+    fn brazilian_portuguese_catalog_is_registered_and_translates_keys() {
+        let pt = Locale::for_language("pt-BR");
+        assert_eq!(pt.name(), "Português (Brasil)");
+        assert!(is_supported("pt-BR"));
+        assert_eq!(pt.text("ui.preferences"), "Preferências");
+        assert_eq!(pt.format("document.save_changes", &[("name", "My {design}")]), "Salvar as alterações em My {design}?");
+        assert_eq!(pt.format("dialog.selected_count", &[("count", "2")]), "↖ 2 selecionados");
+        assert_eq!(pt.label("NonExistentKey"), "NonExistentKey");
+    }
+
+    #[test]
+    fn galician_catalog_is_registered_and_translates_keys() {
+        let gl = Locale::for_language("gl");
+        assert_eq!(gl.name(), "Galego");
+        assert!(is_supported("gl"));
+        assert_eq!(gl.text("ui.preferences"), "Preferencias");
+        assert_eq!(gl.format("document.save_changes", &[("name", "My {design}")]), "Gardar os cambios en My {design}?");
+        assert_eq!(gl.format("dialog.selected_count", &[("count", "2")]), "↖ 2 seleccionados");
+        assert_eq!(gl.label("Fillet"), "Arredondamento");
+        assert_eq!(gl.label("NonExistentKey"), "NonExistentKey");
     }
 
     #[test]

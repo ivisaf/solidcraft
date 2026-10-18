@@ -48,11 +48,13 @@ pub fn install(window: &impl HasWindowHandle) -> bool {
     // SAFETY: `hwnd` is the live window eframe just created on this thread; `frame_proc` has the
     // WNDPROC signature and stays valid for the life of the process. SetWindowLongPtrW returns
     // the previous procedure, which `frame_proc` calls for every other message.
-    let previous = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, frame_proc as *const () as isize) };
+    let previous = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, frame_proc as *const () as isize as _) };
+    // `as _`: on 32-bit Windows SetWindowLongPtrW is SetWindowLongW, which takes and
+    // returns i32.
     if previous == 0 {
         return false;
     }
-    PREVIOUS.store(previous, Ordering::SeqCst);
+    PREVIOUS.store(previous as _, Ordering::SeqCst);
     true
 }
 
@@ -97,7 +99,7 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             // Hand the window back to winit's procedure for its last message.
             if prev.is_some() {
                 // SAFETY: restores the procedure this window had before `install`.
-                unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, PREVIOUS.load(Ordering::SeqCst)) };
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, PREVIOUS.load(Ordering::SeqCst) as _) };
             }
             call_previous()
         }

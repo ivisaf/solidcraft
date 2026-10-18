@@ -64,6 +64,22 @@ warning saying where.
  "bend_radius":"1 mm","corner_relief_shape":"round","corner_relief":"8 mm","active":true}}
 ```
 
+The rule's shape and size are the default. An edge flange feature can choose its own for the
+corners its flanges make: `corner_relief_shape` (`notch`, `round`, `rectangular` or `tear`) and
+`corner_relief` (the size across, a length or an expression) in `sheet.flange`, or Corner Relief
+Shape and Corner Relief in the Flange dialog. In the dialog, Rule as the shape and an empty size
+take the rule's; either one left out follows the rule while the other is the feature's. Corners are
+relieved only between the flanges of one feature, so a feature's choice never meets another's at a
+corner, and two edge flange features of one part can have different reliefs under one rule. A
+base or contour flange takes its corners from the rule only and refuses both parameters. The
+flange gap and the rule's other values stay with the rule for every flange. The feature's choice is
+saved with the design (file format 23).
+
+```json
+{"command":"sheet.flange","params":{"edges":[[60,0,2],[120,45,2],[60,90,2],[0,45,2]],
+ "height":20,"corner_relief_shape":"round","corner_relief":"6 mm"}}
+```
+
 Where the edge flanges of one feature meet at a corner of the base, their panels are closed
 toward each other at any bend angle: each end is cut square to the sheet, on a line in the flat
 chosen so that the edges nearest each other (on the inner faces) run parallel, the rule's

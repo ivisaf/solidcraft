@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 use solidcraft_cam::{self as cam, ContourParams, Cut, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
+use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup, SetupOrigin, StockDef};
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
@@ -42,50 +43,50 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      rs274) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("cam.tool.define", "Define Tool", tool_define)
+    CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
             "number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
-    CommandSpec::new("cam.tool.update", "Update Design Tools", tool_update)
+    CommandSpec::new("cam.tool.update", "Update Design Tools", tool_update).icon("update")
         .params("number?: one tool (default: every tool) — replaces this design's copy with the machine library's tool of that number where they differ; library? → updated: tool numbers"),
     CommandSpec::new("cam.library.list", "Tool Library", library_list)
         .at("MANUFACTURE", "SETUP")
         .icon("cam_tool")
         .noundo()
         .params("library?: file (default: the machine's library) → path, tools (each with design: absent|same|differs, this design's copy against it), only_in_design"),
-    CommandSpec::new("cam.library.define", "Define Library Tool", library_define)
+    CommandSpec::new("cam.library.define", "Define Library Tool", library_define).icon("library")
         .noundo()
         .params("as cam.tool.define, into the machine's library: tools every design on this machine can use; library?: file"),
-    CommandSpec::new("cam.library.remove", "Remove Library Tool", library_remove).noundo().params("number; library? (designs keep their copies)"),
-    CommandSpec::new("cam.library.add", "Add To Library", library_add).noundo().params("number: a tool of this design to put in the machine's library — or all: true; library?"),
-    CommandSpec::new("cam.library.export", "Export Library", library_export).noundo().params("path: a file to write the machine's library to; library?"),
-    CommandSpec::new("cam.library.import", "Import Library", library_import)
+    CommandSpec::new("cam.library.remove", "Remove Library Tool", library_remove).icon("delete").noundo().params("number; library? (designs keep their copies)"),
+    CommandSpec::new("cam.library.add", "Add To Library", library_add).icon("library").noundo().params("number: a tool of this design to put in the machine's library — or all: true; library?"),
+    CommandSpec::new("cam.library.export", "Export Library", library_export).icon("export").noundo().params("path: a file to write the machine's library to; library?"),
+    CommandSpec::new("cam.library.import", "Import Library", library_import).icon("import")
         .noundo()
         .params("path: a tool library file; replace?: bool (default false: tools whose number is taken are skipped); library? → added, replaced, skipped"),
-    CommandSpec::new("cam.tool.export", "Export Tools", tool_export).noundo().params("path: a JSON file to write the tool library to"),
-    CommandSpec::new("cam.tool.import", "Import Tools", tool_import)
+    CommandSpec::new("cam.tool.export", "Export Tools", tool_export).icon("export").noundo().params("path: a JSON file to write the tool library to"),
+    CommandSpec::new("cam.tool.import", "Import Tools", tool_import).icon("import")
         .params("path: a tool library written by cam.tool.export; replace?: bool (default false: tools whose number is taken are skipped) → added, replaced, skipped: tool numbers"),
-    CommandSpec::new("cam.tool.remove", "Remove Tool", tool_remove).params("number (refused while an operation uses it)"),
+    CommandSpec::new("cam.tool.remove", "Remove Tool", tool_remove).icon("delete").params("number (refused while an operation uses it)"),
     CommandSpec::new("cam.setup.create", "New Setup", setup_create)
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).params("setup: id or name; then any of name, axis, origin, stock, post as in cam.setup.create (stock offsets left out stay as they are)"),
-    CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).params("setup: id or name"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).icon("delete").params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); inner profiles are islands")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
-    CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).params(
+    CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
          plunge_feed, coolant, stepdown, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
-    CommandSpec::new("cam.op.move", "Move Operation", op_move)
+    CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
         .params("op: id or name; to: position in the setup's order (0 is cut first) — or by: places later (negative: earlier); setup?: id or name → order: the setup's operation names"),
-    CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).params("op: id or name; setup?: id or name"),
+    CommandSpec::new("cam.op.remove", "Remove Operation", op_remove).icon("delete").params("op: id or name; setup?: id or name"),
     CommandSpec::new("cam.list", "Manufacture", list)
         .at("MANUFACTURE", "ACTIONS")
         .icon("cam_setup")
@@ -112,8 +113,8 @@ fn cam_error(e: cam::CamError) -> EngineError {
 }
 
 /// A length as an expression, to the nanometre (so 6 × 0.4 reads `2.4 mm`).
-fn mm(v: f64) -> String {
-    format!("{} mm", (v * 1e6).round() / 1e6)
+fn mm(v: f64) -> Expr {
+    Expr::new(format!("{} mm", (v * 1e6).round() / 1e6))
 }
 
 fn length(s: &Session, cmd: &str, key: &str, e: &str) -> Result<f64> {
@@ -556,9 +557,9 @@ fn stock_param(s: &Session, v: &Value, was: &StockDef, cmd: &str) -> Result<Stoc
     if !v.is_object() {
         return Err(bad(cmd, "`stock` must be {side?, top?, bottom?}: lengths added to the box around the bodies"));
     }
-    let offset = |k: &str, was: &str| -> Result<String> {
+    let offset = |k: &str, was: &Expr| -> Result<Expr> {
         match v.get(k) {
-            None => Ok(was.to_string()),
+            None => Ok(was.clone()),
             Some(_) => {
                 let e = req_expr(cmd, v, k)?;
                 let d = length(s, cmd, k, &e)?;
@@ -865,7 +866,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         (CamOperationKind::Face { .. }, Some((_, hi))) if matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
         _ => (Some(g.z), None),
     };
-    let height = |what: &str, given: &Option<String>, auto: Option<f64>| match given {
+    let height = |what: &str, given: &Option<Expr>, auto: Option<f64>| match given {
         Some(e) => len(what, e),
         None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
     };
@@ -1055,11 +1056,11 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     Ok(out)
 }
 
-fn ramp_angle(p: &Value) -> String {
+fn ramp_angle(p: &Value) -> Expr {
     expr(p, "ramp_angle").unwrap_or_else(|| "3 deg".into())
 }
 
-fn stock_to_leave(p: &Value) -> String {
+fn stock_to_leave(p: &Value) -> Expr {
     expr(p, "stock_to_leave").unwrap_or_else(|| mm(0.0))
 }
 
@@ -1088,7 +1089,7 @@ fn limit_param(p: &Value, cmd: &str) -> Result<bool> {
 }
 
 /// How far inside or over its boundary a facing operation cuts: a length of 0 or more.
-fn margin_param(s: &Session, p: &Value, cmd: &str) -> Result<String> {
+fn margin_param(s: &Session, p: &Value, cmd: &str) -> Result<Expr> {
     let e = req_expr(cmd, p, "margin")?;
     if length(s, cmd, "margin", &e)? >= 0.0 { Ok(e) } else { Err(bad(cmd, "`margin` must be 0 or more")) }
 }
@@ -1155,14 +1156,14 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
     let positive = |k: &str| num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6).ok_or_else(|| bad(cmd, format!("`{k}` must be above 0")));
     let has = |k: &str| p.get(k).is_some();
     // An expression checked now, so that a bad one names its input.
-    let checked = |k: &str, kind: Kind| -> Result<String> {
+    let checked = |k: &str, kind: Kind| -> Result<Expr> {
         let e = req_expr(cmd, p, k)?;
         s.doc.eval(&e, kind).map_err(|err| bad(cmd, format!("{k}: {err}")))?;
         Ok(e)
     };
     // `null` puts an optional expression back to automatic.
     let optional =
-        |k: &str| -> Result<Option<String>> { if p.get(k).is_some_and(Value::is_null) { Ok(None) } else { checked(k, Kind::Length).map(Some) } };
+        |k: &str| -> Result<Option<Expr>> { if p.get(k).is_some_and(Value::is_null) { Ok(None) } else { checked(k, Kind::Length).map(Some) } };
     if let Some(n) = name_param(p, cmd)? {
         if setup.operations.iter().enumerate().any(|(i, o)| i != oi && o.name.eq_ignore_ascii_case(&n)) {
             return Err(bad(cmd, format!("the setup already has an operation `{n}`")));

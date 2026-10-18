@@ -533,7 +533,9 @@ pub(crate) fn paint_preview_curve(
     mode: u8,
 ) {
     for curve in &mut sketch.curves {
-        curve.centerline = mode == 2 && matches!(curve.kind, solidcraft_engine::sketch::CurveKind::Line { .. });
+        let line = matches!(curve.kind, solidcraft_engine::sketch::CurveKind::Line { .. });
+        curve.centerline = mode == 2 && line;
+        curve.infinite = mode == 3 && line;
         curve.construction = mode != 0 && !curve.centerline;
     }
     paint_curve(&sketch, 0, plane, painter, proj, stroke, &mut solidcraft_engine::render::SamplingBudget::new(4096, 65_536));

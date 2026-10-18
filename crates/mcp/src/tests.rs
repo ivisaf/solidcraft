@@ -10,6 +10,25 @@ fn server() -> Server {
     Server::new(Box::new(Headless::default()))
 }
 
+/// Screenshots are drawn on the GPU by the renderer the host installs (`solidcraft-cli mcp`); the
+/// tests install the same one. `false`, with the reason printed, on a machine without a GPU
+/// adapter: the screenshots are then left out of the test.
+fn renders() -> bool {
+    match solidcraft_gpu::capture::shared() {
+        Ok(c) => {
+            solidcraft_engine::capture::install(std::sync::Arc::new(move |scene, cam, w, h| {
+                c.rgba(scene, cam, w, h).map(|rgba| solidcraft_engine::capture::Picture { rgba, renderer: c.renderer() }).map_err(|e| e.to_string())
+            }));
+            true
+        }
+        Err(e @ solidcraft_gpu::GpuError::NoAdapter(_)) if std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none() => {
+            eprintln!("screenshots left out: {e}");
+            false
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
 fn call(s: &mut Server, id: u64, method: &str, params: Value) -> Value {
     let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
     let r = s.handle_line(&line).expect("reply");
@@ -166,10 +185,12 @@ fn agent_builds_box_fillet_hole() {
     assert!(rel(volume(&mut s), expect) < 5e-4);
 
     // Look at it from the top: a real PNG comes back as an image block.
-    let img = tool(&mut s, "screenshot", json!({"view": "top", "width": 320, "height": 200}));
-    assert_eq!(img["type"], "image");
-    assert_eq!(img["mimeType"], "image/png");
-    assert!(img["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    if renders() {
+        let img = tool(&mut s, "screenshot", json!({"view": "top", "width": 320, "height": 200}));
+        assert_eq!(img["type"], "image");
+        assert_eq!(img["mimeType"], "image/png");
+        assert!(img["data"].as_str().unwrap().starts_with("iVBORw0KGgo"), "not a PNG");
+    }
 
     // Export, save, start over, open.
     let dir = std::env::temp_dir().join(format!("solidcraft-mcp-test-{}", std::process::id()));
@@ -181,8 +202,10 @@ fn agent_builds_box_fillet_hole() {
     tool(&mut s, "export", json!({"path": stl.to_string_lossy(), "format": "stl"}));
     assert!(std::fs::metadata(&stl).unwrap().len() > 1000);
     let shot = dir.join("shot.png");
-    tool(&mut s, "screenshot", json!({"path": shot.to_string_lossy(), "width": 64, "height": 64}));
-    assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+    if renders() {
+        tool(&mut s, "screenshot", json!({"path": shot.to_string_lossy(), "width": 64, "height": 64}));
+        assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+    }
     let design = dir.join("part.solidcraft");
     tool(&mut s, "save", json!({"path": design.to_string_lossy()}));
     tool(&mut s, "new_design", json!({"name": "Empty"}));
@@ -524,7 +547,9 @@ fn the_default_folders_are_the_designs_the_recovery_folder_and_the_scratch_folde
     tool(&mut s, "execute", json!({"command": "parameters.export", "params": {"path": at(&proj, "params.csv")}}));
     tool(&mut s, "save", json!({"path": at(&proj, "copy.solidcraft")}));
     tool(&mut s, "open", json!({"path": at(&proj, "part.solidcraft")}));
-    tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    if renders() {
+        tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    }
     tool(&mut s, "execute", json!({"command": "doc.recovery_list", "params": {"dir": recovery.to_string_lossy()}}));
     assert!(proj.join("part.step").exists() && proj.join("copy.solidcraft").exists());
     // Hidden files in it, and folders beside it, stay out of reach.
@@ -563,7 +588,9 @@ fn tool_calls_stay_inside_the_agents_folders() {
     tool(&mut s, "save", json!({"path": at(&root, "part.solidcraft")}));
     tool(&mut s, "export", json!({"path": at(&root, "part.step")}));
     tool(&mut s, "open", json!({"path": at(&root, "part.solidcraft")}));
-    tool(&mut s, "screenshot", json!({"path": at(&root, "shot.png"), "width": 64, "height": 64}));
+    if renders() {
+        tool(&mut s, "screenshot", json!({"path": at(&root, "shot.png"), "width": 64, "height": 64}));
+    }
     let escapes = vec![at(&out, "x.step"), at(&root, "../out/x.step")];
     #[cfg(unix)]
     let mut escapes = escapes;
@@ -644,7 +671,9 @@ fn short_names_child() {
     assert!(windows_refusal(&temp.to_string_lossy()).is_some_and(|why| why.contains("8.3")), "{}", temp.display());
     let mut s = Server::new(Box::new(Headless::default())).with_path_scope(Some(crate::agent_scope([])));
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}}));
-    tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    if renders() {
+        tool(&mut s, "screenshot", json!({"width": 32, "height": 32}));
+    }
     tool(&mut s, "execute", json!({"command": "doc.recovery_list", "params": {}}));
     // An agent's own short spelling of the scratch folder stays refused.
     let scratch = crate::scratch_dir().unwrap();
@@ -687,6 +716,9 @@ fn a_bridged_request_carries_the_agents_folders() {
 /// standard view.
 #[test]
 fn screenshot_renders_a_saved_named_view() {
+    if !renders() {
+        return;
+    }
     let mut s = server();
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 20, "height": 10}}));
     let camera = json!({"target": [20, 10, 5], "yaw": 0.5, "pitch": -0.6, "distance": 150});
@@ -710,6 +742,9 @@ fn screenshot_renders_a_saved_named_view() {
 /// `browser.visibility` stays out whatever `axes` says.
 #[test]
 fn screenshot_can_leave_the_grid_and_the_axes_out() {
+    if !renders() {
+        return;
+    }
     let mut s = server();
     tool(&mut s, "execute", json!({"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20, "corner": [10, -15, -10]}}));
     let shot = |s: &mut Server, extra: Value| {
@@ -793,6 +828,59 @@ fn bridged_screenshots_with_grid_or_axes_are_model_renders() {
     assert_eq!(r["isError"], json!(true), "{r}");
     assert!(r["content"][0]["text"].as_str().unwrap().contains("source"), "{r}");
     assert!(calls.is_empty(), "{calls:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #1677: a hidden window gives no picture. With no `source`, a model render comes back and says
+/// it is one (`fallback`); asked for the window, the tool says why there is none, at once.
+#[test]
+fn a_hidden_window_screenshot_says_so() {
+    struct Hidden {
+        calls: Vec<String>,
+    }
+    impl crate::backend::Backend for Hidden {
+        fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+            self.calls.push(method.to_string());
+            match method {
+                "ui.screenshot" => Err("no frame was presented (window hidden?); use ui.render".into()),
+                "ui.render" => {
+                    let path = params["path"].as_str().ok_or("missing `path`")?;
+                    std::fs::write(path, b"\x89PNG").map_err(|e| e.to_string())?;
+                    Ok(json!({"path": path, "width": 64, "height": 48}))
+                }
+                other => Err(format!("unknown method `{other}`")),
+            }
+        }
+        fn has_ui(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> String {
+            "app".into()
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("solidcraft-mcp-hidden-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("shot.png").to_string_lossy().to_string();
+    let shoot = |extra: Value| {
+        let mut args = json!({"path": path, "width": 64, "height": 48});
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let mut app = Hidden { calls: Vec::new() };
+        let r = crate::tools::call_tool(&mut app, "screenshot", &args);
+        (app.calls, r)
+    };
+    // The default: the window first, then a model render that says why.
+    let (calls, r) = shoot(json!({}));
+    assert!(r["isError"] != json!(true), "{r}");
+    assert_eq!(calls, ["ui.screenshot", "ui.render"]);
+    let info: Value = serde_json::from_str(r["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(info["source"], "model", "{info}");
+    assert!(info["fallback"].as_str().is_some_and(|f| f.contains("window hidden")), "{info}");
+    // Asked for the window: an error naming the cause and the way out, and no render.
+    let (calls, r) = shoot(json!({"source": "window"}));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("window hidden") && text.contains("source \"model\""), "{text}");
+    assert_eq!(calls, ["ui.screenshot"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1390,4 +1478,45 @@ fn measure_items_gives_diameters_and_centre_distances() {
     assert!((two["center_distance"].as_f64().unwrap() - 50.0).abs() < 1e-9, "{two}");
     assert!((two["min"].as_f64().unwrap() - 45.0).abs() < 1e-9 && (two["max"].as_f64().unwrap() - 55.0).abs() < 1e-9, "{two}");
     assert!(two["distance_mm"].is_number() && two["from"].is_array(), "{two}");
+}
+
+/// #1833: `timings` / `profile` time every step run, the failing one included, headless with the
+/// kernel's share; bridged, the app is asked to time them and its numbers are passed on.
+#[test]
+fn batch_reports_timings_and_profile() {
+    let mut s = server();
+    let steps = json!([
+        {"command": "solid.box", "params": {"length": 10, "width": 10, "height": 10}},
+        {"command": "solid.box", "params": {"length": 4, "width": 4, "height": 30, "operation": "join"}},
+    ]);
+    let r = raw_tool(&mut s, "batch", json!({"commands": steps, "profile": true}));
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let rows = body["timings"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{body}");
+    assert_eq!((rows[1]["index"].as_u64(), rows[1]["command"].as_str()), (Some(1), Some("solid.box")));
+    assert!(rows[1]["profile"]["boolean_ms"].as_f64().unwrap() > 0.0, "{body}");
+    assert!(body["total_ms"].as_f64().is_some(), "{body}");
+
+    let r = raw_tool(
+        &mut s,
+        "batch",
+        json!({"timings": true, "commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}, {"command": "NoSuchCommand"}]}),
+    );
+    let body: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["timings"].as_array().map(Vec::len), Some(2), "the failing step is timed too: {body}");
+    assert!(body["timings"][0].get("profile").is_none());
+    // Not asked: no timings.
+    let d = tool(&mut s, "batch", json!({"commands": [{"command": "solid.box", "params": {"length": 1, "width": 1, "height": 1}}]}));
+    assert!(d.get("timings").is_none(), "{d}");
+
+    let reply =
+        json!({"completed": 1, "results": [{"x": 1}], "undone": 0, "timings": [{"index": 0, "command": "a.one", "ms": 2.5}], "total_ms": 2.6});
+    let (b, body, _) = recorded_batch(Ok(reply), json!({"commands": [{"command": "a.one"}], "profile": true}));
+    assert_eq!(b.calls[0].1["timings"], true);
+    assert_eq!(b.calls[0].1["profile"], true);
+    assert_eq!((body["timings"][0]["ms"].as_f64(), body["total_ms"].as_f64()), (Some(2.5), Some(2.6)), "{body}");
+    // An app without engine.batch is timed step by step here, without a kernel split it can't measure.
+    let (_, body, _) = recorded_batch(Err("unknown method `engine.batch`".into()), json!({"commands": [{"command": "a.one"}], "profile": true}));
+    assert_eq!(body["timings"][0]["command"], "a.one", "{body}");
+    assert!(body["timings"][0].get("profile").is_none(), "{body}");
 }

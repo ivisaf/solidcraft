@@ -361,6 +361,15 @@ impl ReliefShape {
     }
 }
 
+/// The corner relief an edge flange feature asks for in place of the rule's. A value left out
+/// follows the rule.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReliefOverride {
+    pub shape: Option<ReliefShape>,
+    /// How far across the relief is (mm).
+    pub size: Option<f64>,
+}
+
 /// A rule's values (mm, unit-less K).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct RuleValues {
@@ -569,14 +578,22 @@ fn rev_edge(e: EdgeSpec) -> EdgeSpec {
     e.reversed()
 }
 
-/// Largest distance between a folded bend edge and the cubic chain standing in for it.
+/// Largest distance between a folded bend edge and the chain standing in for it.
 const BEND_CHAIN_TOL: f64 = 1e-7;
-/// Most halvings of a bend edge's parameter while fitting its chain.
-const BEND_CHAIN_DEPTH: usize = 10;
+/// Degree of the pieces of a folded bend edge's chain. Hermite pieces of degree 7 match the
+/// edge's point and first three derivatives at both ends, so one or two of them follow a helix
+/// round a whole bend, where cubic pieces (point and tangent) took 32 and more.
+const BEND_CHAIN_DEGREE: usize = 7;
+/// Most pieces of a folded bend edge's chain.
+const BEND_CHAIN_PIECES: usize = 256;
 
-fn cubic_at(p0: Vec3, c1: Vec3, c2: Vec3, p1: Vec3, t: f64) -> Vec3 {
-    let u = 1.0 - t;
-    p0 * (u * u * u) + c1 * (3.0 * u * u * t) + c2 * (3.0 * u * t * t) + p1 * (t * t * t)
+/// The point at `t` of the Bézier over `c` (de Casteljau).
+fn bezier_at(c: &[Vec3], t: f64) -> Vec3 {
+    let mut w = c.to_vec();
+    while w.len() > 1 {
+        w = w.windows(2).map(|p| p[0].lerp(p[1], t)).collect();
+    }
+    w.first().copied().unwrap_or(Vec3::ZERO)
 }
 
 fn dedup(p: &[Vec2]) -> Vec<Vec2> {
@@ -964,8 +981,10 @@ impl SheetBody {
     }
 
     /// A flat point of flange `f`'s bend zone folded onto the bend at height `z` (not clamped
-    /// to the zone), with its rates of change along the zone's flat `n` and `d` directions.
-    fn zone_point(&self, f: &SheetFlange, q: Vec2, z: f64) -> (Vec3, Vec3, Vec3) {
+    /// to the zone), with its first three derivatives along the zone's flat `n` direction and
+    /// its first along `d` (along `d` the bend is straight: the higher ones are zero, and so are
+    /// the mixed ones).
+    fn zone_point(&self, f: &SheetFlange, q: Vec2, z: f64) -> (Vec3, [Vec3; 3], Vec3) {
         let s = (q - f.p).dot(f.n);
         let u = (q - f.p).dot(f.d);
         let neutral = (f.radius + self.k * self.t).max(1e-12);
@@ -978,58 +997,91 @@ impl SheetBody {
         let (sn, cs) = phi.sin_cos();
         let w = self.world(f.parent);
         let local = axis_o + v3(f.d) * u + ez * cs + ek * sn;
+        // Each derivative along n turns the last a right angle about the axis and divides it by
+        // the neutral radius.
         let ds = (ez * -sn + ek * cs) * (1.0 / neutral);
-        (apply_point(&w, local), apply_vector(&w, ds), apply_vector(&w, v3(f.d)))
+        let dss = (ez * cs + ek * sn) * (-1.0 / (neutral * neutral));
+        let dsss = ds * (-1.0 / (neutral * neutral));
+        let along_n = [ds, dss, dsss].map(|v| apply_vector(&w, v));
+        (apply_point(&w, local), along_n, apply_vector(&w, v3(f.d)))
     }
 
     /// A flat edge of flange `f`'s bend zone, folded at height `z`, at parameter `t`: the point
-    /// and its derivative.
-    fn zone_edge_at(&self, f: &SheetFlange, e: &Seg2, z: f64, t: f64) -> (Vec3, Vec3) {
-        let (p, ds, du) = self.zone_point(f, e.point_at(t), z);
-        let dq = e.derivative(t);
-        (p, ds * dq.dot(f.n) + du * dq.dot(f.d))
+    /// and its first three derivatives.
+    fn zone_edge_at(&self, f: &SheetFlange, e: &Seg2, z: f64, t: f64) -> [Vec3; 4] {
+        let (p, [g1, g2, g3], du) = self.zone_point(f, e.point_at(t), z);
+        let [q1, q2, q3] = match e.derivatives(t, 3).as_deref() {
+            Some(&[q1, q2, q3]) => [q1, q2, q3],
+            _ => [e.derivative(t), Vec2::ZERO, Vec2::ZERO],
+        };
+        let ([s1, s2, s3], [u1, u2, u3]) = ([q1, q2, q3].map(|q| q.dot(f.n)), [q1, q2, q3].map(|q| q.dot(f.d)));
+        // The chain rule (Faà di Bruno) through s(t) along n and u(t) along d.
+        [p, g1 * s1 + du * u1, g2 * (s1 * s1) + g1 * s2 + du * u2, g3 * (s1 * s1 * s1) + g2 * (3.0 * s1 * s2) + g1 * s3 + du * u3]
     }
 
-    /// Where to break a bend zone's flat edge so cubic Hermite pieces follow the folded edge
-    /// to within [`BEND_CHAIN_TOL`] on both faces. The breaks depend on the flat edge only, so
-    /// the top face, bottom face and wall of a cut-out share one chain per height.
-    fn zone_breaks(&self, f: &SheetFlange, e: &Seg2) -> Vec<f64> {
-        let mut out = vec![0.0];
-        let mut todo = vec![(0.0, 1.0, 0usize)];
-        while let Some((t0, t1, depth)) = todo.pop() {
-            let fits = depth >= BEND_CHAIN_DEPTH
-                || [0.0, self.t].iter().all(|&z| {
-                    let h = t1 - t0;
-                    let ((p0, d0), (p1, d1)) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
-                    let (c1, c2) = (p0 + d0 * (h / 3.0), p1 - d1 * (h / 3.0));
-                    [0.25, 0.5, 0.75].iter().all(|&x| cubic_at(p0, c1, c2, p1, x).dist(self.zone_edge_at(f, e, z, t0 + h * x).0) <= BEND_CHAIN_TOL)
-                });
-            if fits {
-                out.push(t1);
-            } else {
-                let m = (t0 + t1) / 2.0;
-                // Depth first, right half last on the stack: breaks come out in order.
-                todo.push((m, t1, depth + 1));
-                todo.push((t0, m, depth + 1));
+    /// The control points of the Hermite piece of degree 7 of a folded bend edge from `t0` to
+    /// `t1`: it has the edge's point and first three derivatives at both ends. (The k-th
+    /// derivative of a Bézier of degree 7 at its start is 7!/(7 − k)! times the k-th forward
+    /// difference of its first control points, and the edge's k-th derivative scales by
+    /// (t1 − t0)^k to the piece's parameter; at its end the same, backwards.)
+    fn zone_piece(&self, f: &SheetFlange, e: &Seg2, z: f64, t0: f64, t1: f64) -> [Vec3; BEND_CHAIN_DEGREE + 1] {
+        let h = t1 - t0;
+        let ([p0, a1, a2, a3], [p1, b1, b2, b3]) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
+        let (k1, k2, k3) = (h / 7.0, h * h / 42.0, h * h * h / 210.0);
+        [
+            p0,
+            p0 + a1 * k1,
+            p0 + a1 * (2.0 * k1) + a2 * k2,
+            p0 + a1 * (3.0 * k1) + a2 * (3.0 * k2) + a3 * k3,
+            p1 - b1 * (3.0 * k1) + b2 * (3.0 * k2) - b3 * k3,
+            p1 - b1 * (2.0 * k1) + b2 * k2,
+            p1 - b1 * k1,
+            p1,
+        ]
+    }
+
+    /// Into how many equal pieces (of its parameter) a bend zone's flat edge is folded, so that
+    /// the Hermite pieces are within [`BEND_CHAIN_TOL`] of the folded edge on both faces. The
+    /// count depends on the flat edge only, so the top face, bottom face and wall of a cut-out
+    /// share one chain per height; and as the pieces are equal, the chain's parameter runs evenly
+    /// with the edge's, and the pieces join with equal derivatives up to the third.
+    fn zone_pieces(&self, f: &SheetFlange, e: &Seg2) -> usize {
+        // The largest distance between the pieces and the folded edge, at points inside each.
+        let worst = |n: usize| {
+            let mut worst = 0.0f64;
+            for k in 0..n {
+                let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+                for z in [0.0, self.t] {
+                    let c = self.zone_piece(f, e, z, t0, t1);
+                    for j in 1..8 {
+                        let t = t0 + (t1 - t0) * j as f64 / 8.0;
+                        worst = worst.max(bezier_at(&c, j as f64 / 8.0).dist(self.zone_edge_at(f, e, z, t)[0]));
+                    }
+                }
             }
+            worst
+        };
+        let mut n = 1;
+        loop {
+            let off = worst(n);
+            if off <= BEND_CHAIN_TOL || !off.is_finite() || n >= BEND_CHAIN_PIECES {
+                return n;
+            }
+            // The distance falls as the eighth power of the pieces' length.
+            let guess = (n as f64 * (off / BEND_CHAIN_TOL).powf(1.0 / 8.0)).ceil();
+            n = (guess as usize).clamp(n + 1, BEND_CHAIN_PIECES);
         }
-        out
     }
 
-    /// A bend zone's flat edge folded at height `z`: a chain of cubic Hermite pieces.
+    /// A bend zone's flat edge folded at height `z`: a chain of Hermite pieces of degree 7.
     fn zone_chain(&self, f: &SheetFlange, e: &Seg2, z: f64) -> EdgeSpec {
-        let breaks = self.zone_breaks(f, e);
-        let mut ctrl = Vec::with_capacity(breaks.len() * 3);
-        for w in breaks.windows(2) {
-            let (t0, t1) = (w[0], w[1]);
-            let h = t1 - t0;
-            let ((p0, d0), (p1, d1)) = (self.zone_edge_at(f, e, z, t0), self.zone_edge_at(f, e, z, t1));
-            if ctrl.is_empty() {
-                ctrl.push(p0);
-            }
-            ctrl.extend([p0 + d0 * (h / 3.0), p1 - d1 * (h / 3.0), p1]);
+        let n = self.zone_pieces(f, e);
+        let mut ctrl = Vec::with_capacity(BEND_CHAIN_DEGREE * n + 1);
+        for k in 0..n {
+            let c = self.zone_piece(f, e, z, k as f64 / n as f64, (k + 1) as f64 / n as f64);
+            ctrl.extend_from_slice(if k == 0 { &c } else { &c[1..] });
         }
-        EdgeSpec::Chain { ctrl: ctrl.into() }
+        EdgeSpec::Chain { degree: BEND_CHAIN_DEGREE, ctrl: ctrl.into() }
     }
 
     /// A flat edge of a piece as a 3D edge at height `z`.
@@ -1087,11 +1139,22 @@ impl SheetBody {
             cuts.push(fitted_region(&pocket)?);
         }
         let cuts = material_union(cuts, work)?;
+        let cut_boxes = cuts.iter().map(|c| loop_box(&c.outer)).collect::<Result<Vec<_>>>()?;
         let mut out = Vec::new();
         let mut points = 0usize;
         for (piece, region) in pieces {
             let panel = fitted_region(&planar_region(&region)?)?;
-            let material = if cuts.is_empty() { vec![panel] } else { material_boolean(&[panel], &cuts, kernel::BoolOp::Cut, work)? };
+            // Each piece meets only the cut-outs near it: arranging every cut-out of the sheet (a
+            // label's letters on its base) against each flange and bend zone too would charge the
+            // budget for all of them once per piece.
+            let (lo, hi) = loop_box(&panel.outer)?;
+            let near: Vec<Region2> = cuts
+                .iter()
+                .zip(&cut_boxes)
+                .filter(|(_, (a, b))| a.x <= hi.x && b.x >= lo.x && a.y <= hi.y && b.y >= lo.y)
+                .map(|(c, _)| c.clone())
+                .collect();
+            let material = if near.is_empty() { vec![panel] } else { material_boolean(&[panel], &near, kernel::BoolOp::Cut, work)? };
             for region in material {
                 points = points.saturating_add(region_complexity(std::slice::from_ref(&region))?.1);
                 if points > MAX_FLAT_POINTS || out.len() >= MAX_FLAT_PIECES {
@@ -1493,6 +1556,9 @@ impl SheetBody {
     }
 
     fn machine_pockets(&self, mut body: Body, work: &mut FlatWork) -> Result<Body> {
+        if self.pockets.is_empty() {
+            return Ok(body);
+        }
         if self.pockets.len() > 1000 {
             return Err(flat_budget_error());
         }
@@ -2151,7 +2217,7 @@ impl SheetBody {
         flip: bool,
     ) -> Result<(Vec<usize>, Vec<String>)> {
         let each: Vec<EdgeFlange> = picks.iter().map(|&pick| EdgeFlange { pick, height, angle }).collect();
-        self.add_flanges_each(&each, radius, position, flip)
+        self.add_flanges_each(&each, radius, position, flip, ReliefOverride::default())
     }
 
     /// Edge flanges that each have their own height and angle, in one go: every edge is trimmed
@@ -2164,8 +2230,16 @@ impl SheetBody {
     /// the base that ends beside more of the base gets the rule's bend relief there
     /// (`relieve_bend_ends`). Where cut-outs have taken part of a picked edge away, the flange
     /// runs along the stretch they leave nearest the pick and takes its setback off that stretch
-    /// only; an edge they took whole is refused.
-    pub fn add_flanges_each(&mut self, edges: &[EdgeFlange], radius: f64, position: &str, flip: bool) -> Result<(Vec<usize>, Vec<String>)> {
+    /// only; an edge they took whole is refused. The corners between these flanges are relieved
+    /// as the rule says, except where `relief` names another shape or size.
+    pub fn add_flanges_each(
+        &mut self,
+        edges: &[EdgeFlange],
+        radius: f64,
+        position: &str,
+        flip: bool,
+        relief: ReliefOverride,
+    ) -> Result<(Vec<usize>, Vec<String>)> {
         if edges.is_empty() || edges.len() > 1000 {
             return Err(DocError::Invalid("pick 1…1000 edges".into()));
         }
@@ -2293,7 +2367,7 @@ impl SheetBody {
         for (&i, &free) in made.iter().zip(&freed) {
             notes.extend(self.relieve_bend_ends(i, free));
         }
-        notes.extend(self.close_corners(&made));
+        notes.extend(self.close_corners(&made, relief));
         notes.extend(self.close_return_corners(&made));
         Ok((made, notes))
     }
@@ -2711,9 +2785,10 @@ impl SheetBody {
         out
     }
 
-    /// Close the corners the new flanges make, then cut the rule's relief at each (or tear it).
-    /// Returns a note for every corner left open, without its relief or not torn.
-    fn close_corners(&mut self, made: &[usize]) -> Vec<String> {
+    /// Close the corners the new flanges make, then cut the relief at each (or tear it): the
+    /// rule's, but for the shape or size `relief` names. Returns a note for every corner left
+    /// open, without its relief or not torn.
+    fn close_corners(&mut self, made: &[usize], relief: ReliefOverride) -> Vec<String> {
         let corners = self.corners(made);
         let mut notes = Vec::new();
         let mut closed = Vec::with_capacity(corners.len());
@@ -2723,7 +2798,7 @@ impl SheetBody {
                 Err(why) => notes.push(format!("the flanges at {} are left open: {why}", self.shown(k.c))),
             }
         }
-        notes.extend(self.relieve_corners(&corners, &closed));
+        notes.extend(self.relieve_corners(&corners, &closed, relief));
         notes
     }
 
@@ -2733,16 +2808,18 @@ impl SheetBody {
         format!("({:.3}, {:.3}, {:.3})", w.x, w.y, w.z)
     }
 
-    /// Cut the rule's relief at each of `corners`, or tear those of them that are `closed`.
-    /// Returns a note for every corner without its relief or not torn.
-    fn relieve_corners(&mut self, corners: &[Corner], closed: &[Corner]) -> Vec<String> {
+    /// Cut the relief at each of `corners`, or tear those of them that are `closed`: the rule's,
+    /// but for the shape or size `relief` names. Returns a note for every corner without its
+    /// relief or not torn.
+    fn relieve_corners(&mut self, corners: &[Corner], closed: &[Corner], relief: ReliefOverride) -> Vec<String> {
         let mut notes = Vec::new();
-        match self.relief {
+        let (shape, size) = (relief.shape.unwrap_or(self.relief), relief.size.unwrap_or(self.relief_size));
+        match shape {
             ReliefShape::Notch => {}
             // The reliefs come last: they move the bends' ends, which is how the corners were found.
             ReliefShape::Round | ReliefShape::Rectangular => {
                 for k in corners {
-                    if let Err(why) = self.relieve_corner(k, corners) {
+                    if let Err(why) = self.relieve_corner(k, corners, shape, size) {
                         notes.push(format!("no corner relief at {}: {why}", self.shown(k.c)));
                     }
                 }
@@ -2918,7 +2995,7 @@ impl SheetBody {
         Ok(())
     }
 
-    /// Cut the rule's relief where two bends meet at a corner of the base, `relief_size / 2`
+    /// Cut a relief `size` across where two bends meet at a corner of the base, `size / 2`
     /// from the corner along both edges: a round about the corner through the angle the base
     /// fills there, or the square with that side (a kite where the corner isn't square, its
     /// cuts square to the two edges). The base's edges then start that far from the corner, so
@@ -2928,8 +3005,7 @@ impl SheetBody {
     /// that would leave nothing of an edge it starts on (with the relief at that edge's other
     /// end, where there is one), or one reaching as far from the corner as another edge of the
     /// base is, is refused with the reason.
-    fn relieve_corner(&mut self, k: &Corner, corners: &[Corner]) -> std::result::Result<(), String> {
-        let size = self.relief_size;
+    fn relieve_corner(&mut self, k: &Corner, corners: &[Corner], shape: ReliefShape, size: f64) -> std::result::Result<(), String> {
         if !(size >= MIN_CORNER_RELIEF) {
             return Err(format!("the relief size {size:.4} mm is below {MIN_CORNER_RELIEF} mm"));
         }
@@ -2961,7 +3037,7 @@ impl SheetBody {
         }
         // The relief from the edge that ends at the corner to the one that starts there, and
         // how far from the corner it reaches.
-        let (relief, reach) = match self.relief {
+        let (relief, reach) = match shape {
             ReliefShape::Notch | ReliefShape::Tear => return Ok(()),
             ReliefShape::Round => (vec![Seg2::Arc { center: c, radius: r, start: da.angle(), sweep: -alpha }], r),
             ReliefShape::Rectangular => {
@@ -4238,7 +4314,9 @@ pub fn rename_plane_sheet_body(plane: &mut crate::PlaneRef, old: &str, new: &str
                 *name = renamed;
             }
         }
-        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } => rename_plane_sheet_body(base, old, new),
+        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } | crate::PlaneRef::Flipped { base, .. } => {
+            rename_plane_sheet_body(base, old, new)
+        }
         _ => {}
     }
 }
@@ -4248,7 +4326,9 @@ pub fn rename_plane_sheet_body(plane: &mut crate::PlaneRef, old: &str, new: &str
 pub fn plane_sheet_face(plane: &crate::PlaneRef) -> Option<&str> {
     match plane {
         crate::PlaneRef::Face { name: Some(name), anchor: None, .. } if split_sheet_face_name(name).is_some() => Some(name),
-        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } => plane_sheet_face(base),
+        crate::PlaneRef::Offset { base, .. } | crate::PlaneRef::AtAngle { base, .. } | crate::PlaneRef::Flipped { base, .. } => {
+            plane_sheet_face(base)
+        }
         _ => None,
     }
 }
@@ -4895,21 +4975,34 @@ mod tests {
             assert!(s.zone_point(&f, q, z).0.dist(s.map3(Piece::Zone(0), q, z)) < 1e-12);
         }
         // A flat line across the whole zone, 15 mm along the bend: the bend angle and the
-        // distance along the axis both grow evenly along it.
+        // distance along the axis both grow evenly along it. Two pieces of degree 7 follow it
+        // (cubic ones took 32).
         let e = Seg2::Line { a: f.p + f.d * 20.0, b: f.p + f.n * s.allowance(&f) + f.d * 35.0 };
-        let breaks = s.zone_breaks(&f, &e);
+        let n = s.zone_pieces(&f, &e);
+        assert_eq!(n, 2);
         for z in [0.0, 2.0] {
             let helix = |t: f64| {
                 let (phi, rho) = (angle * t, 3.0 - z);
                 Vec3::new(e.point_at(t).x, setback - rho * phi.sin(), 3.0 - rho * phi.cos())
             };
-            let EdgeSpec::Chain { ctrl } = s.zone_chain(&f, &e, z) else { panic!("a slanted edge folds to a chain") };
-            assert_eq!(ctrl.len(), 3 * (breaks.len() - 1) + 1);
-            for (k, w) in breaks.windows(2).enumerate() {
-                for x in [0.0, 0.1, 0.37, 0.5, 0.81, 1.0] {
-                    let p = cubic_at(ctrl[3 * k], ctrl[3 * k + 1], ctrl[3 * k + 2], ctrl[3 * k + 3], x);
-                    let exact = helix(w[0] + (w[1] - w[0]) * x);
-                    assert!(p.dist(exact) < BEND_CHAIN_TOL, "height {z}, piece {k}: {}", p.dist(exact));
+            let EdgeSpec::Chain { degree: 7, ctrl } = s.zone_chain(&f, &e, z) else { panic!("a slanted edge folds to a chain of degree 7") };
+            assert_eq!(ctrl.len(), 7 * n + 1);
+            for k in 0..n {
+                for i in 0..=40 {
+                    let x = i as f64 / 40.0;
+                    let off = bezier_at(&ctrl[7 * k..=7 * k + 7], x).dist(helix((k as f64 + x) / n as f64));
+                    assert!(off < BEND_CHAIN_TOL, "height {z}, piece {k}, {x}: {off}");
+                }
+            }
+            // The pieces are equal, so the chain is one smooth curve: on either side of a joint
+            // the first three differences of the control points are the same.
+            let diff = |p: &[Vec3]| p.windows(2).map(|w| w[1] - w[0]).collect::<Vec<_>>();
+            for k in 1..n {
+                let (mut before, mut after) = (ctrl[7 * k - 3..=7 * k].to_vec(), ctrl[7 * k..=7 * k + 3].to_vec());
+                for order in 1..=3 {
+                    (before, after) = (diff(&before), diff(&after));
+                    let (b, a) = (before[before.len() - 1], after[0]);
+                    assert!(b.dist(a) < 1e-12, "height {z}, joint {k}, order {order}: {b:?} vs {a:?}");
                 }
             }
         }
@@ -5574,7 +5667,7 @@ mod tests {
                         assert!((s.base.area() - base).abs() < tol, "{what}: {} vs {base}", s.base.area());
                         assert!((flat_area(&s) - (base + len * (ba + panel))).abs() < 1e-6, "{what}: {}", flat_area(&s));
                         // (A sliver 0.0001 wide is below the flat pattern's shortest edge.)
-                        if hair < 0.0 || hair > 1e-3 {
+                        if !(0.0..=1e-3).contains(&hair) {
                             holds_the_flat_material(&s, &what);
                         } else {
                             let b = s.solid().unwrap_or_else(|e| panic!("{what}: no solid: {e}"));
@@ -6075,7 +6168,7 @@ mod tests {
     /// sheet and the notes on corners left open.
     fn flanges_each(base: Region2, rv: &RuleValues, each: &[EdgeFlange]) -> (SheetBody, Vec<String>) {
         let mut s = base_flange("Body1", "AL2", rv, Plane::XY, base);
-        let notes = s.add_flanges_each(each, rv.bend_radius, "inside", false).unwrap().1;
+        let notes = s.add_flanges_each(each, rv.bend_radius, "inside", false, ReliefOverride::default()).unwrap().1;
         (s, notes)
     }
 
@@ -6630,7 +6723,7 @@ mod tests {
         let (mut s, _) = tray(&rv, 90.0, 20.0);
         let each: Vec<EdgeFlange> =
             (0..4).map(|i| EdgeFlange { pick: far_edge_pick(&s, i, true), height: 12.0, angle: [90f64, 70.0][i % 2].to_radians() }).collect();
-        let (made, notes) = s.add_flanges_each(&each, 1.0, "inside", false).unwrap();
+        let (made, notes) = s.add_flanges_each(&each, 1.0, "inside", false, ReliefOverride::default()).unwrap();
         assert!(notes.is_empty() && made == [4, 5, 6, 7], "{made:?} {notes:?}");
         for (a, a_end, b, b_end) in TRAY_RETURNS {
             let (fa, fb) = (&s.flanges[a], &s.flanges[b]);
@@ -6803,7 +6896,7 @@ mod tests {
                     EdgeFlange { pick: far_edge_pick(&s, i, true), height: 12.0, angle: deg.to_radians() }
                 })
                 .collect();
-            let (_, notes) = s.add_flanges_each(&each, 1.0, "inside", false).unwrap();
+            let (_, notes) = s.add_flanges_each(&each, 1.0, "inside", false, ReliefOverride::default()).unwrap();
             assert!(notes.is_empty(), "{what}: {notes:?}");
             returns_keep_out_of_the_walls(&s, &what);
             holds_the_flat_material(&s, &what);
@@ -7411,6 +7504,59 @@ mod tests {
         assert!(notes.is_empty(), "{notes:?}");
         assert!(s.flanges.iter().all(|f| f.tear == (false, false)));
         assert!(s.solid().is_ok() && s.flat_regions().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn a_torn_bend_end_folds_to_two_smooth_pieces_on_its_helix() {
+        // The tray of `a_tear_cuts_each_bend_from_the_corner_to_its_flanges_end` (T = 2, R = 1):
+        // each of its eight torn bend ends is the wall ruled between a helix on the bend's inner
+        // face and one on its outer face, `bend_end` at the turn φ from 0 to θ. Cubic pieces took
+        // 32 at either angle, which a viewer draws as 32 strips; two pieces of degree 7 hold the
+        // helix to within the chains' tolerance.
+        for deg in [90.0f64, 72.0] {
+            let what = format!("{deg}°");
+            let (s, _) = tray(&torn(), deg, 38.6);
+            let mut work = FlatWork::new();
+            let cells = s.cells_with_work(&mut work).unwrap();
+            let faces = s.faces(&cells, 0.0, s.t, &mut work).unwrap();
+            let walls: Vec<(&EdgeSpec, &EdgeSpec)> = faces
+                .iter()
+                .filter_map(|f| match &f.surface {
+                    SurfSpec::Ruled { a, b } => Some((a, b)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(walls.len(), 8, "{what}");
+            let th = deg.to_radians();
+            for (bottom, top) in walls {
+                for (chain, z) in [(bottom, 0.0), (top, s.t)] {
+                    let EdgeSpec::Chain { ctrl, .. } = chain else { panic!("{what}: a torn end folds to a chain") };
+                    assert_eq!(ctrl.len(), 15, "{what}: two pieces of degree 7");
+                    // The torn end this chain runs along, and which way.
+                    let (first, last) = (ctrl[0], ctrl[ctrl.len() - 1]);
+                    let end = s.flanges.iter().flat_map(|f| [(f, false), (f, true)]).find_map(|(f, at_end)| {
+                        let at = |phi: f64| s.bend_end(f, at_end, phi, z);
+                        if at(0.0).dist(first) < 1e-9 && at(th).dist(last) < 1e-9 {
+                            Some((f, at_end, false))
+                        } else if at(th).dist(first) < 1e-9 && at(0.0).dist(last) < 1e-9 {
+                            Some((f, at_end, true))
+                        } else {
+                            None
+                        }
+                    });
+                    let Some((f, at_end, back)) = end else { panic!("{what}: {first:?} to {last:?} is no torn end") };
+                    for k in 0..2 {
+                        for i in 0..=40 {
+                            let t = (k as f64 + i as f64 / 40.0) / 2.0;
+                            let exact = s.bend_end(f, at_end, th * if back { 1.0 - t } else { t }, z);
+                            let off = bezier_at(&ctrl[7 * k..=7 * k + 7], i as f64 / 40.0).dist(exact);
+                            assert!(off < BEND_CHAIN_TOL, "{what}: height {z}, {t}: {off}");
+                        }
+                    }
+                }
+            }
+            holds_the_flat_material(&s, &what);
+        }
     }
 
     #[test]

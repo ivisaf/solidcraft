@@ -26,6 +26,8 @@ use crate::theme::Tokens;
 pub struct Colors {
     pub body: [u8; 4],
     pub added: [u8; 4],
+    /// A body the preview creates (New Body), so it doesn't look like a join.
+    pub new_body: [u8; 4],
     pub removed: [u8; 4],
     pub edge: [u8; 4],
 }
@@ -33,7 +35,7 @@ pub struct Colors {
 impl Colors {
     pub fn from_tokens(t: &Tokens) -> Colors {
         let c = |c: egui::Color32| c.to_srgba_unmultiplied();
-        Colors { body: c(t.body), added: c(t.preview_add), removed: c(t.preview_cut), edge: c(t.body_edge) }
+        Colors { body: c(t.body), added: c(t.preview_add), new_body: c(t.preview_new), removed: c(t.preview_cut), edge: c(t.body_edge) }
     }
 }
 
@@ -96,10 +98,12 @@ pub struct PreviewState {
     pub stopped: Option<serde_json::Value>,
     /// The radius splines the previewed fillet tapered its edges with.
     pub tapered: Vec<(Vec3, solidcraft_engine::kernel::Taper)>,
+    straight: crate::extrude_preview::StraightPreview,
 }
 
 impl PreviewState {
     fn clear(&mut self) {
+        self.straight.clear();
         self.running = None;
         self.running_tool = false;
         self.running_stream_key = None;
@@ -116,6 +120,15 @@ impl PreviewState {
             self.replaced.clear();
             self.set_scene(GpuScene::default());
         }
+    }
+
+    /// Drop the preview of a design that leaves the window. Its scene goes too: the viewport
+    /// keeps drawing the last scene it took until the slot it reads hands it another, so a fresh
+    /// state (another slot, empty) would leave the old preview drawn over the next design.
+    pub fn reset(&mut self) {
+        let (slot, key) = (std::mem::take(&mut self.slot), self.key);
+        *self = PreviewState { slot, key, ..PreviewState::default() };
+        self.set_scene(GpuScene::default());
     }
 
     fn set_scene(&mut self, sc: GpuScene) {
@@ -187,7 +200,20 @@ impl PreviewState {
 /// limits, feature dialog or document cannot reuse an obsolete pose.
 fn motion_key(cmds: &[(String, Value)], revision: u64, colors: Colors) -> Option<u64> {
     if !cmds.iter().any(|(c, p)| c == "joint.drive" || c == "joint.create" && p.get("values").is_some())
-        || !cmds.iter().all(|(c, _)| matches!(c.as_str(), "joint.drive" | "joint.create" | "joint.as_built" | "joint.edit" | "joint.limits"))
+        || !cmds.iter().all(|(c, _)| {
+            matches!(
+                c.as_str(),
+                "joint.drive"
+                    | "joint.create"
+                    | "joint.as_built"
+                    | "joint.edit"
+                    | "joint.limits"
+                    | "joint.gear"
+                    | "joint.rack_pinion"
+                    | "joint.screw"
+                    | "joint.cam"
+            )
+        })
     {
         return None;
     }
@@ -269,6 +295,14 @@ pub fn update(app: &mut SolveApp, ctx: &egui::Context) {
     if pv.running.is_none() && pv.shown_key != Some(key) {
         pv.started = crate::now_ms();
         pv.running_stream_key = stream_key;
+        let mut straight = std::mem::take(&mut app.preview.straight);
+        let job = straight.compute(app, &cmds, colors);
+        app.preview.straight = straight;
+        if let Some(job) = job {
+            app.preview.apply(key, job);
+            app.preview.busy = false;
+            return;
+        }
         let scratch = app.session.scratch();
         spawn(&mut app.preview, key, scratch, cmds, colors, tool);
     }
@@ -317,8 +351,18 @@ fn spawn(pv: &mut PreviewState, key: u64, scratch: Session, cmds: Vec<(String, V
 /// kernel can't do yet), the tool body is still shown, with the error.
 pub fn compute(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
     if cmds.iter().any(|(command, params)| {
-        matches!(command.as_str(), "sketch.redefine" | "sketch.mirror" | "sketch.pattern.rectangular" | "sketch.pattern.circular" | "sketch.offset")
-            || command == "construct.plane.along_path"
+        matches!(
+            command.as_str(),
+            "sketch.redefine"
+                | "sketch.mirror"
+                | "sketch.pattern.rectangular"
+                | "sketch.pattern.circular"
+                | "sketch.offset"
+                | "sketch.fillet"
+                | "sketch.chamfer.equal_distance"
+                | "sketch.chamfer.two_distance"
+                | "sketch.chamfer.distance_angle"
+        ) || command == "construct.plane.along_path"
             || params.get("command").and_then(Value::as_str) == Some("construct.plane.along_path")
     }) {
         let preview = s.preview_visible_world(cmds).map_err(|error| error.to_string())?;
@@ -368,6 +412,51 @@ fn compute_tool(s: &Session, cmds: &[(String, Value)], colors: Colors) -> Job {
         .map_err(|_| "the preview failed".to_string())?;
     b.bounds = state_bounds(&tool.after);
     Ok(b)
+}
+
+fn extrusion_params<'a>(id: &str, params: &'a Value) -> Option<&'a Value> {
+    match id {
+        "solid.extrude" => Some(params),
+        "timeline.redefine" if params.get("command").and_then(Value::as_str) == Some("solid.extrude") => params.get("params"),
+        _ => None,
+    }
+}
+
+/// Check references without intersecting the tool with the target's geometry.
+pub(crate) fn extrusion_target_error(s: &Session, cmds: &[(String, Value)], before: &ModelState) -> Option<String> {
+    for (id, params) in cmds {
+        let params = extrusion_params(id, params)?;
+        let op = params.get("operation").and_then(Value::as_str).unwrap_or("new");
+        if op == "new" {
+            continue;
+        }
+        let targets = params
+            .get("targets")
+            .and_then(Value::as_array)
+            .filter(|targets| !targets.is_empty())
+            .or_else(|| params.get("participants").and_then(Value::as_array));
+        let mut found = false;
+        if let Some(targets) = targets.filter(|targets| !targets.is_empty()) {
+            for target in targets.iter().filter_map(Value::as_str) {
+                if target == "*" {
+                    found |= !before.bodies.is_empty();
+                } else if before.body(target).is_some() {
+                    found = true;
+                } else {
+                    return Some(format!("unknown body `{target}`"));
+                }
+            }
+        } else {
+            found = params.get("faces").and_then(|_| params.get("face_body")).and_then(Value::as_str).map_or_else(
+                || before.bodies.iter().any(|body| s.doc.model_body_component(body) == s.active_component),
+                |name| s.world_state().body(name).is_some(),
+            );
+        }
+        if !found && matches!(op, "cut" | "intersect") {
+            return Some("there is no body to cut or intersect".into());
+        }
+    }
+    None
 }
 
 fn state_bounds(st: &ModelState) -> Aabb3 {
@@ -479,7 +568,11 @@ pub fn build(before: &ModelState, after: &ModelState, c: Colors) -> Built {
         let cut = old.as_ref().is_some_and(|bm| am.measure().volume < bm.measure().volume - 1e-6);
         for (t, f) in am.triangles.iter().zip(&am.tri_face) {
             let new = added.get(*f as usize).copied().unwrap_or(true);
-            let col = if new { c.added } else { c.body };
+            let col = match (new, old.is_some()) {
+                (false, _) => c.body,
+                (true, true) => c.added,
+                (true, false) => c.new_body,
+            };
             for k in t {
                 let i = *k as usize;
                 if let (Some(p), Some(n)) = (am.positions.get(i), am.normals.get(i)) {
@@ -695,7 +788,7 @@ mod tests {
     use serde_json::json;
 
     fn colors() -> Colors {
-        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
+        Colors { body: [1, 1, 1, 255], added: [2, 2, 2, 255], new_body: [4, 4, 4, 255], removed: [3, 3, 3, 100], edge: [0, 0, 0, 255] }
     }
 
     #[test]
@@ -826,6 +919,24 @@ mod tests {
                 motion_key(&[(command.into(), json!({"joint": 1, "values": [90]}))], 7, colors()),
             );
         }
+        // A gear dialog playing its driving joint streams its poses too.
+        let gear = |angle: &str| {
+            vec![
+                ("joint.gear".to_string(), json!({"a": 1, "b": 2, "ra": 10, "rb": 20})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&gear("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&gear("0 deg"), 7, colors()), motion_key(&gear("90 deg"), 7, colors()));
+        // So does a cam dialog turning its cam.
+        let cam = |angle: &str| {
+            vec![
+                ("joint.cam".to_string(), json!({"a": 1, "b": 2, "profile": {"sketch": 3}})),
+                ("joint.drive".to_string(), json!({"joint": 1, "values": [angle]})),
+            ]
+        };
+        assert!(motion_key(&cam("0 deg"), 7, colors()).is_some());
+        assert_eq!(motion_key(&cam("0 deg"), 7, colors()), motion_key(&cam("90 deg"), 7, colors()));
     }
 
     /// Combine previews its result (cut, join or intersect between existing bodies) without an
@@ -966,6 +1077,9 @@ mod tests {
         let b = compute(&s, &[("solid.extrude".into(), json!({"distance": "15 mm"}))], colors()).unwrap();
         assert!(b.replaced.is_empty());
         assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().body), 0);
+        // #1805: a new body has its own colour, not a join's.
+        assert!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().new_body) > 0);
+        assert_eq!(count(&b.scene.tris, crate::gpu::TRI_SIZE, colors().added), 0);
         assert!(b.scene.ghost.is_empty());
         assert!(compute(&s, &[("solid.extrude".into(), json!({"distance": "1 +"}))], colors()).is_err());
         assert!(s.model.state().bodies.is_empty());
@@ -1030,6 +1144,28 @@ mod tests {
         tx.send(Err("too far".into())).unwrap();
         pv.poll(4, None);
         assert!(pv.error.is_none() && pv.shown_key == Some(1), "an old error is dropped");
+    }
+
+    /// A design leaving the window (another tab) takes its preview off the viewport: an empty
+    /// scene in the slot the viewport reads, under a new key. A fresh slot left the fillet
+    /// preview of the old design drawn over the new tab's empty design.
+    #[test]
+    fn reset_hands_the_viewport_an_empty_scene() {
+        let mut pv = PreviewState::default();
+        let mut sc = GpuScene::default();
+        sc.xray_tri([0.0; 3], [0.0, 0.0, 1.0], [255; 4]);
+        pv.set_scene(sc);
+        pv.active = true;
+        pv.replaced = vec!["Body1".into()];
+        let slot = pv.slot.clone();
+        let key = pv.key;
+        // The viewport took the scene.
+        assert!(slot.lock().unwrap().take().is_some_and(|s| !s.xray.is_empty()));
+        pv.reset();
+        assert!(std::sync::Arc::ptr_eq(&slot, &pv.slot), "the slot the viewport reads");
+        assert_ne!(pv.key, key, "a new key: the viewport takes the slot again");
+        assert!(slot.lock().unwrap().as_ref().is_some_and(|s| s.xray.is_empty() && s.blocks.is_empty()));
+        assert!(!pv.active && pv.replaced.is_empty());
     }
 }
 

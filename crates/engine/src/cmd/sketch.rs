@@ -29,7 +29,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sketch.create", "Create Sketch", create_sketch)
         .at("SOLID", "CREATE")
         .icon("sketch")
-        .params("plane: XY|XZ|YZ | construction plane name or id | {origin, x_dir, y_dir} | {face: [world x,y,z], body?: exact world body, index?: face index, path?: complete occurrence ids, fixed?: bool}; new face attachments require a unique certified source (a flat face of a sheet metal body attaches to its panel instead, in the flat pattern's coordinates), fixed:true explicitly freezes the selected plane; offset?: expr, project_edges?: bool, name?"),
+        .params("plane: XY|XZ|YZ | construction plane name or id | {origin, x_dir, y_dir} | {face: [world x,y,z], body?: exact world body, index?: face index, path?: complete occurrence ids, fixed?: bool}; new face attachments require a unique certified source (a flat face of a sheet metal body attaches to its panel instead, in the flat pattern's coordinates), fixed:true explicitly freezes the selected plane; offset?: expr, flip?: bool | \"x\" | \"y\" (not on a face: sketch the plane from its other side, so the normal and the default extrude direction are reversed; a half turn about the plane's own x or y axis, true picks the one keeping the sketch's y axis upward; offset still moves along the unflipped normal), project_edges?: bool, name?"),
     CommandSpec::new("sketch.edit", "Edit Sketch", edit_sketch).noundo().icon("sketch").params("sketch: id or name"),
     CommandSpec::new("sketch.finish", "Finish Sketch", finish_sketch).at("SKETCH", "FINISH SKETCH").icon("finish").enabled(in_sketch).noundo(),
     CommandSpec::new("sketch.line", "Line", draw_line)
@@ -38,7 +38,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .key("L")
         .enabled(in_sketch)
         .params(concat!("points: [[x,y] | \"l1.end\" | {at, ref}…], closed?: bool, construction?: bool, ids?: [..], infer?: bool (add horizontal/vertical)", connect_doc!(), created_doc!())),
-    CommandSpec::new("sketch.draw.dimensioned", "Draw Dimensioned Sketch Geometry", draw_dimensioned)
+    CommandSpec::new("sketch.draw.dimensioned", "Draw Dimensioned Sketch Geometry", draw_dimensioned).icon("dimension")
         .enabled(in_sketch)
         .params(concat!("command: sketch creation command, params: object, dimensions: object of role to numeric or expression value; creates geometry and all driving dimensions atomically in one undo step", created_doc!())),
     CommandSpec::new("sketch.rectangle.two_point", "2-Point Rectangle", rect_two_point)
@@ -91,12 +91,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!("center, radius (to vertices), sides, angle?: deg", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.polygon.circumscribed", "Circumscribed Polygon", polygon_circumscribed)
         .at("SKETCH", "CREATE")
-        .icon("polygon")
+        .icon("polygon_circumscribed")
         .enabled(in_sketch)
         .params(concat!("center, radius (to edge midpoints), sides, angle?: deg", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.polygon.edge", "Edge Polygon", polygon_edge)
         .at("SKETCH", "CREATE")
-        .icon("polygon")
+        .icon("polygon_edge")
         .enabled(in_sketch)
         .params(concat!("p0, p1: one edge, sides", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.slot.center_to_center", "Center to Center Slot", slot_c2c)
@@ -106,12 +106,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(concat!("p0, p1: arc centres, width", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.slot.overall", "Overall Slot", slot_overall)
         .at("SKETCH", "CREATE")
-        .icon("slot")
+        .icon("slot_overall")
         .enabled(in_sketch)
         .params(concat!("p0, p1: overall ends, width", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.point", "Point", draw_point).at("SKETCH", "CREATE").icon("point").enabled(in_sketch).params(concat!("point: [x,y], id?", connect_doc!(), created_doc!())),
     CommandSpec::new("sketch.dimension", "Sketch Dimension", dimension).at("SKETCH", "CREATE").icon("dimension").key("D").enabled(in_sketch).params(
-        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. Returns measured in unit (mm or deg)",
+        "entities: [refs], type?: auto|distance|horizontal|vertical|length|radius|diameter|angle, value?: number or expression (default: current; a bare number is in the design's units, e.g. 2 means 2 in in an inch design; give a unit such as \"50 mm\" to override); text_at?: [x, y]. Two points or a line off the axes: with auto, text_at across from them is the distance between them, above or below them horizontal, beside them vertical. Two lines: the angle between them (acute, or 180° − it when the value is nearer that) unless text_at picks a sector. A dimension the sketch already determines is refused (naming what determines it); if_redundant?: \"driven\" places it as a driven (reference) dimension instead. scale_sketch?: bool (the dimension tool sends true): when this is the sketch's first length dimension and nothing in the sketch fixes a size (no other driving length dimension, nothing fixed or projected), the whole sketch scales about its origin to the value instead of distorting. Returns measured in unit (mm or deg), and scaled: the factor when the sketch was scaled",
     ),
     CommandSpec::new("sketch.constraint.horizontal_vertical", "Horizontal/Vertical", c_horizontal_vertical)
         .at("SKETCH", "CONSTRAINTS")
@@ -174,27 +174,27 @@ pub static COMMANDS: &[CommandSpec] = &[
         .key("X")
         .enabled(in_sketch)
         .params("curves: [ids], value?: bool (default: construction unless all of them already are)"),
-    CommandSpec::new("sketch.delete", "Delete Sketch Entities", sketch_delete)
+    CommandSpec::new("sketch.delete", "Delete Sketch Entities", sketch_delete).icon("delete")
         .enabled(in_sketch)
         .params("entities: [curve, point or constraint ids]"),
-    CommandSpec::new("sketch.move_point", "Drag Sketch Point", move_point).enabled(in_sketch).params("point: ref, to: [x,y]"),
-    CommandSpec::new("sketch.drag", "Drag Sketch Geometry", drag).enabled(in_sketch).live(drag_live).params(
+    CommandSpec::new("sketch.move_point", "Drag Sketch Point", move_point).icon("sketch_move").enabled(in_sketch).params("point: ref, to: [x,y]"),
+    CommandSpec::new("sketch.drag", "Drag Sketch Geometry", drag).icon("sketch_move").enabled(in_sketch).live(drag_live).params(
         "entity: point or curve, from: [x,y] where it was grabbed, to: [x,y], live?: bool: a point goes to `to`, a line (spline, conic) slides by to - from, a circle or arc grabbed on its edge takes the radius to `to`; the rest moves as little as it can and keeps its solution branch (a long move is followed in short steps, each solved with the entity held; a step that cannot be solved that way is approached as far as it can be and the next ones tried; when none past it solves, the last one is left to the sketch's ordinary solve, which may pull it back or leave the sketch unsolved; a step that would sweep an arc through its start is undone and the drag ends there). Returns `reached`: how much of the way from `from` to `to` the geometry followed (0..1), and `at`: where the grabbed spot went (`from` moved as the dragged points did), the `from` of the next move. `live: true` (each frame of an interactive drag) solves the sketch once and leaves the features after it as they were (stale) until `sketch.drag_end` or any command that reads the model; `dof` is then the one from before the drag",
     ),
-    CommandSpec::new("sketch.drag_end", "End Sketch Drag", drag_end).enabled(in_sketch).doc_only().params(
+    CommandSpec::new("sketch.drag_end", "End Sketch Drag", drag_end).icon("sketch_move").enabled(in_sketch).doc_only().params(
         "constraint?: {command: a sketch.constraint.* id, params}: ends a drag made of `sketch.drag` `live: true` frames: adds the constraint it let go on (not kept if it over-constrains the sketch), then evaluates the whole model once; returns the constraint's result and the sketch's solved state and degrees of freedom",
     ),
-    CommandSpec::new("sketch.dimension_text", "Move Dimension Text", dimension_text)
+    CommandSpec::new("sketch.dimension_text", "Move Dimension Text", dimension_text).icon("edit")
         .enabled(in_sketch)
         .params("dimension: constraint id or parameter name; at: [x,y] text centre (sketch coordinates) | reset: true (default place)"),
     CommandSpec::new("sketch.options", "Sketch Palette Options", sketch_options).icon("sketch").params(
         "sketch?: id|name (default active); any of show_profile, show_points, show_dimensions, show_constraints, show_projected, show_construction, grid, snap, slice, sketch_3d: bool. Returns them all",
     ),
-    CommandSpec::new("sketch.chain", "Chain", chain_cmd)
+    CommandSpec::new("sketch.chain", "Chain", chain_cmd).icon("chain")
         .enabled(in_sketch)
         .noundo()
         .params("curve: id: the curves joined to it end to end (what a double-click selects)"),
-    CommandSpec::new("sketch.solve", "Solve Sketch", solve_cmd)
+    CommandSpec::new("sketch.solve", "Solve Sketch", solve_cmd).icon("compute")
         .enabled(in_sketch)
         .noundo()
         .params("reports the solver status and degrees of freedom"),
@@ -543,7 +543,7 @@ pub(crate) fn author_path_for_rebind(s: &Session, feature: &solidcraft_doc::Feat
         let mut plane = plane;
         loop {
             match plane {
-                PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => plane = base,
+                PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane = base,
                 PlaneRef::Face { anchor: Some(anchor), .. } => {
                     saved = Some(anchor.author_path.clone());
                     break;
@@ -623,7 +623,43 @@ pub(super) fn face_contains(m: &solidcraft_geom::Mesh, fi: usize, p: Vec3, tol: 
 
 fn create_sketch(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.create";
-    create_sketch_with_plane(s, p, plane_ref(s, p, cmd)?, None)
+    // These name the plane, so they belong inside `plane`. Next to it they were ignored and the
+    // sketch went to XY (or the plane given) without a word.
+    for (key, example) in [
+        ("face", r#"{"plane": {"face": [x, y, z]}}"#),
+        ("origin", r#"{"plane": {"origin": [x, y, z], "x_dir": [..], "y_dir": [..]}}"#),
+        ("x_dir", r#"{"plane": {"origin": [x, y, z], "x_dir": [..], "y_dir": [..]}}"#),
+        ("y_dir", r#"{"plane": {"origin": [x, y, z], "x_dir": [..], "y_dir": [..]}}"#),
+    ] {
+        if p.get(key).is_some() {
+            return Err(bad(cmd, format!("`{key}` belongs inside `plane`: {example}")));
+        }
+    }
+    let mut plane = plane_ref(s, p, cmd)?;
+    if let Some(about_y) = flip_param(s, p, &plane, cmd)? {
+        plane = PlaneRef::Flipped { base: Box::new(plane), about_y };
+    }
+    create_sketch_with_plane(s, p, plane, None)
+}
+
+/// `flip` of `sketch.create`: `None` keeps the plane's own side, otherwise the axis to turn
+/// about (`true`: about y when the plane's y axis points upward, so it stays up, else about x).
+fn flip_param(s: &Session, p: &Value, plane: &PlaneRef, cmd: &str) -> Result<Option<bool>> {
+    let about_y = match p.get("flip") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => return Ok(None),
+        Some(Value::String(a)) if a.eq_ignore_ascii_case("x") => false,
+        Some(Value::String(a)) if a.eq_ignore_ascii_case("y") => true,
+        Some(Value::Bool(true)) => {
+            let (vals, _) = s.doc.param_values();
+            let resolved = s.doc.resolve_plane_in(&vals, plane, 0, Some(&s.model.state()))?;
+            resolved.y.z > 1e-9
+        }
+        Some(_) => return Err(bad(cmd, "`flip` must be true, false, \"x\" or \"y\"")),
+    };
+    if face::is_face(p) {
+        return Err(bad(cmd, "`flip` is for origin, construction and explicit planes; a face already faces outward"));
+    }
+    Ok(Some(about_y))
 }
 
 /// Used only by face Extrude/Revolve/PressPull, preserving pre-certificate linked profiles.
@@ -1427,10 +1463,10 @@ pub(super) fn apply_in_order(sk: &mut Sketch, rep: &SolveReport, first: &[Ent], 
     if !second_locked {
         ordered(first, second);
     }
-    if !first_locked {
-        for f in first {
-            ordered(&[second], *f);
-        }
+    // Each first entity that can move may (a free symmetry line between two fixed lines, #1796),
+    // even when another of them can't.
+    for f in first.iter().filter(|f| !ent_locked(sk, rep, **f)) {
+        ordered(&[second], *f);
     }
     const TEMP: &str = "__keep_size";
     for (h, extra) in tries {
@@ -1880,6 +1916,8 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
     let value = expr(p, "value");
     let text_at = p.get("text_at").and_then(vec2);
     let driven = bool_(p, "driven").unwrap_or(false);
+    let scale_sketch = bool_(p, "scale_sketch").unwrap_or(false);
+    let mut scaled = None;
     let mut before = None;
     let (mut residual, mut new_id) = (None, String::new());
     let start = s.doc.clone();
@@ -2043,6 +2081,16 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
         // only restates what the sketch already has.
         let want = vals.get(&pname).and_then(|v| v.to_kind(if is_angle { Kind::Angle } else { Kind::Length }).ok());
         residual = want.map(|w| (w - cur).abs()).filter(|r| r.is_finite());
+        // The first length dimension of a sketch with nothing sized yet scales it (#1365).
+        if scale_sketch
+            && !is_angle
+            && let Some(factor) = want.map(|w| w / cur).filter(|f| f.is_finite() && (f - 1.0).abs() > 1e-9)
+            && let Some(big) = sk.scaled_for_first_dimension(factor)
+        {
+            *sk = big;
+            scaled = Some(factor);
+            residual = Some(0.0);
+        }
         let name = k.name();
         let id = sk.add_constraint(k, Some(pname.clone()))?;
         new_id = id.clone();
@@ -2078,7 +2126,11 @@ fn dimension(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let v = s.doc.param(&param).map(|p| p.expr.clone()).unwrap_or_default();
-    Ok(json!({"param": param, "type": kind_name, "expression": v, "measured": current.0, "unit": current.1, "sketch": info}))
+    let mut out = json!({"param": param, "type": kind_name, "expression": v, "measured": current.0, "unit": current.1, "sketch": info});
+    if let Some(factor) = scaled {
+        out["scaled"] = json!(round6(factor));
+    }
+    Ok(out)
 }
 
 /// A dimension's measured value as reported, in the unit its expression is written in.
@@ -2216,11 +2268,14 @@ fn construction(s: &mut Session, p: &Value) -> Result<Value> {
         let mut n = 0;
         for c in cs {
             if let Some(cu) = sk.curves.get_mut(c)
-                && (cu.construction != to || to && cu.centerline)
+                && (cu.construction != to || to && cu.centerline || !to && cu.infinite)
             {
                 cu.construction = to;
                 if to {
                     cu.centerline = false;
+                } else {
+                    // A normal line is a finite one.
+                    cu.infinite = false;
                 }
                 n += 1;
             }
@@ -2463,6 +2518,10 @@ fn solve_cmd(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(test)]
+#[path = "sketch_flip_tests.rs"]
+mod flip_tests;
+
+#[cfg(test)]
 #[path = "sketch_rect_tests.rs"]
 mod rect_tests;
 
@@ -2483,6 +2542,9 @@ mod drag_live_tests;
 #[cfg(test)]
 #[path = "sketch_ids_tests.rs"]
 mod ids_tests;
+#[cfg(test)]
+#[path = "sketch_infinite_tests.rs"]
+mod infinite_tests;
 #[cfg(test)]
 #[path = "sketch_redundant_tests.rs"]
 mod redundant_tests;

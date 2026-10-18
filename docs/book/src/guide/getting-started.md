@@ -32,7 +32,8 @@ When updating from a build released under the previous product name, follow the
 The first time you open the AppImage it adds a menu entry and icons under `~/.local/share`
 (`applications/ai.storyteller.solidcraft.desktop`, `icons/hicolor`), so the desktop shows the
 right name and icon. It adds nothing if [appimaged](https://github.com/probonopd/go-appimage)
-already made an entry for the file (and removes the entry SolidCraft added before). To
+already made an entry for the file, or if a launcher such as Gear Lever or AppImageLauncher
+started it (and removes the entry SolidCraft added before). To
 turn it off for good, create an empty file `~/.local/share/solidcraft/no-desktop-integration`, or
 start the AppImage with `SOLIDCRAFT_NO_DESKTOP_INTEGRATION=1`.
 
@@ -44,10 +45,15 @@ to the same user installation:
 
 ```sh
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak remote-add --user --if-not-exists solidcraft https://bherbruck.github.io/solidcraft/flatpak/solidcraft.flatpakrepo
+flatpak remote-add --user --if-not-exists solidcraft https://docs.solidcraft.io/flatpak/solidcraft.flatpakrepo
 flatpak install --user solidcraft ai.storyteller.solidcraft
 flatpak run ai.storyteller.solidcraft
 ```
+
+A SolidCraft remote added before the project moved to `docs.solidcraft.io` (from
+`bherbruck.github.io`) no longer finds updates. Point it at the new address, then update:
+`flatpak remote-modify --user --url=https://docs.solidcraft.io/flatpak/repo/ solidcraft` and
+`flatpak update --user`.
 
 Releases up to 0.7 used the application ID `ai.storyteller.solvecraft`. If you installed one
 of those from the SolidCraft remote, `flatpak update --user` reports it as end-of-life and offers
@@ -110,6 +116,82 @@ cd apps/solidcraft-web && trunk serve --release --no-autoreload
 Offline use needs `--no-autoreload`: Trunk's live reload changes the page as it serves it, so it
 no longer matches the build the browser would keep. Debug builds (`trunk serve`) never keep a copy.
 
+### Self-hosting with Docker
+
+The web app is also a container image, `ghcr.io/tangency-labs/solidcraft-web`, for Linux on x86_64
+and ARM64: `latest` is the latest release, `0.14.0` or `0.14` a release, `edge` the newest `main`.
+It serves the app with nginx on port 8080 and keeps nothing on the server: designs stay in each
+visitor's browser.
+
+```sh
+docker run -d --name solidcraft -p 8080:8080 --restart unless-stopped ghcr.io/tangency-labs/solidcraft-web:latest
+```
+
+Or with Docker Compose, using
+[`packaging/docker/compose.yaml`](https://github.com/tangency-labs/solidcraft/blob/main/packaging/docker/compose.yaml)
+(`SOLIDCRAFT_PORT` picks another port):
+
+```sh
+docker compose -f packaging/docker/compose.yaml up -d      # start
+docker compose -f packaging/docker/compose.yaml pull && docker compose -f packaging/docker/compose.yaml up -d   # update
+docker compose -f packaging/docker/compose.yaml up -d --build   # build the image from your checkout instead
+```
+
+Then open `http://localhost:8080/`. On another machine the browser only saves designs over HTTPS,
+so put a reverse proxy with a certificate in front (Caddy, Traefik, nginx); the app works under
+any URL path, such as `https://example.com/cad/`. To build the image without Compose, from the
+repository root: `docker build -f packaging/docker/Dockerfile -t solidcraft-web .`
+
+### 3D mouse in the browser
+
+The web app reads a 3Dconnexion SpaceMouse or SpaceNavigator through the browser's Gamepad API,
+with the same switch and speed in Preferences › Navigation as the desktop app. Edge and Chrome
+read the device as it is. A browser shows a gamepad to a page only once it has been moved there,
+so if nothing happens at first, push the cap firmly once. 3DxWare also turns the cap into
+mouse-wheel zoom in browsers; while the cap moves, the web app ignores the wheel and reads the
+cap itself. Before the browser shows the cap to the page, that zoom still gets through, so the
+first push after opening the page may zoom a little.
+
+Firefox doesn't list 3D mice ([Mozilla bug 1226575](https://bugzilla.mozilla.org/show_bug.cgi?id=1226575)).
+On Windows it does list 3DxWare's virtual joystick, which can carry the cap instead. Save this
+as `%APPDATA%\3Dconnexion\3DxWare\Cfg\Firefox.xml`, then restart Firefox (and 3DxWare, if the cap
+still only zooms). It changes Firefox only: there 3DxWare sends the cap's six axes to the
+joystick instead of the mouse wheel. Delete the file to undo it.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<AppCfg Default="false" xmlns="" CfgFormatVersion="1.3" ThisFileVersion="1.1">
+  <AppInfo>
+    <Signature>
+      <Name>STR_FIREFOX</Name>
+      <ExecutableName>FIREFOX.EXE</ExecutableName>
+      <Transport>KMJ</Transport>
+    </Signature>
+    <Options/>
+  </AppInfo>
+  <CfgProperties>
+    <ID>ID_STR_FIREFOX</ID>
+    <Name>STR_FIREFOX</Name>
+    <InheritsFromID>ID_STR_FIREFOX</InheritsFromID>
+  </CfgProperties>
+  <Devices>
+    <Device>
+      <ID>ID_Standard_3D_Mouse</ID>
+      <AxisBank>
+        <Name>STR_DEFAULT_BANK</Name>
+        <ID>Default</ID>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_X</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_X</ActionID></Output></Axis>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_Y</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_Y</ActionID></Output></Axis>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_Z</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_Z</ActionID></Output></Axis>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_Rx</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_Rx</ActionID></Output></Axis>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_Ry</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_Ry</ActionID></Output></Axis>
+        <Axis><Enabled>true</Enabled><Input><ActionID>HIDMultiAxis_Rz</ActionID><Min>-512</Min><Max>511</Max><Deadband>0</Deadband></Input><Output><ActionID>HIDJoystick_Rz</ActionID></Output></Axis>
+      </AxisBank>
+    </Device>
+  </Devices>
+</AppCfg>
+```
+
 ## CLI
 
 `solidcraft-cli` runs the same commands without a window:
@@ -120,6 +202,7 @@ cargo run --release -p solidcraft-cli -- run examples/bracket.json --out bracket
 cargo run --release -p solidcraft-cli -- eval examples/bracket.json     # volume, area, faces…
 cargo run --release -p solidcraft-cli -- snapshot examples/bracket.json --out bracket.png
 cargo run --release -p solidcraft-cli -- exec solid.box '{"length": 20, "width": 10, "height": 5}'
+cargo run --release -p solidcraft-cli -- run mechanism.json --in arm.solidcraft  # with a motion.export_animation step: a GIF
 ```
 
 A script is a list of commands:
@@ -136,7 +219,7 @@ A script is a list of commands:
 
 ![The bracket example, rendered by solidcraft-cli snapshot](../generated/bracket.png)
 
-`snapshot` looks at the model from the iso view. `--view NAME` takes another standard view (`front`, `back`, `top`, `bottom`, `left`, `right`) or the name of a view saved in the design with `view.save`. `--camera JSON` takes any camera, as the MCP `screenshot` tool does (its conventions are in [the MCP page](mcp.md#camera-and-close-up-recipe)). A script that applies a view itself with `view.apply` sets the camera too. The ground grid lies on Z 0, so it cuts through a part that straddles it: `--no-grid` leaves it out of the picture, and `--no-axes` the origin's axes.
+`snapshot` looks at the model from the iso view. `--view NAME` takes another standard view (`front`, `back`, `top`, `bottom`, `left`, `right`) or the name of a view saved in the design with `view.save`. `--camera JSON` takes any camera, as the MCP `screenshot` tool does (its conventions are in [the MCP page](mcp.md#camera-and-close-up-recipe)). A script that applies a view itself with `view.apply` sets the camera too. The ground grid lies on Z 0, so it cuts through a part that straddles it: `--no-grid` leaves it out of the picture, and `--no-axes` the origin's axes. The picture is drawn on the GPU with the viewport's own pipelines, so it shows what the window would (a surface analysis such as `inspect.zebra` included); a machine without a GPU uses a software one (Mesa's lavapipe on Linux, WARP on Windows), and with neither (a Mac without usable Metal, a Linux box without Mesa's Vulkan) the CPU rasterizer draws it, without surface analysis colours, and the reply's `renderer` says `cpu` with a warning. `SOLIDCRAFT_GPU=auto|hardware|software|cpu` chooses (`hardware` and `software` fail rather than fall to the CPU), and `solidcraft-cli gpu` lists the adapters and the tier a snapshot would use.
 
 ```sh
 solidcraft-cli snapshot part.solidcraft --out photo.png --view Photo
@@ -159,6 +242,17 @@ depending on its settings, and strict JSON readers such as Python's `json.load` 
 ```sh
 cargo run --release -p solidcraft-cli -- run examples/bracket.json --results --json-out results.json
 cargo run --release -p solidcraft-cli -- eval examples/bracket.json --json-out measures.json
+```
+
+To find the slow steps of a script, `--timings` prints how long each command took instead of
+the measurement: `{"timings": [{"index", "command", "ms"}], "total_ms"}`, with `index` counted
+from 0. `--profile` adds each command's `profile: {"boolean_ms", "tessellate_ms", "other_ms"}`,
+its wall time in the kernel's booleans, in tessellation and in everything else. With
+`--results` as well, the results go in the same object as `results`; `--results` alone still
+prints a plain array.
+
+```sh
+cargo run --release -p solidcraft-cli -- run examples/bracket.json --profile
 ```
 
 A design's history turns into a script that rebuilds it, which makes a bug that only shows

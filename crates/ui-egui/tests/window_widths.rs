@@ -53,6 +53,8 @@ fn command_dialogs_shrink_to_their_content_within_limits() {
         h.app.dialog = None;
         h.app.params = None;
         h.app.design_properties = None;
+        h.app.manufacture.open = false;
+        h.app.manufacture.tools_open = false;
         h.app.tool = None;
         if h.app.session.active_sketch.is_some() {
             h.app.finish_sketch();

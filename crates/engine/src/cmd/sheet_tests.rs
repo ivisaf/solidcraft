@@ -2816,6 +2816,64 @@ fn a_pocket_around_a_cut_out_rebuilds_on_a_folded_sheet() {
     }
 }
 
+/// Engraving a long channel leaves its corner rounds round. The channel (1200 long, 1 thick) has
+/// 2 mm rounds where its legs end, and two 5.95 x 5 pockets 0.1 apart are cut 0.1 deep into a leg
+/// halfway along. Their walls in one plane leave the second pocket to the exact planar fallback,
+/// whose mesh (a thousandth of the body, 1.2 mm) is flat across a 2 mm round: taken for a plane,
+/// the rounds came back flat chamfers beside a round hole, and without one the cut failed.
+#[test]
+fn engraving_a_long_channel_keeps_its_corner_rounds() {
+    for hole in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "sheet.manage_rules", json!({"name": "Thin", "active": true, "thickness": "1 mm", "bend_radius": "1 mm", "k_factor": "0.44"}));
+        // Along z, 20 wide, its legs 65 and 25 high from the web at y = 65.
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [0, 0, -600], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]}, "name": "Profile"}));
+        run(&mut s, "sketch.line", json!({"points": [[-10, 0], [-10, 65], [10, 65], [10, 40]], "ids": ["l1", "l2", "l3"]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "sheet.flange", json!({"sketch": "Profile", "curves": ["l1", "l2", "l3"], "distance": 1200}));
+        // Each leg's free edge rounded at both ends: the corner outside a quarter circle, cut through.
+        let legs = [(-10.0_f64, 0.0_f64), (10.0, 40.0)];
+        for (k, (x, y)) in legs.iter().enumerate() {
+            let name = format!("Rounds{k}");
+            run(&mut s, "sketch.create", json!({"plane": {"origin": [x, 0, 0], "x_dir": [0, 0, 1], "y_dir": [0, 1, 0]}, "name": name}));
+            for end in [-600.0, 600.0_f64] {
+                let c = end - 2.0 * end.signum();
+                let far = end + 2.0 * end.signum();
+                run(&mut s, "sketch.line", json!({"points": [[c, y], [c, y - 2.0], [far, y - 2.0], [far, y + 2.0], [end, y + 2.0]]}));
+                run(&mut s, "sketch.arc.center_point", json!({"center": [c, y + 2.0], "start": [end, y + 2.0], "sweep": -90.0 * end.signum()}));
+            }
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "solid.extrude", json!({"sketch": name, "distance": 4, "direction": "symmetric", "operation": "cut"}));
+        }
+        if hole {
+            run(&mut s, "sketch.create", json!({"plane": {"origin": [-10, 0, 0], "x_dir": [0, 0, 1], "y_dir": [0, 1, 0]}, "name": "Hole"}));
+            run(&mut s, "sketch.circle.center", json!({"center": [360, 57], "diameter": 4}));
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "solid.extrude", json!({"sketch": "Hole", "distance": 4, "direction": "symmetric", "operation": "cut"}));
+        }
+        let v0 = volume(&mut s);
+        // Into the outer face of the leg at x = -10 (its material from -10 to -9).
+        run(&mut s, "sketch.create", json!({"plane": {"origin": [-10, 0, 0], "x_dir": [0, 0, 1], "y_dir": [0, 1, 0]}, "name": "Label"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-6, 30], "p1": [-0.05, 35]}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0.05, 30], "p1": [6, 35]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"sketch": "Label", "distance": 0.1, "direction": "negative", "operation": "cut"}));
+        // 2 x 5.95 x 5 x 0.1.
+        let removed = v0 - volume(&mut s);
+        assert!((removed - 5.95).abs() < 1e-3, "hole {hole}: removed {removed}");
+        // A point on each round, halfway through the leg: 2 - 2 cos 45 deg in from both edges.
+        let d = 2.0 - std::f64::consts::SQRT_2;
+        let faces: Vec<[f64; 3]> =
+            legs.iter().flat_map(|(x, y)| [-600.0, 600.0_f64].map(|end| [x + 0.5 * -x.signum(), y + d, end - d * end.signum()])).collect();
+        let radii = run(&mut s, "inspect.minimum_radius", json!({"faces": faces}));
+        let items = radii["items"].as_array().unwrap();
+        assert_eq!(items.len(), 4);
+        for item in items {
+            assert!(item["min_radius"].as_f64().is_some_and(|r| (r - 2.0).abs() < 1e-6), "hole {hole}: {item}");
+        }
+    }
+}
+
 /// A fold whose stored `fixed` point ends up off the sheet after a parameter change keeps working:
 /// the point still says which side stays (#370). Only a new pick off the sheet is refused (#263).
 #[test]
@@ -3080,6 +3138,226 @@ fn the_corner_relief_shape_is_a_rule_setting_checked_and_undone() {
     let w = s.model.results.last().and_then(|r| r.warning.clone()).unwrap_or_default();
     assert_eq!(w.matches("no corner relief at (").count(), 4, "{w}");
     assert!(w.contains("would take a whole bend away") && volume(&mut s) == v0, "{w}");
+}
+
+/// A 120 x 90 base in 2 mm aluminium (R 1, K 0.5, gap 0.5; `rule` adds to its settings) with two edge
+/// flange features, 20 high at 90°: `near` on the bottom and left edges, which meet at the corner at
+/// the origin, and `far` on the top and right edges, which meet at the corner at (120, 90). The two
+/// objects hold what each feature is given besides its edges.
+fn two_flange_groups(rule: Value, near: Value, far: Value) -> Session {
+    let mut s = Session::default();
+    let mut r = json!({"name": "AL2", "thickness": "2 mm", "k_factor": 0.5, "bend_radius": "1 mm", "gap": "0.5 mm", "active": true});
+    if let (Some(r), Some(extra)) = (r.as_object_mut(), rule.as_object()) {
+        r.extend(extra.clone());
+    }
+    run(&mut s, "sheet.manage_rules", r);
+    base(&mut s, 120.0, 90.0);
+    for (edges, own) in [(json!([[60, 0, 2], [0, 45, 2]]), near), (json!([[60, 90, 2], [120, 45, 2]]), far)] {
+        let mut p = json!({"edges": edges, "height": 20, "angle": "90 deg"});
+        if let (Some(p), Some(own)) = (p.as_object_mut(), own.as_object()) {
+            p.extend(own.clone());
+        }
+        run(&mut s, "sheet.flange", p);
+    }
+    s
+}
+
+/// What the DXF of the flat pattern draws of the corner reliefs: the arcs (centre, radius) and the
+/// lines' end points.
+fn relief_drawing(s: &mut Session) -> (Vec<(solidcraft_geom::Vec2, f64)>, Vec<solidcraft_geom::Vec2>) {
+    let dxf = run(s, "sheet.export_dxf", json!({}))["dxf"].as_str().unwrap_or_default().to_string();
+    let read = solidcraft_io::read_dxf(&dxf).unwrap_or_default();
+    let arcs = read.iter().filter_map(|g| if let solidcraft_io::Geom2::Arc { c, a, .. } = g { Some((*c, a.dist(*c))) } else { None }).collect();
+    let ends = read.iter().flat_map(|g| if let solidcraft_io::Geom2::Line(a, b) = g { vec![*a, *b] } else { Vec::new() }).collect();
+    (arcs, ends)
+}
+
+#[test]
+fn each_edge_flange_feature_chooses_the_corner_relief_of_its_own_corners() {
+    use solidcraft_geom::Vec2;
+    // At 90° the bends of a corner meet at (s0, s0) in from the sheet's edges, s0 = (R + T)·tan 45° = 3,
+    // and are BA = π/2·(R + K·T) = π wide. A relief d across reaches r = d/2 along both bends and takes,
+    // at its corner, r²·π/4 (round) or r² (rectangular) of the base and r of each bend, 2 mm thick.
+    let (s0, ba) = (3.0, PI);
+    let at = |ends: &[Vec2], x: f64, y: f64| ends.iter().any(|p| p.dist(Vec2::new(x, y)) < 1e-6);
+    // The rule says notch, as it does by default: the corners are not relieved.
+    let mut plain = two_flange_groups(json!({}), json!({}), json!({}));
+    assert!(no_errors_or_warnings(&plain), "{:?}", plain.model.results);
+    let v0 = volume(&mut plain);
+    assert!(relief_drawing(&mut plain).0.is_empty());
+    // The flanges at the origin ask for a round 6 mm across, those at (120, 90) for a rectangular 3 mm.
+    let near = json!({"corner_relief_shape": "round", "corner_relief": "6 mm"});
+    let far = json!({"corner_relief_shape": "Rectangular", "corner_relief": "3 mm"});
+    let mut s = two_flange_groups(json!({}), near, far);
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let listed = run(&mut s, "sheet.rules", json!({}));
+    let rule = &listed["rules"][0];
+    assert_eq!((&rule["rule"]["corner_relief_shape"], &rule["values"]["corner_relief_shape"]), (&json!("notch"), &json!("notch")));
+    // The folded part loses what the two reliefs take.
+    let (v, want) = (volume(&mut s), ((PI * 9.0 / 4.0 + 6.0 * ba) + (1.5 * 1.5 + 3.0 * ba)) * 2.0);
+    assert!((v0 - v - want).abs() < 0.1, "{v0} - {v} vs {want}");
+    // The DXF: one arc of radius 3 about the corner at the origin and nothing round at the other corner;
+    // there the relief is a kite ending 1.5 mm in from the corner of the bends, and none at the origin.
+    let (arcs, ends) = relief_drawing(&mut s);
+    assert!(arcs.len() == 1 && arcs[0].0.dist(Vec2::new(s0, s0)) < 1e-6 && (arcs[0].1 - 3.0).abs() < 1e-6, "{arcs:?}");
+    assert!(at(&ends, 120.0 - s0 - 1.5, 90.0 - s0 - 1.5), "the corner at (120, 90) is relieved with a rectangular relief");
+    assert!(!at(&ends, s0 + 1.5, s0 + 1.5), "the corner at the origin is not");
+    // Unfolding, refolding and reopening the design keep both.
+    run(&mut s, "sheet.unfold", json!({}));
+    run(&mut s, "sheet.refold", json!({}));
+    assert!((volume(&mut s) - v).abs() < 1e-6 * v);
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap());
+    assert!((volume(&mut reopened) - v).abs() < 1e-6 * v);
+    assert_eq!(relief_drawing(&mut reopened).0.len(), 1);
+    // The size is an input of the feature like its height: another size moves the relief.
+    let near_feature = s.doc.features.iter().find(|f| matches!(f.kind, solidcraft_doc::FeatureKind::SheetFlange { .. }));
+    let names = near_feature.map(|f| f.param_names.clone()).unwrap_or_default();
+    assert_eq!(names.len(), 3, "height, angle and the relief: {names:?}");
+    run(&mut s, "parameters.change", json!({"name": names[2], "expression": "4 mm"}));
+    let arcs = relief_drawing(&mut s).0;
+    assert!(arcs.len() == 1 && (arcs[0].1 - 2.0).abs() < 1e-6, "{arcs:?}");
+}
+
+#[test]
+fn an_edge_flange_feature_follows_the_rule_for_the_relief_it_leaves_out() {
+    use solidcraft_geom::Vec2;
+    let s0 = 3.0;
+    let at = |ends: &[Vec2], x: f64, y: f64| ends.iter().any(|p| p.dist(Vec2::new(x, y)) < 1e-6);
+    let round8 = json!({"corner_relief_shape": "round", "corner_relief": "8 mm"});
+    // The rule says a round 8 mm across. A feature that asks for nothing gets it, one that asks for a
+    // size alone keeps the rule's shape.
+    let mut s = two_flange_groups(round8.clone(), json!({"corner_relief": "6 mm"}), json!({}));
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let mut arcs = relief_drawing(&mut s).0;
+    arcs.sort_by(|a, b| a.1.total_cmp(&b.1));
+    assert_eq!(arcs.len(), 2, "{arcs:?}");
+    assert!(arcs[0].0.dist(Vec2::new(s0, s0)) < 1e-6 && (arcs[0].1 - 3.0).abs() < 1e-6, "{arcs:?}");
+    assert!(arcs[1].0.dist(Vec2::new(120.0 - s0, 90.0 - s0)) < 1e-6 && (arcs[1].1 - 4.0).abs() < 1e-6, "{arcs:?}");
+    // A shape alone keeps the rule's size.
+    let mut s = two_flange_groups(round8, json!({"corner_relief_shape": "rectangular"}), json!({}));
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let (arcs, ends) = relief_drawing(&mut s);
+    assert!(arcs.len() == 1 && arcs[0].0.dist(Vec2::new(120.0 - s0, 90.0 - s0)) < 1e-6 && (arcs[0].1 - 4.0).abs() < 1e-6, "{arcs:?}");
+    assert!(at(&ends, s0 + 4.0, s0 + 4.0), "a kite 8 mm across at the origin");
+    // A change of the rule still reaches the feature that asks for nothing.
+    run(&mut s, "sheet.manage_rules", json!({"name": "AL2", "corner_relief": "6 mm"}));
+    let arcs = relief_drawing(&mut s).0;
+    assert!(arcs.len() == 1 && (arcs[0].1 - 3.0).abs() < 1e-6, "{arcs:?}");
+}
+
+#[test]
+fn an_edge_flange_feature_can_tear_its_corners_under_a_notch_rule() {
+    use std::f64::consts::SQRT_2;
+    // Torn, the two bends of a corner run to the corner of the bends and each is cut straight to its
+    // flange's end: at 90° it is grow = sin 90° − gap/√2 past the corner, a triangle BA·grow/2 at each of
+    // the two bend ends, and a corner less at each (see a_tear_of_the_rule_reaches_the_part_the_flat_pattern_and_the_dxf).
+    let (ba, grow) = (PI, 1.0 - 0.5 / SQRT_2);
+    let mut notch = two_flange_groups(json!({}), json!({}), json!({}));
+    let (v0, stepped) = (volume(&mut notch), outline_points(&flat(&mut notch)));
+    let mut s = two_flange_groups(json!({}), json!({"corner_relief_shape": "tear"}), json!({}));
+    assert!(no_errors_or_warnings(&s), "{:?}", s.model.results);
+    let torn = s.model.state().sheets.last().map(|b| b.flanges.iter().map(|f| f.tear).collect::<Vec<_>>()).unwrap_or_default();
+    assert_eq!(torn.iter().filter(|t| **t != (false, false)).count(), 2, "{torn:?}");
+    let want = 2.0 * ba * grow / 2.0 * 2.0;
+    assert!((volume(&mut s) - v0 - want).abs() < 0.05, "{} - {v0} vs {want}", volume(&mut s));
+    assert_eq!(outline_points(&flat(&mut s)).len() + 2, stepped.len());
+}
+
+#[test]
+fn only_an_edge_flange_takes_a_corner_relief_of_its_own() {
+    let mut s = Session::default();
+    run(&mut s, "sheet.manage_rules", json!({"name": "AL2", "thickness": "2 mm", "k_factor": 0.5, "bend_radius": "1 mm", "active": true}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [120, 90]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let features = s.doc.features.len();
+    // A base flange and a contour flange take their relief from the rule, as before: refused, and
+    // the message names the key.
+    for (params, key) in [
+        (json!({"sketch": "Base", "corner_relief_shape": "round"}), "corner_relief_shape"),
+        (json!({"sketch": "Base", "corner_relief": "6 mm"}), "corner_relief"),
+        (json!({"type": "base", "sketch": "Base", "corner_relief_shape": null}), "corner_relief_shape"),
+        (json!({"sketch": "Base", "curves": ["l1"], "distance": 10, "corner_relief": "6 mm"}), "corner_relief"),
+        (json!({"type": "contour", "sketch": "Base", "curves": ["l1"], "distance": 10, "corner_relief_shape": "tear"}), "corner_relief_shape"),
+        (json!({"base": {"sketch": "Base", "corner_relief": "6 mm"}}), "corner_relief"),
+    ] {
+        let e = s.execute("sheet.flange", &params).map(|_| ()).unwrap_err().to_string();
+        let today = format!(
+            "`{key}` is not a sheet.flange parameter: the sheet metal rule sets it. Make a rule with sheet.manage_rules {{name, {key}, …}} and pass its name as `rule`"
+        );
+        assert!(e.contains(&today), "{params}: {e}");
+    }
+    assert_eq!(s.doc.features.len(), features, "a refused flange changes nothing");
+    run(&mut s, "sheet.flange", json!({"sketch": "Base"}));
+    // The rest of the rule stays with the rule for an edge flange as well, and a relief that is no shape
+    // or no length is refused before anything changes.
+    let features = s.doc.features.len();
+    let edge = |extra: Value| {
+        let mut p = json!({"edges": [[60, 0, 2], [0, 45, 2]], "height": 20});
+        if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
+            p.extend(extra.clone());
+        }
+        p
+    };
+    for (extra, want) in [
+        (json!({"thickness": "3 mm"}), "`thickness` is not a sheet.flange parameter"),
+        (json!({"relief_width": "1 mm"}), "`relief_width` is not a sheet.flange parameter"),
+        (json!({"corner_relief_shape": "star"}), "`corner_relief_shape` must be notch, round, rectangular or tear"),
+        (json!({"corner_relief_shape": 2}), "`corner_relief_shape` must be notch, round, rectangular or tear"),
+        (json!({"corner_relief": "wide"}), "corner_relief"),
+        (json!({"corner_relief": "30 deg"}), "corner_relief"),
+    ] {
+        let e = s.execute("sheet.flange", &edge(extra.clone())).map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains(want), "{extra}: {e}");
+    }
+    assert_eq!(s.doc.features.len(), features);
+    // Null is not given: the corners follow the rule. A shape is stored by its name.
+    run(&mut s, "sheet.flange", edge(json!({"corner_relief_shape": null})));
+    let mut torn = edge(json!({"corner_relief_shape": " Tear ", "corner_relief": 5}));
+    torn["edges"] = json!([[60, 90, 2], [120, 45, 2]]);
+    run(&mut s, "sheet.flange", torn);
+    let saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap_or_default();
+    let own: Vec<(Value, Value)> = saved["features"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| f["type"] == "sheet_flange")
+        .map(|f| (f["corner_relief_shape"].clone(), f["corner_relief"].clone()))
+        .collect();
+    assert_eq!(own, [(Value::Null, Value::Null), (json!("tear"), json!("5"))]);
+}
+
+#[test]
+fn a_corner_relief_of_an_edge_flange_is_saved_with_it_and_designs_without_one_save_as_before() {
+    let flange_features = |s: &Session| -> Vec<Value> {
+        let saved: Value = serde_json::from_str(&s.doc.to_json()).unwrap_or_default();
+        saved["features"].as_array().cloned().unwrap_or_default().into_iter().filter(|f| f["type"] == "sheet_flange").collect()
+    };
+    // Without a relief of its own the feature saves what it always did: neither key.
+    let plain = two_flange_groups(json!({}), json!({}), json!({}));
+    let features = flange_features(&plain);
+    assert_eq!(features.len(), 2);
+    assert!(features.iter().all(|f| f.get("corner_relief_shape").is_none() && f.get("corner_relief").is_none()), "{features:?}");
+    // With one, the file has it and a design read from it builds the same part.
+    let near = json!({"corner_relief_shape": "round", "corner_relief": "6 mm"});
+    let mut s = two_flange_groups(json!({}), near, json!({"corner_relief_shape": "tear"}));
+    let features = flange_features(&s);
+    assert_eq!((&features[0]["corner_relief_shape"], &features[0]["corner_relief"]), (&json!("round"), &json!("6 mm")));
+    assert_eq!(features[1]["corner_relief_shape"], "tear");
+    assert!(features[1].get("corner_relief").is_none(), "{}", features[1]);
+    let saved = s.doc.to_json();
+    let mut reopened = Session::new(solidcraft_doc::Document::from_json(&saved).unwrap());
+    assert_eq!(reopened.doc.features, s.doc.features);
+    assert!((volume(&mut reopened) - volume(&mut s)).abs() < 1e-6);
+    assert_eq!(relief_drawing(&mut reopened), relief_drawing(&mut s));
+    // timeline.edit changes the relief of a saved feature, and null takes it back to the rule's.
+    let id = s.doc.features.iter().rev().nth(1).map_or(0, |f| f.id);
+    run(&mut s, "timeline.edit", json!({"feature": id, "set": {"corner_relief_shape": "rectangular"}}));
+    assert!(relief_drawing(&mut s).0.is_empty());
+    run(&mut s, "timeline.edit", json!({"feature": id, "set": {"corner_relief_shape": null, "corner_relief": null}}));
+    assert!(flange_features(&s)[0].get("corner_relief_shape").is_none());
+    assert!(flange_features(&s)[0].get("corner_relief").is_none());
 }
 
 #[test]

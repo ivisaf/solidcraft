@@ -22,6 +22,8 @@ pub enum DxfLinetype {
     Continuous,
     /// AutoCAD's DASHED: a dash of 12.7 mm and a gap of 6.35 mm.
     Dashed,
+    /// Short 2 mm dashes and 1 mm gaps for hidden edges in millimetre drawings.
+    Hidden,
 }
 
 impl DxfLinetype {
@@ -29,6 +31,7 @@ impl DxfLinetype {
         match self {
             DxfLinetype::Continuous => "Continuous",
             DxfLinetype::Dashed => "DASHED",
+            DxfLinetype::Hidden => "HIDDEN",
         }
     }
 }
@@ -57,6 +60,10 @@ impl DxfLayer {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DxfShape {
     Line(Vec2, Vec2),
+    /// Connected straight segments, with continuous linetype generation through the vertices.
+    Polyline {
+        points: Vec<Vec2>,
+    },
     Circle {
         c: Vec2,
         r: f64,
@@ -207,6 +214,7 @@ impl DxfShape {
     fn sample(&self, out: &mut Vec<Vec2>) {
         match self {
             DxfShape::Line(a, b) => out.extend([*a, *b]),
+            DxfShape::Polyline { points } => out.extend(points.iter().copied()),
             DxfShape::Circle { c, r } => out.extend([*c - Vec2::new(*r, *r), *c + Vec2::new(*r, *r)]),
             DxfShape::Arc { c, r, a0, a1 } => {
                 let sweep = (a1 - a0).rem_euclid(360.0);
@@ -348,12 +356,15 @@ pub fn write_dxf_drawing(layers: &[DxfLayer], entities: &[DxfEntity]) -> String 
     o.code(2, "TABLES");
     // The three every drawing has, and DASHED, which the dashed layers name: dash and gap lengths
     // (a gap is negative) after the pattern's total.
-    let linetypes: [(&str, &str, &[f64]); 4] = [
+    let mut linetypes: Vec<(&str, &str, &[f64])> = vec![
         ("ByBlock", "", &[]),
         ("ByLayer", "", &[]),
         ("Continuous", "Solid line", &[]),
         ("DASHED", "Dashed __ __ __ __ __ __ __ __ __ __", &[12.7, -6.35]),
     ];
+    if layer_list.iter().any(|l| l.linetype == DxfLinetype::Hidden) {
+        linetypes.push(("HIDDEN", "Hidden edges", &[2.0, -1.0]));
+    }
     let t = o.table("LTYPE", linetypes.len());
     for (name, description, pattern) in linetypes {
         o.record("LTYPE", "AcDbLinetypeTableRecord", &t);
@@ -414,6 +425,7 @@ pub fn write_dxf_drawing(layers: &[DxfLayer], entities: &[DxfEntity]) -> String 
     for e in entities {
         let kind = match &e.shape {
             DxfShape::Line(..) => "LINE",
+            DxfShape::Polyline { .. } => "LWPOLYLINE",
             DxfShape::Circle { .. } => "CIRCLE",
             DxfShape::Arc { .. } => "ARC",
             DxfShape::Ellipse { .. } => "ELLIPSE",
@@ -427,6 +439,16 @@ pub fn write_dxf_drawing(layers: &[DxfLayer], entities: &[DxfEntity]) -> String 
         o.code(100, "AcDbEntity");
         o.code(8, if e.layer.trim().is_empty() { "0" } else { e.layer.as_str() });
         match &e.shape {
+            DxfShape::Polyline { points } => {
+                o.code(100, "AcDbPolyline");
+                o.code(90, points.len());
+                // Autodesk DXF reference: bit 128 (PLINEGEN) continues the dash pattern.
+                o.code(70, 128);
+                for p in points {
+                    o.num(10, p.x);
+                    o.num(20, p.y);
+                }
+            }
             DxfShape::Line(a, b) => {
                 o.code(100, "AcDbLine");
                 o.point(10, *a);
@@ -645,7 +667,7 @@ mod tests {
         assert!(degree_2(&conic(2.0), Some(vec![1.0, 2.0, 1.0])));
         assert!(degree_2(&conic(1.0 - 1e-9), Some(vec![1.0, 1.0 - 1e-9, 1.0])));
         // A quintic piece: six control points and twelve knots.
-        let mut q = [Vec2::ZERO; 8];
+        let mut q = [Vec2::ZERO; solidcraft_geom::MAX_BEZIER_CTRL];
         for (i, s) in q.iter_mut().enumerate() {
             *s = Vec2::new(i as f64, (i * i) as f64);
         }
@@ -809,6 +831,21 @@ mod tests {
             layers.iter().map(|r| (field(r, 2), field(r, 62), field(r, 6))).collect::<Vec<_>>(),
             [("0", "7", "Continuous"), ("BEND", "1", "DASHED"), ("CUT", "4", "Continuous")]
         );
+    }
+
+    #[test]
+    fn hidden_polylines_continue_short_dashes_across_chords_and_round_trip() {
+        let points = vec![Vec2::ZERO, Vec2::new(1., 0.), Vec2::new(2., 1.), Vec2::new(3., 1.)];
+        let layer = DxfLayer { linetype: DxfLinetype::Hidden, ..DxfLayer::new("HIDDEN", 8) };
+        let text = write_dxf_drawing(&[layer], &[DxfEntity { layer: "HIDDEN".into(), shape: DxfShape::Polyline { points } }]);
+        let records = entities(&text);
+        assert_eq!(records[0].0, "LWPOLYLINE");
+        assert_eq!(field(&records[0].1, 70), "128");
+        assert_eq!(field(&records[0].1, 90), "4");
+        let types = table_records(&pairs(&text), "LTYPE");
+        let hidden = types.iter().find(|r| field(r, 2) == "HIDDEN").unwrap();
+        assert_eq!(hidden.iter().filter(|(c, _)| *c == 49).map(|(_, v)| v.parse::<f64>().unwrap()).collect::<Vec<_>>(), [2., -1.]);
+        assert_eq!(read_dxf(&text).unwrap().len(), 3);
     }
 
     #[test]

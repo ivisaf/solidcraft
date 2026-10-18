@@ -179,13 +179,11 @@ impl Harness {
     /// File pickers answer like a person would: save into the scenario's folder, open the file
     /// the scenario chose.
     fn install(&mut self) {
-        // Frames are laid out, never painted.
-        self.app.viewport.no_pixels = true;
         let dir = self.dir.clone();
         self.app.services.pick_save =
             Some(Box::new(move |name, _| Box::pin(std::future::ready(Some(dir.join(name).to_string_lossy().into_owned())))));
         let next = self.next_file.clone();
-        self.app.services.pick_open = Some(Box::new(move || Box::pin(std::future::ready(next.borrow_mut().take()))));
+        self.app.services.pick_open = Some(Box::new(move |_| Box::pin(std::future::ready(next.borrow_mut().take()))));
     }
 
     /// Autosave into the scenario's recovery folder (as the desktop app does into the user's).
@@ -217,6 +215,34 @@ impl Harness {
         for _ in 0..n {
             self.frame();
         }
+    }
+
+    /// One frame in which the platform drops `files`, the pointer last seen at `at` (a drop
+    /// itself carries no position with winit 0.30).
+    pub fn drop_files(&mut self, at: egui::Pos2, files: Vec<egui::DroppedFileHandle>) {
+        self.drag_files(at, Vec::new(), files);
+    }
+
+    /// One frame in which files are dragged over the window (`hovered`) or dropped, the pointer
+    /// last seen at `at`.
+    pub fn drag_files(&mut self, at: egui::Pos2, hovered: Vec<egui::HoveredFile>, dropped: Vec<egui::DroppedFileHandle>) {
+        self.time += 1.0 / 60.0;
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+            time: Some(self.time),
+            focused: true,
+            events: vec![egui::Event::PointerMoved(at)],
+            hovered_files: hovered,
+            dropped_files: dropped,
+            ..Default::default()
+        };
+        let app = &mut self.app;
+        let mut out = self.ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        });
+        out.textures_delta.clear();
+        self.output = out.platform_output;
     }
 
     /// Frames until the queued input is used up (and the view has settled).
@@ -444,8 +470,19 @@ impl Harness {
             } else if let Some(name) = s.get("shot").and_then(Value::as_str) {
                 // With SOLIDCRAFT_SCENARIO_SHOTS set: a render of the model as the camera sees it.
                 if let Ok(dir) = solidcraft_engine::geom::env::var("SCENARIO_SHOTS").ok_or(()) {
+                    // Drawn on the GPU: the headless device, as the CLI draws.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if solidcraft_engine::capture::installed().is_none() {
+                        solidcraft_engine::capture::install(std::sync::Arc::new(|scene, cam, w, h| {
+                            let (rgba, renderer) = solidcraft_gpu::capture::headless_rgba(scene, cam, w, h)?;
+                            Ok(solidcraft_engine::capture::Picture { rgba, renderer })
+                        }));
+                    }
                     let path = std::path::Path::new(&dir).join(format!("{name}.png"));
-                    self.call("ui.render", json!({"path": path.to_string_lossy(), "width": 1000, "height": 700}));
+                    let r = self.call("ui.render", json!({"path": path.to_string_lossy(), "width": 1000, "height": 700}));
+                    if r["ok"] != true {
+                        return Err(format!("shot {name}: {}", r["error"]));
+                    }
                 }
                 return Ok(());
             } else if let Some(c) = s.get("camera") {

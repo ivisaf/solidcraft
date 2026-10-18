@@ -170,14 +170,20 @@ fn from_round(a: &Shape, b: &Shape) -> Option<Centre> {
     let Shape::Round { center: ca, axis: na, radius: ra, planar: pa, lo: loa, hi: hia, .. } = *a else { return None };
     let full_a = a.full();
     let c = match *b {
-        Shape::Round { center: cb, axis: nb, radius: rb, lo: lob, hi: hib, .. } => {
+        Shape::Round { center: cb, axis: nb, radius: rb, planar: pb, lo: lob, hi: hib, .. } => {
+            // A picked circle/arc has a fixed centre; only a cylindrical face has an
+            // infinite axis. Do not project a rim's centre onto an imaginary extension.
+            let (from, to) = match (pa, pb) {
+                (true, true) => (ca, cb),
+                (true, false) => (ca, cb + nb * (ca - cb).dot(nb)),
+                (false, true) => (ca + na * (cb - ca).dot(na), cb),
+                (false, false) => line_line(ca, na, cb, nb),
+            };
+            let (mut min, mut max) = (None, None);
             if parallel(na, nb) {
                 let w = cb - ca;
                 let along = w.dot(na);
-                // Drawn level with A's centre: on B's axis, the foot of A's centre.
-                let foot = cb - na * along;
                 let d = (w - na * along).len();
-                let (mut min, mut max) = (None, None);
                 if full_a && b.full() {
                     // B's extent along A's axis.
                     let s = if na.dot(nb) >= 0.0 { 1.0 } else { -1.0 };
@@ -189,11 +195,8 @@ fn from_round(a: &Shape, b: &Shape) -> Option<Centre> {
                     min = Some(near.hypot(gap));
                     max = Some(far.hypot(reach));
                 }
-                Centre { distance: d, from: ca, to: foot, min, max }
-            } else {
-                let (p, q) = line_line(ca, na, cb, nb);
-                Centre { distance: p.dist(q), from: p, to: q, min: None, max: None }
             }
+            Centre { distance: from.dist(to), from, to, min, max }
         }
         Shape::Plane { point, normal } => {
             let n = normal.normalized()?;
@@ -212,11 +215,22 @@ fn from_round(a: &Shape, b: &Shape) -> Option<Centre> {
         }
         Shape::Line { a: la, b: lb } => {
             let dir = (lb - la).normalized()?;
-            let (p, q) = line_line(ca, na, la, dir);
-            let d = p.dist(q);
             let across = dir.dot(na).abs() < 1e-6;
-            let min = (full_a && across && d >= ra).then_some(d - ra);
-            Centre { distance: d, from: p, to: q, min, max: None }
+            if pa {
+                // A circle/arc has a fixed centre. Project that point onto the picked
+                // finite edge, retaining the height difference and clamping to its ends.
+                let to = la + dir * (ca - la).dot(dir).clamp(0.0, (lb - la).len());
+                let offset = to - ca;
+                let height = offset.dot(na);
+                let radial = (offset - na * height).len();
+                let min = (full_a && across && radial >= ra).then(|| (radial - ra).hypot(height));
+                Centre { distance: ca.dist(to), from: ca, to, min, max: None }
+            } else {
+                let (p, q) = line_line(ca, na, la, dir);
+                let d = p.dist(q);
+                let min = (full_a && across && d >= ra).then_some(d - ra);
+                Centre { distance: d, from: p, to: q, min, max: None }
+            }
         }
         Shape::Point(p) => {
             if pa {
@@ -340,6 +354,50 @@ mod tests {
     }
 
     #[test]
+    fn circles_at_different_heights_keep_both_actual_centres() {
+        let (a, b) = (Vec3::new(0.0, 0.0, 10.0), Vec3::new(34.0, 19.0, 32.0));
+        let c = centre(&circle(a, 4.0), &circle(b, 4.0)).unwrap();
+        assert_eq!((c.from, c.to), (a, b));
+        assert!((c.distance - 2001_f64.sqrt()).abs() < 1e-12);
+        assert!((c.min.unwrap() - (1517_f64.sqrt() - 8.0).hypot(22.0)).abs() < 1e-12);
+        assert!((c.max.unwrap() - (1517_f64.sqrt() + 8.0).hypot(22.0)).abs() < 1e-12);
+        let swapped = centre(&circle(b, 4.0), &circle(a, 4.0)).unwrap();
+        assert_eq!((swapped.from, swapped.to, swapped.distance), (b, a, c.distance));
+    }
+
+    #[test]
+    fn arcs_on_different_planes_measure_between_their_centres() {
+        let a = Shape::Round { center: Vec3::ZERO, axis: Vec3::Z, radius: 2.0, angle: PI, planar: true, lo: 0.0, hi: 0.0 };
+        let b = Shape::Round { center: Vec3::new(3.0, 4.0, 12.0), axis: Vec3::X, radius: 4.0, angle: PI / 2.0, planar: true, lo: 0.0, hi: 0.0 };
+        let c = centre(&a, &b).unwrap();
+        assert_eq!((c.from, c.to, c.distance), (Vec3::ZERO, Vec3::new(3.0, 4.0, 12.0), 13.0));
+        assert!(c.min.is_none() && c.max.is_none());
+    }
+
+    #[test]
+    fn a_circle_to_a_cylinder_uses_its_fixed_centre_and_the_cylinders_axis() {
+        let a = circle(Vec3::new(0.0, 0.0, 10.0), 4.0);
+        for axis in [Vec3::Z, Vec3::X] {
+            let b = Shape::Round { center: Vec3::new(34.0, 19.0, 27.0), axis, radius: 4.0, angle: TAU, planar: false, lo: -5.0, hi: 5.0 };
+            let c = centre(&a, &b).unwrap();
+            let expected = if axis == Vec3::Z { Vec3::new(34.0, 19.0, 10.0) } else { Vec3::new(0.0, 19.0, 27.0) };
+            assert_eq!((c.from, c.to), (Vec3::new(0.0, 0.0, 10.0), expected));
+            assert!((c.distance - c.from.dist(expected)).abs() < 1e-12);
+            let swapped = centre(&b, &a).unwrap();
+            assert_eq!((swapped.from, swapped.to, swapped.distance), (c.to, c.from, c.distance));
+        }
+    }
+
+    #[test]
+    fn two_cylindrical_faces_still_measure_axis_pitch() {
+        let a = Shape::Round { center: Vec3::new(0.0, 0.0, 5.0), axis: Vec3::Z, radius: 4.0, angle: TAU, planar: false, lo: -5.0, hi: 5.0 };
+        let b = Shape::Round { center: Vec3::new(34.0, 19.0, 27.0), axis: Vec3::Z, radius: 4.0, angle: TAU, planar: false, lo: -5.0, hi: 5.0 };
+        let c = centre(&a, &b).unwrap();
+        assert_eq!((c.from, c.to), (Vec3::new(0.0, 0.0, 5.0), Vec3::new(34.0, 19.0, 5.0)));
+        assert!((c.distance - 1517_f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
     fn a_cylinder_to_a_side_plane_measures_from_its_axis() {
         let cyl = Shape::Round { center: Vec3::new(10.0, 15.0, 5.0), axis: Vec3::Z, radius: 2.5, angle: TAU, planar: false, lo: -5.0, hi: 5.0 };
         let plane = Shape::Plane { point: Vec3::ZERO, normal: Vec3::new(-1.0, 0.0, 0.0) };
@@ -361,6 +419,48 @@ mod tests {
         assert!((c.distance - 15.0).abs() < 1e-12);
         assert!((c.min.unwrap() - 12.5).abs() < 1e-12);
         assert!(c.from.dist(Vec3::new(10.0, 15.0, 10.0)) < 1e-12 && c.to.dist(Vec3::new(10.0, 0.0, 10.0)) < 1e-12);
+    }
+
+    #[test]
+    fn a_circle_or_arc_to_a_line_keeps_its_real_center() {
+        let edge = Shape::Line { a: Vec3::new(0.0, 0.0, 6.0), b: Vec3::new(68.0, 0.0, 6.0) };
+        for angle in [TAU, PI / 2.0] {
+            let round = Shape::Round { center: Vec3::new(34.0, 25.0, 20.0), axis: Vec3::Z, radius: 12.0, angle, planar: true, lo: 0.0, hi: 0.0 };
+            let c = centre(&round, &edge).unwrap();
+            assert_eq!((c.from, c.to), (Vec3::new(34.0, 25.0, 20.0), Vec3::new(34.0, 0.0, 6.0)));
+            assert!((c.distance - 25_f64.hypot(14.0)).abs() < 1e-12);
+            if angle == TAU {
+                assert!((c.min.unwrap() - 13_f64.hypot(14.0)).abs() < 1e-12);
+            } else {
+                assert!(c.min.is_none());
+            }
+            let swapped = centre(&edge, &round).unwrap();
+            assert_eq!((swapped.from, swapped.to, swapped.distance), (c.to, c.from, c.distance));
+        }
+    }
+
+    #[test]
+    fn a_tilted_arc_to_a_sloped_line_keeps_all_components() {
+        let edge = Shape::Line { a: Vec3::ZERO, b: Vec3::new(6.0, 0.0, 6.0) };
+        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
+            let arc = Shape::Round { center: Vec3::new(3.0, 4.0, 6.0), axis, radius: 2.0, angle: PI, planar: true, lo: 0.0, hi: 0.0 };
+            let c = centre(&arc, &edge).unwrap();
+            assert!(c.from.dist(Vec3::new(3.0, 4.0, 6.0)) < 1e-12);
+            assert!(c.to.dist(Vec3::new(4.5, 0.0, 4.5)) < 1e-12);
+            assert!((c.distance - 20.5_f64.sqrt()).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn a_circle_center_to_a_finite_edge_does_not_use_its_extension() {
+        for (center, expected) in [(Vec3::new(20.0, 3.0, 4.0), Vec3::new(10.0, 0.0, 0.0)), (Vec3::new(-10.0, 3.0, 4.0), Vec3::ZERO)] {
+            for (a, b) in [(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0)), (Vec3::new(10.0, 0.0, 0.0), Vec3::ZERO)] {
+                let c = centre(&circle(center, 2.0), &Shape::Line { a, b }).unwrap();
+                assert_eq!((c.from, c.to), (center, expected));
+                assert!((c.distance - 125_f64.sqrt()).abs() < 1e-12);
+            }
+        }
+        assert!(centre(&circle(Vec3::ZERO, 2.0), &Shape::Line { a: Vec3::ZERO, b: Vec3::ZERO }).is_none());
     }
 
     #[test]

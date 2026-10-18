@@ -1121,7 +1121,7 @@ pub fn fillet_g2(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
         let (made, rec) = guard("G2 fillet", || blend_one(&solid, &edge, size, radius, Shape::Curvature))?;
         cur = record::after(record::rebuilt(made, &[&solid], &rec)?, &cur, &counts);
     }
-    closed(cur)
+    closed(body, cur)
 }
 
 /// Most edges whose other orders are tried when the order given is refused.
@@ -1611,7 +1611,7 @@ fn tangent_faces(solid: &Solid, edge: &mt::Edge) -> bool {
 
 /// The chain of edges continuing `edge` smoothly at its ends (its ids): closed, or open where
 /// the next edge turns sharply.
-fn smooth_chain(solid: &Solid, edge: &mt::Edge) -> Option<Vec<mt::EdgeID>> {
+pub(crate) fn smooth_chain(solid: &Solid, edge: &mt::Edge) -> Option<Vec<mt::EdgeID>> {
     smooth_chain_within(solid, edge, &|_| true)
 }
 
@@ -1637,7 +1637,7 @@ fn lies_on(e: &mt::Edge, along: &[mt::Edge], tol: f64) -> bool {
 }
 
 /// [`smooth_chain`], walking on only over edges `keep` allows.
-fn smooth_chain_within(solid: &Solid, edge: &mt::Edge, keep: &dyn Fn(&mt::Edge) -> bool) -> Option<Vec<mt::EdgeID>> {
+pub(crate) fn smooth_chain_within(solid: &Solid, edge: &mt::Edge, keep: &dyn Fn(&mt::Edge) -> bool) -> Option<Vec<mt::EdgeID>> {
     use mt::{BoundedCurve, ParametricCurve};
     let all = Body::unique_edges(solid);
     // Along the edge as it runs from its front to its back (an edge may run against its curve).
@@ -1773,7 +1773,20 @@ fn loop_split(cur: &Body, pts: &[Vec3]) -> Result<Option<(Vec<Vec<Vec3>>, Vec<Ve
         let Some(e) = near.iter().find(|e| planar_edge.contains(&e.id())).or(near.first()) else { return Ok(None) };
         per.push((*p, e.id()));
     }
-    let ids: Vec<mt::EdgeID> = per.iter().map(|x| x.1).collect();
+    // Fillets follow tangent chains in the original body. Include those edges before
+    // recognising a whole loop, too: two picks across a sharp arc/line joint can cover
+    // the entire rim once each pick's smooth chain is included.
+    let ids = guard("loop tangent chains", || {
+        let mut ids: std::collections::HashSet<mt::EdgeID> = per.iter().map(|x| x.1).collect();
+        for (_, id) in &per {
+            if let Some(edge) = all.iter().find(|e| e.id() == *id)
+                && let Some(chain) = smooth_chain(&solid, edge)
+            {
+                ids.extend(chain);
+            }
+        }
+        Ok(ids)
+    })?;
     let mut covered: Vec<mt::EdgeID> = Vec::new();
     let mut groups = Vec::new();
     for f in solid.face_iter() {
@@ -1804,9 +1817,16 @@ fn loop_split(cur: &Body, pts: &[Vec3]) -> Result<Option<(Vec<Vec<Vec3>>, Vec<Ve
 /// A fillet's result, refused when a face's boundary crosses itself (#871): rounds that
 /// overlap where a wall is thinner than both leave such faces, which the topology checks
 /// don't see but which show as holes in the model. A fillet either closes the solid or is
-/// refused.
-fn closed(b: Body) -> Result<Body> {
-    match b.crossed_face_loops()? {
+/// refused. Faces of `input` that crossed already and that the fillet carried over unchanged
+/// (a sliver an earlier boolean left far from the rounds, #1488) are not the fillet's doing.
+fn closed(input: &Body, b: Body) -> Result<Body> {
+    let after = b.crossed_faces()?;
+    if after.is_empty() {
+        return Ok(b);
+    }
+    let before = input.crossed_faces()?;
+    let tol = (input.size().max(b.size()) * 1e-6).max(1e-9);
+    match after.iter().filter(|p| !before.iter().any(|q| q.dist(**p) <= tol)).count() {
         0 => Ok(b),
         _ => Err(KernelError::Failed(
             "fillet: the rounds would leave openings in the surface (they overlap where a wall or a face is narrower than both)".into(),
@@ -1832,17 +1852,17 @@ pub fn fillet(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
 fn fillet_built(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
     // Corners the local blends refuse (an earlier round at an edge's end): radius per edge.
     blend(body, edges, radius, Shape::Round, "fillet")
-        .and_then(closed)
+        .and_then(|b| closed(body, b))
         .or_else(|e| {
             let sel: Vec<(Vec3, f64)> = edges.iter().map(|p| (*p, radius)).collect();
             // The local blend's refusal, unless only the corner build found the radius too large.
             crate::blend_corner::fillet_radii(body, &sel)
-                .and_then(closed)
+                .and_then(|b| closed(body, b))
                 .map_err(|e2| keep_size(e, e2))
                 // Three edges at a vertex of any faces end in a sphere.
                 .or_else(|e| {
                     if edges.len() >= 3 {
-                        crate::blend_vertex::fillet_ball_vertices(body, edges, radius).and_then(closed).map_err(|_| e)
+                        crate::blend_vertex::fillet_ball_vertices(body, edges, radius).and_then(|b| closed(body, b)).map_err(|_| e)
                     } else {
                         Err(e)
                     }
@@ -1850,9 +1870,9 @@ fn fillet_built(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
         })
         // Straight edges ending at a curved face that isn't an earlier round's: a rolling ball
         // trimmed by the face. Refused, the refusal above stands.
-        .or_else(|e| blend_with(body, edges, radius, Shape::Round, "fillet", true).and_then(closed).map_err(|_| e))
+        .or_else(|e| blend_with(body, edges, radius, Shape::Round, "fillet", true).and_then(|b| closed(body, b)).map_err(|_| e))
         // Blends meeting at corners on curved faces: all at once.
-        .or_else(|e| corners(body, edges, radius, Shape::Round, "fillet").and_then(closed).map_err(|e2| keep_size(e, e2)))
+        .or_else(|e| corners(body, edges, radius, Shape::Round, "fillet", false).and_then(|b| closed(body, b)).map_err(|e2| keep_size(e, e2)))
 }
 
 /// The first refusal, unless only the second found the blend too large (a smaller one may fit).
@@ -1865,8 +1885,9 @@ fn keep_size(e: KernelError, e2: KernelError) -> KernelError {
 }
 
 /// Blend the edges together, rebuilding the corners where they meet on faces of any surface
-/// (see [`crate::curveblend::corner_blend`]).
-fn corners(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Result<Body> {
+/// (see [`crate::curveblend::corner_blend`]); with `g2`, the corners where three blends meet are
+/// G2 patches ([`crate::corner_g2`]) instead of pieces of the ball's sphere.
+fn corners(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str, g2: bool) -> Result<Body> {
     let counts = record::counts(&[body]);
     let cur = crate::boolean_record::healed(body)?;
     let size = cur.size();
@@ -1875,8 +1896,25 @@ fn corners(body: &Body, edges: &[Vec3], r: f64, shape: Shape, what: &str) -> Res
     if ids.len() != edges.len() {
         return Err(KernelError::Invalid("no edge near a selected point".into()));
     }
-    let (made, rec) = guard(what, || crate::curveblend::corner_blend(&solid, &ids, size, r, shape == Shape::Round))?;
+    let (made, rec) = guard(what, || match g2 {
+        // The corner blend as it always was, bit for bit.
+        false => crate::curveblend::corner_blend(&solid, &ids, size, r, shape == Shape::Round),
+        true => crate::curveblend::corner_blend_style(&solid, &ids, size, r, shape == Shape::Round, true),
+    })?;
     Ok(record::after(record::rebuilt(made, &[&solid], &rec)?, &cur, &counts))
+}
+
+/// [`fillet`] whose corners where three blended edges meet are G2 patches: the corner repeats each
+/// blend's surface up to the second order (see [`crate::corner_g2`]) instead of the rolling ball's
+/// sphere. The corner construction is the all-at-once corner blend, so a configuration it cannot
+/// hold is refused rather than quietly given the ball's sphere; [`fillet`] (the default) is
+/// unchanged.
+pub fn fillet_g2_corners(body: &Body, edges: &[Vec3], radius: f64) -> Result<Body> {
+    body.require_brep("fillet")?;
+    if !(radius.is_finite() && radius > 0.0) {
+        return Err(KernelError::Invalid("the blend radius must be finite and positive".into()));
+    }
+    corners(body, edges, radius, Shape::Round, "fillet", true).and_then(|b| closed(body, b))
 }
 
 /// The step of the radius search: three significant digits of the requested radius.
@@ -1970,7 +2008,7 @@ pub fn fillet_each(body: &Body, edges: &[Vec3], radii: &[f64]) -> Result<Body> {
         }
         Ok(b)
     };
-    if let Ok(b) = crate::blend_corner::fillet_radii(body, &sel).and_then(closed).and_then(fit) {
+    if let Ok(b) = crate::blend_corner::fillet_radii(body, &sel).and_then(|b| closed(body, b)).and_then(fit) {
         return Ok(b);
     }
     let mut by_radius: Vec<(f64, Vec<Vec3>)> = Vec::new();
@@ -2184,7 +2222,7 @@ fn chamfer_built(body: &Body, edges: &[Vec3], distance: f64) -> Result<Body> {
         Ok(cur)
     };
     // Chamfers meeting at corners on curved faces: all at once.
-    one_by_one().or_else(|e| corners(body, edges, distance, Shape::Flat, "chamfer").map_err(|e2| keep_size(e, e2)))
+    one_by_one().or_else(|e| corners(body, edges, distance, Shape::Flat, "chamfer", false).map_err(|e2| keep_size(e, e2)))
 }
 
 /// `cur` cut by one cutter, with its history over `[cur]` (`None`: nothing left).

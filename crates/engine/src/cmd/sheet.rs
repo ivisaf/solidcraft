@@ -4,6 +4,8 @@
 use serde_json::{Value, json};
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::sheet::{self, SheetBody, SheetRule};
+use solidcraft_doc::{BodyName, SketchId};
+use solidcraft_doc::{FacePick, Position};
 use solidcraft_doc::{FeatureKind, FlangeEdge};
 use solidcraft_geom::{Vec2, Vec3};
 
@@ -17,10 +19,13 @@ pub static COMMANDS: &[CommandSpec] = &[
         "base: sketch + profiles? (rule?, flip?) | contour: sketch + curves (open chain of lines) + distance (rule?, flip?, reverse?) | \
          edge: edges: [[x,y,z] on top/bottom edges, or {point: [x,y,z], angle?, height?} for an edge with its own angle and height] + \
          height (to the outer face), angle? (default 90 deg), radius? (default: rule), \
-         position?: inside|outside|middle, flip?, body?; type?: base|edge|contour (default from the inputs); name?, body_name? (the new body). \
-         Thickness, K-factor and bend radius come from the rule (sheet.manage_rules); passing them here is refused",
+         position?: inside|outside|middle, flip?, body?, corner_relief_shape?: notch|round|rectangular|tear and corner_relief? (size across): \
+         the relief at the corners these flanges make (default: the rule's); \
+         type?: base|edge|contour (default from the inputs); name?, body_name? (the new body). \
+         Thickness, K-factor and bend radius come from the rule (sheet.manage_rules); passing them here is refused, \
+         and so is the corner relief on a base or contour flange",
     ),
-    CommandSpec::new("sheet.perforate", "Perforate", perforate).at("SHEET METAL", "CREATE").icon("hem").params(
+    CommandSpec::new("sheet.perforate", "Perforate", perforate).at("SHEET METAL", "CREATE").icon("perforate").params(
         "diameter, pitch: expr; margin?: expr (clear of edges, cut-outs and bends; default: the diameter); pattern?: staggered (60°, default) | square; body? - a perforation field over the whole flat sheet: holes in the flat pattern (perforations), the DXF (layer PERFORATION) and the measured volume, not cut into the B-rep (#732)",
     ),
     CommandSpec::new("sheet.hem", "Hem", hem)
@@ -54,7 +59,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          `corner_relief` across; tear none, each bend's end is cut straight from the corner to its flange's end; default notch); \
          active?: bool; delete?: bool",
     ),
-    CommandSpec::new("sheet.rules", "List Sheet Metal Rules", list_rules).noundo().doc_only().params("→ rules with their expressions and values, and the active one"),
+    CommandSpec::new("sheet.rules", "List Sheet Metal Rules", list_rules).icon("sheet_rules").noundo().doc_only().params("→ rules with their expressions and values, and the active one"),
     CommandSpec::new("sheet.flat_pattern", "Create Flat Pattern", flat_pattern)
         .at("SHEET METAL", "CREATE")
         .icon("flat")
@@ -62,7 +67,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(
             "body? → flat size, outline loops and cut-outs (flat coordinates, as point lists), cutout_shapes (the same cut-outs exactly, in the same order: {circle: {center, radius}} for a round hole, else {segments: [{line: [a, b]} | {arc: {center, radius, start_deg, sweep_deg}} | {polyline: [...]}]}), pockets (with their own cutout_shapes), bend lines and the bend table",
         ),
-    CommandSpec::new("sheet.export_dxf", "Export Flat Pattern as DXF", export_dxf)
+    CommandSpec::new("sheet.export_dxf", "Export Flat Pattern as DXF", export_dxf).icon("dxf")
         .noundo()
         .params(
             "body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those), \
@@ -72,7 +77,7 @@ pub static COMMANDS: &[CommandSpec] = &[
              → DXF (AutoCAD 2000, mm): layers OUTLINE (the outer contour), CUT (what is cut out inside it), TEXT or ETCH (letters), BEND_UP and BEND_DOWN (dashed centre lines), BEND_NOTES, \
              POCKET_<BOTTOM|TOP|INTERNAL>_Z<from>_TO_<to>_MM (one per side and depth) and PERFORATION; inner contours come before the outline",
         ),
-    CommandSpec::new("sheet.export_bend_table", "Export Bend Table", export_bend_table)
+    CommandSpec::new("sheet.export_bend_table", "Export Bend Table", export_bend_table).icon("bendtable")
         .noundo()
         .params("body?, format?: csv|json (default csv), path? → bend table in mm and degrees, including rule and flat centre-line coordinates; a bend that cut-outs split has a row for each piece"),
 ];
@@ -107,7 +112,7 @@ fn flange_edges(s: &Session, p: &Value, cmd: &str) -> Result<Vec<FlangeEdge>> {
             return Err(bad(cmd, format!("edges[{i}]: unknown key `{k}` (an edge takes point, angle and height)")));
         }
         let point = o.get("point").and_then(vec3).ok_or_else(|| bad(cmd, format!("edges[{i}]: `point` must be [x, y, z]")))?;
-        let own = |k: &str, kind: Kind| -> Result<Option<String>> {
+        let own = |k: &str, kind: Kind| -> Result<Option<solidcraft_doc::Expr>> {
             if o.get(k).is_none_or(Value::is_null) {
                 return Ok(None);
             }
@@ -115,7 +120,7 @@ fn flange_edges(s: &Session, p: &Value, cmd: &str) -> Result<Vec<FlangeEdge>> {
             check_expr(s, &e, kind, cmd, &format!("edges[{i}].{k}"))?;
             Ok(Some(e))
         };
-        edges.push(FlangeEdge { point, angle: own("angle", Kind::Angle)?, height: own("height", Kind::Length)? });
+        edges.push(FlangeEdge { point: Position(point), angle: own("angle", Kind::Angle)?, height: own("height", Kind::Length)? });
     }
     Ok(edges)
 }
@@ -133,10 +138,20 @@ fn rule_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<String>> {
 const RULE_ONLY: [&str; 8] =
     ["thickness", "k_factor", "bend_radius", "relief_width", "relief_depth", "corner_relief", "corner_relief_shape", "hem_gap"];
 
+/// The two rule values an edge flange may set for itself: the corner relief.
+const EDGE_RELIEF: [&str; 2] = ["corner_relief", "corner_relief_shape"];
+
 fn flange(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sheet.flange";
     let nested = p.get("base").filter(|b| b.is_object());
-    if let Some(key) = RULE_ONLY.iter().find(|k| p.get(**k).is_some() || nested.is_some_and(|b| b.get(**k).is_some())) {
+    let ty = match str_(p, "type") {
+        Some(t) => t.to_ascii_lowercase(),
+        None if p.get("edges").is_some() => "edge".into(),
+        None if p.get("curves").is_some() => "contour".into(),
+        None => "base".into(),
+    };
+    let refused = |k: &&&str| !(ty == "edge" && EDGE_RELIEF.contains(*k));
+    if let Some(key) = RULE_ONLY.iter().filter(refused).find(|k| p.get(**k).is_some() || nested.is_some_and(|b| b.get(**k).is_some())) {
         return Err(bad(
             cmd,
             format!(
@@ -145,17 +160,15 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
             ),
         ));
     }
-    let ty = match str_(p, "type") {
-        Some(t) => t.to_ascii_lowercase(),
-        None if p.get("edges").is_some() => "edge".into(),
-        None if p.get("curves").is_some() => "contour".into(),
-        None => "base".into(),
-    };
     match ty.as_str() {
         "base" => {
             let sketch = feature_sketch(s, p, cmd)?;
             let rule = rule_param(s, p, cmd)?;
-            add_feature(s, p, FeatureKind::SheetBase { sketch, profiles: profiles(p, cmd)?, rule, flip: bool_(p, "flip").unwrap_or(false) })
+            add_feature(
+                s,
+                p,
+                FeatureKind::SheetBase { sketch: SketchId(sketch), profiles: profiles(p, cmd)?, rule, flip: bool_(p, "flip").unwrap_or(false) },
+            )
         }
         "contour" => {
             let sketch = sketch_id(s, p.get("sketch"), cmd, "sketch")?;
@@ -170,7 +183,7 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
                 s,
                 p,
                 FeatureKind::SheetContour {
-                    sketch,
+                    sketch: SketchId(sketch),
                     curves,
                     distance,
                     rule,
@@ -194,7 +207,35 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
                 return Err(bad(cmd, "`position` must be inside, outside or middle"));
             }
             let body = str_(p, "body").map(str::to_string);
-            add_feature(s, p, FeatureKind::SheetFlange { edges, height, angle, radius, position, flip: bool_(p, "flip").unwrap_or(false), body })
+            // The corner relief these flanges make, in place of the rule's; null is not given.
+            let corner_relief_shape = match p.get("corner_relief_shape").filter(|v| !v.is_null()) {
+                Some(v) => Some(
+                    v.as_str()
+                        .and_then(solidcraft_doc::sheet::ReliefShape::parse)
+                        .map(|shape| shape.name().to_string())
+                        .ok_or_else(|| bad(cmd, "`corner_relief_shape` must be notch, round, rectangular or tear"))?,
+                ),
+                None => None,
+            };
+            let corner_relief = expr(p, "corner_relief");
+            if let Some(c) = &corner_relief {
+                check_expr(s, c, Kind::Length, cmd, "corner_relief")?;
+            }
+            add_feature(
+                s,
+                p,
+                FeatureKind::SheetFlange {
+                    edges,
+                    height,
+                    angle,
+                    radius,
+                    position,
+                    flip: bool_(p, "flip").unwrap_or(false),
+                    body: body.map(BodyName),
+                    corner_relief_shape,
+                    corner_relief,
+                },
+            )
         }
         other => Err(bad(cmd, format!("unknown flange type `{other}` (base, edge or contour)"))),
     }
@@ -214,7 +255,7 @@ fn perforate(s: &mut Session, p: &Value) -> Result<Value> {
     if pattern.as_deref().is_some_and(|t| t != "staggered" && t != "square") {
         return Err(bad(cmd, "`pattern` is \"staggered\" (60°, default) or \"square\""));
     }
-    add_feature(s, p, FeatureKind::SheetPerforate { diameter, pitch, margin, pattern, body: str_(p, "body").map(str::to_string) })
+    add_feature(s, p, FeatureKind::SheetPerforate { diameter, pitch, margin, pattern, body: str_(p, "body").map(BodyName::from) })
 }
 
 fn hem(s: &mut Session, p: &Value) -> Result<Value> {
@@ -229,7 +270,13 @@ fn hem(s: &mut Session, p: &Value) -> Result<Value> {
     add_feature(
         s,
         p,
-        FeatureKind::SheetHem { edges, length, gap, flip: bool_(p, "flip").unwrap_or(false), body: str_(p, "body").map(str::to_string) },
+        FeatureKind::SheetHem {
+            edges: edges.into_iter().map(Position).collect(),
+            length,
+            gap,
+            flip: bool_(p, "flip").unwrap_or(false),
+            body: str_(p, "body").map(BodyName::from),
+        },
     )
 }
 
@@ -276,7 +323,18 @@ fn fold(s: &mut Session, p: &Value) -> Result<Value> {
     let r = add_feature(
         s,
         p,
-        FeatureKind::SheetFold { sketch, curve, a, b, angle, radius, position, flip: bool_(p, "flip").unwrap_or(false), fixed, body },
+        FeatureKind::SheetFold {
+            sketch: sketch.map(SketchId),
+            curve,
+            a: Position(a),
+            b: Position(b),
+            angle,
+            radius,
+            position,
+            flip: bool_(p, "flip").unwrap_or(false),
+            fixed: fixed.map(Position),
+            body: body.map(BodyName),
+        },
     )?;
     // A recompute keeps a stored fold whose fixed point no longer touches the sheet (with a
     // warning); a new fold refuses one, since it picks no side (#263).
@@ -295,11 +353,11 @@ fn fold(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn unfold(s: &mut Session, p: &Value) -> Result<Value> {
-    add_feature(s, p, FeatureKind::SheetUnfold { body: str_(p, "body").map(str::to_string), refold: false })
+    add_feature(s, p, FeatureKind::SheetUnfold { body: str_(p, "body").map(BodyName::from), refold: false })
 }
 
 fn refold(s: &mut Session, p: &Value) -> Result<Value> {
-    add_feature(s, p, FeatureKind::SheetUnfold { body: str_(p, "body").map(str::to_string), refold: true })
+    add_feature(s, p, FeatureKind::SheetUnfold { body: str_(p, "body").map(BodyName::from), refold: true })
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
@@ -320,7 +378,11 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, format!("`{key}` is not a sheet.convert parameter: the sheet metal rule sets it. Pass a rule's name as `rule`")));
     }
     let rule = rule_param(s, p, cmd)?;
-    add_feature(s, p, FeatureKind::SheetConvert { body, face, rule, bends })
+    add_feature(
+        s,
+        p,
+        FeatureKind::SheetConvert { body: BodyName(body), face: FacePick(face), rule, bends: bends.into_iter().map(Position).collect() },
+    )
 }
 
 fn rules(s: &mut Session, p: &Value) -> Result<Value> {
@@ -351,7 +413,7 @@ fn rules(s: &mut Session, p: &Value) -> Result<Value> {
         ("gap", &mut rule.gap),
     ] {
         if let Some(e) = expr(p, k) {
-            *slot = e;
+            *slot = e.into();
         }
     }
     if let Some(shape) = p.get("corner_relief_shape").filter(|v| !v.is_null()) {
@@ -830,6 +892,10 @@ fn export_bend_table(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 #[path = "sheet_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sheet_batch_cuts_tests.rs"]
+mod batch_cuts_tests;
 
 #[cfg(test)]
 #[path = "sheet_convert_tests.rs"]

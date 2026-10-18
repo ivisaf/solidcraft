@@ -47,6 +47,7 @@ A slider's value grows as b moves along +z of its origin. Give its two origins t
 {"command":"joint.motion_link","params":{"a":"Hinge","b":"Hinge 2","ratio":-1}}
 {"command":"joint.drive","params":{"joint":"Hinge","value":20}}
 {"command":"joint.drive","params":{"joint":"Spindle","values":[30,5]}}
+{"command":"joint.reach","params":{"occurrence":"Gripper","at":[120,0,40],"point":[60,80,40],"z":[0,0,-1],"axis":[1,0,0],"quiet":true}}
 {"command":"joint.limits","params":{"joint":"Hinge","min":0,"max":60}}
 {"command":"joint.edit","params":{"joint":"Hinge","flip":true}}
 {"command":"joint.delete","params":{"link":0}}
@@ -61,8 +62,11 @@ A slider's value grows as b moves along +z of its origin. Give its two origins t
 - `joint.create` and `joint.as_built` start the joint at its `values` (default 0). A value outside the limits starts at the nearer limit, and the reply's `warnings` say so: the part turned as it was joined.
 - `joint.as_built` takes occurrences, not origins. `at` is the joint's frame (default: b's component origin).
 - `joint.rigid_group` joins every occurrence to the first one with a rigid as-built joint.
-- `joint.motion_link`: b = ratio·a + offset, clamped to b's limits. `offset` is in b's units: degrees for an angle, mm for a distance, or an expression such as `"10 deg"`. `joint.list` gives each link's `offset` with its `unit`. `ia`/`ib` pick a value of a multi-value joint (default 0). `joint.delete {"link": n}` removes link n (its index in `joint.list` `links`).
+- `joint.motion_link`: b = ratio·a + offset, clamped to b's limits. `ratio` is in b's units per a's: mm per degree when an angle drives a distance (a pinion of pitch radius r moves its rack r·π/180 mm per degree), degrees per mm the other way, and a plain factor between two angles or two distances. `offset` is in b's units: degrees for an angle, mm for a distance, or an expression such as `"10 deg"`. `joint.list` gives each link's `ratio` the same way and its `offset` with its `unit`. `ia`/`ib` pick a value of a multi-value joint (default 0). `joint.delete {"link": n}` removes link n (its index in `joint.list` `links`).
+- `joint.gear {a, b, ra, rb, internal?, reverse?}`, `joint.rack_pinion {a, b, radius, reverse?}` and `joint.screw {joint | a, b; pitch, reverse?}` make a motion link whose ratio comes from its sizes: gears -ra/rb (+ra/rb internal), a rack r mm per radian of its pinion (either joint may be `a`), a screw pitch per turn. Each size is mm, an expression, or `{occurrence, circle: [x,y,z]}`: the radius of the round face there, read again whenever the design changes. The reply gives `link` (its index) and `ratio` as `joint.list` does; `link: n` in the params replaces link n and keeps its offset. A new coupling's offset keeps b where it is. `joint.list` `links` carry the `coupling` and an `error` when it can't be worked out (a picked face gone: the last ratio stays). A value two links would set, or a coupling that would drive its own driver, is refused.
+- `joint.cam {a, b, profile, follower?, radius?, tip?, flip?, link?}`: a is the cam's revolute joint, b a slider or revolute follower. `profile` is `{sketch, index?}` (a closed profile of a sketch in the cam's component) or `{edges: [[x,y,z]...], occurrence?}` (edges of the cam's body; one edge continues around its closed loop in the plane). The reply gives `link`, `lift: {min, max, rise, unit}` (b's travel over a turn), `reverse` (the side it rides from; `flip: true` takes the other) and, for a slider, `follower_offset`. `joint.list` `links` show `lift` instead of `ratio` for a cam.
 - `joint.drive`: `values` drives the values it lists, in order (`Spindle` above is cylindrical: 30 degrees, then 5 mm), and `value` the first; values left out keep theirs, or follow in a closed loop. Values are clamped to the limits. The reply gives `values` as `joint.list` does (`{name, value, unit, limits}`), and `moved`; when the joint can move nothing, a `reason`.
+- `joint.reach` (inverse kinematics): moves the joints on the occurrence's chain so its point `at` (world, where it is now; default: the centre of its bodies) gets to `point`, from the pose it is in to the nearest one, within limits, through motion links, and with closed loops kept closed. `z` with `axis` (world, now; default its own z) also turns that axis. `joints: [...]` moves only those (loop followers still follow). The reply: `reached`, `error_mm` (and `error_deg`), `point` where it ended, `values` of the joints that moved, `moved`, and when short, `stopped_by_limit: [{joint, value, limit}]` or `stopped_by_loop: {joint}`. A part that nothing moves answers `moved: false` with a `reason`. Contact sets are not checked; check with `contact.check` afterwards.
 - `motion.study {"study":..., ...}` edits a study; `keys` given replace all keys.
 - `motion.play` sets the joints to the study's values at a step (fractions work) and changes the design. `motion.export` does not change it.
 
@@ -123,7 +127,12 @@ The same pattern moved the solar wings of the SELENE rover (`Rover-v7.solidcraft
 | A part turns by some other angle when joined | The two origins have different forms or x axes. Use `point` + `z` on both sides, or `joint.as_built`. |
 | `joint.drive` answers `moved: false`, or `motion.play` lists the joint under `unmoved` | Read `reason`. Most often the chain is joined to nothing grounded: `unconnected` names the part, and `joint.list` lists the chain under `floating`, its occurrences with `dof: 6`. Ground it, join it, or `joint.rigid_group` it with the structure. |
 | A drive stops short, `stopped_by_loop` | A loop reached a limit or can't close further; `joint` names the joint that stopped it. Check the limits against your stroke numbers. |
+| A gear, rack or screw turns its partner the wrong way | The joints' axes point opposite ways (or the rack lies on the other side of the pinion). Run the command again with `reverse: true` and `link: n`. |
+| `joint.cam` says the follower's line misses the cam | The slider's line (through `tip` when given) passes beside the cam at some angle. Pick the follower's tip, or move its slider's axis over the cam. |
+| A cam's follower rides the wrong flank or sinks into the cam | It took the other side of the cam's axis (`reverse` in the reply): run `joint.cam` again with `flip: true` and `link: n`. |
+| `already follows a motion link` from `joint.gear` | A joint follows one link at most. Make the joint that already follows the driving one (`a`), as in a gear train G1 → G2 → G3. |
 | A linked joint stops following | Its value is clamped to its own limits. Hinge 2 in the example has `[[-60, 0]]`, so a drive of Hinge below 0 leaves it at 0. Give a mirrored joint the mirrored limits. |
+| `joint.reach` answers `reached: false` | The point is out of reach: `point` and `error_mm` give the nearest pose. `stopped_by_limit` names the limits it rests on, `stopped_by_loop` the loop that can't follow further; with neither, the chain can't get there at all (too far, or out of its plane). |
 | A drive stops short, `stopped_by_contact` | Two bodies of a contact set touch. `fraction` is how far the move got. |
 | `occurrence.ground` says there is no occurrence `Frame` | It takes occurrence names only: `Frame:1`. |
 | `a joint needs two different occurrences` | Both origins found the same part. Give `occurrence` on both. If the parts are bodies of one component (an imported STEP file often brings them so), run `component.from_bodies {"bodies": [...]}` first. |
@@ -140,9 +149,11 @@ The same pattern moved the solar wings of the SELENE rover (`Rover-v7.solidcraft
 | `joint.list` | about 0.5 KB per joint: 16 KB for 29 joints |
 | `motion.play` | about 0.2 KB per occurrence, per step: 9 KB on SELENE |
 | `motion.export` | the same per sample; pass `samples`, or `path` to write it to a file |
-| `joint.create`, `joint.drive`, `joint.motion_link` | the `dof` list of every occurrence again, 40 B each; `quiet: true` leaves it out |
+| `joint.create`, `joint.drive`, `joint.motion_link`, `joint.gear`, `joint.rack_pinion`, `joint.screw` | the `dof` list of every occurrence again, 40 B each; `quiet: true` leaves it out |
 | `occurrence.properties` | under 1 KB per occurrence |
 
 ## Showing it moving
 
-Bridged to the app, `motion.play {"study":..., "step":s}` moves the user's viewport, and `screenshot` captures the window at each step. To record outside MCP, drive the app's control channel (`docs/control-protocol.md`): `engine.execute` with `motion.play`, then `ui.screenshot` with a `path`, once per frame.
+`motion.export_animation {"study":..., "path":"tour.gif"}` draws the whole motion as an animated GIF in one call, headless or bridged, and changes nothing: `{"joint":..., "from":0, "to":90, "path":...}` animates a drive instead. A path that does not end in `.gif` is a folder for PNG frames (`frame-0001.png`, ...). Pass `camera` (the reply of `ui.camera`, or any of its fields), `width`/`height` (default 800 x 500), `samples` (frames; default the study's steps + 1, or 100), `fps` (default 20), and `grid: false` / `axes: false` for a clean background. The reply is small: `frames`, `bytes`, and `stopped_at` with `stopped_by_loop`/`stopped_by_contact` where the motion first stopped short.
+
+Bridged to the app, `motion.play {"study":..., "step":s}` moves the user's viewport, and `screenshot` captures the window at that step.

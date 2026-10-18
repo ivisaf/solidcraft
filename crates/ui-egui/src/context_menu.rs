@@ -47,9 +47,10 @@ pub enum Target {
     Occurrence {
         path: Vec<u64>,
     },
-    /// A browser group of items.
+    /// A browser group of items, under the design (`scope` `c0`) or a placement (`o:<path>`).
     Group {
         id: u64,
+        scope: String,
     },
     /// The Origin folder.
     Origin,
@@ -78,10 +79,12 @@ pub enum Target {
     },
     /// The Section Analysis in the browser's Analysis folder.
     Section,
-    /// A component's Bodies, Sketches or Construction folder.
+    /// A component's Bodies, Sketches or Construction folder, under the design (`scope` `c0`)
+    /// or a placement (`o:<path>`).
     Folder {
         component: u64,
         folder: String,
+        scope: String,
     },
 }
 
@@ -179,6 +182,9 @@ pub struct MenuState {
     pub over_geometry: bool,
     /// The plane under the cursor when the viewport menu opened: it offers a sketch on it.
     pub plane: Option<String>,
+    /// The button that opened the menu, when it toggles it: a press there is not a press outside,
+    /// so its click closes the menu instead of closing and reopening it (#1522).
+    opener: Option<Rect>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -262,7 +268,7 @@ pub fn target_bodies(app: &SolveApp, target: &Target) -> Vec<String> {
         Target::Body { name } => vec![name.clone()],
         Target::Component { id } => component_bodies(app, *id),
         Target::Occurrence { path } => app.session.occurrence_bodies(path, true).unwrap_or_default(),
-        Target::Group { id } => crate::browser::group_bodies(app, *id),
+        Target::Group { id, .. } => crate::browser::group_bodies(app, *id),
         Target::Sketch { .. }
         | Target::Plane { .. }
         | Target::OriginPlane { .. }
@@ -327,8 +333,8 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::OriginPlane { name } => origin_plane_items(app, name),
         Target::Component { id } => component_items(app, *id),
         Target::Occurrence { path } => occurrence_items(app, path),
-        Target::Group { id } => crate::browser::group_items(app, *id),
-        Target::Folder { component, folder } => crate::browser::folder_items(app, *component, folder),
+        Target::Group { id, scope } => crate::browser::group_items(app, *id, scope),
+        Target::Folder { component, folder, scope } => crate::browser::folder_items(app, *component, folder, scope),
         Target::Canvas { id } => crate::browser::canvas_items(app, *id),
         Target::Origin => crate::browser::origin_items(app),
         Target::NamedViews => vec![act("ui.newView", "New Named View", "perspective")],
@@ -339,8 +345,8 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::Workspace => {
             let rendering = crate::render_workspace::active(app);
             let mut v = vec![
-                act("ui.workspace.design", "Design", "box").with(json!({"workspace":"design"})).key(if rendering { "" } else { "current" }),
-                act("ui.workspace.render", "Render", "camera")
+                act("ui.workspace.design", "Design", "ws_design").with(json!({"workspace":"design"})).key(if rendering { "" } else { "current" }),
+                act("ui.workspace.render", "Render", "ws_render")
                     .with(json!({"workspace":"render"}))
                     .key(if rendering { "current" } else { "" })
                     .on(app.session.active_sketch.is_none() && app.tool.is_none() && app.dialog.is_none() && !app.file_load.busy()),
@@ -467,7 +473,9 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         v.push(act("ui.fit", "Fit", "fit"));
         v.push(act("ui.home", "Home View", "home"));
         v.push(Item::sep());
-        let anything_hidden = !app.session.visibility.hidden_bodies.is_empty() || !app.session.visibility.hidden_sketches.is_empty();
+        let anything_hidden = !app.session.visibility.hidden_bodies.is_empty()
+            || !app.session.visibility.hidden_sketches.is_empty()
+            || !app.session.visibility.hidden_folders.is_empty();
         v.push(act("ui.showAll", "Show All", "eye").on(anything_hidden));
         v.push(act("ui.showAll", "Unisolate", "").on(!app.session.visibility.hidden_bodies.is_empty()));
         v.push(Item::sep());
@@ -716,6 +724,13 @@ fn component_items(app: &SolveApp, id: u64) -> Vec<Item> {
     v
 }
 
+/// Explode Text (#1842): the selected text's outlines become normal sketch lines, arcs and
+/// curves, no longer tied to the text, so they can be picked, trimmed and edited one by one.
+fn explode_text(app: &SolveApp) -> Option<Item> {
+    let link = crate::sketch_text::selected_link(app)?;
+    Some(cmd(app, "sketch.break_link", "Explode Text").with(json!({ "link": link })))
+}
+
 /// Sketch entity items: construction, fix, delete, dimension and the constraints the selection
 /// can take.
 fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
@@ -751,11 +766,14 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     if curves.is_empty() && points.is_empty() {
         if crate::sketch_text::selected_entity(app).is_some() {
             v.push(cmd(app, "sketch.edit_text", "Edit Text"));
+            v.extend(explode_text(app));
         }
         v.push(cmd(app, "sketch.line", "Line"));
         v.push(cmd(app, "sketch.rectangle.two_point", "Rectangle"));
         v.push(cmd(app, "sketch.circle.center", "Circle"));
         v.push(cmd(app, "sketch.dimension", "Sketch Dimension"));
+        v.push(Item::sep());
+        v.push(act("ui.paste", "Paste", "").key("Ctrl+V").on(app.session.sketch_clipboard.is_some()));
         return v;
     }
     let ents: Vec<String> = curves.iter().chain(points.iter()).cloned().collect();
@@ -768,10 +786,28 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     }
     if crate::sketch_text::selected_entity(app).is_some() {
         v.push(cmd(app, "sketch.edit_text", "Edit Text"));
+        v.extend(explode_text(app));
     }
     v.push(cmd(app, "sketch.move", "Move/Copy").key("M"));
+    v.push(act("ui.cut", "Cut", "").key("Ctrl+X"));
+    v.push(act("ui.copy", "Copy", "").key("Ctrl+C"));
+    v.push(act("ui.paste", "Paste", "").key("Ctrl+V").on(app.session.sketch_clipboard.is_some()));
     if !curves.is_empty() {
         v.push(cmd(app, "sketch.construction", "Normal / Construction").with(json!({ "curves": curves })));
+    }
+    // Infinite lines (#1359): the selected lines switch together.
+    let lines: Vec<String> = curves
+        .iter()
+        .filter(|id| {
+            ss.sketch
+                .curve_index(id)
+                .and_then(|i| ss.sketch.curves.get(i))
+                .is_some_and(|c| matches!(c.kind, solidcraft_engine::sketch::CurveKind::Line { .. }))
+        })
+        .cloned()
+        .collect();
+    if !lines.is_empty() {
+        v.push(cmd(app, "sketch.infinite", "Infinite Line").with(json!({ "curves": lines })));
     }
     if curves.len() == 1 && ss.sketch.freeform_offsets.iter().any(|offset| offset.output == curves[0]) {
         v.push(cmd(app, "sketch.offset.break", "Break Offset Association").with(json!({"curve":curves[0]})));
@@ -852,6 +888,9 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.delete" if item.params.is_some() => crate::delete::request(app, p),
         "ui.delete" => delete(app),
         "ui.finishSketch" => app.finish_sketch(),
+        "ui.copy" => drop(crate::edit_clipboard::copy(app)),
+        "ui.cut" => drop(crate::edit_clipboard::cut(app)),
+        "ui.paste" => drop(crate::edit_clipboard::paste(app, Some(at))),
         "ui.editSketchPattern" => {
             if let Some(id) = p.get("pattern").and_then(Value::as_str) {
                 crate::sketch_modify_ui::edit_pattern(app, id);
@@ -868,6 +907,9 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.showAll" => {
             let _ = app.run("browser.visibility", json!({"folder":"bodies", "visible":true}));
             app.session.visibility.hidden_sketches.clear();
+            // Hidden folders and groups too, so everything really shows.
+            app.session.visibility.hidden_folders.clear();
+            app.ui.show_sketches = true;
         }
         "ui.isolate" => {
             app.session.visibility.hidden_bodies =
@@ -953,7 +995,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             drop(app.run("inspect.section", json!({"clear": true})));
         }
         "ui.editSection" => app.start("inspect.section"),
-        "ui.sectionVisible" => crate::browser::set_section_visible(app, p.get("visible").and_then(Value::as_bool).unwrap_or(true)),
+        "ui.sectionVisible" => crate::browser::set_section_shown(app, p.get("visible").and_then(Value::as_bool).unwrap_or(true)),
         "ui.fit" => app.animate_view("fit"),
         "ui.home" => app.animate_view("home"),
         // One command for the whole selection: all fixed unless all already are.
@@ -1054,8 +1096,8 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             }
         }
         "ui.folderVisible" => {
-            if let Some(f) = p.get("folder").and_then(Value::as_str) {
-                crate::browser::toggle_folder(app, id_of(&p, "component").unwrap_or(0), f);
+            if let Some(key) = p.get("key").and_then(Value::as_str) {
+                crate::browser::toggle_folder(app, key);
             }
         }
         "ui.originAll" => {
@@ -1341,12 +1383,24 @@ pub fn open_for(app: &mut SolveApp, at: Pos2, target: Target) {
     app.menu.radial = target == Target::Viewport && app.preferences.radial_context_menu;
     app.menu.target = target;
     app.menu.flick = false;
+    app.menu.opener = None;
     app.viewport.context_menu = Some(at);
+}
+
+/// A button's menu: a click opens it, and a click on the same button while it is open closes it.
+pub fn toggle_for(app: &mut SolveApp, opener: Rect, at: Pos2, target: Target) {
+    if app.viewport.context_menu.is_some() && app.menu.target == target && app.menu.opener == Some(opener) {
+        close(app);
+    } else {
+        open_for(app, at, target);
+        app.menu.opener = Some(opener);
+    }
 }
 
 pub fn close(app: &mut SolveApp) {
     app.viewport.context_menu = None;
     app.menu.flick = false;
+    app.menu.opener = None;
 }
 
 /// Open the menu at a point for automation: the pointer moves there first so what is under it
@@ -1549,8 +1603,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let target = app.menu.target.clone();
     let list = items(app, &target);
     let mut picked: Option<Item> = None;
-    let mut inside = false;
     let pointer = ctx.input(|i| i.pointer.latest_pos());
+    let mut inside = app.menu.opener.is_some_and(|r| pointer.is_some_and(|p| r.contains(p)));
 
     let list_at = if app.menu.radial {
         let c = radial_center(at, screen);

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use solidcraft_geom::{Aabb3, Plane, Vec3};
-use solidcraft_render::{Camera, Rgb, Scene, SceneLine, SceneMesh};
+use solidcraft_render::{AnalysisColors, Camera, Rgb, Scene, SceneAnalysis, SceneLine, SceneMesh};
 use solidcraft_sketch::Sketch;
 
 use crate::{Sel, Session};
@@ -68,6 +68,8 @@ pub struct Palette {
     pub axes: [Rgb; 3],
     /// What the section cap is tinted toward.
     pub cap: Rgb,
+    /// The surface analysis colours.
+    pub analysis: AnalysisColors,
 }
 
 impl Palette {
@@ -89,6 +91,7 @@ impl Palette {
         sketch_centerline: colors::SKETCH_CENTERLINE,
         axes: [colors::AXIS_X, colors::AXIS_Y, colors::AXIS_Z],
         cap: colors::SECTION_CAP,
+        analysis: AnalysisColors::DEFAULT,
     };
 }
 
@@ -126,6 +129,62 @@ pub fn visible_bounds(s: &Session, sketches: bool) -> Aabb3 {
         }
     }
     b
+}
+
+/// The origin plane a grid lies on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GridPlane {
+    /// The ground: the camera frame's XY.
+    #[default]
+    Ground,
+    /// Upright, facing a view along ±Y (the Front or Back view): the frame's XZ.
+    Xz,
+    /// Upright, facing a view along ±X (the Left or Right view): the frame's YZ.
+    Yz,
+}
+
+impl GridPlane {
+    /// The plane's two axes, in the camera's Z-up frame.
+    pub fn axes(self) -> (Vec3, Vec3) {
+        match self {
+            GridPlane::Ground => (Vec3::X, Vec3::Y),
+            GridPlane::Xz => (Vec3::X, Vec3::Z),
+            GridPlane::Yz => (Vec3::Y, Vec3::Z),
+        }
+    }
+}
+
+/// The plane to draw the grid on for a view whose direction toward the eye is `back` (in the
+/// camera's Z-up frame), given the plane the last frame drew (`last`).
+///
+/// The ground (frame XY) unless it is seen nearly edge-on, as in the Front or Right view; then
+/// the upright origin plane facing the view, so the grid stays visible (#1470). Both thresholds
+/// are further for leaving than for entering, so a view hovering at one does not flicker the
+/// grid, and the upright plane changes to the other only close to a side view, never at the 45°
+/// crossing (#1993).
+pub fn grid_plane(back: Vec3, last: GridPlane) -> GridPlane {
+    // About 11.5° above or below the ground to leave it, and 15° to return.
+    const EDGE_ON: f64 = 0.2;
+    const EDGE_LEAVE: f64 = 0.26;
+    // About 15° from the Front/Back or Left/Right view: only that close does the wall change.
+    const SIDE_VIEW: f64 = 0.966;
+    let horizontal = (back.x * back.x + back.y * back.y).sqrt();
+    if !back.x.is_finite() || !back.y.is_finite() || !back.z.is_finite() || !horizontal.is_finite() {
+        return GridPlane::Ground;
+    }
+    if last == GridPlane::Ground && back.z.abs() <= EDGE_ON && horizontal > 0.0 {
+        return if back.y.abs() >= back.x.abs() { GridPlane::Xz } else { GridPlane::Yz };
+    }
+    if last != GridPlane::Ground && back.z.abs() <= EDGE_LEAVE && horizontal > 0.0 {
+        if back.x.abs() / horizontal >= SIDE_VIEW {
+            return GridPlane::Yz;
+        }
+        if back.y.abs() / horizontal >= SIDE_VIEW {
+            return GridPlane::Xz;
+        }
+        return last;
+    }
+    GridPlane::Ground
 }
 
 /// Grid spacing (minor, major) for a view of the given half height.
@@ -362,32 +421,34 @@ fn build_scene(
 ) -> Scene {
     let st = s.world_state();
     let section = section.filter(|(o, n)| o.is_finite() && n.is_finite() && n.len() > 1e-9);
-    let mut sc = Scene { background: Some(p.background), clip: section.map(|(o, n)| (n, n.dot(o))), cap: Some(p.cap), ..Default::default() };
+    let mut sc = Scene {
+        background: Some(p.background),
+        clip: section.map(|(o, n)| (n, n.dot(o))),
+        cap: Some(p.cap),
+        analysis: s.analysis.map(|a| SceneAnalysis { mode: a.mode(), colors: p.analysis }),
+        ..Default::default()
+    };
     let b = bounds(s);
     sc.radius = (b.diagonal() * 0.5).max(cam.half_height()).max(10.0) + b.center().dist(cam.target);
-    // Grid on the ground plane (XY with Z up, XZ with Y up).
+    // Grid on the ground plane (XY with Z up, XZ with Y up), drawn under the model as in the viewport.
     if guides.grid {
         let (minor, major) = grid_step(cam.half_height());
         let ext = (cam.half_height() * 3.0 / major).ceil() * major;
         let tf = cam.to_frame(cam.target);
-        let c = Vec3::new((tf.x / major).round() * major, (tf.y / major).round() * major, 0.0);
+        // Headless pictures keep the grid on the ground, the viewport's default.
+        let (u, v) = (Vec3::X, Vec3::Y);
+        let snap = |a: Vec3| a * ((tf.dot(a) / major).round() * major);
+        let c = snap(u) + snap(v);
         let w = |p: Vec3| cam.from_frame(p);
         let n = ((ext / minor) as i64).clamp(1, 400);
         for i in -n..=n {
             let t = i as f64 * minor;
-            let col = if (t / major).fract().abs() < 1e-9 { p.grid_major } else { p.grid };
-            sc.lines.push(SceneLine {
-                points: vec![w(c + Vec3::new(t, -ext, 0.0)), w(c + Vec3::new(t, ext, 0.0))],
-                color: col,
-                width: 0.6,
-                on_top: false,
-            });
-            sc.lines.push(SceneLine {
-                points: vec![w(c + Vec3::new(-ext, t, 0.0)), w(c + Vec3::new(ext, t, 0.0))],
-                color: col,
-                width: 0.6,
-                on_top: false,
-            });
+            let major_line = (t / major).fract().abs() < 1e-9;
+            let col = if major_line { p.grid_major } else { p.grid };
+            // The viewport's widths (pixels).
+            let width = if major_line { 1.0 } else { 0.7 };
+            sc.grid.push(SceneLine { points: vec![w(c + u * t - v * ext), w(c + u * t + v * ext)], color: col, width, on_top: false });
+            sc.grid.push(SceneLine { points: vec![w(c - u * ext + v * t), w(c + u * ext + v * t)], color: col, width, on_top: false });
         }
     }
     // The origin's axes, each unless hidden one by one (`browser.visibility`), as in the viewport.
@@ -472,18 +533,18 @@ pub fn sketch_shown(s: &Session, id: u64) -> bool {
     sketch_drawn(s, id, true)
 }
 
-/// Is a sketch drawn, with the browser's Sketches folder shown (`folder`) or hidden? The sketch
-/// being edited always is; otherwise not when hidden, nor in a hidden component, and one used by
-/// a feature only when shown on its own.
+/// Is a sketch drawn, with sketches shown (`folder`) or hidden? The sketch being edited always
+/// is; otherwise not when hidden, nor in a hidden component, Sketches folder or group (even one
+/// shown on its own), and one used by a feature only when shown on its own.
 pub fn sketch_drawn(s: &Session, id: u64, folder: bool) -> bool {
     let v = &s.visibility;
     if s.active_sketch == Some(id) {
         return true;
     }
-    if v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) {
+    if !folder || v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
         return false;
     }
-    v.shown_sketches.contains(&id) || (folder && !sketch_consumed(s, id))
+    v.shown_sketches.contains(&id) || !sketch_consumed(s, id)
 }
 
 /// Is the placement a sketch is drawn at shown (the active one while its component is being
@@ -583,8 +644,8 @@ mod tests {
 
     use super::*;
 
-    /// The CPU renderer (snapshots) shows appearances as the viewport does: a body's colour and
-    /// faces with looks of their own.
+    /// Headless pictures show appearances as the viewport does: a body's colour and faces with
+    /// looks of their own (the picture itself: `solidcraft-gpu`'s capture tests).
     #[test]
     fn snapshot_scene_carries_appearances() {
         let mut s = Session::default();
@@ -596,9 +657,6 @@ mod tests {
         let sc = scene(&s, &cam);
         assert!(sc.meshes.iter().any(|m| m.color == Rgb(220, 60, 40)));
         assert!(sc.meshes.iter().any(|m| m.face_colors.iter().any(|(_, c)| *c == Rgb(40, 170, 80))));
-        // And the rendered picture has the green top.
-        let img = solidcraft_render::render(&sc, &cam, 200, 140);
-        assert!(img.rgba.chunks(4).any(|p| p[1] > 120 && p[0] < 90 && p[2] < 110), "no green pixels");
     }
 
     /// A render can leave out the ground grid and the origin's axes (a box straddling Z 0 is cut
@@ -610,7 +668,7 @@ mod tests {
         let cam = home_camera(&s);
         let grid = [colors::GRID, colors::GRID_MAJOR];
         let axes = [colors::AXIS_X, colors::AXIS_Y, colors::AXIS_Z];
-        let count = |sc: &Scene, colours: &[Rgb]| sc.lines.iter().filter(|l| colours.contains(&l.color)).count();
+        let count = |sc: &Scene, colours: &[Rgb]| sc.grid.iter().chain(&sc.lines).filter(|l| colours.contains(&l.color)).count();
         let all = scene(&s, &cam);
         let (grid_lines, edges) = (count(&all, &grid), count(&all, &[colors::EDGE]));
         assert!(grid_lines > 20 && edges >= 12, "{grid_lines} grid lines, {edges} edges");
@@ -622,10 +680,7 @@ mod tests {
         let no_axes = render(Guides { grid: true, axes: false });
         assert_eq!((count(&no_axes, &grid), count(&no_axes, &axes), count(&no_axes, &[colors::EDGE])), (grid_lines, 0, edges));
         let bare = render(Guides { grid: false, axes: false });
-        assert_eq!(bare.lines.len(), edges);
-        // The picture changes with each.
-        let png = |sc: &Scene| solidcraft_render::render_png(sc, &cam, 160, 100);
-        assert!(png(&all) != png(&no_grid) && png(&all) != png(&no_axes) && png(&no_grid) != png(&bare));
+        assert_eq!((bare.lines.len(), bare.grid.len()), (edges, 0));
     }
 
     /// An origin axis hidden with `browser.visibility` stays out of headless renders, as it does
@@ -646,14 +701,43 @@ mod tests {
         s.execute("browser.visibility", &json!({"folder": "origin", "visible": false})).unwrap();
         assert!(shown(&s).is_empty());
         let sc = scene_with_guides(&s, &cam, None, Guides { grid: true, axes: true });
-        assert!(sc.lines.iter().any(|l| l.color == colors::GRID), "the grid is not part of the origin");
+        assert!(sc.grid.iter().any(|l| l.color == colors::GRID), "the grid is not part of the origin");
         s.execute("browser.visibility", &json!({"folder": "origin", "visible": true})).unwrap();
         assert_eq!(shown(&s), axes);
     }
 
-    /// Curved surfaces get a dark silhouette line in snapshots where they turn away.
+    /// A section cuts the headless scene: the clip plane and the cap colour, and the outline
+    /// where the plane cuts each body (the picture: `solidcraft-gpu`'s capture tests).
     #[test]
-    fn snapshots_draw_silhouettes_on_curved_surfaces() {
+    fn the_section_cuts_the_scene() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        let cam = home_camera(&s);
+        assert!(scene(&s, &cam).clip.is_none());
+        s.execute("inspect.section", &json!({"plane": {"origin": [0, 15, 0], "normal": [0, -1, 0]}})).unwrap();
+        let sc = scene(&s, &cam);
+        let (n, d) = sc.clip.unwrap();
+        assert!((n - Vec3::new(0.0, -1.0, 0.0)).len() < 1e-12 && (d + 15.0).abs() < 1e-12, "{n:?} {d}");
+        assert_eq!(sc.cap, Some(colors::SECTION_CAP));
+        assert!(!section_segments(&s.world_state().bodies[0].mesh(), Vec3::new(0.0, 15.0, 0.0), -Vec3::Y).is_empty());
+    }
+
+    /// The surface analysis shades the headless scene too, in the palette's colours.
+    #[test]
+    fn the_surface_analysis_shades_the_scene() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        let cam = home_camera(&s);
+        assert!(scene(&s, &cam).analysis.is_none());
+        s.analysis = Some(crate::SurfaceAnalysis::Curvature { radius: 5.0 });
+        let a = scene(&s, &cam).analysis.unwrap();
+        assert_eq!((a.mode, a.colors), (solidcraft_render::AnalysisMode::Curvature { radius: 5.0 }, Palette::DEFAULT.analysis));
+    }
+
+    /// The CPU rasterizer (the last tier of headless pictures, `SOLIDCRAFT_GPU=cpu` or no adapter
+    /// under `auto`): curved surfaces get a dark silhouette line where they turn away.
+    #[test]
+    fn cpu_pictures_draw_silhouettes_on_curved_surfaces() {
         let mut s = Session::default();
         s.execute("solid.sphere", &json!({"diameter": 20})).unwrap();
         let cam = home_camera(&s);
@@ -662,9 +746,9 @@ mod tests {
         assert!(dark > 40, "silhouette pixels: {dark}");
     }
 
-    /// A section shows in snapshots: the cut part is gone and the cut face is drawn.
+    /// The CPU rasterizer: a section shows; the cut part is gone and the cut face is drawn.
     #[test]
-    fn snapshots_show_the_section() {
+    fn cpu_pictures_show_the_section() {
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
         let cam = home_camera(&s);
@@ -681,7 +765,7 @@ mod tests {
     /// plane's depth, not on the far wall like a pane of glass), shows in the cap colour, and
     /// the cut's outline is drawn.
     #[test]
-    fn snapshot_section_caps_hide_the_inside() {
+    fn cpu_picture_section_caps_hide_the_inside() {
         let mut s = Session::default();
         s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
         // Cut away the front half (y < 15), so the iso camera looks into the cut.

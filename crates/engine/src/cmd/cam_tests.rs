@@ -478,7 +478,7 @@ fn manufacture_is_saved_undone_and_reported_when_it_breaks() {
     let mut again = Session::new(reopened);
     assert_eq!(run(&mut again, "cam.toolpath", json!({"points": false}))["operations"][0]["cut_length"], length);
     // A design without manufacturing data does not mention it.
-    assert!(!Session::default().doc.to_json().contains("manufacture"));
+    assert!(!Session::default().doc.to_json().contains("\"manufacture\""));
 
     run(&mut s, "edit.undo", json!({}));
     assert!(s.doc.manufacture.setups[0].operations.is_empty());

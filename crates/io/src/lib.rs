@@ -1,8 +1,8 @@
 //! File formats. Designs use JSON or versioned containers (`.solidcraft`); the authoritative
 //! document rebuilds on load and optional display caches remain provisional. Bodies export
-//! as STL (binary or ASCII), OBJ, STEP and 3MF, and assemblies as URDF ([`urdf()`]); STEP
-//! files import as a base feature (see [`step_import_feature`]), 3MF and STL files as mesh bodies
-//! (see [`mesh_import_feature`]).
+//! as STL (binary or ASCII), OBJ, STEP and 3MF, and assemblies as URDF ([`urdf()`]); STEP, IGES,
+//! FreeCAD and Rhino files import as a base feature (see [`step_import_feature`]), 3MF and
+//! STL files as mesh bodies (see [`mesh_import_feature`]).
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -18,6 +18,10 @@ pub use design::{
     write_design_container_with_thumbnail,
 };
 mod legacy_dir;
+#[cfg(test)]
+mod mutate;
+mod native_cad;
+pub use native_cad::{NATIVE_CAD_EXTS, is_native_cad_path, native_cad_to_step};
 pub mod safe_write;
 mod sketch2d;
 mod svg;
@@ -31,6 +35,8 @@ pub use legacy_dir::{APP_ID, LEGACY_APP_ID, adopt_legacy_dir, legacy_flatpak_pat
 pub use safe_write::{backup_path, write_atomic};
 pub use sketch2d::{Geom2, MAX_DRAWING_BYTES};
 pub use svg::read_svg;
+mod gltf_in;
+pub use gltf_in::{GltfImport, Loader, MAX_GLTF_BYTES, MeshPlan, PlanPlace, glb_container, is_gltf_path, read_gltf};
 mod obj;
 pub use obj::read_obj;
 pub use threemf::{MAX_3MF_BYTES, MeshObject, model_xml, model_xml_with, read_3mf, weld, write_3mf, write_3mf_with};
@@ -76,13 +82,14 @@ pub type Result<T> = std::result::Result<T, IoError>;
 /// Largest STEP file we read.
 pub const MAX_STEP_BYTES: usize = 512 << 20;
 
-/// Is this a CAD exchange file read as an Import base feature: STEP (`.step` / `.stp`) or IGES
-/// (`.igs` / `.iges`), any case?
+/// Is this a CAD file read as an Import base feature: STEP (`.step` / `.stp`), IGES
+/// (`.igs` / `.iges`) or a format read through cadmpeg ([`is_native_cad_path`]), any case?
 pub fn is_step_path(path: &str) -> bool {
     std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| ["step", "stp", "igs", "iges"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+        || is_native_cad_path(path)
 }
 
 /// Is this an IGES file name (`.igs` / `.iges`, any case)?
@@ -160,11 +167,14 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     if bytes.len() > MAX_STEP_BYTES {
         return Err(IoError::Invalid(format!("STEP file too large ({} MB, limit {} MB)", bytes.len() >> 20, MAX_STEP_BYTES >> 20)));
     }
-    // STEP is 7-bit text with escapes; tolerate stray 8-bit bytes. IGES is restated as STEP
-    // (the feature keeps that STEP text).
-    let text = String::from_utf8_lossy(bytes).into_owned();
-    let (text, iges_warnings) =
-        if is_iges_path(file) { solidcraft_kernel::iges_to_step(&text).map_err(IoError::Invalid)? } else { (text, Vec::new()) };
+    // STEP is 7-bit text with escapes; tolerate stray 8-bit bytes. IGES and the cadmpeg formats
+    // are restated as STEP (the feature keeps that STEP text).
+    let (text, iges_warnings) = if is_native_cad_path(file) {
+        native_cad_to_step(bytes, file).map_err(IoError::Invalid)?
+    } else {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        if is_iges_path(file) { solidcraft_kernel::iges_to_step(&text).map_err(IoError::Invalid)? } else { (text, Vec::new()) }
+    };
     let imp = solidcraft_kernel::step_import_shared(&text)?;
     let stem = std::path::Path::new(file)
         .file_stem()
@@ -188,12 +198,15 @@ pub fn step_import_feature_named(bytes: &[u8], file: &str, names: StepNames) -> 
     })
 }
 
-/// Is this a mesh file we import (`.3mf`, `.stl`, `.obj`, any case)?
+/// Is this a mesh file we import (`.3mf`, `.stl`, `.obj`, `.glb`, `.gltf`, any case)?
 pub fn is_mesh_path(path: &str) -> bool {
-    std::path::Path::new(path).extension().and_then(|e| e.to_str()).is_some_and(|e| ["3mf", "stl", "obj"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["3mf", "stl", "obj", "glb", "gltf"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
-/// A 3MF, STL or OBJ file read as a mesh import feature.
+/// A 3MF, STL, OBJ or glTF file read as a mesh import feature.
 pub struct MeshFeature {
     /// Timeline name: the only mesh's name, else the file name.
     pub name: String,
@@ -202,8 +215,16 @@ pub struct MeshFeature {
     pub warnings: Vec<String>,
 }
 
-/// Read 3MF, STL or OBJ bytes (the format from `file`'s extension) into a MeshImport feature.
+/// Read 3MF, STL, OBJ or glTF bytes (the format from `file`'s extension) into a MeshImport
+/// feature. A glTF file's bodies are all built where they are (see [`read_gltf`] for its node
+/// tree), and it can't read buffers in other files.
 pub fn mesh_import_feature(bytes: &[u8], file: &str) -> Result<MeshFeature> {
+    if is_gltf_path(file) {
+        let mut no_files = |name: &str| Err(format!("`{name}` can't be read here"));
+        let mut g = read_gltf(bytes, file, &mut no_files)?;
+        g.flatten();
+        return Ok(g.feature);
+    }
     if bytes.len() > MAX_3MF_BYTES {
         return Err(IoError::Invalid(format!("mesh file too large ({} MB)", bytes.len() >> 20)));
     }
@@ -469,7 +490,9 @@ fn mesh_object(b: &solidcraft_doc::ModelBody, tagged: bool) -> Result<MeshObject
 
 /// STEP assembly of a design with components: a product per component holding its bodies in
 /// the component's own frame (`local` is the model before placing occurrences), and an
-/// assembly occurrence per component occurrence.
+/// assembly occurrence per component occurrence. A body with an offset (an imported assembly's
+/// part, built where the file placed it) is taken into its component's frame by that offset,
+/// as the world placement does, so the occurrences above it place it only once.
 pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<Vec<u8>> {
     use solidcraft_kernel::{ExportBody, ExportProduct};
     let mut index: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
@@ -479,10 +502,18 @@ pub fn step_assembly(doc: &Document, local: &ModelState, name: &str) -> Result<V
         index.insert(c.id, products.len());
         products.push(ExportProduct { name: c.name.clone(), bodies: Vec::new(), children: Vec::new() });
     }
-    for b in &local.bodies {
-        let comp = doc.body_component(&b.name, b.feature);
+    let framed: Vec<Option<solidcraft_kernel::Body>> = local
+        .bodies
+        .iter()
+        .map(|b| match doc.model_body_offset(b) {
+            Some(offset) if !solidcraft_doc::is_identity(offset) => solidcraft_kernel::transform_matrix(&b.body, *offset).map(Some),
+            _ => Ok(None),
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    for (b, framed) in local.bodies.iter().zip(&framed) {
+        let comp = doc.model_body_component(b);
         let Some(p) = index.get(&comp).and_then(|i| products.get_mut(*i)) else { continue };
-        p.bodies.push(ExportBody { name: b.name.clone(), body: &b.body, color: b.body.color() });
+        p.bodies.push(ExportBody { name: b.name.clone(), body: framed.as_ref().unwrap_or(&b.body), color: b.body.color() });
     }
     for o in &doc.occurrences {
         let (Some(&parent), Some(&child)) = (index.get(&o.parent), index.get(&o.component)) else { continue };
@@ -840,11 +871,12 @@ mod tests {
         .unwrap();
         doc.add_feature(
             FeatureKind::Fillet {
-                edges: vec![Vec3::new(0.0, 0.0, 5.0)],
+                edges: vec![solidcraft_doc::Position(Vec3::new(0.0, 0.0, 5.0))],
                 radius: "4".into(),
                 body: None,
                 style: Default::default(),
                 fit: Default::default(),
+                corner: Default::default(),
             },
             None,
         )
@@ -852,7 +884,7 @@ mod tests {
         doc.add_feature(
             FeatureKind::Cylinder {
                 base: point_expr(Vec3::new(80.0, 0.0, 0.0)),
-                axis: Vec3::Z,
+                axis: solidcraft_doc::Dir(Vec3::Z),
                 radius: "6".into(),
                 height: "15".into(),
                 operation: Operation::NewBody,
@@ -924,11 +956,12 @@ mod tests {
         .unwrap();
         doc.add_feature(
             FeatureKind::Fillet {
-                edges: vec![Vec3::new(0.1, -0.3, 5.0 + 1.0 / 3.0)],
+                edges: vec![solidcraft_doc::Position(Vec3::new(0.1, -0.3, 5.0 + 1.0 / 3.0))],
                 radius: "4".into(),
                 body: None,
                 style: Default::default(),
                 fit: Default::default(),
+                corner: Default::default(),
             },
             None,
         )

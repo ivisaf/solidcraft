@@ -1,9 +1,8 @@
 //! Colours and widget style: a dark theme (the default, a blue-grey in the spirit of desktop CAD
-//! tools, viewport #2e3440) and a light one, each with colour vision modes. Every colour the UI
-//! uses comes from [`Tokens`].
+//! tools, viewport #2e3440) and a light one, each with colour vision modes, and theme files that
+//! set any of their colours (`theme_files`). Every colour the UI uses comes from [`Tokens`].
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "../../../assets/styles/ui/palettes.rs"]
 mod palettes;
@@ -11,10 +10,11 @@ mod palettes;
 use egui::{Color32, Stroke};
 use serde::{Deserialize, Serialize};
 
-static DARK: AtomicBool = AtomicBool::new(true);
-
 thread_local! {
-    /// The colour vision mode, per thread, where the dark theme is one global (`DARK`). Each app
+    /// Theme state belongs to the UI thread drawing the frame. Concurrent app/test renderers
+    /// must not change one another's palette while a frame or icon texture is being built.
+    static DARK: Cell<bool> = const { Cell::new(true) };
+    /// The colour vision mode, per thread. Each app
     /// sets it from its own preferences at the start of every frame (`SolveApp::logic`), on the
     /// thread that draws it. Tests run many apps side by side on their own threads in one process:
     /// with one global, a test in a mode changed the colours under another one
@@ -22,11 +22,32 @@ thread_local! {
     /// it: the preview thread is handed its colours (`preview::Colors`) and thumbnails are drawn by
     /// the engine in the model's colours, so a new thread starts Off and stays Off.
     static VISION: Cell<ColorVision> = const { Cell::new(ColorVision::Off) };
+    /// The palette of a theme file (`theme_files`) in place of the built-in one of its base
+    /// (dark or light), per thread like the rest. `None`: the built-in palettes.
+    static CUSTOM: Cell<Option<Custom>> = const { Cell::new(None) };
+}
+
+/// A theme file's palette and whether it is dark.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Custom {
+    pub dark: bool,
+    pub tokens: Tokens,
+}
+
+/// Use a theme file's palette for its base, or the built-in palettes (`None`). Returns whether
+/// that changed anything (the visuals follow on the next [`apply`]).
+pub fn set_custom(custom: Option<Custom>) -> bool {
+    CUSTOM.with(|c| c.replace(custom) != custom)
 }
 
 /// Is the dark theme on?
 pub fn is_dark() -> bool {
-    DARK.load(Ordering::Relaxed)
+    DARK.get()
+}
+
+/// The common conversion boundary for compiled icon palette data.
+pub(crate) const fn icon_color(rgb: [u8; 3]) -> Color32 {
+    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
 }
 
 /// Colour vision modes (#778): a second set of values for the colours that carry a meaning, for
@@ -108,18 +129,8 @@ pub fn srgb(c: [f32; 3]) -> Color32 {
 }
 
 /// Surface analysis colours, straight sRGB 0..1 as the shader takes them (exact, so they read
-/// the same as when they were literals in the WGSL).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AnalysisColors {
-    /// Draft Analysis: at least the draft angle, between, at most minus the angle.
-    pub draft: [[f32; 3]; 3],
-    /// Accessibility Analysis: reachable, blocked.
-    pub access: [[f32; 3]; 2],
-    /// Curvature Map: flat, the middle of the scale, at or below the analysis radius.
-    pub curvature: [[f32; 3]; 3],
-    /// Stripe the negative draft and blocked faces too, so colour is not the only cue.
-    pub hatch: bool,
-}
+/// the same as when they were literals in the WGSL). The light theme's are the headless default.
+pub use solidcraft_engine::render::AnalysisColors;
 
 /// The colours icons draw of their own (`icons::paint` takes ink, fill and accent from its
 /// caller). Every icon colour is a token so a colour vision mode can reach it.
@@ -213,6 +224,8 @@ pub struct Tokens {
     pub manipulator: Color32,
     /// New surface in a feature preview.
     pub preview_add: Color32,
+    /// The surface of a body a feature preview creates (New Body), apart from a join (#1805).
+    pub preview_new: Color32,
     /// Proposed sketch geometry, distinct from blue selections.
     pub preview_sketch: Color32,
     /// Removed material in a feature preview (translucent).
@@ -291,6 +304,10 @@ pub struct Tokens {
     pub bend_down: Color32,
     /// Interference: the clash fill, before its shading.
     pub interference: Color32,
+    /// Continuity Analysis seams, best to worst as `inspect.continuity` judges them: smooth (G2),
+    /// tangent with a curvature jump (G1), a crease (G0) and a gap. Bluish green, blue, yellow
+    /// and reddish purple stay apart in every colour vision mode, so no mode changes them.
+    pub continuity: [Color32; 4],
     pub analysis: AnalysisColors,
     pub icons: IconColors,
     /// The application bar's buttons: ink, fill and accent of their icons.
@@ -305,9 +322,11 @@ impl Tokens {
         Tokens::themed(is_dark(), vision())
     }
 
-    /// The tokens of a theme and colour vision mode.
+    /// The tokens of a theme and colour vision mode: a theme file's palette when one is on for
+    /// that base ([`set_custom`]), else the built-in one; the colour vision mode on top.
     pub fn themed(dark: bool, mode: ColorVision) -> Tokens {
-        (if dark { Tokens::dark() } else { Tokens::light() }).with_vision(dark, mode)
+        let custom = CUSTOM.get().filter(|c| c.dark == dark).map(|c| c.tokens);
+        custom.unwrap_or(if dark { Tokens::dark() } else { Tokens::light() }).with_vision(dark, mode)
     }
 
     /// These tokens with a colour vision mode's values on top (the tables in `palettes.rs`); Off
@@ -343,7 +362,7 @@ pub fn material_color(name: &str) -> Option<Color32> {
 
 /// Switch themes (the visuals follow on the next [`apply`]).
 pub fn set_dark(dark: bool) {
-    DARK.store(dark, Ordering::Relaxed);
+    DARK.set(dark);
 }
 
 fn visuals(dark: bool) -> egui::Visuals {
@@ -383,6 +402,24 @@ pub fn apply(ctx: &egui::Context) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn concurrent_ui_renderers_keep_their_own_theme_and_vision() {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (dark, vision) in [(false, super::ColorVision::Off), (true, super::ColorVision::Protan)] {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    super::set_dark(dark);
+                    super::set_vision(vision);
+                    barrier.wait();
+                    assert_eq!(super::is_dark(), dark);
+                    assert_eq!(super::vision(), vision);
+                    assert_eq!(super::Tokens::get().sketch_accent, super::Tokens::themed(dark, vision).sketch_accent);
+                });
+            }
+        });
+    }
+
     /// Title and section bands stand out from a dialog, the title more than its sections.
     #[test]
     fn heading_bands_are_darker_than_the_dialog_in_order() {

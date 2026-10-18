@@ -69,8 +69,12 @@ impl FaceAnchor {
         }
         let inverse = crate::mat_inverse(&self.author_frame(doc, author)?)
             .ok_or_else(|| DocError::Invalid("attached sketch author frame is invalid".into()))?;
-        let source =
-            EmbossFace { body: self.target.body.clone(), at: self.target.point, path: self.path.clone(), author_path: self.author_path.clone() };
+        let source = EmbossFace {
+            body: self.target.body.clone().into(),
+            at: crate::FacePick(self.target.point),
+            path: self.path.clone(),
+            author_path: self.author_path.clone(),
+        };
         Ok(crate::mat_mul(&inverse, &source.body_frame(doc, body)?))
     }
 }
@@ -78,7 +82,7 @@ impl FaceAnchor {
 pub fn plane_face_anchor(plane: &PlaneRef) -> Option<&FaceAnchor> {
     match plane {
         PlaneRef::Face { anchor, .. } => anchor.as_deref(),
-        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => plane_face_anchor(base),
+        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => plane_face_anchor(base),
         _ => None,
     }
 }
@@ -86,7 +90,7 @@ pub fn plane_face_anchor(plane: &PlaneRef) -> Option<&FaceAnchor> {
 fn has_face_reference(plane: &PlaneRef) -> bool {
     match plane {
         PlaneRef::Face { .. } => true,
-        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => has_face_reference(base),
+        PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => has_face_reference(base),
         _ => false,
     }
 }
@@ -106,7 +110,9 @@ impl Document {
             }
             match plane {
                 PlaneRef::Face { anchor: Some(anchor), .. } => *plane = PlaneRef::Custom { plane: doc.resolve_face_anchor(anchor, author, state)? },
-                PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } => replace(doc, base, author, state, depth + 1)?,
+                PlaneRef::Offset { base, .. } | PlaneRef::AtAngle { base, .. } | PlaneRef::Flipped { base, .. } => {
+                    replace(doc, base, author, state, depth + 1)?
+                }
                 _ => {}
             }
             Ok(())
@@ -447,7 +453,7 @@ mod tests {
             .add_feature(
                 FeatureKind::Extrude {
                     thin: None,
-                    sketch: source,
+                    sketch: crate::SketchId(source),
                     profiles: crate::ProfileSel::Indices { indices: vec![0, 1] },
                     extent,
                     operation: crate::Operation::NewBody,
@@ -558,7 +564,7 @@ mod tests {
             .add_feature(
                 FeatureKind::Extrude {
                     thin: None,
-                    sketch: sk,
+                    sketch: crate::SketchId(sk),
                     profiles: crate::ProfileSel::All,
                     extent,
                     operation: crate::Operation::NewBody,

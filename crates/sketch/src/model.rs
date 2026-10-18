@@ -169,6 +169,11 @@ pub struct Curve {
     /// Fixed (locked): its points and radius are constants for the solver.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fixed: bool,
+    /// Infinite line type (#1359), for lines only: construction geometry drawn across the whole
+    /// view, through its two points, which fix where it lies and which way it runs. Never part of
+    /// a profile (it is construction too).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub infinite: bool,
 }
 
 /// Geometric constraints and dimensions. Indices refer to `Sketch::points` (`p`, `q`) or
@@ -184,6 +189,9 @@ pub enum ConstraintKind {
         center: Option<usize>,
         angle: f64,
         offset: Vec2,
+        /// Displacements along and perpendicular to live sketch lines (at most two).
+        #[serde(default)]
+        directions: [Option<(usize, Vec2)>; 2],
     },
     /// The independent radius of a patterned circle or ellipse follows its seed.
     PatternRadius {
@@ -418,7 +426,9 @@ impl ConstraintKind {
     pub fn indices(&self) -> (Vec<usize>, Vec<usize>) {
         use ConstraintKind::*;
         match *self {
-            PatternPoint { p, q, center, .. } => (vec![p, q].into_iter().chain(center).collect(), vec![]),
+            PatternPoint { p, q, center, directions, .. } => {
+                (vec![p, q].into_iter().chain(center).collect(), directions.into_iter().flatten().map(|(l, _)| l).collect())
+            }
             PatternRadius { a, b } => (vec![], vec![a, b]),
             Coincident { p, q } | HorizontalPoints { p, q } | VerticalPoints { p, q } => (vec![p, q], vec![]),
             Distance { p, q, .. } | DistanceX { p, q, .. } | DistanceY { p, q, .. } => (vec![p, q], vec![]),
@@ -438,7 +448,9 @@ impl ConstraintKind {
             OffsetDistance { .. } => (vec![], vec![]),
         }
     }
-    pub(crate) fn remap(&mut self, pmap: &dyn Fn(usize) -> Option<usize>, cmap: &dyn Fn(usize) -> Option<usize>) -> bool {
+    /// Renumber the points and curves the constraint refers to; false when one has no new
+    /// number (the constraint is then partly renumbered and should be dropped).
+    pub fn remap(&mut self, pmap: &dyn Fn(usize) -> Option<usize>, cmap: &dyn Fn(usize) -> Option<usize>) -> bool {
         use ConstraintKind::*;
         let mut ok = true;
         let mut fp = |i: &mut usize| match pmap(*i) {
@@ -451,11 +463,14 @@ impl ConstraintKind {
             None => ok2 = false,
         };
         match self {
-            PatternPoint { p, q, center, .. } => {
+            PatternPoint { p, q, center, directions, .. } => {
                 fp(p);
                 fp(q);
                 if let Some(c) = center {
                     fp(c);
+                }
+                for (l, _) in directions.iter_mut().flatten() {
+                    fc(l);
                 }
             }
             PatternRadius { a, b } => {
@@ -733,6 +748,7 @@ impl Sketch {
             link: None,
             centerline: false,
             fixed: false,
+            infinite: false,
         });
         Ok(self.curves.len() - 1)
     }
@@ -770,6 +786,7 @@ impl Sketch {
             link: None,
             centerline: false,
             fixed: false,
+            infinite: false,
         });
         Ok(self.curves.len() - 1)
     }
@@ -804,6 +821,7 @@ impl Sketch {
             link: None,
             centerline: false,
             fixed: false,
+            infinite: false,
         });
         Ok(self.curves.len() - 1)
     }
@@ -838,7 +856,13 @@ impl Sketch {
         let need_line = |i: usize| if is_line(i) { Ok(()) } else { Err(SketchError::WrongKind(name(i), "needs a line".into())) };
         let need_round = |i: usize| if is_round(i) { Ok(()) } else { Err(SketchError::WrongKind(name(i), "needs a circle or arc".into())) };
         match *k {
-            PatternPoint { p, q, angle, offset, .. } => {
+            PatternPoint { p, q, angle, offset, directions, .. } => {
+                for (l, distance) in directions.into_iter().flatten() {
+                    need_line(l)?;
+                    if !distance.x.is_finite() || !distance.y.is_finite() || distance.x.abs() > MAX_COORD || distance.y.abs() > MAX_COORD {
+                        return Err(SketchError::Invalid("invalid pattern direction displacement".into()));
+                    }
+                }
                 if p == q
                     || !angle.is_finite()
                     || angle.abs() > std::f64::consts::TAU
@@ -947,6 +971,54 @@ impl Sketch {
             return Err(SketchError::Invalid("arc sweep must be nonzero and less than a full turn".into()));
         }
         Ok(())
+    }
+
+    /// The sketch scaled by `factor` about its origin, for its first dimension (#1365): drawn
+    /// geometry has no size of its own until a dimension gives it one, so the first length
+    /// dimension scales the whole sketch to its value instead of distorting it. Only a sketch
+    /// with nothing that fixes a size: no other driving length dimension, nothing fixed,
+    /// projected or patterned, no offsets and no 3D curves. Every geometric constraint
+    /// (coincident, horizontal, parallel, tangent, equal, symmetric, …) and every angle holds
+    /// on the scaled sketch as it held before. `None` when the sketch does not qualify.
+    pub fn scaled_for_first_dimension(&self, factor: f64) -> Option<Sketch> {
+        if !(factor.is_finite() && (1e-6..=1e6).contains(&factor)) {
+            return None;
+        }
+        let sizes = self.constraints.iter().any(|c| match c.kind {
+            ConstraintKind::Fix { .. } | ConstraintKind::PatternPoint { .. } | ConstraintKind::PatternRadius { .. } => true,
+            ref k => k.is_dimension() && !k.is_angle() && !c.driven,
+        });
+        if sizes
+            || !self.links.is_empty()
+            || !self.patterns.is_empty()
+            || !self.offsets.is_empty()
+            || !self.freeform_offsets.is_empty()
+            || !self.wires.is_empty()
+            || self.curves.iter().any(|c| c.fixed || c.link.is_some())
+            || self.points.iter().enumerate().any(|(i, p)| (p.fixed || p.link.is_some()) && (i != 0 || p.pos != Vec2::ZERO))
+        {
+            return None;
+        }
+        let mut out = self.clone();
+        for p in out.points.iter_mut().filter(|p| !p.fixed) {
+            p.pos = p.pos * factor;
+            if !in_range(p.pos) {
+                return None;
+            }
+        }
+        for c in &mut out.curves {
+            if let CurveKind::Circle { r, .. } | CurveKind::Ellipse { r, .. } = &mut c.kind {
+                *r *= factor;
+                if !radius_in_range(*r) {
+                    return None;
+                }
+            }
+        }
+        // Dimension texts keep their places relative to what they measure.
+        for t in out.constraints.iter_mut().filter_map(|c| c.text.as_mut()) {
+            *t = *t * factor;
+        }
+        Some(out)
     }
 
     /// Is point `i` held in place: fixed, projected (linked), fixed by a Fix constraint or a
@@ -1217,8 +1289,8 @@ impl Sketch {
     }
 
     /// Exact boundary segments of a free-form curve: ellipses as four conics, conics, fit
-    /// splines and control splines up to degree 3 as Béziers. None for other curves (and for
-    /// higher-degree splines, which stay polylines).
+    /// splines and control splines up to `MAX_BEZIER_DEGREE` as Béziers. None for other curves
+    /// (and for higher-degree splines, which stay polylines).
     pub fn exact_segs(&self, ci: usize) -> Option<Vec<Seg2>> {
         let cu = self.curves.get(ci)?;
         let pt = |i: &usize| self.point(*i);
@@ -1251,6 +1323,17 @@ impl Sketch {
                 Some(crate::curves::bspline_beziers(&p, k).iter().filter_map(|c| solidcraft_geom::bezier(c)).collect())
             }
             _ => None,
+        }
+    }
+
+    /// The exact [`Seg2`] pieces of a curve of any kind, in the curve's own direction of travel:
+    /// lines, circles and arcs from their analytic form, free-form curves through
+    /// [`Sketch::exact_segs`]. Empty for a curve with no exact pieces (a spline above
+    /// `solidcraft_geom::MAX_BEZIER_DEGREE`).
+    pub fn exact_pieces(&self, ci: usize) -> Vec<Seg2> {
+        match self.exact_segs(ci) {
+            Some(segs) => segs,
+            None => self.segs(ci),
         }
     }
 
@@ -1303,8 +1386,11 @@ impl Sketch {
                 "e"
             }
             CurveKind::Spline { pts, control, degree, periodic } => {
-                if pts.len() < 2 || pts.len() > crate::curves::MAX_SPLINE_POINTS || !(1..=7).contains(degree) {
-                    return Err(SketchError::Invalid("a spline needs 2 to 500 points and degree 1 to 7".into()));
+                if pts.len() < 2 || pts.len() > crate::curves::MAX_SPLINE_POINTS || !(1..=solidcraft_geom::MAX_BEZIER_DEGREE as u8).contains(degree) {
+                    return Err(SketchError::Invalid(format!(
+                        "a spline needs 2 to 500 points and degree 1 to {}",
+                        solidcraft_geom::MAX_BEZIER_DEGREE
+                    )));
                 }
                 if *periodic {
                     if *control || *degree != 3 {
@@ -1326,7 +1412,7 @@ impl Sketch {
             }
         };
         let id = self.curve_id(id, prefix)?;
-        self.curves.push(Curve { id, kind, construction: false, reversed: false, link: None, centerline: false, fixed: false });
+        self.curves.push(Curve { id, kind, construction: false, reversed: false, link: None, centerline: false, fixed: false, infinite: false });
         Ok(self.curves.len() - 1)
     }
 
