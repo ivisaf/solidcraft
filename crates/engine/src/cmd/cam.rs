@@ -39,7 +39,7 @@ macro_rules! op_doc {
 const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direction the tool comes from: the setup's +Z (default +z); \
      stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0); origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
-     the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|lnc|lnc_atc (default \
+     the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -103,7 +103,7 @@ pub static COMMANDS: &[CommandSpec] = &[
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
-        "setup?: id or name; op?: id or name, to write that operation alone (default: every operation, in order); post?: rs274|grbl|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
+        "setup?: id or name; op?: id or name, to write that operation alone (default: every operation, in order); post?: rs274|grbl|grblhal|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
          cut_minutes, and gcode (the program text) when no path is given",
     ),
 ];

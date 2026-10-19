@@ -475,6 +475,25 @@ M30
     assert_eq!(back.stats().lowest_z, Some(-4.0));
 }
 
+/// grblHAL: the first tool is the one in the spindle; a later one is called with `T… M6` (the
+/// controller's `$341` decides what that does), never with `G43`, which needs a tool table.
+#[test]
+fn grblhal_calls_later_tools_with_m6_and_no_length_offset_word() {
+    let mut program = drill_program();
+    let mut second = program.operations[0].clone();
+    second.tool.number = 4;
+    program.operations.push(second);
+    let text = emit(&program, &Post::grblhal()).unwrap();
+    assert!(text.starts_with("G17 G21 G40 G49 G54 G80 G90 G94\n") || text.contains("\nG17 G21 G40 G49 G54 G80 G90 G94\n"), "{text}");
+    assert_eq!(text.matches(" M6\n").count(), 1, "only the second tool is called:\n{text}");
+    assert!(text.contains("M5\nT4 M6\n") && !text.contains("G43") && !text.contains("M0\n"), "{text}");
+    assert_eq!(text.matches("S3000 M3").count(), 2, "the spindle restarts after the tool change");
+    assert_eq!(Post::builtin("grblHAL"), Some(Post::grblhal()));
+    assert!(Post::BUILTIN.iter().all(|name| Post::builtin(name).is_some_and(|p| p.validate().is_ok())));
+    let back = Toolpath { moves: parse(&text).unwrap() };
+    close(back.stats().cut_length, Toolpath { moves: parse(&emit(&program, &Post::grbl()).unwrap()).unwrap() }.stats().cut_length, 1e-9);
+}
+
 #[test]
 fn grbl_stops_for_a_manual_tool_change_and_inches_are_converted() {
     let mut program = drill_program();

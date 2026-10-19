@@ -167,6 +167,20 @@ impl Post {
         }
     }
 
+    /// grblHAL: Grbl's language plus `T… M6`, which the controller answers as its `$341`
+    /// setting says (a manual change, touch-off by hand or on a tool sensor, an automatic changer,
+    /// or nothing). The first tool is the one already in the spindle, touched off by hand, so only
+    /// a later tool is called with `M6`; the controller keeps its length offset (`G43.1`),
+    /// so the program writes no `G43`, which needs a tool table grblHAL may be built without.
+    pub fn grblhal() -> Post {
+        Post {
+            name: "grblhal".into(),
+            header: lines(&["G17 {units} G40 G49 G54 G80 G90 G94"]),
+            tool_change: lines(&["M5", "T{tool} M6"]),
+            ..Post::grbl()
+        }
+    }
+
     /// LNC MW/M-series controllers with a manual tool change, after the Advantech-LNC milling
     /// programming manual (V01.02.000): numbers always carry a decimal point as in its
     /// examples and motion codes two digits; `G04 X` dwells in seconds; arcs are `G02`/`G03` with `I` `J` (helical arcs are
@@ -217,13 +231,14 @@ impl Post {
         match name.trim().to_ascii_lowercase().as_str() {
             "rs274" | "linuxcnc" => Some(Post::rs274()),
             "grbl" => Some(Post::grbl()),
+            "grblhal" | "grbl_hal" => Some(Post::grblhal()),
             "lnc" => Some(Post::lnc()),
             "lnc_atc" => Some(Post::lnc_atc()),
             _ => None,
         }
     }
 
-    pub const BUILTIN: &'static [&'static str] = &["rs274", "grbl", "lnc", "lnc_atc"];
+    pub const BUILTIN: &'static [&'static str] = &["rs274", "grbl", "grblhal", "lnc", "lnc_atc"];
 
     pub fn validate(&self) -> Result<()> {
         if self.decimals > 6 || self.feed_decimals > 4 {
