@@ -86,6 +86,11 @@ pub enum Target {
         folder: String,
         scope: String,
     },
+    /// A manufacturing setup in the browser, or one operation of it.
+    Cam {
+        setup: u64,
+        op: Option<u64>,
+    },
 }
 
 /// One menu entry: a command id (run with `params` when given, else started like a toolbar
@@ -282,6 +287,7 @@ pub fn target_bodies(app: &SolveApp, target: &Target) -> Vec<String> {
         | Target::Workspace
         | Target::NamedViews
         | Target::NamedView { .. }
+        | Target::Cam { .. }
         | Target::Section => Vec::new(),
     }
 }
@@ -340,6 +346,7 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::NamedViews => vec![act("ui.newView", "New Named View", "perspective")],
         Target::Section => crate::browser::section_items(app),
         Target::Joint { id } => joint_items(app, *id),
+        Target::Cam { setup, op } => crate::cam_ui::menu_items(app, *setup, *op),
         Target::ToolbarCommand { id } => crate::toolbar_custom::command_items(app, id),
         Target::Toolbar => crate::toolbar_custom::toolbar_items(app),
         Target::Workspace => {
@@ -1092,6 +1099,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
                 }
             }
         }
+        "ui.cam" => crate::cam_ui::menu_action(app, &p),
         "ui.newView" => drop(crate::browser::save_view(app, None)),
         "ui.restoreView" => {
             if let Some(v) = p.get("view").and_then(Value::as_str) {

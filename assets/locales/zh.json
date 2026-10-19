@@ -1377,6 +1377,8 @@
   "ui.mirror_line": "镜像线",
   "ui.modify": "修改",
   "ui.move": "移动",
+  "ui.move_down": "下移",
+  "ui.move_up": "上移",
   "ui.multiple": "多个",
   "ui.named_views": "命名视图",
   "ui.navigation": "导航",

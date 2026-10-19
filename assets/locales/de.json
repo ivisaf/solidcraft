@@ -1044,6 +1044,8 @@
   "ui.mirror_line": "Spiegelachse",
   "ui.modify": "Ändern",
   "ui.move": "Verschieben",
+  "ui.move_down": "Nach unten",
+  "ui.move_up": "Nach oben",
   "ui.multiple": "Mehrfach",
   "ui.named_views": "Benannte Ansichten",
   "ui.navigation": "Navigation",

@@ -307,6 +307,12 @@ pub struct CamUi {
     /// How far each panel was dragged from its docked place by its header (zero: docked).
     pub offset: egui::Vec2,
     pub tools_offset: egui::Vec2,
+    /// The setup, or the operation of a setup, picked in the browser.
+    pub picked: Option<(u64, Option<u64>)>,
+    /// The browser's eye keeps the toolpaths drawn while the Manufacture panel is closed.
+    pub pinned_paths: bool,
+    /// `cam.list` as the browser last read it, and the design revision it was read at.
+    browser_listing: Option<(u64, Value)>,
     /// The tool picked in the Tool Library window: whether it is the machine library's, and its number.
     pub selected_tool: Option<(bool, u64)>,
     /// The tool library file to use instead of the machine's own (tests).
@@ -339,6 +345,9 @@ impl Default for CamUi {
             panel: None,
             offset: egui::Vec2::ZERO,
             tools_offset: egui::Vec2::ZERO,
+            picked: None,
+            pinned_paths: false,
+            browser_listing: None,
             selected_tool: None,
             library: None,
             listing: None,
@@ -941,9 +950,14 @@ pub fn setup_lines(view: &SetupView) -> (Vec<(Vec3, Vec3)>, [(Vec3, Vec3); 3]) {
 }
 
 /// The screen segments of the toolpaths: `(from, to, cutting)`.
+/// Whether the toolpaths are drawn: while the Manufacture panel is open, or kept on by the browser's eye.
+pub fn paths_drawn(app: &SolveApp) -> bool {
+    app.manufacture.show_paths && (app.manufacture.open || app.manufacture.pinned_paths)
+}
+
 pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, bool)> {
     let mut out = Vec::new();
-    if !(app.manufacture.open && app.manufacture.show_paths) {
+    if !paths_drawn(app) {
         return out;
     }
     for path in app.manufacture.cache.iter().flat_map(|(_, p, _)| p) {
@@ -1678,6 +1692,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
     }
     app.manufacture = cam;
+    answer(app, asked);
+}
+
+/// Does what a panel, the browser or a menu asked for.
+fn answer(app: &mut SolveApp, mut asked: Asked) {
     for (id, p) in std::mem::take(&mut asked.run) {
         app.manufacture.error = run(app, id, p).err();
     }
@@ -1725,6 +1744,200 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
             }
         });
     }
+}
+
+/// The design's setups and their operations in the browser, under a Manufacture folder (none
+/// while there is no setup). Its eye shows and hides the toolpaths; a double-click edits a setup
+/// or an operation, and the right button opens their menu.
+pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
+    use crate::browser::{Row, draw_row, is_open, toggle};
+    if app.session.doc.manufacture.setups.is_empty() {
+        app.manufacture.picked = None;
+        app.manufacture.browser_listing = None;
+        return;
+    }
+    // Read again once the design changed, but never while its model waits to be rebuilt (a
+    // sketch drag in progress): listing would rebuild it under the drag.
+    let revision = app.session.revision;
+    if app.manufacture.browser_listing.as_ref().is_none_or(|(r, _)| *r != revision) && !app.session.model.is_stale() {
+        let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+        app.manufacture.browser_listing = Some((revision, listed));
+    }
+    let setups = app.manufacture.browser_listing.as_ref().and_then(|(_, l)| l["setups"].as_array().cloned()).unwrap_or_default();
+    if setups.is_empty() {
+        return;
+    }
+    let key = "c0/manufacture";
+    let open = is_open(app, key, true);
+    let shown = paths_drawn(app);
+    if shown {
+        refresh(app);
+    }
+    let r = draw_row(
+        ui,
+        ui.id().with(key),
+        &Row { depth, fold: Some(open), eye: Some(shown), icon: "folder", label: "Manufacture", dim: !shown, ..Default::default() },
+    );
+    if r.eye {
+        app.manufacture.show_paths = !shown;
+        app.manufacture.pinned_paths = !shown;
+    } else if r.fold || r.clicked {
+        toggle(app, key, true);
+    }
+    if !open {
+        return;
+    }
+    let mut asked = Asked::default();
+    for setup in &setups {
+        let Some(id) = setup["id"].as_u64() else { continue };
+        let skey = format!("c0/manufacture/{id}");
+        let sopen = is_open(app, &skey, true);
+        let name = text(setup, "name");
+        let ops = setup["operations"].as_array().cloned().unwrap_or_default();
+        let r = draw_row(
+            ui,
+            ui.id().with(("cam_setup", id)),
+            &Row {
+                depth: depth + 1,
+                fold: (!ops.is_empty()).then_some(sopen),
+                icon: "cam_setup",
+                label: &name,
+                name: true,
+                selected: app.manufacture.picked == Some((id, None)),
+                ..Default::default()
+            },
+        );
+        if let Some(resp) = &r.resp {
+            let hover = setup.get("error").and_then(Value::as_str).map_or_else(|| format!("post: {}", text(setup, "post")), str::to_string);
+            resp.clone().on_hover_text(hover);
+        }
+        if r.fold {
+            toggle(app, &skey, true);
+        } else if r.clicked {
+            app.manufacture.picked = Some((id, None));
+        }
+        if r.double {
+            asked.form = setup_form(setup);
+            app.manufacture.open = true;
+        }
+        if let Some(at) = r.secondary {
+            app.manufacture.picked = Some((id, None));
+            crate::context_menu::open_for(app, at, crate::context_menu::Target::Cam { setup: id, op: None });
+        }
+        if !sopen {
+            continue;
+        }
+        for op in &ops {
+            let Some(op_id) = op["id"].as_u64() else { continue };
+            let error = op.get("error").and_then(Value::as_str);
+            let label = text(op, "name");
+            let icon = format!("cam_{}", text(op, "kind"));
+            let r = draw_row(
+                ui,
+                ui.id().with(("cam_op", id, op_id)),
+                &Row {
+                    depth: depth + 2,
+                    icon: &icon,
+                    label: &label,
+                    name: true,
+                    selected: app.manufacture.picked == Some((id, Some(op_id))),
+                    color: error.map(|_| Tokens::get().error),
+                    ..Default::default()
+                },
+            );
+            if let Some(resp) = &r.resp {
+                let hover = error.map_or_else(
+                    || {
+                        format!(
+                            "{}, T{}, {:.1} min",
+                            text(op, "kind"),
+                            op["tool"].as_u64().unwrap_or(0),
+                            op["toolpath"]["cut_minutes"].as_f64().unwrap_or(0.0)
+                        )
+                    },
+                    str::to_string,
+                );
+                resp.clone().on_hover_text(hover);
+            }
+            if r.clicked {
+                app.manufacture.picked = Some((id, Some(op_id)));
+            }
+            if r.double {
+                asked.edit_op = Some((setup.clone(), op.clone()));
+                app.manufacture.open = true;
+            }
+            if let Some(at) = r.secondary {
+                app.manufacture.picked = Some((id, Some(op_id)));
+                crate::context_menu::open_for(app, at, crate::context_menu::Target::Cam { setup: id, op: Some(op_id) });
+            }
+        }
+    }
+    answer(app, asked);
+}
+
+/// A menu entry that `menu_action` does: `what` to the setup, or to one operation of it.
+fn menu_item(label: &str, icon: &str, what: &str, setup: u64, op: Option<u64>) -> crate::context_menu::Item {
+    let mut item = crate::context_menu::Item::action("ui.cam", label, icon);
+    item.params = Some(json!({ "do": what, "setup": setup, "op": op }));
+    item
+}
+
+/// The menu of a setup, or of one operation of it, in the browser.
+pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::context_menu::Item> {
+    use crate::context_menu::Item;
+    let Some(s) = app.session.doc.manufacture.setups.iter().find(|s| s.id == setup) else { return Vec::new() };
+    let ops: Vec<u64> = s.operations.iter().map(|o| o.id).collect();
+    let disable = |mut item: Item, on: bool| {
+        item.enabled = on;
+        item
+    };
+    match op {
+        None => vec![
+            menu_item("Edit Setup", "edit", "edit", setup, None),
+            disable(menu_item("Simulate", "", "simulate", setup, None), !ops.is_empty()),
+            disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
+            Item::sep(),
+            menu_item("Remove Setup", "delete", "remove", setup, None),
+        ],
+        Some(op) => {
+            let at = ops.iter().position(|o| *o == op);
+            vec![
+                menu_item("Edit Operation", "edit", "edit", setup, Some(op)),
+                menu_item("Post Process", "cam_post", "post", setup, Some(op)),
+                Item::sep(),
+                disable(menu_item("Move Up", "", "up", setup, Some(op)), at.is_some_and(|i| i > 0)),
+                disable(menu_item("Move Down", "", "down", setup, Some(op)), at.is_some_and(|i| i + 1 < ops.len())),
+                Item::sep(),
+                menu_item("Remove Operation", "delete", "remove", setup, Some(op)),
+            ]
+        }
+    }
+}
+
+/// Does a browser menu's entry (`ui.cam`): `p` is `{do, setup, op?}`.
+pub fn menu_action(app: &mut SolveApp, p: &Value) {
+    let (Some(setup), op) = (p["setup"].as_u64(), p["op"].as_u64()) else { return };
+    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let Some(s) = listed["setups"].as_array().into_iter().flatten().find(|s| s["id"].as_u64() == Some(setup)).cloned() else { return };
+    let o = op.and_then(|op| s["operations"].as_array().into_iter().flatten().find(|o| o["id"].as_u64() == Some(op)).cloned());
+    let mut asked = Asked::default();
+    match (p["do"].as_str().unwrap_or(""), &o) {
+        ("edit", None) => asked.form = setup_form(&s),
+        ("edit", Some(o)) => asked.edit_op = Some((s.clone(), o.clone())),
+        ("simulate", None) => asked.simulate = Some(setup),
+        ("post", None) => asked.post = Some((setup, None, text(&s, "post"))),
+        ("post", Some(o)) => asked.post = Some((setup, o["id"].as_u64().map(|id| (id, text(o, "name"))), text(&s, "post"))),
+        ("up" | "down", Some(o)) => {
+            let by = if p["do"] == "up" { -1 } else { 1 };
+            asked.run.push(("cam.op.move", json!({ "setup": setup, "op": o["id"], "by": by })));
+        }
+        ("remove", None) => asked.run.push(("cam.setup.remove", json!({ "setup": setup }))),
+        ("remove", Some(o)) => asked.run.push(("cam.op.remove", json!({ "setup": setup, "op": o["id"] }))),
+        _ => {}
+    }
+    // What is edited or simulated shows in the Manufacture panel.
+    app.manufacture.open = true;
+    answer(app, asked);
 }
 
 /// Writes a setup's program, or one operation of it, to `path`.

@@ -536,3 +536,67 @@ fn panels_move_by_their_headers_and_dock_again() {
     h.frames(4);
     assert!((rect(&h, "sc_cam_window").min - panel.min).length() < 0.5, "double-click docks it again");
 }
+
+/// The browser lists the setups and their operations under a Manufacture folder; its eye
+/// shows and hides the toolpaths, a double-click edits, and the right button's menu edits,
+/// reorders and removes.
+#[test]
+fn browser_lists_setups_and_operations_with_their_menus() {
+    use crate::context_menu::{Target, items, run_item};
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.frames(2);
+    let rows = |_: &Harness| crate::browser::drawn_rows().into_iter().map(|r| r.0).collect::<Vec<_>>();
+    assert!(!rows(&h).iter().any(|r| r == "Manufacture"), "no folder without a setup");
+
+    h.app.run("cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": "6 mm", "spindle_rpm": 10000, "feed": 600})).unwrap();
+    h.app.run("cam.setup.create", json!({"stock": {"top": 1}})).unwrap();
+    h.app.run("cam.op.face", json!({"tool": 1, "name": "Top"})).unwrap();
+    h.app.run("cam.op.face", json!({"tool": 1, "name": "Again"})).unwrap();
+    h.frames(2);
+    let drawn = rows(&h);
+    let at = |name: &str| drawn.iter().position(|r| r == name).unwrap_or_else(|| panic!("no row {name}: {drawn:?}"));
+    assert!(at("Manufacture") < at("Setup1") && at("Setup1") < at("Top") && at("Top") < at("Again"));
+
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    let ops: Vec<u64> = h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.id).collect();
+    let labels =
+        |h: &Harness, op: Option<u64>| items(&h.app, &Target::Cam { setup, op }).into_iter().map(|i| (i.label, i.enabled)).collect::<Vec<_>>();
+    assert!(labels(&h, None).contains(&("Simulate".to_string(), true)));
+    let first = labels(&h, Some(ops[0]));
+    assert!(first.contains(&("Move Up".to_string(), false)) && first.contains(&("Move Down".to_string(), true)), "{first:?}");
+
+    // Move Down puts the first operation last.
+    let down = items(&h.app, &Target::Cam { setup, op: Some(ops[0]) }).into_iter().find(|i| i.label == "Move Down").unwrap();
+    run_item(&mut h.app, &down, egui::Pos2::ZERO);
+    let order: Vec<u64> = h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.id).collect();
+    assert_eq!(order, vec![ops[1], ops[0]]);
+
+    // Edit opens the Manufacture panel on the operation's form.
+    let edit = items(&h.app, &Target::Cam { setup, op: Some(ops[0]) }).into_iter().find(|i| i.label == "Edit Operation").unwrap();
+    run_item(&mut h.app, &edit, egui::Pos2::ZERO);
+    assert!(h.app.manufacture.open && matches!(&h.app.manufacture.form, Some(Form::Op(f)) if f.editing.is_some()));
+    h.app.manufacture.form = None;
+
+    // The folder's eye hides the toolpaths, and keeps them drawn once the panel is closed.
+    h.frames(1);
+    assert!(paths_drawn(&h.app));
+    let eye = crate::scenario::handle_at("eye:Manufacture").expect("the folder has an eye");
+    h.call("ui.click", json!({"x": eye.x, "y": eye.y}));
+    h.frames(2);
+    assert!(!paths_drawn(&h.app) && !h.app.manufacture.show_paths);
+    h.app.manufacture.open = false;
+    h.frames(1);
+    h.call("ui.click", json!({"x": eye.x, "y": eye.y}));
+    h.frames(2);
+    assert!(paths_drawn(&h.app), "the eye draws the toolpaths without the panel");
+    assert!(!paths(&mut h.app).is_empty());
+
+    let remove = items(&h.app, &Target::Cam { setup, op: Some(ops[1]) }).into_iter().find(|i| i.label == "Remove Operation").unwrap();
+    run_item(&mut h.app, &remove, egui::Pos2::ZERO);
+    assert_eq!(h.app.session.doc.manufacture.setups[0].operations.len(), 1);
+    let remove = items(&h.app, &Target::Cam { setup, op: None }).into_iter().find(|i| i.label == "Remove Setup").unwrap();
+    run_item(&mut h.app, &remove, egui::Pos2::ZERO);
+    h.frames(2);
+    assert!(!rows(&h).iter().any(|r| r == "Manufacture"), "the folder goes with the last setup");
+}

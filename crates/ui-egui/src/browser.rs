@@ -797,6 +797,7 @@ fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, 
     }
     if id == 0 {
         crate::dialogs_assembly::browser_joints(app, ui, d);
+        crate::cam_ui::browser_rows(app, ui, d);
     }
     let children = model_children(app, id);
     for occurrence in children {

@@ -1377,6 +1377,8 @@
   "ui.mirror_line": "Mirror line",
   "ui.modify": "Modify",
   "ui.move": "Move",
+  "ui.move_down": "Move Down",
+  "ui.move_up": "Move Up",
   "ui.multiple": "Multiple",
   "ui.named_views": "Named Views",
   "ui.navigation": "Navigation",
