@@ -1015,7 +1015,7 @@ fn files_wait_with_their_message_and_pictures_skip_an_agent_that_takes_none() {
 
 #[test]
 fn at_most_eight_files_on_a_message() {
-    let d = attachable("cap");
+    let d = attachable("eight");
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     for _ in 0..attach::MAX_FILES {
         attach_path(&mut app, &at(&d, "brief.md")).unwrap();
