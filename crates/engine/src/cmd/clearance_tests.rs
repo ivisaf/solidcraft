@@ -252,6 +252,59 @@ fn a_small_gap_past_a_corner_is_not_contact() {
     }
 }
 
+/// A second call measures only the pairs with a body that changed or moved since the first.
+#[test]
+fn pairs_whose_bodies_did_not_change_or_move_are_not_measured_again() {
+    let mut s = Session::default();
+    run(&mut s, "component.create", json!({"name": "Bought"}));
+    cube(&mut s, "Housing", 10.0, [0.0, 0.0, 0.0]);
+    cube(&mut s, "Insert", 4.0, [8.0, 3.0, 3.0]);
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    let bracket = run(&mut s, "component.create", json!({"name": "Bracket"}))["component"].as_u64().unwrap();
+    cube(&mut s, "Plate", 10.0, [-9.5, 0.0, 0.0]);
+    let settings = json!({"clearance": 1});
+    let first = run(&mut s, "inspect.clearance", settings.clone());
+    assert_eq!((first["pairs_checked"].as_u64(), first["pairs_reused"].as_u64()), (Some(2), Some(0)), "{first}");
+    let again = run(&mut s, "inspect.clearance", settings.clone());
+    assert_eq!(again["pairs_reused"], 2, "{again}");
+    for k in ["overlaps", "near", "unchecked"] {
+        assert_eq!(again[k], first[k], "{k}");
+    }
+    // Other settings are measured afresh.
+    assert_eq!(run(&mut s, "inspect.clearance", json!({"clearance": 2}))["pairs_reused"], 0);
+    // The bracket moves 1 mm away: only its pair is measured again, and it is now near, not over.
+    let o = s.doc.occurrence_of(bracket).unwrap().id;
+    run(&mut s, "occurrence.move", json!({"occurrence": o, "translate": [-1, 0, 0], "capture": true}));
+    let moved = run(&mut s, "inspect.clearance", settings.clone());
+    assert_eq!((moved["pairs_checked"].as_u64(), moved["pairs_reused"].as_u64()), (Some(2), Some(1)), "{moved}");
+    let overlaps: Vec<[String; 2]> = moved["overlaps"].as_array().into_iter().flatten().map(pair).collect();
+    assert_eq!(overlaps, vec![["Housing".to_string(), "Insert".to_string()]], "{moved}");
+    assert!((f(&moved["near"][0]["distance_mm"]) - 0.5).abs() < 1e-6, "{moved}");
+    let still = run(&mut s, "inspect.clearance", settings);
+    assert_eq!(still["pairs_reused"], 2, "nothing changed since: {still}");
+    assert_eq!(still["near"], moved["near"]);
+}
+
+/// A body rebuilt with other geometry is measured again, not taken from an earlier call.
+#[test]
+fn a_body_that_changed_shape_is_measured_again() {
+    let mut s = Session::default();
+    cube(&mut s, "A", 10.0, [0.0, 0.0, 0.0]);
+    cube(&mut s, "B", 10.0, [10.5, 0.0, 0.0]);
+    let r = run(&mut s, "inspect.clearance", json!({"clearance": 1}));
+    assert!((f(&r["near"][0]["distance_mm"]) - 0.5).abs() < 1e-6, "{r}");
+    let list = run(&mut s, "parameters.list", json!({"filter": "feature"}));
+    let length = list["parameters"][0]["name"].as_str().unwrap().to_string();
+    run(&mut s, "parameters.change", json!({"name": length, "expression": "10.2 mm"}));
+    let r = run(&mut s, "inspect.clearance", json!({"clearance": 1}));
+    assert_eq!(r["pairs_reused"], 0, "{r}");
+    assert!((f(&r["near"][0]["distance_mm"]) - 0.3).abs() < 1e-6, "{r}");
+    // Set back, the first shape's result is the right one again.
+    run(&mut s, "parameters.change", json!({"name": length, "expression": "10 mm"}));
+    let r = run(&mut s, "inspect.clearance", json!({"clearance": 1}));
+    assert!((f(&r["near"][0]["distance_mm"]) - 0.5).abs() < 1e-6, "{r}");
+}
+
 /// The shared volume is checked against the bodies and their union: two 10 mm cubes sharing a
 /// 3 mm corner cube agree at 27 mm³, and a shared part read as three times that (as a mirrored
 /// pair once was) does not.

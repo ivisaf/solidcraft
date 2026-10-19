@@ -633,23 +633,97 @@ fn offset_loop(lp: &Loop2, d: f64) -> Result<Vec<Option<Seg2>>> {
     }
     let all_arcs = lp.segs.iter().all(|s| matches!(s, Seg2::Arc { .. }));
     if all_arcs {
-        return lp
+        let moved = lp
             .segs
             .iter()
             .map(|s| match *s {
                 Seg2::Arc { center, radius, start, sweep } => {
                     let r = radius + sweep.signum() * d;
                     if r > 1e-6 {
-                        Ok(Some(Seg2::Arc { center, radius: r, start, sweep }))
+                        Ok(Seg2::Arc { center, radius: r, start, sweep })
                     } else {
                         Err(KernelError::Invalid("the taper closes the profile".into()))
                     }
                 }
                 _ => Err(KernelError::Failed("taper: profile loop".into())),
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
+        return arc_corners(lp, moved).map(|arcs| arcs.into_iter().map(Some).collect());
     }
     offset_segments(lp, d)
+}
+
+/// The moved arcs of an all-arc loop made to meet again: where two arcs of different circles meet
+/// at a corner (a circle and the lobes on its sides), their moved circles no longer cross at the
+/// arcs' old end angles, so the corner goes to where the moved circles cross, nearest the old
+/// corner, and both arcs are cut there. Arcs meeting tangentially (or on one circle) keep their
+/// angles: moved along their shared normal, they still meet.
+fn arc_corners(lp: &Loop2, moved: Vec<Seg2>) -> Result<Vec<Seg2>> {
+    let bad = || KernelError::Failed("taper: profile loop".into());
+    let closes = || KernelError::Invalid("the taper closes the profile".into());
+    let n = moved.len();
+    // Each arc's start and end angle once moved.
+    let mut ang: Vec<(f64, f64)> = moved
+        .iter()
+        .map(|s| match *s {
+            Seg2::Arc { start, sweep, .. } => Ok((start, start + sweep)),
+            _ => Err(bad()),
+        })
+        .collect::<Result<_>>()?;
+    for i in 0..n {
+        let k = (i + n - 1) % n;
+        let (Some(prev), Some(this), Some(Seg2::Arc { center: c1, radius: r1, .. }), Some(Seg2::Arc { center: c2, radius: r2, .. })) =
+            (lp.segs.get(k), lp.segs.get(i), moved.get(k).copied(), moved.get(i).copied())
+        else {
+            return Err(bad());
+        };
+        let (tin, tout) = (prev.end_tangent(), this.start_tangent());
+        if tin.cross(tout).abs() < 1e-6 && tin.dot(tout) > 0.0 {
+            continue;
+        }
+        let x = circles_cross(c1, r1, c2, r2, this.start()).ok_or_else(|| {
+            KernelError::Failed("not supported yet: a taper this steep for arcs meeting at a corner (their moved circles part)".into())
+        })?;
+        if let Some(a) = ang.get_mut(k) {
+            a.1 = (x - c1).angle();
+        }
+        if let Some(a) = ang.get_mut(i) {
+            a.0 = (x - c2).angle();
+        }
+    }
+    moved
+        .iter()
+        .zip(&ang)
+        .map(|(s, &(a0, a1))| match *s {
+            Seg2::Arc { center, radius, sweep, .. } => {
+                // The same turning sense, the whole-turn equivalent nearest the old sweep.
+                let tau = std::f64::consts::TAU;
+                let mut sw = a1 - a0;
+                sw += ((sweep - sw) / tau).round() * tau;
+                if sw * sweep <= 0.0 || sw.abs() < 1e-9 {
+                    return Err(closes());
+                }
+                Ok(Seg2::Arc { center, radius, start: a0, sweep: sw })
+            }
+            _ => Err(bad()),
+        })
+        .collect()
+}
+
+/// Where the circles (`c1`, `r1`) and (`c2`, `r2`) cross, the crossing nearest `near`; `None`
+/// when they don't (apart, one inside the other, or concentric).
+fn circles_cross(c1: Vec2, r1: f64, c2: Vec2, r2: f64, near: Vec2) -> Option<Vec2> {
+    let d = c1.dist(c2);
+    if d < 1e-12 || d > r1 + r2 + 1e-9 || d < (r1 - r2).abs() - 1e-9 {
+        return None;
+    }
+    let u = (c2 - c1) * (1.0 / d);
+    let a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d);
+    let h = (r1 * r1 - a * a).max(0.0).sqrt();
+    let base = c1 + u * a;
+    let (p, q) = (base + u.perp() * h, base - u.perp() * h);
+    let x = if p.dist(near) <= q.dist(near) { p } else { q };
+    x.is_finite().then_some(x)
 }
 
 /// Where the line through `p` along `tin` and the one through `q` along `tout` meet once each

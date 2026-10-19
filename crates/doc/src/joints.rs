@@ -1,11 +1,13 @@
 //! Joints between occurrences: joint origins (snap frames on component geometry, re-found on
 //! every solve so they follow edits), joints (rigid, revolute, slider, cylindrical, pin-slot,
-//! planar, ball) with their motion values and limits, motion links (gears, racks and screws are
+//! planar, ball, and relations that tie only part of a placement, `joints_relations.rs`) with
+//! their motion values and limits, motion links (gears, racks and screws are
 //! links whose ratio comes from radii or a pitch; a cam's follower follows a table worked out from
 //! its profile, `joints_cam.rs`), and the solver that places occurrences from the joint graph.
 //!
 //! A joint makes B's joint frame coincide with A's frame moved by the joint's motion:
-//! `T_B · F_b = T_A · F_a · M(q) · Flip`, so `T_B = T_A · F_a · M(q) · Flip · F_b⁻¹`, where `T`
+//! `T_B · F_b = T_A · F_a · M(q) · Flip · Tail(q)`, so `T_B = T_A · F_a · M(q) · Flip · Tail(q) · F_b⁻¹`
+//! (`Tail` is a relation's tilt and turns after the mate; the identity for the others), where `T`
 //! are occurrence world transforms, `F` the joint frames in each component's own frame, and `q`
 //! the joint's values (angles in radians, distances in mm). The solver walks the graph from
 //! grounded occurrences (and the root, which never moves). Joints that close a loop (a four-bar
@@ -203,6 +205,20 @@ pub enum JointKind {
     PinSlot,
     Planar,
     Ball,
+    /// B's z stays parallel to A's (against it unless flipped); B moves and turns about z freely.
+    Parallel,
+    /// B's z stays square to A's; B moves freely and turns about either z.
+    Perpendicular,
+    /// B's z stays at the joint's `angle` from mated (about their common x); B moves freely and
+    /// turns about either z.
+    Angle,
+    /// B's origin stays on A's xy plane (`offset` off it); B slides on it and turns any way.
+    PointOnPlane,
+    /// B's origin stays on A's z axis; B slides along it and turns any way.
+    PointOnLine,
+    /// B's z axis lies in A's xy plane (`offset` off it: a cylinder's radius makes it tangent);
+    /// B slides on the plane, turns about A's z and about its own axis.
+    LineOnPlane,
 }
 
 impl JointKind {
@@ -215,6 +231,12 @@ impl JointKind {
             "pinslot" => JointKind::PinSlot,
             "planar" => JointKind::Planar,
             "ball" => JointKind::Ball,
+            "parallel" => JointKind::Parallel,
+            "perpendicular" | "square" => JointKind::Perpendicular,
+            "angle" => JointKind::Angle,
+            "pointonplane" | "pointonface" => JointKind::PointOnPlane,
+            "pointonline" | "pointonaxis" => JointKind::PointOnLine,
+            "lineonplane" | "lineonface" => JointKind::LineOnPlane,
             _ => return None,
         })
     }
@@ -228,10 +250,29 @@ impl JointKind {
             JointKind::PinSlot => &["angle", "slide"],
             JointKind::Planar => &["x", "y", "angle"],
             JointKind::Ball => &["yaw", "pitch", "roll"],
+            JointKind::Parallel => &["x", "y", "z", "angle"],
+            JointKind::Perpendicular | JointKind::Angle => &["x", "y", "z", "turn", "spin"],
+            JointKind::PointOnPlane => &["x", "y", "yaw", "pitch", "roll"],
+            JointKind::PointOnLine => &["slide", "yaw", "pitch", "roll"],
+            JointKind::LineOnPlane => &["x", "y", "turn", "spin"],
         }
     }
     pub fn is_angle(self, i: usize) -> bool {
-        matches!(self.dofs().get(i), Some(&("angle" | "yaw" | "pitch" | "roll")))
+        matches!(self.dofs().get(i), Some(&("angle" | "yaw" | "pitch" | "roll" | "turn" | "spin")))
+    }
+    /// A relation that only ties some directions or points (parallel, on a plane…): made where
+    /// the parts are, its values start as the nearest that meet it, so B moves no more than it
+    /// must.
+    pub fn is_relation(self) -> bool {
+        matches!(
+            self,
+            JointKind::Parallel
+                | JointKind::Perpendicular
+                | JointKind::Angle
+                | JointKind::PointOnPlane
+                | JointKind::PointOnLine
+                | JointKind::LineOnPlane
+        )
     }
 }
 
@@ -599,6 +640,10 @@ fn rot_z(a: f64) -> Mat {
     let (s, c) = a.sin_cos();
     [[c, s, 0.0, 0.0], [-s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
 }
+fn rot_x(a: f64) -> Mat {
+    let (s, c) = a.sin_cos();
+    [[1.0, 0.0, 0.0, 0.0], [0.0, c, s, 0.0], [0.0, -s, c, 0.0], [0.0, 0.0, 0.0, 1.0]]
+}
 fn rot_y(a: f64) -> Mat {
     let (s, c) = a.sin_cos();
     [[c, 0.0, -s, 0.0], [0.0, 1.0, 0.0, 0.0], [s, 0.0, c, 0.0], [0.0, 0.0, 0.0, 1.0]]
@@ -620,7 +665,38 @@ pub fn motion(kind: JointKind, q: &[f64]) -> Mat {
         JointKind::PinSlot => mat_mul(&shift(v(1), 0.0, 0.0), &rot_z(v(0))),
         JointKind::Planar => mat_mul(&shift(v(0), v(1), 0.0), &rot_z(v(2))),
         JointKind::Ball => mat_mul(&mat_mul(&rot_z(v(0)), &rot_y(v(1))), &rot_z(v(2))),
+        JointKind::Parallel => mat_mul(&shift(v(0), v(1), v(2)), &rot_z(v(3))),
+        JointKind::Perpendicular | JointKind::Angle => mat_mul(&shift(v(0), v(1), v(2)), &rot_z(v(3))),
+        // Their turn is about B's origin, after the offset (`tail`).
+        JointKind::PointOnPlane => shift(v(0), v(1), 0.0),
+        JointKind::PointOnLine => shift(0.0, 0.0, v(0)),
+        JointKind::LineOnPlane => mat_mul(&shift(v(0), v(1), 0.0), &rot_z(v(2))),
     }
+}
+
+fn turn_zyx(yaw: f64, pitch: f64, roll: f64) -> Mat {
+    mat_mul(&mat_mul(&rot_z(yaw), &rot_y(pitch)), &rot_x(roll))
+}
+
+/// What follows the mate (`flip_of`) in a joint's link: for a relation that tilts B's z, the tilt
+/// and B's turn about its own z (`spin`); for a point relation, B's turn about its origin (yaw,
+/// pitch and roll about z, y and x: free of gimbal lock at the start, all 0); nothing for the
+/// other joints.
+fn tail(j: &Joint, q: &[f64]) -> Mat {
+    let v = |i: usize| q.get(i).copied().unwrap_or(0.0);
+    match j.kind {
+        JointKind::Perpendicular => mat_mul(&rot_x(std::f64::consts::FRAC_PI_2), &rot_z(v(4))),
+        JointKind::Angle => mat_mul(&rot_x(j.angle), &rot_z(v(4))),
+        JointKind::LineOnPlane => mat_mul(&rot_y(std::f64::consts::FRAC_PI_2), &rot_z(v(3))),
+        JointKind::PointOnPlane => turn_zyx(v(2), v(3), v(4)),
+        JointKind::PointOnLine => turn_zyx(v(1), v(2), v(3)),
+        _ => IDENTITY,
+    }
+}
+
+/// B's joint frame in A's for the joint's values: `M(q) · Flip · tail`.
+fn link_of(j: &Joint, q: &[f64]) -> Mat {
+    mat_mul(&mat_mul(&motion(j.kind, q), &flip_of(j)), &tail(j, q))
 }
 
 /// Bodies of a component in the model (its own frame).
@@ -770,7 +846,10 @@ pub struct Solution {
     pub conflicts: Vec<(u64, String, String)>,
     /// Joints that could not be applied (bad origin…): (joint id, name, why).
     pub errors: Vec<(u64, String, String)>,
-    /// Remaining degrees of freedom per occurrence (6 = free, 0 = fixed).
+    /// Remaining degrees of freedom per occurrence (6 = free, 0 = fixed): how many independent
+    /// values still move it, from the fixed occurrences, with loops kept closed and a value a
+    /// motion link sets moving with the values its link chain starts from (a driven gear has its
+    /// driving gear's one, a screw's travel its turn's).
     pub dof: BTreeMap<u64, usize>,
     /// Occurrences fixed in place (grounded, or the root's).
     pub fixed: Vec<u64>,
@@ -854,14 +933,16 @@ pub fn joint_values(asm: &Assembly) -> BTreeMap<u64, Vec<f64>> {
 /// The turn and offset from A's joint frame to B's: mated (B's z against A's, as faces meet)
 /// unless flipped.
 fn flip_of(j: &Joint) -> Mat {
-    let mut m = rot_z(j.angle);
+    // An angle relation's `angle` is its tilt (`tail`); a perpendicular one has none.
+    let turn = if matches!(j.kind, JointKind::Angle | JointKind::Perpendicular) { 0.0 } else { j.angle };
+    let mut m = rot_z(turn);
     m[3][2] = j.offset;
     if !j.flip { mat_mul(&m, &[[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]) } else { m }
 }
 
 /// B's world transform from A's (or A's from B's, going the other way) for the joint's values.
 fn through(j: &Joint, (fa, fb): &(Mat, Mat), q: &[f64], from_a: bool, t: &Mat) -> Option<Mat> {
-    let link = mat_mul(&mat_mul(&motion(j.kind, q), &flip_of(j)), &mat_inverse(fb)?);
+    let link = mat_mul(&link_of(j, q), &mat_inverse(fb)?);
     if from_a {
         Some(mat_mul(&mat_mul(t, fa), &link))
     } else {
@@ -928,6 +1009,10 @@ impl Tree<'_> {
 /// on at most: larger ones are only checked.
 const MAX_LOOP_VALUES: usize = 64;
 const MAX_LOOPS: usize = 100;
+/// Loop-closing joints one solve takes on at most, over all its groups: a part placed by several
+/// relations closes a loop with each one after the first, so a panel of parts has many small
+/// groups.
+const MAX_CLOSING: usize = 5_000;
 /// Residual evaluations one solve may spend on all its loops.
 const MAX_LOOP_WORK: usize = 200_000;
 
@@ -961,6 +1046,46 @@ fn link_chains(asm: &Assembly, tree: &Tree, around: &BTreeSet<u64>, linked: &BTr
     (feeds, starts)
 }
 
+/// The values that move each value a motion link sets: the values its link chain starts from,
+/// which no link sets (none for a chain that comes back round on itself, which only a hand-edited
+/// design has). A driven gear's turn is its driving gear's: one degree of freedom, not two.
+fn link_sources(asm: &Assembly) -> BTreeMap<(u64, usize), BTreeSet<(u64, usize)>> {
+    let mut into: BTreeMap<(u64, usize), Vec<(u64, usize)>> = BTreeMap::new();
+    for l in &asm.links {
+        into.entry((l.b, l.ib)).or_default().push((l.a, l.ia));
+    }
+    let mut sources = BTreeMap::new();
+    if into.is_empty() {
+        return sources;
+    }
+    // A link from a value its joint doesn't have (a hand-edited design) moves nothing.
+    let real: BTreeSet<(u64, usize)> = asm.joints.iter().flat_map(|j| (0..j.kind.dofs().len()).map(|i| (j.id, i))).collect();
+    for &v in into.keys() {
+        // Back along the links, as far as a link chain carries a value (`MAX_LINK_PASSES`).
+        let (mut from, mut seen) = (BTreeSet::new(), BTreeSet::from([v]));
+        let mut frontier = vec![v];
+        for _ in 0..MAX_LINK_PASSES {
+            let mut next = Vec::new();
+            for w in frontier.iter().filter_map(|w| into.get(w)).flatten() {
+                if !seen.insert(*w) {
+                    continue;
+                }
+                if into.contains_key(w) {
+                    next.push(*w);
+                } else if real.contains(w) {
+                    from.insert(*w);
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        sources.insert(v, from);
+    }
+    sources
+}
+
 /// The held values among `touches` that move: (joint, index, from, to), `from` within the
 /// joint's limits. A suppressed joint still sets values through its motion links.
 fn held_moves(asm: &Assembly, held: &Held, touches: &BTreeSet<(u64, usize)>, vals: &Values) -> Vec<(u64, usize, f64, f64)> {
@@ -984,13 +1109,13 @@ fn held_moves(asm: &Assembly, held: &Held, touches: &BTreeSet<(u64, usize)>, val
 /// moves; a group that can't close without moving is left to the conflict check).
 fn close_loops(tree: &Tree, closing: &[u64], asm: &Assembly, held: &Held, vals: &mut Values) -> (Values, BTreeSet<u64>) {
     let (mut changed, mut stuck) = (BTreeMap::new(), BTreeSet::new());
-    if closing.len() > MAX_LOOPS {
+    if closing.len() > MAX_CLOSING {
         return (Values::new(), stuck);
     }
     let linked = set_values(asm);
     let groups = loop_groups(tree, closing, asm, &linked);
     let spent = std::cell::Cell::new(0usize);
-    for (group, around, touches) in &groups {
+    for (group, around, touches) in groups.iter().filter(|(c, _, _)| c.len() <= MAX_LOOPS) {
         let moves = held_moves(asm, held, touches, vals);
         match close_group(tree, group, around, &moves, asm, held, &linked, &spent, vals) {
             Some(m) => changed.extend(m),
@@ -1179,11 +1304,12 @@ fn nearby_pose(tree: &Tree, groups: &[Group], asm: &Assembly, linked: &BTreeSet<
 /// pose alone counts 0. The tree's count stands where a loop group is over the solver's caps or
 /// the work runs out.
 fn loop_dof(tree: &Tree, closing: &[u64], asm: &Assembly, vals: &Values, dof: &mut BTreeMap<u64, usize>) {
-    if closing.len() > MAX_LOOPS {
+    if closing.len() > MAX_CLOSING {
         return;
     }
     let linked = set_values(asm);
-    let groups = loop_groups(tree, closing, asm, &linked);
+    let mut groups = loop_groups(tree, closing, asm, &linked);
+    groups.retain(|(c, _, _)| c.len() <= MAX_LOOPS);
     // The joints loops depend on: those around them, those whose values they read, and those a
     // motion link carries any of these values into.
     let mut relevant: BTreeSet<u64> = groups.iter().flat_map(|(_, a, t)| a.iter().copied().chain(t.iter().map(|(j, _)| *j))).collect();
@@ -1592,8 +1718,18 @@ struct Built<'a> {
 fn build<'a>(doc: &'a Document, st: &ModelState, vals: &Values, sol: &mut Solution) -> Built<'a> {
     let asm = &doc.assembly;
     let joints: Vec<&Joint> = asm.joints.iter().filter(|j| !j.suppressed).take(MAX_JOINTS).collect();
-    // Joint frames in component coordinates (errors leave the joint out).
+    // Joint frames in component coordinates (errors leave the joint out). An origin several joints
+    // share (a panel face every part sits on) is found once.
     let mut frames: BTreeMap<u64, (Mat, Mat)> = BTreeMap::new();
+    let mut found: BTreeMap<(u64, String), std::result::Result<Mat, String>> = BTreeMap::new();
+    let mut resolve = |o: &JointOrigin| -> Result<Mat> {
+        let Ok(comp) = component_of(doc, o.occurrence) else { return resolve_origin(doc, st, o) };
+        found
+            .entry((comp, format!("{:?}", o.snap)))
+            .or_insert_with(|| resolve_origin(doc, st, o).map_err(|e| e.to_string()))
+            .clone()
+            .map_err(DocError::Invalid)
+    };
     for j in &joints {
         // A joint whose expressions can't be worked out (a parameter gone) is left out rather
         // than placed by numbers that no longer say what it was defined by.
@@ -1603,7 +1739,7 @@ fn build<'a>(doc: &'a Document, st: &ModelState, vals: &Values, sol: &mut Soluti
             sol.errors.push((j.id, j.name.clone(), e.to_string()));
             continue;
         }
-        match (resolve_origin(doc, st, &j.a), resolve_origin(doc, st, &j.b)) {
+        match (resolve(&j.a), resolve(&j.b)) {
             (Ok(fa), Ok(fb)) => {
                 frames.insert(j.id, (fa, fb));
             }
@@ -1632,6 +1768,14 @@ fn build<'a>(doc: &'a Document, st: &ModelState, vals: &Values, sol: &mut Soluti
         Tree { joints: asm.joints.iter().map(|j| (j.id, j)).collect(), frames, fixed: placed.clone(), parent: BTreeMap::new(), order: Vec::new() };
     let mut used: BTreeSet<u64> = BTreeSet::new();
     let mut queue: VecDeque<u64> = placed.keys().copied().collect();
+    // An occurrence's degrees of freedom are the distinct values that move it: those of the
+    // joints on its path, a value a motion link sets standing for the values its link chain
+    // starts from (a driven gear turns with its driving gear's one value). Kept per occurrence as
+    // a count of the values no link reads or sets, which no other path value can repeat, and the
+    // set of the ones that may be repeated (links' sources).
+    let sources = link_sources(asm);
+    let shared: BTreeSet<(u64, usize)> = sources.values().flatten().copied().collect();
+    let mut moved_by: BTreeMap<u64, (usize, BTreeSet<(u64, usize)>)> = BTreeMap::new();
     // The joints at each occurrence, in the joints' order (a large assembly is not walked joint by
     // joint for every occurrence).
     let mut at: BTreeMap<u64, Vec<&Joint>> = BTreeMap::new();
@@ -1662,7 +1806,18 @@ fn build<'a>(doc: &'a Document, st: &ModelState, vals: &Values, sol: &mut Soluti
             placed.insert(other, m);
             tree.parent.insert(other, (occ, j.id, from_a));
             tree.order.push(other);
-            dof.insert(other, dof.get(&occ).copied().unwrap_or(0) + j.kind.dofs().len());
+            let (mut own, mut common) = moved_by.get(&occ).cloned().unwrap_or_default();
+            for v in (0..j.kind.dofs().len()).map(|i| (j.id, i)) {
+                match sources.get(&v) {
+                    Some(from) => common.extend(from.iter().copied()),
+                    None if shared.contains(&v) => {
+                        common.insert(v);
+                    }
+                    None => own += 1,
+                }
+            }
+            dof.insert(other, own + common.len());
+            moved_by.insert(other, (own, common));
             queue.push_back(other);
         }
     }
@@ -1735,7 +1890,10 @@ mod reach;
 #[path = "joints_face.rs"]
 mod face;
 pub use face::{end_faces, face_name_at, named_face_spot, pin_end, round_end_at};
+#[path = "joints_relations.rs"]
+mod relations;
 pub use reach::{REACH_TOL, Reach, Reached, reach};
+pub use relations::relation_values;
 
 /// The rest angle that turns B least as joint `j` is made, as B sits now: none or a half turn
 /// about the joint's z. Origins whose x is chosen for them (a face, a circle, a point without
@@ -1794,6 +1952,26 @@ mod tests {
         let links =
             (1..n).rev().map(|a| MotionLink { a, ia: 0, b: a + 1, ib: 0, ratio: 2.0, offset: 0.0, coupling: None, lift: Vec::new() }).collect();
         Assembly { joints, links, ..Assembly::default() }
+    }
+
+    /// A linked value moves with the free value its chain starts from, however the chain is
+    /// stored; a chain that comes back round on itself, or a link from a value its joint lacks
+    /// (hand-edited designs), moves it with nothing.
+    #[test]
+    fn linked_values_move_with_their_chains_start() {
+        let mut asm = chain(5, 0.0);
+        let sources = link_sources(&asm);
+        for b in 2..=5 {
+            assert_eq!(sources.get(&(b, 0)), Some(&BTreeSet::from([(1, 0)])), "J{b}: {sources:?}");
+        }
+        assert!(!sources.contains_key(&(1, 0)));
+        let link = |a: u64, ia: usize, b: u64| MotionLink { a, ia, b, ib: 0, ratio: 1.0, offset: 0.0, coupling: None, lift: Vec::new() };
+        asm.links.push(link(5, 0, 1));
+        assert!(link_sources(&asm).values().all(BTreeSet::is_empty), "{:?}", link_sources(&asm));
+        let mut asm = chain(2, 0.0);
+        asm.links = vec![link(1, 7, 2)];
+        assert_eq!(link_sources(&asm).get(&(2, 0)), Some(&BTreeSet::new()));
+        assert!(link_sources(&Assembly::default()).is_empty());
     }
 
     /// Links carry a value down a chain stored from its end, each linked value within its limits

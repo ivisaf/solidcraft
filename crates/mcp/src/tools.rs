@@ -187,7 +187,9 @@ pub fn tool_definitions() -> Vec<Value> {
              Connected to the app: a screenshot of the window (source \"window\", the default) or a render of the model \
              with the app's camera (source \"model\"). Both show an active section (inspect.section) with its cut face \
              capped. `view` first turns the camera to a standard view or a saved named view (view.save), `camera` to              any camera (as view.apply). \
-             `grid: false` and `axes: false` leave the ground grid (on Z 0) and the origin's axes out of a model render.",
+             `grid: false` and `axes: false` leave the ground grid (on Z 0) and the origin's axes out of a model render. \
+             A body whose appearance is see-through (appearance.assign with an `opacity` below 1) is drawn see-through, \
+             so what is inside it shows: that is how to look at the body a cut would remove inside the material it meets.",
             obj(
                 json!({
                     "view": string(

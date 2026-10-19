@@ -1756,6 +1756,9 @@ fn loop_split(cur: &Body, pts: &[Vec3]) -> Result<Option<(Vec<Vec<Vec3>>, Vec<Ve
     // Each point's edge. A point on a vertex is as near to the edges meeting there (a circle
     // and a cylinder's seam line): prefer one on a planar face's boundary.
     let polys = cur.edges(tol)?;
+    // Only break actual distance ties. The tessellation tolerance can exceed half a short
+    // rim edge's length: using it here would pick a nearby wall seam instead (#2498).
+    let tie_tol = (size * 1e-7).max(1e-9);
     let planar_edge: std::collections::HashSet<mt::EdgeID> = solid
         .face_iter()
         .filter(|f| matches!(f.oriented_surface(), mt::Surface::Plane(_)))
@@ -1769,7 +1772,7 @@ fn loop_split(cur: &Body, pts: &[Vec3]) -> Result<Option<(Vec<Vec<Vec3>>, Vec<Ve
         if best > size * 0.05 + 1e-3 {
             return Ok(None);
         }
-        let near: Vec<&mt::Edge> = dists.iter().filter(|x| x.1 <= best + tol).filter_map(|x| all.get(x.0)).collect();
+        let near: Vec<&mt::Edge> = dists.iter().filter(|x| x.1 <= best + tie_tol).filter_map(|x| all.get(x.0)).collect();
         let Some(e) = near.iter().find(|e| planar_edge.contains(&e.id())).or(near.first()) else { return Ok(None) };
         per.push((*p, e.id()));
     }

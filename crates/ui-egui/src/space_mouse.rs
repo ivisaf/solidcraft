@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use crate::SolveApp;
 
+pub use solidcraft_space_mouse::{AxisCalibration, Calibration};
+
 /// What a 3Dconnexion device reports at full deflection, in raw units, on every axis.
 pub const FULL_SCALE: i16 = 350;
 
@@ -24,6 +26,31 @@ impl Axes {
     pub fn moving(self) -> bool {
         self.translation.iter().chain(&self.rotation).any(|&v| normalized(v) != 0.0)
     }
+}
+
+impl From<Axes> for [i16; 6] {
+    fn from(axes: Axes) -> Self {
+        let ([x, y, z], [rx, ry, rz]) = (axes.translation, axes.rotation);
+        [x, y, z, rx, ry, rz]
+    }
+}
+
+impl From<[i16; 6]> for Axes {
+    fn from([x, y, z, rx, ry, rz]: [i16; 6]) -> Self {
+        Self { translation: [x, y, z], rotation: [rx, ry, rz] }
+    }
+}
+
+/// The 3D mouse as of this frame.
+#[derive(Debug, Default)]
+pub struct Input {
+    /// The device being read: where from and its vendor and product ids (`hid 256f:c63a`,
+    /// `web 256f:c63a`), or where from alone (`spacenavd`). Its calibration is saved under it.
+    pub device: Option<String>,
+    /// This frame's reading, before calibration.
+    pub raw: Axes,
+    /// The guided calibration while its window is open, and the device it is for.
+    pub calibrating: Option<(String, solidcraft_space_mouse::Wizard)>,
 }
 
 /// Seconds after the cap last moved that wheel events are still taken for 3DxWare's: one can be
@@ -134,13 +161,39 @@ pub struct DeviceMotion {
     pub seconds: f64,
 }
 
+/// The saved calibration of the device being read, when it has one.
+pub fn calibration(app: &SolveApp) -> Option<Calibration> {
+    app.space_mouse.device.as_ref().and_then(|device| app.preferences.space_mouse_calibrations.get(device)).copied()
+}
+
+/// A reading on 3Dconnexion's axes: through `calibration` when there is one. Whether the cap is
+/// moving is asked of this, never of the raw reading, so a device resting off zero isn't "moving"
+/// and a short-range one moves as soon as it does.
+pub fn calibrated(axes: Axes, calibration: Option<Calibration>) -> Axes {
+    calibration.map_or(axes, |calibration| calibration.apply(axes.into()).into())
+}
+
 /// Hands one frame of 3D mouse input, `seconds` after the previous frame, to the page showing
 /// the camera. Nothing happens with navigation switched off, on the start page or while a file
-/// picker is open. Returns whether there was motion to hand over; it then asks for the next frame
-/// itself.
+/// picker is open, or while the reading is inside the dead zone (after calibration, which takes
+/// off the device's own rest offset), so a cap resting just off zero doesn't keep redrawing.
+/// Returns whether there was motion to hand over; it then asks for the next frame itself. The
+/// reading goes through the device's saved calibration first, when it has one; while the
+/// calibration window is open, the reading goes to it instead and the view stays put.
 pub fn navigate_frame(app: &mut SolveApp, ctx: &egui::Context, mapping: DriverMapping, axes: Axes, seconds: f64) -> bool {
+    app.space_mouse.raw = axes;
+    if let Some((device, wizard)) = &mut app.space_mouse.calibrating {
+        if app.space_mouse.device.as_ref() == Some(device) {
+            wizard.feed(axes.into(), seconds);
+            ctx.request_repaint_after(Duration::from_millis(16));
+            return false;
+        }
+        // Another device is being read now, or none: what was recorded isn't its.
+        app.space_mouse.calibrating = None;
+    }
+    let axes = calibrated(axes, calibration(app));
     // Only the window with focus: with two windows open, the cap moves the one being used, not both.
-    if !app.preferences.space_mouse_enabled || app.home.open || app.file_picker_busy() || axes == Axes::default() || !ctx.input(|i| i.focused) {
+    if !app.preferences.space_mouse_enabled || app.home.open || app.file_picker_busy() || !axes.moving() || !ctx.input(|i| i.focused) {
         return false;
     }
     let speed = f64::from(app.preferences.space_mouse_speed);
@@ -466,5 +519,113 @@ mod tests {
         let mut events = vec![wheel(100.0)];
         guard.filter(false, f64::NAN, &mut events);
         assert_eq!(events.len(), 1);
+    }
+
+    /// A homemade device that sends push forward/back as its fifth axis, the other way round, at
+    /// ten times 3Dconnexion's range.
+    fn homemade() -> solidcraft_space_mouse::Calibration {
+        let axis = |source, reversed| solidcraft_space_mouse::AxisCalibration { source, reversed, rest: 0, dead_zone: 0, full: [3500; 2] };
+        solidcraft_space_mouse::Calibration {
+            dead_zone_share: 0.0,
+            axes: [axis(0, false), axis(4, true), axis(2, false), axis(3, false), axis(1, false), axis(5, false)],
+        }
+    }
+
+    #[test]
+    fn a_devices_saved_calibration_puts_its_axes_on_3dconnexions() {
+        let ctx = window(true);
+        let mut reference = app();
+        frame(&mut reference, &ctx, DriverMapping::default(), PUSH, 0.02);
+        let sent = Axes { translation: [0; 3], rotation: [0, -3500, 0] };
+        let mut calibrated = app();
+        calibrated.space_mouse.device = Some("hid 1234:5678".into());
+        calibrated.preferences.space_mouse_calibrations.insert("hid 1234:5678".into(), homemade());
+        assert!(frame(&mut calibrated, &ctx, DriverMapping::default(), sent, 0.02));
+        assert_eq!(calibrated.cam, reference.cam);
+        // Another device's calibration isn't applied: the reading turns the view as it comes.
+        let mut other = app();
+        other.space_mouse.device = Some("hid 256f:c63a".into());
+        other.preferences.space_mouse_calibrations.insert("hid 1234:5678".into(), homemade());
+        frame(&mut other, &ctx, DriverMapping::default(), sent, 0.02);
+        assert_ne!(other.cam, reference.cam);
+    }
+
+    #[test]
+    fn while_calibrating_the_cap_feeds_the_calibration_and_the_view_stays() {
+        let ctx = window(true);
+        let mut app = app();
+        crate::space_mouse_calibration::start(&mut app);
+        assert!(app.space_mouse.calibrating.is_none(), "nothing to calibrate without a device");
+        app.space_mouse.device = Some("hid 256f:c63a".into());
+        crate::space_mouse_calibration::start(&mut app);
+        let before = app.cam;
+        assert!(!frame(&mut app, &ctx, DriverMapping::default(), PUSH, 0.02));
+        assert_eq!(app.cam, before);
+        assert_eq!(app.space_mouse.raw, PUSH);
+        assert!(app.space_mouse.calibrating.as_ref().is_some_and(|(_, wizard)| wizard.progress() > 0.0));
+        // Closing Preferences ends it, so the cap moves the view again.
+        app.prefs_window.open = false;
+        crate::prefs::show(&mut app, &ctx);
+        assert!(app.space_mouse.calibrating.is_none());
+        assert!(frame(&mut app, &ctx, DriverMapping::default(), PUSH, 0.02));
+    }
+
+    #[test]
+    fn a_reading_resting_off_zero_is_kept_for_calibration_and_doesnt_move_the_view() {
+        let ctx = window(true);
+        // Inside the dead zone and not calibrated: no motion, so no redraw either.
+        let mut app = app();
+        let resting = Axes { translation: [0, 15, 0], rotation: [0; 3] };
+        let before = app.cam;
+        assert!(!frame(&mut app, &ctx, DriverMapping::default(), resting, 0.02));
+        assert_eq!(app.cam, before);
+        // The calibration window gets it as it is, to measure where the cap rests.
+        app.space_mouse.device = Some("web 1234:5678".into());
+        crate::space_mouse_calibration::start(&mut app);
+        frame(&mut app, &ctx, DriverMapping::default(), resting, 0.02);
+        assert_eq!(app.space_mouse.raw, resting);
+        app.space_mouse.calibrating = None;
+        // A device resting far off zero, calibrated: still at rest, moving when pushed.
+        let mut offset = homemade();
+        for axis in &mut offset.axes {
+            axis.rest = 1000;
+        }
+        app.preferences.space_mouse_calibrations.insert("web 1234:5678".into(), offset);
+        let at_rest = Axes { translation: [1000; 3], rotation: [1000; 3] };
+        assert!(!frame(&mut app, &ctx, DriverMapping::default(), at_rest, 0.02));
+        assert_eq!(app.cam, before);
+        assert!(frame(&mut app, &ctx, DriverMapping::default(), Axes { rotation: [1000, 1000 - 3500, 1000], ..at_rest }, 0.02));
+    }
+
+    #[test]
+    fn another_device_turning_up_mid_calibration_ends_it() {
+        let ctx = window(true);
+        let mut app = app();
+        app.space_mouse.device = Some("hid 256f:c63a".into());
+        crate::space_mouse_calibration::start(&mut app);
+        frame(&mut app, &ctx, DriverMapping::default(), PUSH, 0.02);
+        app.space_mouse.device = Some("spacenavd".into());
+        assert!(frame(&mut app, &ctx, DriverMapping::default(), PUSH, 0.02), "the new device moves the view");
+        assert!(app.space_mouse.calibrating.is_none());
+        assert!(app.preferences.space_mouse_calibrations.is_empty());
+    }
+
+    #[test]
+    fn calibrations_are_saved_with_the_preferences() {
+        let mut prefs = crate::prefs::Prefs::default();
+        prefs.space_mouse_calibrations.insert("hid 1234:5678".into(), homemade());
+        let mut saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(crate::prefs::lenient(&saved), prefs);
+        // One that can't be read, or that could spin the view, is dropped on its own.
+        let mut spinning = homemade();
+        spinning.axes[0].full = [0; 2];
+        saved["space_mouse_calibrations"]["spacenavd"] = serde_json::to_value(spinning).unwrap();
+        saved["space_mouse_calibrations"]["web 046d:c62b"] = serde_json::json!({ "axes": "garbled" });
+        assert_eq!(crate::prefs::lenient(&saved), prefs);
+        // One saved before the dead zone setting existed reads with none.
+        let mut older = serde_json::to_value(homemade()).unwrap();
+        older.as_object_mut().unwrap().remove("dead_zone_share");
+        saved["space_mouse_calibrations"]["hid 1234:5678"] = older;
+        assert_eq!(crate::prefs::lenient(&saved), prefs);
     }
 }

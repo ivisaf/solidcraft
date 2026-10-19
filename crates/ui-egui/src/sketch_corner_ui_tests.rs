@@ -595,3 +595,28 @@ fn fillet_chamfer_corner_preview_draws_curves() {
     let sk = h.app.session.world_state().sketch(sid).unwrap().sketch.clone();
     assert_eq!(sk.curves.len(), 2, "chamfer preview must not modify the sketch");
 }
+
+/// #3052: with Trim, the hover over a line crossed by two others is the piece between them, the
+/// one a click takes away; the whole line is no longer shown hovered. With another tool, nothing.
+#[test]
+fn trim_hover_shows_the_piece_a_click_takes_away() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    let line = h.app.run("sketch.line", json!({"points": [[0,0],[30,0]], "connect": false})).unwrap()["curves"][0].as_str().unwrap().to_string();
+    h.app.run("sketch.line", json!({"points": [[10,-5],[10,5]], "connect": false})).unwrap();
+    h.app.run("sketch.line", json!({"points": [[20,-5],[20,5]], "connect": false})).unwrap();
+    h.settle();
+    let sid = h.app.session.active_sketch.unwrap();
+    h.step(&json!({"start":"sketch.trim"})).unwrap();
+    h.step(&json!({"move":{"world":[15,0,0]}})).unwrap();
+    assert!(matches!(&h.app.viewport.hover, Some(crate::viewport::Hit::SketchCurve { id, .. }) if *id == line), "{:?}", h.app.viewport.hover);
+    let piece = trim_hover_piece(&h.app, sid, &line).unwrap();
+    let ends = [piece[0], piece[piece.len() - 1]];
+    assert!(
+        ends.iter().all(|p| p.y.abs() < 1e-6) && ends.iter().any(|p| (p.x - 10.0).abs() < 1e-6) && ends.iter().any(|p| (p.x - 20.0).abs() < 1e-6),
+        "{ends:?}"
+    );
+    h.step(&json!({"key":"Escape"})).unwrap();
+    h.step(&json!({"move":{"world":[15,0,0]}})).unwrap();
+    assert!(trim_hover_piece(&h.app, sid, &line).is_none(), "only Trim shows a piece");
+}

@@ -141,6 +141,12 @@ fn remember_at(s: &Session, #[cfg(not(target_arch = "wasm32"))] identity: Option
     Some(img)
 }
 
+/// A Home picture is being drawn off the UI thread.
+#[cfg(test)]
+pub(crate) fn remembering(h: &HomeState) -> bool {
+    h.remembering.is_some()
+}
+
 pub(crate) fn remember_session(h: &mut HomeState, s: &Session) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = &s.path {
@@ -166,11 +172,6 @@ pub(crate) fn remember_session(h: &mut HomeState, s: &Session) {
     {
         let _ = (h, s);
     }
-}
-
-pub(crate) fn install(h: &mut HomeState, ctx: &egui::Context, key: &str, img: Option<egui::ColorImage>) {
-    let tex = img.map(|i| ctx.load_texture(format!("thumb:{key}"), i, egui::TextureOptions::LINEAR));
-    h.thumbs.insert(key.to_string(), tex);
 }
 
 /// Build what a key stands for (runs off the UI thread where threads exist).

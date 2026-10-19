@@ -1619,3 +1619,46 @@ fn trim_keeps_the_rest_of_a_dimensioned_line_where_it_was() {
     assert!(corner(&s).dist(Vec2::new(40.0, 23.0)) < 1e-6, "the step moved to {:?}", corner(&s));
     assert!(forty(&s).is_empty(), "{:?}", forty(&s));
 }
+
+/// #3052: the piece Trim shows under the cursor is the one `sketch.trim` takes away there: its
+/// ends lie on the crossings either side of the cursor (or the curve's own end), and after the
+/// trim no curve runs through its middle any more. A line crossed twice, its middle and an end
+/// piece; a circle crossed by a line, the half round the cursor; a line nothing crosses, whole.
+#[test]
+fn trim_piece_is_what_a_trim_there_takes_away() {
+    let near = |a: Vec2, b: [f64; 2]| (a - Vec2::new(b[0], b[1])).len() < 1e-6;
+    let crossed_line = || {
+        let mut s = new_sketch();
+        let line = ids(&run(&mut s, "sketch.line", json!({"points": [[0,0], [30,0]], "connect": false}))["curves"])[0].clone();
+        run(&mut s, "sketch.line", json!({"points": [[10,-5], [10,5]], "connect": false}));
+        run(&mut s, "sketch.line", json!({"points": [[20,-5], [20,5]], "connect": false}));
+        (s, line)
+    };
+    let crossed_circle = || {
+        let mut s = new_sketch();
+        let circle = ids(&run(&mut s, "sketch.circle.center", json!({"center": [0,0], "radius": 10}))["curves"])[0].clone();
+        run(&mut s, "sketch.line", json!({"points": [[-20,0], [20,0]], "connect": false}));
+        (s, circle)
+    };
+    let cases: [(&dyn Fn() -> (Session, String), [f64; 2], [[f64; 2]; 2], [f64; 2]); 4] = [
+        (&crossed_line, [15.0, 0.0], [[10.0, 0.0], [20.0, 0.0]], [15.0, 0.0]),
+        (&crossed_line, [4.0, 0.0], [[0.0, 0.0], [10.0, 0.0]], [5.0, 0.0]),
+        (&crossed_circle, [0.0, 10.0], [[10.0, 0.0], [-10.0, 0.0]], [0.0, 10.0]),
+        (&crossed_circle, [0.0, -10.0], [[10.0, 0.0], [-10.0, 0.0]], [0.0, -10.0]),
+    ];
+    for (make, at, ends, inside) in cases {
+        let (mut s, curve) = make();
+        let piece = super::trim_piece(&sketch(&s), &curve, Vec2::new(at[0], at[1])).unwrap();
+        let (first, last) = (piece[0], piece[piece.len() - 1]);
+        assert!((near(first, ends[0]) && near(last, ends[1])) || (near(first, ends[1]) && near(last, ends[0])), "{at:?}: {first:?} {last:?}");
+        let mid = if piece.len() > 2 { piece[piece.len() / 2] } else { (first + last) * 0.5 };
+        assert!(near(mid, inside), "{at:?}: {mid:?}");
+        run(&mut s, "sketch.trim", json!({"curve": curve, "at": at}));
+        let sk = sketch(&s);
+        assert!(!(0..sk.curves.len()).filter_map(|i| sk.shape(i)).any(|sh| sh.dist(mid) < 1e-6), "the trim at {at:?} took the piece shown away");
+    }
+    let mut s = new_sketch();
+    let lone = ids(&run(&mut s, "sketch.line", json!({"points": [[0,0], [8,0]], "connect": false}))["curves"])[0].clone();
+    let piece = super::trim_piece(&sketch(&s), &lone, Vec2::new(3.0, 0.0)).unwrap();
+    assert!(near(piece[0], [0.0, 0.0]) && near(piece[piece.len() - 1], [8.0, 0.0]), "{piece:?}");
+}

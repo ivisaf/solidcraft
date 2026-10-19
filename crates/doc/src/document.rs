@@ -233,7 +233,9 @@ pub struct Extent {
     pub convention: ExtrudeConvention,
     #[serde(default)]
     pub direction: Direction,
-    /// Optional second side distance (two-sided extrude), along the negative normal.
+    /// Optional second side distance (two-sided extrude): the other way from the first side (against
+    /// the normal, or along it when the first side goes against it: `direction: negative`, a
+    /// negative distance, or a To Object below the sketch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[walk(length = "Distance 2")]
     pub distance2: Option<Expr>,
@@ -1511,14 +1513,31 @@ pub enum FeatureKind {
         #[walk(length = "Tolerance")]
         tolerance: Expr,
     },
-    /// A surface body trimmed by a plane, or by a face of a body (`tool`), keeping the side of
-    /// `keep`.
+    /// A surface body trimmed by a plane, by a face of a body (`tool`, its surface extended) or
+    /// by sketch curves swept onto it (`curves`), keeping the side of `keep`; with `keep_more`,
+    /// the regions (pieces that hang together once cut) `keep` and those points pick instead.
+    /// With `with`, a mutual trim: `body` and `with` (one face each) cut each other, `with`
+    /// keeping the side of its one `keep_with` point or the regions of several; `extend`
+    /// extends one that stops short of the other to meet it, and `stitch` sews the two kept
+    /// pieces into `body` (`with` is then gone).
     SurfaceTrim {
         body: BodyName,
         plane: PlaneRef,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<FaceAt>,
         keep: Position,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keep_more: Vec<Position>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        curves: Option<TrimCurves>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        with: Option<BodyName>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keep_with: Vec<Position>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stitch: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        extend: bool,
     },
     Move {
         bodies: Vec<BodyName>,
@@ -1689,6 +1708,18 @@ impl FilletStyle {
     }
 }
 
+/// Sketch curves a trim cuts with: chains of the curves `curves` (every curve of the sketch
+/// that is not construction geometry when empty) swept along `direction` (the sketch's normal
+/// when none) onto the surface.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
+pub struct TrimCurves {
+    pub sketch: SketchId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub curves: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<Dir>,
+}
+
 /// A face picked by a point on it, on a named body.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, solidcraft_derive::Walk)]
 pub struct FaceAt {
@@ -1823,13 +1854,21 @@ pub struct SketchPoints {
 
 /// A component: a node of the design tree that owns sketches, features and bodies. The root
 /// (id 0) is the design itself and is not stored.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Component {
     pub id: u64,
     pub name: String,
     /// Parent component (0 = the root).
     #[serde(default)]
     pub parent: u64,
+    /// The definition's part properties (part number, description, revision…) and other tools'
+    /// data, under the same rules as the design's own `metadata`. Every occurrence shares them;
+    /// the bill of materials reads them.
+    #[serde(default, skip_serializing_if = "crate::Metadata::is_empty")]
+    pub metadata: crate::Metadata,
+    /// Free text properties of the definition (material grade, finish, supplier…), by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub properties: std::collections::BTreeMap<String, String>,
 }
 
 /// One loft section: profiles of a sketch.
@@ -2597,6 +2636,23 @@ impl Document {
         *self == normalized
     }
 
+    /// Only components' part properties (metadata and free properties) changed: nothing to
+    /// evaluate. The same whole-Document proof as [`Document::differs_only_in_render`].
+    pub fn differs_only_in_part_properties(&self, previous: &Document) -> bool {
+        if self.components.len() != previous.components.len()
+            || self.components.iter().zip(&previous.components).any(|(a, b)| a.id != b.id)
+            || self.components == previous.components
+        {
+            return false;
+        }
+        let mut normalized = previous.clone();
+        for (n, c) in normalized.components.iter_mut().zip(&self.components) {
+            n.metadata = c.metadata.clone();
+            n.properties = c.properties.clone();
+        }
+        *self == normalized
+    }
+
     /// The colour a body is shown and exported in (sRGB as 0–1 fractions): its appearance,
     /// else its component's, else its material's look, else the colour it was imported with.
     /// (Faces may have their own: `face_looks`.)
@@ -2695,6 +2751,23 @@ impl Document {
         if body.transferred || body.source_name.is_some() { body.component } else { self.legacy_body_component(&body.name, body.feature) }
     }
 
+    /// The components that own a body in `state` ([`Document::model_body_component`] of each),
+    /// in one pass: the timeline is looked up once, not once per body.
+    pub fn body_owners(&self, state: &crate::ModelState) -> std::collections::HashSet<u64> {
+        let features: std::collections::HashMap<u64, u64> = self.features.iter().rev().map(|f| (f.id, f.component)).collect();
+        state
+            .bodies
+            .iter()
+            .map(|b| {
+                if b.transferred || b.source_name.is_some() {
+                    b.component
+                } else {
+                    self.body_components.get(&b.name).copied().unwrap_or_else(|| features.get(&b.feature).copied().unwrap_or(0))
+                }
+            })
+            .collect()
+    }
+
     /// Recorded transfers already converted geometry into the new local frame.
     pub fn model_body_offset(&self, body: &crate::ModelBody) -> Option<&crate::Mat> {
         if body.transferred { None } else { self.body_offsets.get(&body.name) }
@@ -2720,7 +2793,7 @@ impl Document {
                 format!("Component{k}")
             }
         };
-        self.components.push(Component { id, name, parent });
+        self.components.push(Component { id, name, parent, ..Default::default() });
         self.add_occurrence(id, parent, crate::IDENTITY)?;
         Ok(id)
     }

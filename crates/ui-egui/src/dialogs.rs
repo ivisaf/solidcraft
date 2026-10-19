@@ -15,13 +15,70 @@ use solidcraft_engine::geom::{Aabb3, Vec3};
 use crate::SolveApp;
 use crate::selection::{self, AXES, Accept, BODIES, CURVES, EDGES, FACES, PLANAR_FACES, PLANES, PROFILES, SelInput};
 use crate::theme::Tokens;
+use crate::tool_modifiers::{Audit, Scope, ToolModifiers};
 use crate::viewport::Hit;
+
+const SELECT_ONLY: &[Scope] = &[Scope::Selection, Scope::FeaturePreview];
+const SELECT_MANIP: &[Scope] = &[Scope::Selection, Scope::Manipulator, Scope::FeaturePreview];
+
+/// Per-tool modifier descriptors owned by this host file (SOLID / construct / inspect dialogs).
+pub const MODIFIERS: &[ToolModifiers] = &[
+    ToolModifiers { tool: "sketch.create", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.extrude", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.revolve", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.fillet", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.chamfer", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.shell", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.draft", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.mirror", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.rib", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.web", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.emboss", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.replace_face", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.boundary_fill", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.align", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.remove", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    // Pattern parameters are dialog-only - no viewport modifier chords.
+    ToolModifiers { tool: "solid.pattern.path", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.pattern.rectangular", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.pattern.circular", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.pipe", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.bounding_solid", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "construct.plane.offset", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "construct.plane.along_path", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "construct.plane.at_angle", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.split_body", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.scale", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.offset_face", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.thread", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "material.assign", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "inspect.section", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "inspect.measure", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.loft", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.sweep", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    // Move: no Alt-copy / inventable chords; inherits Selection + Manipulator only.
+    ToolModifiers { tool: "solid.move", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.hole", scopes: SELECT_MANIP, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.box", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.cylinder", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.sphere", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.torus", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.coil", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+    ToolModifiers { tool: "solid.combine", scopes: SELECT_ONLY, bindings: &[], audit: Audit::VerifiedNoOp },
+];
 
 pub(crate) const OPS: [&str; 4] = ["new", "join", "cut", "intersect"];
 pub(crate) const OP_LABELS: [&str; 4] = ["New Body", "Join", "Cut", "Intersect"];
-const DIRS: [&str; 4] = ["positive", "negative", "symmetric", "positive"];
+const DIRS: [&str; 5] = ["positive", "negative", "symmetric", "positive", "negative"];
 /// The "Two sides" direction (a second distance the other way).
 pub const TWO_SIDES: usize = 3;
+/// Two sides, reversed: the first side goes against the normal and the second along it (#2700).
+pub const TWO_SIDES_REVERSED: usize = 4;
+
+/// An extrude direction with a second side.
+pub fn two_sided(direction: usize) -> bool {
+    direction == TWO_SIDES || direction == TWO_SIDES_REVERSED
+}
 /// Thin Extrude wall locations, as `solid.extrude` names them, and their labels.
 const WALL_SIDES: [&str; 4] = ["center", "inside", "outside", "two_sides"];
 const WALL_LABELS: [&str; 4] = ["Center", "Inside", "Outside", "Two Sides"];
@@ -116,6 +173,10 @@ pub enum Kind {
     },
     /// Halfway between two planes or planar faces.
     Midplane,
+    /// An imported mesh body rebuilt as editable faces (#3001).
+    MeshConvert {
+        tolerance: String,
+    },
     /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
     /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
     Construct {
@@ -287,6 +348,7 @@ pub enum Kind {
     Motion(crate::dialogs_motion::Mo),
     /// Insert Part from the standard parts library (`dialogs_parts`).
     Part(crate::dialogs_parts::Pt),
+    PartSize(crate::dialogs_part_size::Resize),
     /// Edit Text: a sketch text's content and placement (`sketch_text`).
     Text(Box<crate::sketch_text::Tx>),
     TextMove(crate::sketch_text_move::TextMove),
@@ -533,6 +595,7 @@ impl Dialog {
             "construct.plane.offset" => {
                 Dialog::new(Kind::OffsetPlane { offset: "0 mm".into() }, vec![SelInput::new("Plane", PLANES | PLANAR_FACES, false)])
             }
+            "mesh.convert" => Dialog::new(Kind::MeshConvert { tolerance: "0.05 mm".into() }, vec![SelInput::new("Mesh body", BODIES, false)]),
             "construct.plane.midplane" => Dialog::new(
                 Kind::Midplane,
                 vec![SelInput::new("First plane", PLANES | PLANAR_FACES, false), SelInput::new("Second plane", PLANES | PLANAR_FACES, false)],
@@ -654,6 +717,7 @@ impl Dialog {
                     .or_else(|| crate::dialogs_appearance::start(app, id))
                     .or_else(|| crate::dialogs_motion::start(app, id))
                     .or_else(|| crate::dialogs_parts::start(app, id))
+                    .or_else(|| crate::dialogs_part_size::start(app, id))
                     .or_else(|| crate::sketch_text::start(app, id))
                     .or_else(|| crate::sketch_text_move::start(app, id))
                     .or_else(|| crate::sketch_modify_ui::start(app, id))?;
@@ -792,7 +856,7 @@ impl Dialog {
             Kind::Surface(_) => return true,
             Kind::SketchModify(k) => return k.previews(),
             Kind::Plastic(k) => return k.previews(),
-            Kind::Part(_) => return true,
+            Kind::Part(_) | Kind::PartSize(_) => return true,
             _ => {}
         }
         matches!(
@@ -1427,6 +1491,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Material { .. } => "PHYSICAL MATERIAL",
         Kind::OffsetPlane { .. } => "OFFSET PLANE",
         Kind::Midplane => "MIDPLANE",
+        Kind::MeshConvert { .. } => "CONVERT MESH",
         Kind::Construct { title, .. } => title,
         Kind::PathPlane { .. } => "PLANE ALONG PATH",
         Kind::Rib { web: false, .. } => "RIB",
@@ -1472,6 +1537,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Appearance(_) => "APPEARANCE",
         Kind::Motion(k) => k.title(),
         Kind::Part(_) => "INSERT PART",
+        Kind::PartSize(_) => "Change Part Size",
         Kind::Text(_) => "EDIT TEXT",
         Kind::TextMove(_) => "MOVE/COPY TEXT",
         Kind::SketchModify(k) => k.title(),
@@ -2437,10 +2503,21 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         row_label(ui, "Direction");
                         // One Side, Two Sides, Symmetric (a flip is a negative distance).
                         let order = [0usize, TWO_SIDES, 2];
-                        let mut pos = order.iter().position(|o| o == direction).unwrap_or(0);
+                        let reversed = *direction == 1 || *direction == TWO_SIDES_REVERSED;
+                        let shown = match *direction {
+                            1 => 0,
+                            TWO_SIDES_REVERSED => TWO_SIDES,
+                            d => d,
+                        };
+                        let mut pos = order.iter().position(|o| *o == shown).unwrap_or(0);
                         combo(ui, "ex_dir", &["One Side", "Two Sides", "Symmetric"], &mut pos);
-                        if pos != order.iter().position(|o| o == direction).unwrap_or(0) {
-                            *direction = order.get(pos).copied().unwrap_or(0);
+                        if pos != order.iter().position(|o| *o == shown).unwrap_or(0) {
+                            // One Side and Two Sides keep Reverse.
+                            *direction = match (order.get(pos).copied().unwrap_or(0), reversed) {
+                                (0, true) => 1,
+                                (TWO_SIDES, true) => TWO_SIDES_REVERSED,
+                                (d, _) => d,
+                            };
                             // Selecting Symmetric applies the current total-distance semantics.
                             d.extra.insert("convention".into(), json!(solidcraft_engine::doc::ExtrudeConvention::TotalDistance));
                             // An explicit direction ends the automatic choices (#1257).
@@ -2448,11 +2525,15 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             *auto_op = false;
                         }
                         ui.end_row();
-                        if *direction < 2 {
+                        if *direction < 2 || two_sided(*direction) {
                             row_label(ui, "Reverse");
-                            let mut reverse = *direction == 1;
+                            let mut reverse = *direction == 1 || *direction == TWO_SIDES_REVERSED;
                             if ui.checkbox(&mut reverse, tr("Reverse Direction")).changed() {
-                                *direction = usize::from(reverse);
+                                *direction = match (two_sided(*direction), reverse) {
+                                    (true, true) => TWO_SIDES_REVERSED,
+                                    (true, false) => TWO_SIDES,
+                                    (false, r) => usize::from(r),
+                                };
                                 // An explicit direction ends the automatic choices (#1257).
                                 smart.manual_dir = true;
                                 *auto_op = false;
@@ -2470,15 +2551,17 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             row_label(ui, "Distance");
                             enter |= field(ui, distance);
                             ui.end_row();
-                            if *direction == TWO_SIDES {
-                                row_label(ui, "Distance 2");
-                                enter |= field(ui, distance2);
-                                ui.end_row();
-                            }
                         }
                         if ext == 1 {
                             row_label(ui, "To Offset");
                             enter |= field(ui, to_offset);
+                            ui.end_row();
+                        }
+                        // The second side is a distance whatever the first side's extent: All one
+                        // way and a distance the other is a common two-sided cut (#2700).
+                        if two_sided(*direction) {
+                            row_label(ui, "Distance 2");
+                            enter |= field(ui, distance2);
                             ui.end_row();
                         }
                         if *direction < 2 {
@@ -2746,6 +2829,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         ui.end_row();
                     }
                     Kind::Split | Kind::ReplaceFace | Kind::Remove | Kind::Midplane | Kind::Construct { t: None, .. } => {}
+                    Kind::MeshConvert { tolerance } => {
+                        row_label(ui, "Tolerance");
+                        enter |= field(ui, tolerance);
+                        ui.end_row();
+                    }
                     Kind::Construct { t: Some(t), .. } => {
                         row_label(ui, "Position (0 to 1)");
                         enter |= field(ui, t);
@@ -3054,6 +3142,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                     Kind::Appearance(k) => enter |= crate::dialogs_appearance::rows(app, ui, k, &mut d.inputs),
                     Kind::Motion(k) => enter |= crate::dialogs_motion::rows(app, ui, k, &mut d.inputs),
                     Kind::Part(k) => enter |= crate::dialogs_parts::rows(app, ui, k, &d.inputs),
+                    Kind::PartSize(k) => enter |= crate::dialogs_part_size::rows(app, ui, k),
                     Kind::Text(k) => enter |= crate::sketch_text::rows(ui, k, &mut d.inputs, &mut d.active),
                     Kind::TextMove(k) => enter |= crate::sketch_text_move::rows(ui, k),
                     Kind::ConfirmDelete { with, fail, .. } => {
@@ -3755,7 +3844,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             need(0, if *thin { "curves or profiles" } else { "profiles or a planar face" })?;
             let mut common = json!({"distance": distance, "direction": DIRS.get(*direction).copied().unwrap_or("positive"), "operation": OPS.get(*operation).copied().unwrap_or("new")});
             let tapered = s.doc.eval(taper, ValueKind::Angle).map(|v| v.abs() > 1e-12).unwrap_or(!taper.trim().is_empty());
-            if *direction == TWO_SIDES {
+            if two_sided(*direction) {
                 common["distance2"] = json!(distance2);
             } else if *direction < 2 && (*taper_present || tapered) {
                 common["taper"] = json!(taper);
@@ -4027,6 +4116,14 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             need(0, "a plane")?;
             let base = plane_arg(app, sels(d, 0).first())?;
             ("construct.plane.offset", json!({"base": base, "offset": offset}))
+        }
+        Kind::MeshConvert { tolerance } => {
+            need(0, "the mesh body")?;
+            let body = match sels(d, 0).first() {
+                Some(Sel::Body { name }) => name.clone(),
+                _ => return Err("pick the mesh body to convert".into()),
+            };
+            ("mesh.convert", json!({"body": body, "tolerance": tolerance}))
         }
         Kind::Midplane => {
             need(0, "the first plane")?;
@@ -4381,6 +4478,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
         Kind::Appearance(k) => return Ok(crate::dialogs_appearance::commands(k, &d.inputs)),
         Kind::Motion(k) => return crate::dialogs_motion::commands(app, k, &d.inputs),
         Kind::Part(k) => return crate::dialogs_parts::commands(app, k, &d.inputs),
+        Kind::PartSize(k) => return crate::dialogs_part_size::commands(app, k),
         Kind::Text(k) => return crate::sketch_text::commands(app, k),
         Kind::TextMove(k) => return crate::sketch_text_move::commands(app, k),
     };
@@ -4807,6 +4905,7 @@ pub fn for_feature(app: &SolveApp, id: u64, marker: Option<usize>) -> Option<Dia
             d.kind = Kind::Extrude {
                 distance: extent.distance.to_string(),
                 direction: match (extent.direction, &extent.distance2) {
+                    (Direction::Negative, Some(_)) => TWO_SIDES_REVERSED,
                     (_, Some(_)) => TWO_SIDES,
                     (Direction::Positive, None) => 0,
                     (Direction::Negative, None) => 1,

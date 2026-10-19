@@ -234,6 +234,9 @@ pub struct Session {
     world_cache: std::sync::Mutex<Option<WorldCache>>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
+    /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
+    /// scratch copies): a body that did not change or move is not measured again.
+    clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
     /// Features copied with `timeline.copy` (pasted by `timeline.paste`).
     pub clipboard: Vec<solidcraft_doc::Feature>,
     /// Sketch geometry copied with `sketch.copy` (pasted by `sketch.paste`).
@@ -372,6 +375,7 @@ impl Session {
             world_cache: Default::default(),
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
+            clearance_cache: Default::default(),
             clipboard: Vec::new(),
             sketch_clipboard: None,
             section: None,
@@ -591,9 +595,12 @@ impl Session {
         }
     }
 
-    /// Only persistent render intent changed. Never evaluate or clear a stale model here.
+    /// Only persistent render intent, or only part properties, changed. Never evaluate or clear
+    /// a stale model here.
     fn render_only_change(&self, before: &Snapshot) -> bool {
-        self.active_sketch == before.active_sketch && self.pending_moves == before.pending_moves && self.doc.differs_only_in_render(&before.doc)
+        self.active_sketch == before.active_sketch
+            && self.pending_moves == before.pending_moves
+            && (self.doc.differs_only_in_render(&before.doc) || self.doc.differs_only_in_part_properties(&before.doc))
     }
 
     fn refresh_render(&mut self, previous: &Arc<Document>) {
@@ -840,6 +847,7 @@ impl Session {
             world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
+            clearance_cache: self.clearance_cache.clone(),
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
@@ -1040,6 +1048,8 @@ mod naming_history_tests;
 mod pattern_suppress_tests;
 #[cfg(test)]
 mod profile_curves_tests;
+#[cfg(test)]
+mod profile_fallback_tests;
 #[cfg(test)]
 mod profile_refs_tests;
 #[cfg(test)]

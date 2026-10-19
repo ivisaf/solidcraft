@@ -307,6 +307,37 @@ fn bracket(sk: &Sketch, ci: usize, tq: f64) -> (Vec<(f64, Vec2, usize)>, bool) {
     (before.into_iter().chain(after).collect(), false)
 }
 
+/// The piece of `curve` a trim at `at` takes away, as points along it, for the Trim tool to show
+/// under the cursor (#3052): the part between the crossings either side of `at`, as `sketch.trim`
+/// cuts it, or the whole curve where nothing crosses it. `None` where trim works otherwise (a
+/// free-form or infinite curve) or the curve isn't in the sketch: the tool shows the curve.
+pub fn trim_piece(sk: &Sketch, curve: &str, at: Vec2) -> Option<Vec<Vec2>> {
+    let ci = sk.curve_index(curve)?;
+    let c = sk.curves.get(ci)?;
+    if c.infinite || c.kind.is_freeform() {
+        return None;
+    }
+    let sh = sk.shape(ci)?;
+    let tq = sh.param(sh.project(at));
+    let (t0, t1) = sh.range();
+    let (cuts, full) = bracket(sk, ci, tq);
+    let (a, b) = match (cuts.as_slice(), full) {
+        ([], _) => (t0, t1),
+        // A whole circle: the arc between the two crossings round `at`.
+        ([x, y], true) => {
+            if tq > x.0 && tq < y.0 {
+                (x.0, y.0)
+            } else {
+                (y.0, x.0 + TAU)
+            }
+        }
+        (_, true) => return None,
+        (cuts, false) => (cuts.iter().rev().find(|c| c.0 < tq).map_or(t0, |c| c.0), cuts.iter().find(|c| c.0 > tq).map_or(t1, |c| c.0)),
+    };
+    let n = if matches!(sh, Shape::Line { .. }) { 1 } else { 64 };
+    Some((0..=n).map(|i| sh.point(a + (b - a) * f64::from(i) / f64::from(n))).collect())
+}
+
 fn trim(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.trim";
     let at = req_vec2(cmd, p, "at")?;

@@ -41,6 +41,10 @@ Changes:
   a moved vertex), across the passes that fold in the operands' extra shells. `and` / `or` are
   wrappers that drop the history; the `*_with_history` forms return the same solid with the
   history as an `Option` (`None` where a face or edge went unrecorded).
+- `transversal/integrate/mod.rs`: `meshes` and `and_with_history_meshed` take the first
+  operand's shell meshes made beforehand (copied for each use, since the loops stores cut their
+  edges): a large body cut down to the regions of many small ones is meshed once, which was most
+  of each operation's time.
 
 ## truck-geometry 0.5.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 

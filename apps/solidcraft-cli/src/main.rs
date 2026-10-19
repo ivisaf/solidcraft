@@ -7,6 +7,7 @@
 //! solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]] loading timings as JSON lines
 //! solidcraft-cli bench-agent [--scale F] [--save F] [--script-out F] a ~1,300-body design built command by command, timed
 //! solidcraft-cli snapshot <script|design> [--in design|part.step] --out shot.png [--width W] [--height H] [--view iso|front|top|…|NAME | --camera JSON] [--no-grid] [--no-axes]
+//!                                                             [--body NAME:opacity=0.3,color=#rrggbb]... [--tool NAME]... [--section z=27]
 //! solidcraft-cli exec <command> [json-params]                 run one command on an empty design
 //! solidcraft-cli commands                                     the command registry as JSON
 //! solidcraft-cli recipe <recipe.json>                         translate an oracle recipe to a script
@@ -23,6 +24,7 @@ mod bench_agent;
 mod crashes;
 mod fuzz;
 mod oracle;
+mod preview;
 mod recipe;
 mod render;
 mod spatial;
@@ -50,11 +52,18 @@ const USAGE: &str = "usage:
   solidcraft-cli bench-open <design.solidcraft | part.step> [--parse-only] [--display LEVEL [--edit NAME EXPR]]
   solidcraft-cli bench-agent [--scale F] [--save design.solidcraft] [--script-out script.json]
   solidcraft-cli snapshot <script|design> [--in design.solidcraft|part.step] --out shot.png [--width W] [--height H] [--view NAME | --camera JSON] [--no-grid] [--no-axes]
+      [--body NAME:opacity=0.3,color=#rrggbb]... [--tool NAME]... [--section z=27]
   solidcraft-cli snapshot --in <design.solidcraft|part.step> --out shot.png ...
       (as with run, --in starts from a design and the script runs on top of it; an option snapshot doesn't take is an error;
        --view: iso, front, back, top, bottom, left, right, or the name of a view saved in the design with view.save;
        --camera: {target: [x,y,z], yaw, pitch, distance, fov?} in mm and radians, as the MCP screenshot takes it (docs/mcp.md);
-       --no-grid and --no-axes leave the ground grid (on Z 0) and the origin's axes out of the picture)
+       --no-grid and --no-axes leave the ground grid (on Z 0) and the origin's axes out of the picture;
+       --body: how one body is drawn, as appearance.assign takes it: opacity 0-1 (below 1 is see-through, so what is inside
+         it shows) and color #rrggbb, either or both, once per body;
+       --tool: draw this body solid in the tool colour and every other body see-through, so a cut's or a join's tool body
+         is visible inside the material it meets; a later --body overrides it;
+       --section: cut the model as inspect.section does, so the inside shows: z=27 (the plane through that world
+         coordinate, keeping the smaller side), add ,flip to keep the other side, or XY, XZ, YZ, or its own JSON)
   solidcraft-cli render <script|design> --out image.png [--setup NAME] [--width W] [--height H] [--transparent] [--overwrite] [--timeout SECONDS]
   solidcraft-cli exec <command> [json-params]
   solidcraft-cli commands
@@ -405,7 +414,12 @@ fn install_renderer() {
 
 fn cmd_snapshot(args: &[String]) -> Result<(), String> {
     install_renderer();
-    known_flags("snapshot", args, &["--in", "--out", "--width", "--height", "--view", "--camera"], &["--no-grid", "--no-axes"])?;
+    known_flags(
+        "snapshot",
+        args,
+        &["--in", "--out", "--width", "--height", "--view", "--camera", "--body", "--tool", "--section"],
+        &["--no-grid", "--no-axes"],
+    )?;
     if positional(args).is_none() && flag(args, "--in").is_none() {
         return Err(USAGE.to_string());
     }
@@ -416,6 +430,9 @@ fn cmd_snapshot(args: &[String]) -> Result<(), String> {
     };
     let (w, h) = (size("--width", 1280)?, size("--height", 800)?);
     let mut s = open(flag(args, "--in"), positional(args))?;
+    // How the bodies are drawn and where the model is cut, through the commands the app's
+    // Appearance dialog and Section Analysis run (`preview`).
+    preview::apply(&mut s, &flags(args, "--body"), &flags(args, "--tool"), flag(args, "--section"))?;
     // The camera choices of the MCP `screenshot`, through the same command (`view.apply`): a
     // standard view, a view saved in the design, or an explicit camera. A script that applies a
     // view itself sets the camera too; without any, the iso view framing the model.
@@ -630,10 +647,14 @@ pub(crate) fn cmd_bench_open(args: &[String]) -> Result<(), String> {
     }
     let t = std::time::Instant::now();
     let st = s.world_state();
+    let place_ms = t.elapsed().as_secs_f64() * 1000.0;
     // As the desktop app prepares a design it opened.
     st.warm_meshes(|| true);
     let triangles: usize = st.bodies.iter().map(|b| b.mesh().triangles.len()).sum();
-    println!("{}", json!({"step": "mesh", "ms": t.elapsed().as_secs_f64() * 1000.0, "bodies": st.bodies.len(), "triangles": triangles}));
+    println!(
+        "{}",
+        json!({"step": "mesh", "ms": t.elapsed().as_secs_f64() * 1000.0, "place_ms": place_ms, "bodies": st.bodies.len(), "triangles": triangles})
+    );
     // `--display LEVEL`: the display plans the viewport draws at that display quality, made as
     // the GPU viewport makes them; `--edit NAME EXPR` then changes a parameter and times the
     // evaluation and the plans of the bodies it changed.

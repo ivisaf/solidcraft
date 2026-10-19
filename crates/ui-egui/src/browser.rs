@@ -709,7 +709,8 @@ fn component_name(app: &SolveApp, id: u64) -> String {
     let doc = &app.session.doc;
     let name = doc.components.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default();
     let n = doc.occurrences.iter().filter(|o| o.component == id).count();
-    if n > 1 { format!("{name} ({n} instances)") } else { format!("{name}:1") }
+    let name = if n > 1 { format!("{name} ({n} instances)") } else { format!("{name}:1") };
+    crate::dialogs_part_size::browser_label(app, id, &name)
 }
 
 fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, acts: &mut Actions) {
@@ -766,7 +767,11 @@ fn component_rows(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, depth: usize, 
         }
     }
     if r.double {
-        let _ = app.run("component.activate", json!({ "component": id }));
+        if app.session.doc.parts.contains_key(&id) {
+            crate::dialogs_part_size::open(app, id);
+        } else {
+            let _ = app.run("component.activate", json!({ "component": id }));
+        }
     }
     if r.hovered {
         acts.hover_bodies = bodies.clone();
@@ -824,6 +829,7 @@ fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth:
     let selected = app.session.selection.contains(&Sel::Occurrence { path: path.clone() });
     let faded = app.session.active_occurrence_path.as_ref().is_some_and(|p| !path.starts_with(p) && !p.starts_with(&path));
     let badges: &[&str] = if placement.grounded { &["pin"] } else { &[] };
+    let label = crate::dialogs_part_size::browser_label(app, placement.component, &placement.name);
     app.tree.order.push(key.clone());
     let r = draw_row(
         ui,
@@ -833,7 +839,7 @@ fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth:
             fold: Some(open),
             eye: Some(own_visible),
             icon: "component",
-            label: &placement.name,
+            label: &label,
             name: true,
             selected,
             dim: faded || !visible,
@@ -870,8 +876,11 @@ fn occurrence_rows(app: &mut SolveApp, ui: &mut egui::Ui, path: Vec<u64>, depth:
     if r.eye {
         let _ = app.run("browser.visibility", json!({"visible": app.session.occurrence_hidden(&path), "paths": [path]}));
     }
-    if r.radio || r.double {
+    if r.radio || (r.double && !app.session.doc.parts.contains_key(&placement.component)) {
         let _ = app.run("component.activate", json!({"component": placement.component, "occurrence": placement.occurrence, "path": path}));
+    }
+    if r.double && app.session.doc.parts.contains_key(&placement.component) {
+        crate::dialogs_part_size::open(app, placement.component);
     }
     if r.clicked {
         click_select(app, ui, key.clone(), Some(Sel::Occurrence { path: path.clone() }));

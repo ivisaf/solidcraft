@@ -74,7 +74,8 @@ pub fn coaxial_overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if a.is_mesh() || b.is_mesh() {
         return None;
     }
-    crate::guard("near-coaxial overlap", || Ok(overlap(a, b))).ok().flatten()
+    // The boolean that takes the core can fail in one order of the bodies and not the other.
+    crate::guard("near-coaxial overlap", || Ok(overlap(a, b).or_else(|| overlap(b, a)))).ok().flatten()
 }
 
 fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
@@ -90,6 +91,14 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if !ca.iter().any(|x| cb.iter().any(|y| close(x, y))) {
         return None;
     }
+    // A wall that runs once round along a seam edge (as STEP files have them) is cut in two
+    // first: the boolean cannot always intersect it whole.
+    let (sa, sb) = (crate::step_in::split::split_seams(a), crate::step_in::split::split_seams(b));
+    let (ca, cb) = match (&sa, &sb) {
+        (None, None) => (ca, cb),
+        _ => (sa.as_ref().map_or(ca, cylinders), sb.as_ref().map_or(cb, cylinders)),
+    };
+    let (a, b) = (sa.as_ref().unwrap_or(a), sb.as_ref().unwrap_or(b));
     let (wa, wb) = (walls(a, ca, same)?, walls(b, cb, same)?);
     let mut pairs = Vec::new();
     for x in &wa {
@@ -100,8 +109,10 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
             let (pin, hole, pin_in_a) = match (x.boss, y.boss) {
                 (true, false) => (x, y, true),
                 (false, true) => (y, x, false),
-                // Two pins or two holes on nearly one cylinder: not this case.
-                _ if near(x, y, same).is_some() => return None,
+                // Two pins or two holes on nearly one cylinder, side by side along it: not this
+                // case. Apart along the axis (a screw's head beside a bush of its radius), they
+                // don't meet.
+                _ if near(x, y, same).is_some() && total(&intersect(&union(&x.spans), &union(&project(y, x)))) > same => return None,
                 _ => continue,
             };
             let Some((toward, offset)) = near(pin, hole, same) else { continue };
@@ -116,6 +127,11 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     if pairs.is_empty() {
         return None;
     }
+    // A pin's face flush against the other body (a rivet's head on the sheet) touches it over
+    // an area, which the boolean cannot always take: it is pulled back off it by a little.
+    // Only material outside the other body goes, so the overlap is the same.
+    let back = pairs.iter().map(|p| p.step).fold(f64::INFINITY, f64::min) * 0.05;
+    let (fa, fb) = (flush(a, b, same, back), flush(b, a, same, back));
     // A pin's faces move together: one step for each of them (the pin's walls do not repeat
     // across pairs unless one pin is near two holes, which the check below then answers).
     let shared_at = |k: f64| -> Option<(f64, Option<Body>)> {
@@ -124,13 +140,21 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
             if mine.is_empty() {
                 return Some(body.clone());
             }
-            let shift = |i: usize, _| mine.iter().find(|p| p.pin.faces.contains(&i)).map(|p| p.step * k).unwrap_or(0.0);
+            let flush = if in_a { &fa } else { &fb };
+            let shift = |i: usize, _| match mine.iter().find(|p| p.pin.faces.contains(&i)) {
+                Some(p) => p.step * k,
+                None if flush.contains(&i) => -back,
+                None => 0.0,
+            };
             let m = crate::offset::offset_body(body, shift).ok()?;
             m.validity().is_empty().then_some(m)
         };
         let (ma, mb) = (moved(a, true)?, moved(b, false)?);
         let (r, report) = crate::capture_boolean_diagnostics(|| crate::ops::boolean(&ma, &mb, BoolOp::Intersect));
-        if report.unverified().is_some() || report.warning().is_some() {
+        // The core is the answer and must be exact. The wider pins only check the band, to
+        // 2 % of what it gains: a tool nudged by a hair of the step there is as good.
+        let nudge = if k > 0.0 { pairs.iter().map(|p| p.step).fold(f64::INFINITY, f64::min) * 1e-2 } else { 0.0 };
+        if report.unverified().is_some() || !altered_by_at_most(&report, nudge, size) {
             return None;
         }
         match r.ok()? {
@@ -186,6 +210,17 @@ fn overlap(a: &Body, b: &Body) -> Option<CoaxialOverlap> {
     Some(CoaxialOverlap { volume: volume.max(0.0), area, centroid, bbox, offset, length })
 }
 
+/// Whether every retry of a boolean that can change its result moved the tool by at most
+/// `limit` (a rotation counted at the bodies' `size` from its pivot): none for a `limit` of 0.
+fn altered_by_at_most(report: &crate::BooleanDiagnostics, limit: f64, size: f64) -> bool {
+    !report.truncated
+        && report
+            .events
+            .iter()
+            .filter(|e| e.strategy.alters_result())
+            .all(|e| e.strategy == crate::BooleanStrategy::ToolNudge && limit > 0.0 && e.translation_mm + e.rotation_rad * size <= limit)
+}
+
 /// The pin's offset to the hole, when the two are nearly on one cylinder but not on the same
 /// surface: the unit direction from the pin's axis to the hole's (any, for one axis) and the
 /// distance.
@@ -202,6 +237,51 @@ fn near(pin: &Wall, hole: &Wall, same: f64) -> Option<(Vec3, f64)> {
     }
     let toward = across.normalized().unwrap_or_else(|| pin.axis.any_perp());
     Some((toward, offset))
+}
+
+/// The planar faces of `x` that lie on a face of `y`'s facing the other way, where the two touch
+/// flat: on a plane of `y`'s, with `y` just beyond the face and not just behind it (within
+/// `depth`, at every sampled facet of it). A face on such a plane elsewhere (a collar's
+/// underside inside the other body, level with a pocket's floor) is not one.
+fn flush(x: &Body, y: &Body, same: f64, depth: f64) -> Vec<usize> {
+    let planes = |b: &Body| -> Vec<(usize, Vec3, Vec3)> {
+        (0..b.face_count())
+            .filter_map(|i| match crate::face_surface(b, i)? {
+                FaceSurface::Plane { normal, point } => Some((i, normal.vec(), point)),
+                _ => None,
+            })
+            .collect()
+    };
+    let theirs = planes(y);
+    let level: Vec<(usize, Vec3)> = planes(x)
+        .into_iter()
+        .filter(|(_, n, p)| theirs.iter().any(|(_, m, q)| n.dot(*m) < -1.0 + 1e-9 && (*q - *p).dot(*n).abs() <= same))
+        .map(|(i, n, _)| (i, n))
+        .collect();
+    if level.is_empty() || !(depth.is_finite() && depth > 0.0) {
+        return Vec::new();
+    }
+    let tol = (x.size().max(y.size()) * 2e-3).max(1e-4);
+    let (Ok(mx), Ok(my)) = (x.tessellate(tol), y.tessellate(tol)) else { return Vec::new() };
+    // At most this many facets of a face are sampled.
+    const SAMPLES: usize = 64;
+    level
+        .into_iter()
+        .filter(|&(i, n)| {
+            let centres: Vec<Vec3> = mx
+                .triangles
+                .iter()
+                .zip(&mx.tri_face)
+                .filter(|(_, f)| **f as usize == i)
+                .filter_map(|(t, _)| mx.tri(t))
+                .filter(|[a, b, c]| (*b - *a).cross(*c - *a).len() > 0.0)
+                .map(|[a, b, c]| (a + b + c) / 3.0)
+                .collect();
+            let stride = centres.len().div_ceil(SAMPLES).max(1);
+            !centres.is_empty() && centres.iter().step_by(stride).all(|c| my.contains(*c + n * depth) && !my.contains(*c - n * depth))
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The body's cylindrical faces, each as a wall of its own with no side or extent yet.
@@ -246,7 +326,9 @@ fn walls(b: &Body, cylinders: Vec<Wall>, same: f64) -> Option<Vec<Wall>> {
         let wall = Wall { faces: vec![face], origin, axis, radius, boss, spans: vec![(lo, hi)] };
         match out.iter_mut().find(|w| w.boss == boss && on_one_cylinder(w, &wall, same)) {
             Some(w) => {
-                let s = (origin - w.origin).dot(w.axis) * if axis.dot(w.axis) < 0.0 { -1.0 } else { 1.0 };
+                // Where the face's origin lies along the wall's axis; a face whose axis runs the
+                // other way measures its span backwards from there.
+                let s = (origin - w.origin).dot(w.axis);
                 let (a, b) = if axis.dot(w.axis) < 0.0 { (-hi, -lo) } else { (lo, hi) };
                 w.faces.push(face);
                 w.spans.push((a + s, b + s));
@@ -420,5 +502,88 @@ mod tests {
         // Pins on the very axis, or far off it, aren't asked about.
         assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.0).1).is_none());
         assert!(coaxial_overlap(&plate, &plate_and_pin(3.0, 0.5).1).is_none());
+    }
+
+    /// A bush and a headed screw whose shank ends inside the bore, both written to STEP and
+    /// read back: their cylinders come back as one face each that runs once round along a seam
+    /// edge, which the boolean cannot intersect where the shank's end meets the bore. The
+    /// walls are cut in two first and the answer is the one of the bodies as built.
+    #[test]
+    fn a_screw_in_a_bush_after_a_step_round_trip() {
+        let e = 0.01;
+        let outer = crate::cylinder(Vec3::ZERO, Vec3::Z, 5.0, 10.0).unwrap();
+        let bore = crate::cylinder(Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 3.0, 12.0).unwrap();
+        let bush = crate::boolean(&outer, &bore, BoolOp::Cut).unwrap().unwrap();
+        let shank = crate::cylinder(Vec3::new(e, 0.0, -2.0), Vec3::Z, 3.0, 8.0).unwrap();
+        let head = crate::cylinder(Vec3::new(e, 0.0, -5.0), Vec3::Z, 5.25, 3.0).unwrap();
+        let screw = crate::boolean(&shank, &head, BoolOp::Union).unwrap().unwrap();
+        let back = |b: &Body| crate::step_import(&crate::step_export(&[b], "round trip").unwrap()).unwrap().bodies.remove(0).body;
+        let (bush, screw) = (back(&bush), back(&screw));
+        // The shank shares a crescent with the bush over the 6 mm it reaches into the bore.
+        let want = 6.0 * crescent(3.0, 3.0, e).area;
+        for (x, y) in [(&bush, &screw), (&screw, &bush)] {
+            let o = coaxial_overlap(x, y).unwrap();
+            assert!((o.volume - want).abs() < 1e-6 * want, "{o:?} {want}");
+            assert!((o.length - 6.0).abs() < 1e-6, "{o:?}");
+        }
+        // Cut in two, each wall is a face more and the body keeps its volume.
+        let split = crate::step_in::split::split_seams(&bush).unwrap();
+        assert_eq!(split.face_count(), bush.face_count() + 2);
+        let (v0, v1) = (crate::measure(&bush).unwrap().volume, crate::measure(&split).unwrap().volume);
+        assert!((v0 - v1).abs() < 1e-6 * v0, "{v0} {v1}");
+        assert!(crate::step_in::split::split_seams(&outer).is_none());
+    }
+
+    /// A pin with a Ø7 collar embedded in a block (the collar's underside at z = 0, inside the
+    /// block's material), a hair off its hole, and a pocket elsewhere in the block whose floor
+    /// is at z = 0 too, facing the collar's underside: the two are level but don't touch, so the
+    /// collar is not pulled back, and all of it inside the block counts.
+    #[test]
+    fn a_collar_level_with_a_pocket_floor_elsewhere_is_not_pulled_back() {
+        let e = 0.01;
+        let mut block = crate::box_solid(Vec3::new(-10.0, -10.0, -5.0), Vec3::new(20.0, 10.0, 3.0)).unwrap();
+        let hole = crate::cylinder(Vec3::new(0.0, 0.0, -6.0), Vec3::Z, 2.0, 10.0).unwrap();
+        let pocket = crate::box_solid(Vec3::new(10.0, -3.0, 0.0), Vec3::new(14.0, 3.0, 4.0)).unwrap();
+        for cut in [&hole, &pocket] {
+            block = crate::boolean(&block, cut, BoolOp::Cut).unwrap().unwrap();
+        }
+        let shank = crate::cylinder(Vec3::new(e, 0.0, -7.0), Vec3::Z, 2.0, 8.0).unwrap();
+        let collar = crate::cylinder(Vec3::new(e, 0.0, 0.0), Vec3::Z, 3.5, 1.0).unwrap();
+        let pin = crate::boolean(&shank, &collar, BoolOp::Union).unwrap().unwrap();
+        // The collar less the hole, plus the shank's crescent over the 5 mm below the collar.
+        let want = std::f64::consts::PI * (3.5 * 3.5 - 2.0 * 2.0) + 5.0 * crescent(2.0, 2.0, e).area;
+        for (x, y) in [(&block, &pin), (&pin, &block)] {
+            let o = coaxial_overlap(x, y).unwrap();
+            assert!((o.volume - want).abs() < 1e-4 * want, "{o:?} {want}");
+        }
+    }
+
+    /// Two rivets with their heads flush on both faces of a sheet, each a hair off its hole,
+    /// read back from STEP: the heads touch the sheet flat, which the boolean cannot always
+    /// take, so they are pulled back off it first. Each rivet shares its own crescent.
+    #[test]
+    fn two_rivets_flush_on_a_sheet_after_a_step_round_trip() {
+        let rivet = |x: f64| {
+            let shank = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 2.0, 3.5).unwrap();
+            let under = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 3.5, 1.0).unwrap();
+            let over = crate::cylinder(Vec3::new(x, 0.0, 1.5), Vec3::Z, 3.5, 1.0).unwrap();
+            let r = crate::boolean(&shank, &under, BoolOp::Union).unwrap().unwrap();
+            crate::boolean(&r, &over, BoolOp::Union).unwrap().unwrap()
+        };
+        let mut sheet = crate::box_solid(Vec3::new(-20.0, -10.0, 0.0), Vec3::new(20.0, 10.0, 1.5)).unwrap();
+        for x in [-4.0, 4.0] {
+            let drill = crate::cylinder(Vec3::new(x, 0.0, -1.0), Vec3::Z, 2.0, 4.0).unwrap();
+            sheet = crate::boolean(&sheet, &drill, BoolOp::Cut).unwrap().unwrap();
+        }
+        let back = |b: &Body| crate::step_import(&crate::step_export(&[b], "round trip").unwrap()).unwrap().bodies.remove(0).body;
+        let sheet = back(&sheet);
+        for (x, e) in [(-4.0, 0.004), (4.0, 0.006)] {
+            let r = back(&rivet(x + e));
+            let want = 1.5 * crescent(2.0, 2.0, e).area;
+            for (p, q) in [(&sheet, &r), (&r, &sheet)] {
+                let o = coaxial_overlap(p, q).unwrap();
+                assert!((o.volume - want).abs() < 1e-6 * want, "{o:?} {want}");
+            }
+        }
     }
 }

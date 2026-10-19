@@ -429,7 +429,8 @@ fn certified_planar_construction(body: &crate::ModelBody, index: usize) -> bool 
 
 pub fn resolve_anchored_face(doc: &Document, st: &ModelState, plane: &Plane, kind: LinkKind, anchor: &crate::FaceAnchor) -> Result<Resolved> {
     let body = st.body(&anchor.target.body).ok_or_else(|| lost("anchored projection body"))?;
-    let indices = doc.configuration_face_indices(body, &anchor.target)?;
+    // The sketch's plane says when the face was found by fallback; its projection follows it.
+    let (indices, _) = doc.anchored_face_indices(st, body, &anchor.target)?;
     resolve_face_indices(st, plane, kind, &body.name, &indices)
 }
 
