@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Tool</title>
+  <path d="M21 12.35L21 30.01A11 6.35 0 0 0 43 30.01L43 12.35Z" fill="#b8c3cf"/>
+  <path d="M35.85 12.35L35.85 35.96A11 6.35 0 0 0 43 30.01L43 12.35Z" fill="#8e9faf"/>
+  <path d="M21 12.35L21 30.01A11 6.35 0 0 0 43 30.01L43 12.35Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M21 12.35A11 6.35 0 1 0 43 12.35A11 6.35 0 1 0 21 12.35Z" fill="#e2e8ef" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M21 30L21 55A11 6.35 0 0 0 43 55L43 30A11 6.35 0 0 1 21 30Z" fill="#328bd3"/>
+  <path d="M22 42L42 31" fill="none" stroke="#b9ddf8" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M22 51L42 40" fill="none" stroke="#b9ddf8" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M21 30L21 55A11 6.35 0 0 0 43 55L43 30A11 6.35 0 0 1 21 30Z" fill="none" stroke="#236ead" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M21 30A11 6.35 0 0 0 43 30" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

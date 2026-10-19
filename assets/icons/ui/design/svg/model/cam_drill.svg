@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Drill</title>
+  <path d="M3 28.65L32 45.39L32 52.09L3 35.35Z" fill="#b8c3cf"/>
+  <path d="M61 28.65L32 45.39L32 52.09L61 35.35Z" fill="#8e9faf"/>
+  <path d="M32 11.91L61 28.65L32 45.39L3 28.65Z" fill="#e2e8ef"/>
+  <path d="M32 11.91L61 28.65L61 35.35L32 52.09L3 35.35L3 28.65Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3 28.65L32 45.39L61 28.65" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 45.39L32 52.09" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M23.8 28.65A8.2 4.74 0 1 0 40.2 28.65A8.2 4.74 0 1 0 23.8 28.65Z" fill="#34465b"/>
+  <path d="M23.8 28.65A8.2 4.74 0 1 0 40.2 28.65A8.2 4.74 0 1 0 23.8 28.65Z" fill="#8e9faf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M26.91 3.5L37.09 3.5L37.09 27.1L32 30.15L26.91 27.1Z" fill="#ffffff" stroke="#ffffff" stroke-width="4.95" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M26.91 3.5L37.09 3.5L37.09 27.1L32 30.15L26.91 27.1Z" fill="#328bd3"/>
+  <path d="M26.91 12.5L37.09 6.5" fill="none" stroke="#b9ddf8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M26.91 19.5L37.09 13.5" fill="none" stroke="#b9ddf8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M26.91 3.5L37.09 3.5L37.09 27.1L32 30.15L26.91 27.1Z" fill="none" stroke="#236ead" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

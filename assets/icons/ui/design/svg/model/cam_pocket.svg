@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>2D Pocket</title>
+  <path d="M3 27.54L32 44.28L32 53.21L3 36.46Z" fill="#b8c3cf"/>
+  <path d="M61 27.54L32 44.28L32 53.21L61 36.46Z" fill="#8e9faf"/>
+  <path d="M32 10.79L61 27.54L32 44.28L3 27.54Z" fill="#e2e8ef"/>
+  <path d="M32 10.79L61 27.54L61 36.46L32 53.21L3 36.46L3 27.54Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M3 27.54L32 44.28L61 27.54" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 44.28L32 53.21" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 15.81L52.3 27.54L52.3 33.67L32 21.95Z" fill="#8e9faf"/>
+  <path d="M32 15.81L11.7 27.54L11.7 33.67L32 21.95Z" fill="#b8c3cf"/>
+  <path d="M32 21.95L52.3 33.67L32 45.39L11.7 33.67Z" fill="#e2e8ef"/>
+  <path d="M52.3 33.67L32 21.95L11.7 33.67" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 15.81L32 21.95" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 15.81L52.3 27.54L32 39.26L11.7 27.54Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 25.86L45.53 33.67L32 41.49L18.47 33.67L27.65 28.37L36.83 33.67L32 36.46L28.62 34.51" fill="none" stroke="#236ead" stroke-width="3.83" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

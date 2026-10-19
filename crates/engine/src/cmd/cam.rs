@@ -96,7 +96,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
     ),
-    CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_setup").noundo().params(
+    CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_simulate").noundo().params(
         "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
          width in mm (default: the stock's longer side / 300) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
          against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {frame, origin, cell, nx, ny, floor, z: [nx × ny heights], \

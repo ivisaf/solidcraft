@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Post Process</title>
+  <path d="M16.5 5L40 5L51 16L51 55.5A3.5 3.5 0 0 1 47.5 59L16.5 59A3.5 3.5 0 0 1 13 55.5L13 8.5A3.5 3.5 0 0 1 16.5 5Z" fill="#e2e8ef"/>
+  <path d="M16.5 5L40 5L51 16L51 55.5A3.5 3.5 0 0 1 47.5 59L16.5 59A3.5 3.5 0 0 1 13 55.5L13 8.5A3.5 3.5 0 0 1 16.5 5Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M40 5L40 16L51 16" fill="#b8c3cf" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M20 24L44 24L44 31L20 31L20 38L44 38L44 45L20 45" fill="none" stroke="#236ead" stroke-width="3.61" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

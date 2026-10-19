@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>2D Contour</title>
+  <path d="M54.23 37.02L55.08 37.62L55.72 38.3L56.1 39.04L56.24 39.81L56.1 40.58L55.72 41.32L55.08 42.01L54.23 42.6L36.83 52.65L35.8 53.14L34.62 53.51L33.33 53.73L32 53.81L30.67 53.73L29.38 53.51L28.2 53.14L27.17 52.65L9.77 42.6L8.92 42.01L8.28 41.32L7.9 40.58L7.76 39.81L7.9 39.04L8.28 38.3L8.92 37.62L9.77 37.02L27.17 26.98L28.2 26.49L29.38 26.12L30.67 25.9L32 25.82L33.33 25.9L34.62 26.12L35.8 26.49L36.83 26.98Z" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M16.53 24.19L32 33.12L32 48.74L16.53 39.81Z" fill="#b8c3cf"/>
+  <path d="M47.47 24.19L32 33.12L32 48.74L47.47 39.81Z" fill="#8e9faf"/>
+  <path d="M32 15.26L47.47 24.19L32 33.12L16.53 24.19Z" fill="#e2e8ef"/>
+  <path d="M32 15.26L47.47 24.19L47.47 39.81L32 48.74L16.53 39.81L16.53 24.19Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M16.53 24.19L32 33.12L47.47 24.19" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 33.12L32 48.74" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M55.72 41.32L55.08 42.01L54.23 42.6L36.83 52.65L35.8 53.14L34.62 53.51L33.33 53.73L32 53.81L30.67 53.73L29.38 53.51L28.2 53.14L27.17 52.65L9.77 42.6L8.92 42.01L8.28 41.32L7.9 40.58" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>

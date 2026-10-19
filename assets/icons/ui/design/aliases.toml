@@ -35,11 +35,3 @@ sketch_scale = { master = "scale", accent = "sketch" }
 sketch_text = { master = "text", accent = "sketch" }
 surface_fair = { master = "spline_cv", accent = "surface" }
 mesh_export = { master = "export", accent = "mesh" }
-# Manufacture: borrowed artwork until the CAM icons are drawn.
-cam_tool = "library"
-cam_setup = "origin"
-cam_face = "flat"
-cam_contour = "offset"
-cam_pocket = "cut"
-cam_drill = "hole"
-cam_post = "export"

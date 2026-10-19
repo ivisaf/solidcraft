@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Setup</title>
+  <path d="M7.7 40.42L32 54.45L32 60.06L7.7 46.03Z" fill="#b8c3cf"/>
+  <path d="M56.3 40.42L32 54.45L32 60.06L56.3 46.03Z" fill="#8e9faf"/>
+  <path d="M32 26.39L56.3 40.42L32 54.45L7.7 40.42Z" fill="#e2e8ef"/>
+  <path d="M32 26.39L56.3 40.42L56.3 46.03L32 60.06L7.7 46.03L7.7 40.42Z" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M7.7 40.42L32 54.45L56.3 40.42" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 54.45L32 60.06" fill="none" stroke="#34465b" stroke-width="2.55" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 37.61L41.33 43" fill="none" stroke="#ffffff" stroke-width="6.45" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47.39 46.5L38.34 46.18L42.59 38.82Z" fill="#ffffff" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 37.61L41.33 43" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M47.39 46.5L38.34 46.18L42.59 38.82Z" fill="#236ead"/>
+  <path d="M32 37.61L22.67 43" fill="none" stroke="#ffffff" stroke-width="6.45" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M16.61 46.5L21.41 38.82L25.66 46.18Z" fill="#ffffff" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 37.61L22.67 43" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M16.61 46.5L21.41 38.82L25.66 46.18Z" fill="#236ead"/>
+  <path d="M32 37.61L32 24.03" fill="none" stroke="#ffffff" stroke-width="6.45" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 17.03L36.25 25.03L27.75 25.03Z" fill="#ffffff" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 37.61L32 24.03" fill="none" stroke="#236ead" stroke-width="4.25" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M32 17.03L36.25 25.03L27.75 25.03Z" fill="#236ead"/>
+  <circle cx="32" cy="37.61" r="3.3" fill="#ffffff" stroke="#ffffff" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+  <circle cx="32" cy="37.61" r="3.3" fill="#236ead"/>
+</svg>

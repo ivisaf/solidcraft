@@ -1894,7 +1894,7 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
     match op {
         None => vec![
             menu_item("Edit Setup", "edit", "edit", setup, None),
-            disable(menu_item("Simulate", "", "simulate", setup, None), !ops.is_empty()),
+            disable(menu_item("Simulate", "cam_simulate", "simulate", setup, None), !ops.is_empty()),
             disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
             Item::sep(),
             menu_item("Remove Setup", "delete", "remove", setup, None),
