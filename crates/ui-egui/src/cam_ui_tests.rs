@@ -436,7 +436,7 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     // The design took a copy of the tool, which the library window says.
     assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1500.0));
     h.frames(2);
-    assert!(h.widget("in this design").is_some() && h.widget("Tool Library…").is_some());
+    assert!(h.widget("in use").is_some() && h.widget("Tool Library…").is_some());
 
     // A second tool with other data: choosing it in an open form brings its data in.
     fill(&mut h, "cam.tool.define", |f| {
@@ -463,7 +463,7 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     h.app.manufacture.form = Some(Form::Tool(form));
     apply(&mut h.app);
     h.frames(2);
-    assert!(h.widget("changed since this design copied it").is_some());
+    assert!(h.widget("changed").is_some());
     h.app.manufacture.selected_tool = Some((true, 1));
     h.frames(2);
     assert!(h.widget("Update this design").is_some());
@@ -501,4 +501,38 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
         );
         h.frames(2);
     }
+}
+
+/// The Manufacture and Tool Library panels move by their headers, each on its own and kept
+/// on screen; a double-click on a header docks the panel again.
+#[test]
+fn panels_move_by_their_headers_and_dock_again() {
+    let mut h = lab();
+    h.call("ui.resize", json!({"width": 1600.0, "height": 960.0}));
+    h.app.manufacture.open = true;
+    h.app.manufacture.tools_open = true;
+    h.frames(6);
+    let rect = |h: &Harness, id: &str| h.ctx.memory(|m| m.area_rect(egui::Id::new(id))).expect("drawn");
+    let (panel, tools) = (rect(&h, "sc_cam_window"), rect(&h, "sc_cam_tools"));
+    assert!(tools.right() <= panel.left(), "the Tool Library docks left of the Manufacture panel: {tools:?} {panel:?}");
+
+    let title = crate::scenario::handle_at("sc_cam_window:title").expect("header");
+    h.call("ui.drag", json!({"x0": title.x, "y0": title.y, "x1": title.x - 200.0, "y1": title.y + 250.0, "steps": 8}));
+    h.frames(4);
+    let moved = rect(&h, "sc_cam_window");
+    assert!((moved.min - panel.min - egui::vec2(-200.0, 250.0)).length() < 2.0, "{panel:?} -> {moved:?}");
+    assert!((rect(&h, "sc_cam_tools").min - tools.min).length() < 0.5, "the Tool Library stays where it docks");
+    assert!(h.app.manufacture.open, "dragging the header keeps the panel open");
+
+    // Dragged far off, it stays on screen.
+    let title = crate::scenario::handle_at("sc_cam_tools:title").expect("header");
+    h.call("ui.drag", json!({"x0": title.x, "y0": title.y, "x1": title.x - 5000.0, "y1": title.y + 5000.0, "steps": 8}));
+    h.frames(4);
+    let viewport = h.app.viewport.rect.expect("viewport");
+    assert!(viewport.contains(rect(&h, "sc_cam_tools").min));
+
+    let title = crate::scenario::handle_at("sc_cam_window:title").expect("header");
+    h.call("ui.click", json!({"x": title.x, "y": title.y, "double": true}));
+    h.frames(4);
+    assert!((rect(&h, "sc_cam_window").min - panel.min).length() < 0.5, "double-click docks it again");
 }

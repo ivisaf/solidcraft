@@ -304,6 +304,9 @@ pub struct CamUi {
     pub folded: bool,
     pub tools_folded: bool,
     panel: Option<egui::Rect>,
+    /// How far each panel was dragged from its docked place by its header (zero: docked).
+    pub offset: egui::Vec2,
+    pub tools_offset: egui::Vec2,
     /// The tool picked in the Tool Library window: whether it is the machine library's, and its number.
     pub selected_tool: Option<(bool, u64)>,
     /// The tool library file to use instead of the machine's own (tests).
@@ -334,6 +337,8 @@ impl Default for CamUi {
             folded: false,
             tools_folded: false,
             panel: None,
+            offset: egui::Vec2::ZERO,
+            tools_offset: egui::Vec2::ZERO,
             selected_tool: None,
             library: None,
             listing: None,
@@ -1266,25 +1271,68 @@ struct Dock {
     /// The panel's top right corner.
     anchor: egui::Pos2,
     max_height: f32,
+    /// The viewport, which a dragged panel stays inside.
+    viewport: egui::Rect,
+}
+
+/// Let `band` (a panel's header) drag the panel: the drag adds to `offset`, its distance from
+/// its docked place; `applied` of it is where the panel is now, after keeping it on screen. A
+/// double-click docks it again. Called before the header's buttons, so they keep their clicks.
+fn drag_header(ui: &egui::Ui, id: &str, band: egui::Rect, offset: &mut egui::Vec2, applied: egui::Vec2) {
+    let response = ui.interact(band, egui::Id::new((id, "drag")), egui::Sense::click_and_drag());
+    crate::scenario::publish_handle(&format!("{id}:title"), band.center());
+    // The drag runs from where the press started, so no movement is lost while egui decides it is a drag.
+    let base = egui::Id::new((id, "drag_base"));
+    if response.drag_started()
+        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
+    {
+        ui.ctx().data_mut(|d| d.insert_temp(base, (applied, origin)));
+    }
+    if response.double_clicked() {
+        *offset = egui::Vec2::ZERO;
+    } else if response.dragged() || response.drag_stopped() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let start = ui.ctx().data(|d| d.get_temp::<(egui::Vec2, egui::Pos2)>(base));
+        *offset = match (start, ui.input(|i| i.pointer.latest_pos())) {
+            (Some((start, from)), Some(now)) => start + (now - from),
+            _ => applied + response.drag_delta(),
+        };
+    } else {
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        // Kept on screen: remember where it is, not where it was dragged off to.
+        *offset = applied;
+    }
 }
 
 /// A panel docked at the right of the viewport, as the app's command dialogs are: no title
 /// bar, a header row with "−" to fold it, its name and "×" to close it, and a body that scrolls
-/// when it is taller than the viewport. → whether it stays open, and where it was drawn.
+/// when it is taller than the viewport. Its header drags it away from the dock (`offset`).
+/// → whether it stays open, and where it was drawn.
 fn docked_panel(
     ctx: &egui::Context,
     id: &str,
     title: &str,
     dock: Dock,
     folded: &mut bool,
+    offset: &mut egui::Vec2,
     body: impl FnOnce(&mut egui::Ui),
 ) -> (bool, Option<egui::Rect>) {
-    use crate::frame::{DIALOG_WIDE_MAX_W, Width};
+    use crate::frame::{DIALOG_WIDE_MAX_W, Side, Width};
     let t = Tokens::get();
-    let frame = crate::frame::dock_frame(ctx, crate::frame::Side::Right);
+    let frame = crate::frame::dock_frame(ctx, Side::Right);
     let margin = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
+    // Kept inside the viewport, as wide as it was last drawn (its top right corner is the anchor).
+    let width = ctx.memory(|m| m.area_rect(egui::Id::new(id))).map_or(crate::frame::DIALOG_MIN_W, |r| r.width());
+    let vp = dock.viewport;
+    let p = dock.anchor + *offset;
+    let x = if vp.left() + width <= vp.right() { p.x.clamp(vp.left() + width, vp.right()) } else { dock.anchor.x };
+    let y = if vp.top() <= vp.bottom() - 40.0 { p.y.clamp(vp.top(), vp.bottom() - 40.0) } else { dock.anchor.y };
+    let anchor = egui::pos2(x, y);
+    let max_height = dock.max_height - (anchor.y - dock.anchor.y);
     let mut keep = true;
-    let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), dock.anchor, dock.max_height, Width::Wide)
+    let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), anchor, max_height, Width::Wide)
         .frame(frame)
         .show(ctx, |ui| {
             // Long texts (errors, notes) wrap instead of widening the panel.
@@ -1293,6 +1341,8 @@ fn docked_panel(
             ui.set_min_width(min_w);
             ui.set_max_width(DIALOG_WIDE_MAX_W - margin);
             let total = crate::frame::content_width(ui, egui::Id::new((id, "w")), min_w);
+            let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
+            drag_header(ui, id, band, offset, anchor - dock.anchor);
             ui.horizontal(|ui| {
                 if ui
                     .add(egui::Button::new(RichText::new(if *folded { "+" } else { "−" }).size(14.0)).frame(false))
@@ -1301,7 +1351,9 @@ fn docked_panel(
                 {
                     *folded = !*folded;
                 }
-                ui.label(RichText::new(title).strong().size(12.5));
+                // Not selectable: a drag on the title moves the panel.
+                ui.add(egui::Label::new(RichText::new(title).strong().size(12.5)).selectable(false))
+                    .on_hover_text("Drag to move, double-click to dock again");
                 let width = ui.spacing().interact_size.x;
                 crate::frame::right_aligned(ui, total, width, |ui| {
                     let close = egui::Button::new(RichText::new("×").size(14.0).color(t.text_dim)).frame(false).min_size(egui::vec2(width, 0.0));
@@ -1314,7 +1366,7 @@ fn docked_panel(
                 return;
             }
             ui.add_space(2.0);
-            let height = (dock.max_height - ui.min_rect().height() - 28.0).max(80.0);
+            let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
             // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
             egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
             crate::frame::remember_width(ui, egui::Id::new((id, "w")));
@@ -1339,7 +1391,7 @@ struct Asked {
 }
 
 /// The tool table's columns.
-const TOOL_HEADS: [&str; 7] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Chip load", "Feed"];
+const TOOL_HEADS: [&str; 8] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Chip load", "Feed", "Design"];
 
 /// A table of tools, each row picked by clicking its name. `library`: these are the machine library's tools.
 fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picked: &mut Option<(bool, u64)>) {
@@ -1347,29 +1399,36 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
     egui::ScrollArea::horizontal().id_salt(id).auto_shrink([false, true]).show(ui, |ui| {
         // A table's cells are never wrapped: it scrolls sideways instead.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        egui::Grid::new(id).num_columns(TOOL_HEADS.len() + 1).spacing([18.0, 6.0]).striped(true).show(ui, |ui| {
+        egui::Grid::new(id).num_columns(TOOL_HEADS.len()).spacing([18.0, 6.0]).striped(true).show(ui, |ui| {
             for head in TOOL_HEADS {
                 ui.label(RichText::new(head).color(t.text_dim));
             }
             ui.end_row();
             for tool in tools {
                 let number = tool["number"].as_u64().unwrap_or(0);
-                let data = |k: &str, decimals: usize| tool[k].as_f64().map_or("—".to_string(), |v| shown(v, decimals));
+                let data = |k: &str, decimals: usize| tool[k].as_f64().map(|v| shown(v, decimals));
+                // Cutting data a tool has none of: each operation is given it instead.
+                let cell = |ui: &mut egui::Ui, v: Option<String>| match v {
+                    Some(v) => ui.label(v),
+                    None => ui.label(RichText::new("—").color(t.text_dim)).on_hover_text("Not set: operations with this tool ask for it"),
+                };
                 let name = text(tool, "description");
                 let label = if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") };
                 if ui.selectable_label(*picked == Some((library, number)), label).clicked() {
                     *picked = if *picked == Some((library, number)) { None } else { Some((library, number)) };
                 }
                 ui.label(text(tool, "kind").replace('_', " "));
-                ui.label(format!("{} mm", data("diameter", 3)));
-                ui.label(data("flutes", 0));
-                ui.label(data("spindle_rpm", 0));
-                ui.label(data("chip_load", 4));
-                ui.label(data("feed", 1));
+                cell(ui, data("diameter", 3).map(|d| format!("{d} mm")));
+                cell(ui, data("flutes", 0));
+                cell(ui, data("spindle_rpm", 0));
+                cell(ui, data("chip_load", 4));
+                cell(ui, data("feed", 1));
                 // How this design's copy of a library tool stands.
                 match tool["design"].as_str() {
-                    Some("same") => ui.label(RichText::new("in this design").color(t.text_dim)),
-                    Some("differs") => ui.label(RichText::new("changed since this design copied it").color(t.warning)),
+                    Some("same") => ui.label(RichText::new("in use").color(t.text_dim)).on_hover_text("This design uses it as the library has it"),
+                    Some("differs") => {
+                        ui.label(RichText::new("changed").color(t.warning)).on_hover_text("Changed in the library since this design copied it")
+                    }
                     _ => ui.label(""),
                 };
                 ui.end_row();
@@ -1385,7 +1444,8 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
 fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &Choices, dock: Dock, asked: &mut Asked) {
     let t = Tokens::get();
     let mut folded = cam.tools_folded;
-    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, |ui| {
+    let mut offset = cam.tools_offset;
+    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, &mut offset, |ui| {
         {
             // Everything is as wide as the panel, never wider: tables scroll inside it.
             ui.set_max_width(ui.available_width());
@@ -1464,6 +1524,7 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
         }
     });
     cam.tools_folded = folded;
+    cam.tools_offset = offset;
     cam.tools_open = open;
 }
 
@@ -1479,7 +1540,8 @@ fn manufacture_window(
 ) {
     let t = Tokens::get();
     let mut folded = cam.folded;
-    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, |ui| {
+    let mut offset = cam.offset;
+    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, &mut offset, |ui| {
         {
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
@@ -1582,6 +1644,7 @@ fn manufacture_window(
         }
     });
     cam.folded = folded;
+    cam.offset = offset;
     cam.panel = rect;
     cam.open = open;
 }
@@ -1607,11 +1670,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut asked = Asked::default();
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
-        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height }, &mut asked);
+        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
     }
     if cam.tools_open {
-        let beside = if cam.open { cam.panel.map_or(right - crate::frame::DIALOG_WIDE_MAX_W, |r| r.left()) - 6.0 } else { right };
-        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height }, &mut asked);
+        // Beside where the Manufacture panel docks, wherever it was dragged to.
+        let beside = if cam.open { right - cam.panel.map_or(crate::frame::DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
+        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
     }
     app.manufacture = cam;
     for (id, p) in std::mem::take(&mut asked.run) {
