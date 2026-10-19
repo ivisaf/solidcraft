@@ -739,7 +739,7 @@ fn configurations_rows(
         value
     });
     let mut tb = table(&v);
-    // Bare numbers show with their parameter's unit ("40" is 40 mm), as Fusion shows them.
+    // Bare numbers show with their parameter's unit ("40" is 40 mm).
     let kinds = app.session.doc.all_param_exprs();
     for (_, vals) in &mut tb.rows {
         for (c, val) in tb.columns.iter().zip(vals.iter_mut()) {

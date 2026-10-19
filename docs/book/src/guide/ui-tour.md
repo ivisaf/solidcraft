@@ -63,6 +63,7 @@ Preferences (File › Preferences) hold the theme, the units of new designs, the
 visual style and autosave. Graphics › Colour vision gives the colours that carry a meaning (sketch
 states, axes, bends, analyses, icons) values for a weak red, green or blue sense: Protan, Deutan or
 Tritan. In a mode, the faces Draft and Accessibility Analysis mark as failing are striped too.
+Command messages and errors show for a few seconds in the status chip at the bottom left of the view. Click the chip, or choose Help › **Messages…**, for every message of the session: newest first, errors in red, each line selectable, with **Copy all** for a bug report.
 Help › Keyboard Shortcuts lists every key, and File › Keyboard
 Shortcuts changes them.
 

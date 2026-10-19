@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
-use solidcraft_geom::{Mesh, Vec3};
+use solidcraft_geom::{Mesh, UnitVec3, Vec3};
 
 use crate::Result;
 use crate::body::{Body, from_p3};
@@ -24,7 +24,7 @@ pub struct TopoCounts {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Surf {
     Plane { n: Vec3, d: f64 },
-    Cylinder { axis: Vec3, p: Vec3, r: f64 },
+    Cylinder { axis: UnitVec3, p: Vec3, r: f64 },
     Sphere { c: Vec3, r: f64 },
     Cone { axis: Vec3, apex: Vec3, cos: f64 },
     Other(usize),
@@ -97,7 +97,7 @@ fn classify(pts: &[Vec3], nrm: &[Vec3], tol: f64, id: usize) -> Surf {
     }
     // Cylinder: all normals perpendicular to one axis.
     let far = nrm.iter().copied().min_by(|a, b| a.dot(n0).abs().total_cmp(&b.dot(n0).abs())).unwrap_or(n0);
-    if let Some(axis) = n0.cross(far).normalized()
+    if let Some(axis) = n0.cross(far).unit()
         && nrm.iter().all(|n| n.dot(axis).abs() < 2e-3)
     {
         let u = axis.any_perp();
@@ -381,10 +381,10 @@ fn classify_faces(b: &Body, mesh: &Mesh, nf: usize, tol: f64) -> Vec<Surf> {
         .map(|(i, fit)| match (fit, faces.get(i)) {
             (Surf::Sphere { .. } | Surf::Other(_), Some(face)) => match crate::offset::surf_of(face, exact_tol) {
                 Some(crate::offset::Surf::Plane { n, d }) => Surf::Plane { n, d },
-                Some(crate::offset::Surf::Cylinder { o, a, r, .. }) => {
-                    let axis = if a.x + a.y * 1e-3 + a.z * 1e-6 < 0.0 { -a } else { a };
-                    Surf::Cylinder { axis, p: o, r }
-                }
+                Some(crate::offset::Surf::Cylinder { o, a, r, .. }) => match a.unit() {
+                    Some(a) => Surf::Cylinder { axis: if a.x + a.y * 1e-3 + a.z * 1e-6 < 0.0 { -a } else { a }, p: o, r },
+                    None => fit,
+                },
                 Some(crate::offset::Surf::Sphere { c, r, .. }) => Surf::Sphere { c, r },
                 _ => fit,
             },
@@ -554,7 +554,7 @@ pub fn merged_topology(b: &Body, mesh: &Mesh) -> Result<TopoCounts> {
         }
         let gs: Vec<usize> = faces.iter().map(|f| find(&mut fp, *f)).collect();
         // A free-form face pinched to a point (a horn torus at its axis): a zero-length edge
-        // inside one face. Fusion keeps a degenerate loop there (two edges and a vertex).
+        // inside one face. A degenerate loop is kept there (two edges and a vertex).
         if let Some(g) = gs.first()
             && gs.iter().all(|x| x == g)
             && matches!(surfs.get(*g), Some(Surf::Other(_)))
@@ -636,7 +636,7 @@ pub fn merged_topology(b: &Body, mesh: &Mesh) -> Result<TopoCounts> {
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct CylinderFace {
     pub axis_point: Vec3,
-    pub axis: Vec3,
+    pub axis: UnitVec3,
     pub radius: f64,
     pub start: f64,
     pub end: f64,
@@ -688,7 +688,6 @@ pub fn cylinder_face_at(b: &Body, p: Vec3) -> Option<CylinderFace> {
 /// body's). `None` when the face is not part of a cylinder, or has no triangles.
 pub fn cylinder_face(b: &Body, mesh: &Mesh, face: usize) -> Option<CylinderFace> {
     let crate::FaceSurface::Cylinder { origin, axis, radius } = crate::face_surface(b, face)? else { return None };
-    let axis = axis.normalized()?;
     let c = cylinder_extent(mesh, u32::try_from(face).ok()?, axis, origin, radius);
     (c.start.is_finite() && c.end.is_finite()).then_some(c)
 }
@@ -724,7 +723,7 @@ pub fn cylinder_end_at(b: &Body, p: Vec3) -> Option<CylinderFace> {
 }
 
 /// The extent along its axis, and the side, of a cylindrical face of a tessellated body.
-fn cylinder_extent(mesh: &Mesh, face: u32, axis: Vec3, ap: Vec3, r: f64) -> CylinderFace {
+fn cylinder_extent(mesh: &Mesh, face: u32, axis: UnitVec3, ap: Vec3, r: f64) -> CylinderFace {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     let mut inward = 0.0;

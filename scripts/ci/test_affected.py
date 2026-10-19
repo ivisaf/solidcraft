@@ -71,6 +71,14 @@ class RealWorkspace(unittest.TestCase):
     def test_docs_only_selects_nothing(self):
         self.assertEqual(affected.select(self.meta, ["docs/book/src/dev/testing.md", "CONTRIBUTING.md"]), (False, []))
 
+    def test_translation_selects_the_ui_and_xtask_not_the_kernel(self):
+        full, pk = affected.select(self.meta, ["assets/locales/ja.json", "assets/locales/it.json"])
+        self.assertFalse(full)
+        self.assertIn("solidcraft-ui-egui", pk)
+        self.assertIn("xtask", pk)
+        self.assertNotIn("solidcraft-kernel", pk)
+        self.assertNotIn("solidcraft-engine", pk)
+
 
 if __name__ == "__main__":
     unittest.main()

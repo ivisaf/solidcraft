@@ -383,7 +383,7 @@ fn body_feature_and_sketch(app: &SolveApp, body: &str) -> (Option<u64>, Option<u
     (f, sketch)
 }
 
-/// The canvas menus follow Fusion's (`plan/fusion/ui/NOTES.md`, feature names only): Repeat on
+/// The canvas menus put Repeat on
 /// top, then what fits the selection, our extras after a separator.
 fn viewport_items(app: &SolveApp) -> Vec<Item> {
     let sel = &app.session.selection;
@@ -703,6 +703,9 @@ fn component_items(app: &SolveApp, id: u64) -> Vec<Item> {
             .on(id != 0 || !bodies.is_empty()),
     );
     v.push(act("ui.properties", "Properties", "measure").with(json!({ "component": id })));
+    if doc.links.contains_key(&id) {
+        v.push(act("ui.relinkSource", "Relink Source (All Instances)…", "update").with(json!({"component": id})));
+    }
     if id == 0 {
         v.push(act("ui.designProperties", "Design Properties", "settings"));
     }
@@ -888,6 +891,11 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.delete" if item.params.is_some() => crate::delete::request(app, p),
         "ui.delete" => delete(app),
         "ui.finishSketch" => app.finish_sketch(),
+        "ui.relinkSource" => {
+            if let Some(component) = id_of(&p, "component") {
+                crate::linked_source::start(app, component);
+            }
+        }
         "ui.copy" => drop(crate::edit_clipboard::copy(app)),
         "ui.cut" => drop(crate::edit_clipboard::cut(app)),
         "ui.paste" => drop(crate::edit_clipboard::paste(app, Some(at))),

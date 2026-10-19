@@ -270,6 +270,9 @@ struct Reader {
     /// An item placed more than once: its first instance's display, shared by the later ones
     /// (with the placement that first instance had), so the part is meshed once.
     shown: HashMap<u64, (Arc<crate::body::SharedDisplay>, mt::Matrix4)>,
+    /// An item placed more than once: its body oriented where the file defines it, so each
+    /// later instance is only placed (orienting meshes the whole part).
+    oriented: HashMap<u64, Body>,
     used_items: HashSet<u64>,
     /// Items already instanced for the product being read.
     node_items: HashSet<u64>,
@@ -312,6 +315,7 @@ impl Reader {
             solids: HashMap::new(),
             once: HashSet::new(),
             shown: HashMap::new(),
+            oriented: HashMap::new(),
             used_items: HashSet::new(),
             node_items: HashSet::new(),
             visits: 0,
@@ -743,7 +747,11 @@ impl Reader {
                 Err(shared) => (*shared).clone(),
             };
             sources.push((i, item, closed, file_faces, face_origin));
-            solids.push(parallel::Job { solid, check_mesh: !self.unmeshed_checked.contains(&item) });
+            let source = match self.oriented.get(&item) {
+                Some(body) => parallel::Source::Oriented(body.clone()),
+                None => parallel::Source::Solid(solid),
+            };
+            solids.push(parallel::Job { source, check_mesh: !self.unmeshed_checked.contains(&item) });
         }
         let Some(batch) = self.batches.get(id) else { return true };
         let (m, path, product, instance) = (batch.m, batch.path.clone(), batch.product.clone(), batch.instance.clone());
@@ -751,7 +759,10 @@ impl Reader {
         for ((i, item, closed, file_faces, face_origin), body) in sources.into_iter().zip(prepared) {
             let Some(e) = ex.get(item) else { continue };
             match body {
-                Ok((body, missing)) => {
+                Ok((body, missing, oriented)) => {
+                    if !self.once.contains(&item) {
+                        self.oriented.entry(item).or_insert(oriented);
+                    }
                     let own = e.params().first().and_then(Param::as_str).unwrap_or("").trim().to_string();
                     let name = if own.is_empty() { product.clone() } else { own };
                     // Faces the mesher gives up on (or that the budget cut short) are reported.
@@ -933,7 +944,7 @@ impl Reader {
 /// Check a STEP file's structure: it parses, no entity id is defined twice, every reference
 /// names a defined entity, nothing but root entities (relationships, definitions,
 /// presentation) is left unreferenced, and ids are dense (`#1`…`#n`). Returns the entity count.
-/// Faces whose boundary runs the wrong way round their normal, as a strict reader (Fusion)
+/// Faces whose boundary runs the wrong way round their normal, as a strict reader
 /// sees them: each face's normal is its surface's own parametric normal (∂S/∂u × ∂S/∂v, ISO
 /// 10303-42), reversed when `same_sense` is false, and the outer loop must run counter-clockwise
 /// seen from that side. Checked on faces whose loop spans a clear direction (patches, not bands

@@ -257,6 +257,31 @@ fn tie(sk: &mut Sketch, pieces: &[usize]) -> Result<()> {
     Ok(())
 }
 
+/// Dimensions and relations that measure the whole of curve `ci` (a line's length, an equal
+/// length, its midpoint, an arc's length or sweep) would stay on the piece that keeps its id
+/// after a trim and stretch that piece back to the old size, moving the rest of the sketch. A
+/// length becomes the distance between the curve's old ends, as a fillet keeps it to its virtual
+/// corner (it goes with an end the trim removes); the others go.
+fn release_extent(sk: &mut Sketch, ci: usize) {
+    let ends = match sk.curves.get(ci).map(|c| &c.kind) {
+        Some(CurveKind::Line { a, b }) => Some((*a, *b)),
+        _ => None,
+    };
+    sk.constraints.retain_mut(|k| match k.kind {
+        ConstraintKind::Length { l, value } if l == ci => match ends {
+            Some((p, q)) => {
+                k.kind = ConstraintKind::Distance { p, q, value };
+                true
+            }
+            None => false,
+        },
+        ConstraintKind::Equal { a, b } if ends.is_some() && (a == ci || b == ci) => false,
+        ConstraintKind::Midpoint { l, .. } if l == ci => false,
+        ConstraintKind::ArcLength { c, .. } | ConstraintKind::ArcSweep { c, .. } if c == ci => false,
+        _ => true,
+    });
+}
+
 /// The cut parameters bracketing `tq` on curve `ci`: (before, after) with their cutter curves.
 fn bracket(sk: &Sketch, ci: usize, tq: f64) -> (Vec<(f64, Vec2, usize)>, bool) {
     let Some(sh) = sk.shape(ci) else { return (Vec::new(), false) };
@@ -305,6 +330,7 @@ fn trim(s: &mut Session, p: &Value) -> Result<Value> {
             doc.prune_model_params();
             return Ok(json!({"deleted": id}));
         }
+        release_extent(sk, ci);
         let ts: Vec<f64> = cuts.iter().map(|c| c.0).collect();
         let (pieces, pts) = split_at(sk, ci, &ts)?;
         // The piece containing tq.
@@ -638,7 +664,7 @@ struct CornerKept {
 /// when anything measures to it: a constraint or dimension on the point, the length of either
 /// line, or it is the origin or still ends another curve. It stays as a virtual sharp corner,
 /// held on both curves' extensions (their intersection), and the line lengths become distances
-/// from the far end to it, so the part keeps its size, as in Fusion. Otherwise None: the
+/// from the far end to it, so the part keeps its size. Otherwise None: the
 /// caller removes the point.
 fn keep_corner(sk: &mut Sketch, c: usize, [(ca, na), (cb, nb)]: [(usize, usize); 2]) -> Result<Option<CornerKept>> {
     let used = sk.curves.iter().any(|x| uses(x, c));

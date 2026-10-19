@@ -116,6 +116,14 @@ pub enum Kind {
     },
     /// Halfway between two planes or planar faces.
     Midplane,
+    /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
+    /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
+    Construct {
+        command: &'static str,
+        title: &'static str,
+        keys: Vec<&'static str>,
+        t: Option<String>,
+    },
     /// A construction plane through an axis at an angle to a plane.
     AnglePlane {
         angle: String,
@@ -481,7 +489,7 @@ impl Dialog {
             "solid.chamfer" => Dialog::new(fillet_kind("1 mm", true), vec![SelInput::new("Edges", EDGES | FACES, true)]),
             "solid.shell" => {
                 let mut d = Dialog::new(Kind::Shell { thickness: "2 mm".into() }, vec![SelInput::new("Faces/Body", FACES, true)]);
-                // Fusion opens faces joined smoothly to the picked ones too.
+                // Faces joined smoothly to the picked ones too.
                 d.extra.insert("tangent_chain".into(), json!(true));
                 d
             }
@@ -529,6 +537,13 @@ impl Dialog {
                 Kind::Midplane,
                 vec![SelInput::new("First plane", PLANES | PLANAR_FACES, false), SelInput::new("Second plane", PLANES | PLANAR_FACES, false)],
             ),
+            id if construct_picks(id).is_some() => {
+                let (command, title, picks) = construct_picks(id)?;
+                let inputs = picks.iter().map(|(label, accept, _)| SelInput::new(label, *accept, false)).collect();
+                let keys = picks.iter().map(|(_, _, key)| *key).collect();
+                let t = (command == "construct.point.along_path").then(|| "0.5".to_string());
+                Dialog::new(Kind::Construct { command, title, keys, t }, inputs)
+            }
             "construct.plane.along_path" => {
                 Dialog::new(Kind::PathPlane { t: "0.5".into(), sketch: None }, vec![SelInput::new("Path", CURVES | EDGES, false)])
             }
@@ -805,6 +820,7 @@ impl Dialog {
                 | Kind::Sweep { .. }
                 | Kind::PathPlane { .. }
                 | Kind::Midplane
+                | Kind::Construct { .. }
                 | Kind::Move { .. }
                 | Kind::Hole { .. }
                 | Kind::Primitive { .. }
@@ -1411,6 +1427,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Material { .. } => "PHYSICAL MATERIAL",
         Kind::OffsetPlane { .. } => "OFFSET PLANE",
         Kind::Midplane => "MIDPLANE",
+        Kind::Construct { title, .. } => title,
         Kind::PathPlane { .. } => "PLANE ALONG PATH",
         Kind::Rib { web: false, .. } => "RIB",
         Kind::Rib { web: true, .. } => "WEB",
@@ -2728,7 +2745,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         enter |= field(ui, t);
                         ui.end_row();
                     }
-                    Kind::Split | Kind::ReplaceFace | Kind::Remove | Kind::Midplane => {}
+                    Kind::Split | Kind::ReplaceFace | Kind::Remove | Kind::Midplane | Kind::Construct { t: None, .. } => {}
+                    Kind::Construct { t: Some(t), .. } => {
+                        row_label(ui, "Position (0 to 1)");
+                        enter |= field(ui, t);
+                        ui.end_row();
+                    }
                     Kind::Rib { thickness, depth, flip, normal, .. } => {
                         row_label(ui, "Direction");
                         let mut i = usize::from(*normal);
@@ -3381,7 +3403,7 @@ fn fillet_kind(size: &str, chamfer: bool) -> Kind {
 /// A length field's first text: `number` in the design's units, with the unit written out so the
 /// field shows it as the other dialogs show theirs ("20 mm", "20 in"). OK makes the size the bare
 /// number would.
-fn length_default(s: &Session, number: &str) -> String {
+pub(crate) fn length_default(s: &Session, number: &str) -> String {
     match s.doc.with_design_unit(number, ValueKind::Length) {
         e if e != number => e,
         // A millimetre design (or one whose units are not a length): bare numbers are mm.
@@ -4013,6 +4035,18 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             let b = plane_arg(app, sels(d, 1).first())?;
             ("construct.plane.midplane", json!({"a": a, "b": b}))
         }
+        Kind::Construct { command, keys, t, .. } => {
+            let mut p = serde_json::Map::new();
+            for (i, key) in keys.iter().enumerate() {
+                let input = d.inputs.get(i).map_or("", |inp| inp.label);
+                let sel = sels(d, i).first().ok_or_else(|| format!("pick the {}", input.to_lowercase()))?;
+                p.insert((*key).to_string(), construct_ref(app, sel)?);
+            }
+            if let Some(t) = t {
+                p.insert("t".into(), json!(t));
+            }
+            (*command, Value::Object(p))
+        }
         Kind::PathPlane { t, sketch } => {
             need(0, "a path")?;
             let path = match sels(d, 0).first() {
@@ -4581,21 +4615,35 @@ pub(crate) fn edge_sel(s: &Session, p0: Vec3) -> Option<Sel> {
 
 /// The body face containing a point (nearest triangle).
 pub(crate) fn face_sel(s: &Session, p0: Vec3) -> Option<Sel> {
+    use solidcraft_engine::kernel::{self, FaceSurface};
+
+    if !p0.is_finite() {
+        return None;
+    }
     let st = s.world_state();
     let frames = stored_frames(s);
-    let mut best: Option<(f64, Sel)> = None;
+    let mut best: Option<(f64, &solidcraft_engine::doc::ModelBody, usize, Vec3)> = None;
     for b in &st.bodies {
         let p = stored_on(&frames, &b.name, p0);
         let m = b.mesh();
         for (t, f) in m.triangles.iter().zip(&m.tri_face) {
             let Some([a, bb, c]) = m.tri(t) else { continue };
             let d = crate::preview::point_triangle_dist(p, a, bb, c);
-            if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
-                best = Some((d, Sel::Face { body: b.name.clone(), index: *f as usize, point: p }));
+            if best.as_ref().is_none_or(|(bd, _, _, _)| d < *bd) {
+                best = Some((d, b, *f as usize, p));
             }
         }
     }
-    best.filter(|(d, _)| *d < 1e-3 + 1e-6 * p0.len()).map(|x| x.1)
+    let (d, body, index, point) = best?;
+    let surface = kernel::guard("refill face surface", || Ok(kernel::face_surface(&body.body, index))).ok().flatten();
+    // A curved face's viewport pick can be a full chord tolerance from the reference
+    // facets. Planar and unclassified faces keep the tight limit so a stale pick cannot
+    // silently select a nearby plane, including a flat cap on an otherwise curved body.
+    let tolerance = match surface {
+        Some(FaceSurface::Plane { .. }) | None => 1e-3,
+        Some(_) => body.display_tol(),
+    } + 1e-6 * point.len();
+    (d <= tolerance).then(|| Sel::Face { body: body.name.clone(), index, point })
 }
 
 fn emboss_face_sel(s: &Session, component: u64, face: &solidcraft_engine::doc::EmbossFace, persistent: &str) -> Option<Sel> {
@@ -4608,6 +4656,87 @@ fn emboss_face_sel(s: &Session, component: u64, face: &solidcraft_engine::doc::E
     let point = solidcraft_engine::doc::apply_point(&author, face.at.0);
     s.world_state().body(&world_name)?;
     Some(Sel::Face { body: world_name, index, point })
+}
+
+/// The construct tools that take only picks (#2474, #2494): their command, dialog title and
+/// inputs as (label, what it accepts, parameter). Offset Plane, Midplane, Plane Along Path and
+/// Plane At Angle have dialogs of their own.
+fn construct_picks(id: &str) -> Option<(&'static str, &'static str, &'static [(&'static str, Accept, &'static str)])> {
+    const PLANE: Accept = PLANES | PLANAR_FACES;
+    const POINT: Accept = selection::VERTICES | selection::POINTS;
+    const LINE: Accept = EDGES | AXES;
+    const CURVE: Accept = EDGES | CURVES;
+    Some(match id {
+        "construct.axis.through_cylinder" => ("construct.axis.through_cylinder", "AXIS THROUGH CYLINDER", &[("Face", FACES | EDGES, "face")]),
+        "construct.axis.normal_to_face" => {
+            ("construct.axis.normal_to_face", "AXIS PERPENDICULAR TO FACE", &[("Face", FACES, "face"), ("Point", POINT, "point")])
+        }
+        "construct.axis.two_planes" => {
+            ("construct.axis.two_planes", "AXIS THROUGH TWO PLANES", &[("First plane", PLANE, "a"), ("Second plane", PLANE, "b")])
+        }
+        "construct.axis.two_points" => {
+            ("construct.axis.two_points", "AXIS THROUGH TWO POINTS", &[("First point", POINT, "a"), ("Second point", POINT, "b")])
+        }
+        "construct.axis.edge" => ("construct.axis.edge", "AXIS THROUGH EDGE", &[("Edge", LINE, "edge")]),
+        "construct.point.vertex" => ("construct.point.vertex", "POINT AT VERTEX", &[("Point", POINT, "point")]),
+        "construct.point.two_edges" => {
+            ("construct.point.two_edges", "POINT THROUGH TWO EDGES", &[("First edge", CURVE, "a"), ("Second edge", CURVE, "b")])
+        }
+        "construct.point.three_planes" => (
+            "construct.point.three_planes",
+            "POINT THROUGH THREE PLANES",
+            &[("First plane", PLANE, "a"), ("Second plane", PLANE, "b"), ("Third plane", PLANE, "c")],
+        ),
+        "construct.point.center" => ("construct.point.center", "POINT AT CENTER", &[("Circle or sphere", FACES | CURVE, "of")]),
+        "construct.point.edge_plane" => {
+            ("construct.point.edge_plane", "POINT AT EDGE AND PLANE", &[("Edge", CURVE, "edge"), ("Plane", PLANE, "plane")])
+        }
+        "construct.point.along_path" => ("construct.point.along_path", "POINT ALONG PATH", &[("Path", CURVE, "path")]),
+        "construct.plane.two_edges" => {
+            ("construct.plane.two_edges", "PLANE THROUGH TWO EDGES", &[("First edge", LINE, "a"), ("Second edge", LINE, "b")])
+        }
+        "construct.plane.three_points" => (
+            "construct.plane.three_points",
+            "PLANE THROUGH THREE POINTS",
+            &[("First point", POINT, "a"), ("Second point", POINT, "b"), ("Third point", POINT, "c")],
+        ),
+        "construct.plane.tangent" => ("construct.plane.tangent", "TANGENT PLANE", &[("Face", FACES, "face")]),
+        "construct.plane.perpendicular" => {
+            ("construct.plane.perpendicular", "PERPENDICULAR PLANE", &[("Plane", PLANE, "plane"), ("Line", LINE, "line")])
+        }
+        _ => return None,
+    })
+}
+
+/// A dialog pick as a construction reference (`construct.*`'s `{face|edge|vertex: [x,y,z]}`,
+/// `{plane}`, `{axis}` or `{sketch, point|curve}`).
+fn construct_ref(app: &SolveApp, sel: &Sel) -> Result<Value, String> {
+    Ok(match sel {
+        Sel::Face { point, .. } => json!({"face": pt(*point)}),
+        Sel::Edge { point, .. } => json!({"edge": pt(*point)}),
+        Sel::Vertex { point, .. } => json!({"vertex": pt(*point)}),
+        Sel::Plane { name } => json!({"plane": name}),
+        Sel::Axis { name } => json!({"axis": name}),
+        // Picked across sketches as "<sketch id>:<point id>".
+        Sel::SketchPoint { id } => match id.split_once(':').and_then(|(sk, p)| Some((sk.parse::<u64>().ok()?, p))) {
+            Some((sketch, point)) => json!({"sketch": sketch, "point": point}),
+            None => return Err("pick the point in the viewport".into()),
+        },
+        Sel::SketchCurve { id } => {
+            let st = app.session.world_state();
+            let sketches: Vec<u64> = st
+                .sketches
+                .iter()
+                .filter(|ss| ss.sketch.curve_index(id).is_some() || ss.sketch.wire_index(id).is_some())
+                .map(|ss| ss.feature)
+                .collect();
+            match sketches.as_slice() {
+                [sketch] => json!({"sketch": sketch, "curve": id}),
+                _ => return Err("pick a model edge, or a sketch curve in only one sketch".into()),
+            }
+        }
+        _ => return Err("this pick can't be used here".into()),
+    })
 }
 
 /// A picked plane or planar face as `construct.plane.*` takes it.

@@ -2189,6 +2189,10 @@ mod offset_identity_tests;
 mod offset_edit_guard_tests;
 
 #[cfg(test)]
+#[path = "offset_ends_tests.rs"]
+mod offset_ends_tests;
+
+#[cfg(test)]
 #[path = "offset_plane_face_tests.rs"]
 mod offset_plane_face_tests;
 

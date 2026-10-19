@@ -297,7 +297,7 @@ pub fn open(app: &mut SolveApp, at: Pos2) -> bool {
 fn open_with(app: &mut SolveApp, proj: &Proj, at: Pos2) -> bool {
     let (rows, total) = rows_capped(app, proj, at);
     if rows.is_empty() {
-        app.status = Some(("Nothing to select here".into(), crate::now_ms(), false));
+        app.set_status("Nothing to select here", false);
         return false;
     }
     close(app);
@@ -488,7 +488,7 @@ pub fn cycle_click(app: &mut SolveApp, proj: &Proj, at: Pos2) -> bool {
     let next = rows.iter().position(|r| crate::selection::same_item(&r.sel, &c.chosen)).map_or(0, |k| (k + 1) % rows.len());
     let Some(row) = rows.get(next).cloned() else { return false };
     apply(app, &row, false);
-    app.status = Some((format!("{} ({} of {})", row.label, next + 1, rows.len()), crate::now_ms(), false));
+    app.set_status(format!("{} ({} of {})", row.label, next + 1, rows.len()), false);
     remember(app, c.at, Some(row.sel));
     true
 }

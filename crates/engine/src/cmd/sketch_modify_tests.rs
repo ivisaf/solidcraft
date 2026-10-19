@@ -1585,3 +1585,37 @@ fn offset_driver_format18_offsets_keep_fixed_distances_on_upgrade() {
     assert!(!sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::OffsetDistance { .. })));
     assert_eq!(ids(&result["curves"]).len(), sk.offsets[0].outputs.len());
 }
+
+#[test]
+fn trim_keeps_the_rest_of_a_dimensioned_line_where_it_was() {
+    // A 40 x 40 square, its right side dimensioned with the Dimension tool (a line length).
+    let mut s = new_sketch();
+    let sq = ids(&run(&mut s, "sketch.line", json!({"points": [[0, 0], [40, 0], [40, 40], [0, 40]], "closed": true, "infer": true}))["curves"]);
+    let (right, top) = (sq[1].clone(), sq[2].clone());
+    run(&mut s, "sketch.dimension", json!({"entities": [right]}));
+    // A step drawn across the top right corner, its ends on the top and right sides.
+    let step = ids(&run(&mut s, "sketch.line", json!({"points": [[23, 40], [23, 23], [40, 23]], "infer": true}))["curves"]);
+    run(&mut s, "sketch.constraint.coincident", json!({"a": format!("{}.start", step[0]), "b": top}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": format!("{}.end", step[1]), "b": right}));
+    let corner = |s: &Session| {
+        let sk = sketch(s);
+        sk.point(sk.resolve_point(&format!("{}.end", step[1])).unwrap()).unwrap()
+    };
+    let forty = |s: &Session| {
+        sketch(s).constraints.iter().filter(|c| c.kind.value().is_some_and(|v| close(v, 40.0))).map(|c| c.kind.clone()).collect::<Vec<_>>()
+    };
+
+    // Trim the right side above the step: the 40 stays between the square's corners, which are
+    // both still there, instead of stretching the 23 mm that is left back to 40.
+    run(&mut s, "sketch.trim", json!({"curve": right, "at": [40, 30]}));
+    assert!(corner(&s).dist(Vec2::new(40.0, 23.0)) < 1e-6, "the step moved to {:?}", corner(&s));
+    let sk = sketch(&s);
+    let ends = sk.shape(sk.curve_index(&right).unwrap()).unwrap();
+    assert!(matches!(ends, solidcraft_sketch::Shape::Line { a, b } if close(a.dist(b), 23.0)), "{ends:?}");
+    assert!(matches!(forty(&s)[..], [ConstraintKind::Distance { .. }]), "{:?}", forty(&s));
+
+    // Trim the top side right of the step: the corner the 40 measured to goes, and the 40 with it.
+    run(&mut s, "sketch.trim", json!({"curve": top, "at": [30, 40]}));
+    assert!(corner(&s).dist(Vec2::new(40.0, 23.0)) < 1e-6, "the step moved to {:?}", corner(&s));
+    assert!(forty(&s).is_empty(), "{:?}", forty(&s));
+}

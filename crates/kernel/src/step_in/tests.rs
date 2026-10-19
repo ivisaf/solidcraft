@@ -242,7 +242,7 @@ fn parallel_body_preparation_reports_errors_in_place_and_preserves_placement() {
     let body = cylinder(Vec3::new(2.0, 2.0, 0.0), Vec3::Z, 2.0, 4.0).unwrap();
     let solids = vec![body.solid.as_ref().clone(), mt::Solid::new(Vec::new()), body.solid.as_ref().clone(), body.solid.as_ref().clone()];
     let placement = mt::Matrix4::from_translation(mt::Vector3::new(10.0, 20.0, 30.0));
-    let jobs: Vec<_> = solids.into_iter().map(|solid| parallel::Job { solid, check_mesh: true }).collect();
+    let jobs: Vec<_> = solids.into_iter().map(|solid| parallel::Job { source: parallel::Source::Solid(solid), check_mesh: true }).collect();
     let serial = parallel::bodies(&jobs, &placement, 1);
     let threaded = parallel::bodies(&jobs, &placement, 4);
     assert_eq!(serial.len(), 4);
@@ -653,6 +653,63 @@ fn hand_written_assembly() {
     assert!((root.children[1].transform[3][0] - 100.0).abs() < 1e-9);
 }
 
+/// The cube part (in cm) placed `n` times in a millimetre assembly, each instance moved along X
+/// and turned about Z.
+fn instanced_assembly(n: u64) -> String {
+    let mut t = String::from(HEAD);
+    t += "#8=PRODUCT_DEFINITION_CONTEXT('part definition',#9,'design');\n#9=APPLICATION_CONTEXT('');\n";
+    t += &cube_entities();
+    t += &context(20, "(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.CENTI.,.METRE.))");
+    t += &context(30, "(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))");
+    t += &product(50, "Block");
+    t += &product(70, "Assembly");
+    t += "#60=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#101,#65),#20);\n#61=SHAPE_DEFINITION_REPRESENTATION(#54,#60);\n";
+    t += "#65=AXIS2_PLACEMENT_3D('',#66,$,$);\n#66=CARTESIAN_POINT('',(0.,0.,0.));\n";
+    let items: Vec<String> = (0..n).map(|k| format!("#{}", 3000 + k * 10)).collect();
+    t += &format!("#80=SHAPE_REPRESENTATION('',({}),#30);\n#88=SHAPE_DEFINITION_REPRESENTATION(#74,#80);\n", items.join(","));
+    for k in 0..n {
+        let (a, turn) = (3000 + k * 10, k as f64 * 0.7);
+        t += &format!("#{a}=AXIS2_PLACEMENT_3D('',#{},#{},#{});\n", a + 1, a + 2, a + 3);
+        t += &format!("#{}=CARTESIAN_POINT('',({}.,0.,0.));\n", a + 1, 50 * k);
+        t += &format!("#{}=DIRECTION('',(0.,0.,1.));\n#{}=DIRECTION('',({},{},0.));\n", a + 2, a + 3, turn.cos(), turn.sin());
+        let u = 6000 + k * 10;
+        t += &format!("#{u}=NEXT_ASSEMBLY_USAGE_OCCURRENCE('{k}','Block:{k}','',#70,#50,$);\n");
+        t += &format!("#{}=PRODUCT_DEFINITION_SHAPE('','',#{u});\n", u + 1);
+        t += &format!("#{}=ITEM_DEFINED_TRANSFORMATION('','',#65,#{a});\n", u + 2);
+        t += &format!(
+            "#{}=(REPRESENTATION_RELATIONSHIP('','',#60,#80)REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{})SHAPE_REPRESENTATION_RELATIONSHIP());\n",
+            u + 3,
+            u + 2
+        );
+        t += &format!("#{}=CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{},#{});\n", u + 4, u + 3, u + 1);
+    }
+    t += TAIL;
+    t
+}
+
+/// A part placed many times is oriented (meshed whole) once, not once per instance (#2814:
+/// an assembly with hundreds of instances spent most of an hour re-meshing the same parts),
+/// and every instance still comes out outward-facing at its own place.
+#[test]
+fn instanced_parts_are_oriented_once() {
+    let n = 24;
+    let t = instanced_assembly(n);
+    crate::body::ORIENTED.with(|c| c.set(0));
+    let imp = step_import_with_workers(&t, 1).unwrap();
+    assert_eq!(crate::body::ORIENTED.with(|c| c.get()), 1, "one distinct part");
+    assert_eq!(imp.bodies.len(), n as usize);
+    assert!(imp.warnings.is_empty(), "{:?}", imp.warnings);
+    for (k, b) in imp.bodies.iter().enumerate() {
+        let m = measure(&b.body).unwrap();
+        assert!(rel(m.volume, 1000.0) < 1e-9, "instance {k}: {}", m.volume);
+        let centre = (m.bbox.min + m.bbox.max) * 0.5;
+        let turn = k as f64 * 0.7;
+        let expected = Vec3::new(50.0 * k as f64 + 5.0 * (turn.cos() - turn.sin()), 5.0 * (turn.sin() + turn.cos()), 5.0);
+        assert!(centre.dist(expected) < 1e-6, "instance {k}: {centre:?} vs {expected:?}");
+    }
+    assert_same_import(&imp, &step_import_with_workers(&t, 8).unwrap());
+}
+
 /// A part an assembly places twice is meshed once: the second instance shows the first one's
 /// display mesh, placed (the same triangles and faces, at its own place), and keeps its own
 /// placed geometry for everything else.
@@ -974,7 +1031,7 @@ fn hostile_boundaries_mesh_in_bounded_time() {
 }
 
 /// A cylinder written as a surface of revolution, oriented the ISO 10303-42 way (normal
-/// ∂S/∂angle × ∂S/∂profile, outward here, so `same_sense` .T.). Fusion reads such faces this
+/// ∂S/∂angle × ∂S/∂profile, outward here, so `same_sense` .T.). Strict readers read such faces this
 /// way; reading them with truck's profile-first normal turned faces inside out.
 #[test]
 fn surface_of_revolution_sense_follows_iso() {

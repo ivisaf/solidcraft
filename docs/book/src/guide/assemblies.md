@@ -28,6 +28,24 @@ made. Contact sets stop motion where bodies would pass through each other,
 **Motion Study** keys joint values along a timeline, and **Interference** shows overlapping
 volumes in red, lists the pairs closer than its **Clearance** and each body's nearest neighbour.
 
+A joint origin on a face or a hole keeps the turn it had when it was picked: when the face tilts
+(a bend angle or a rotation changing with a parameter) the part on it tilts with the face but
+doesn't spin about it.
+
+A joint origin can also sit on an edge of a flat face (`"edge": [x, y, z]`): at the edge's middle,
+pointing out of the face with its y into it, or with `"corner": [x, y, z]` at the corner near that
+point, its x and y running along the two edges into the face. The edge, the face and the corner
+are found again by name, so a bracket set 40 mm in from a panel's corner (a planar joint with
+values `[40, 40, 0]`) stays 40 mm in from that corner when the panel changes size.
+
+A joint's offset, angle and values can be typed as expressions over the design's parameters
+(`"offset": "gap + 2"`, `"values": ["travel"]`). The joint keeps them and works them out again
+whenever the design changes, so a part seated `gap` above a panel moves with `gap`. Renaming a
+parameter carries into the joints that use it, and deleting one they use is refused. If an
+expression stops working out (say a parameter becomes an angle), the joint is left out of the
+solve and `joint.solve` gives the reason, instead of placing the part from old numbers. Typing a
+plain number, or driving the value, drops that expression.
+
 The check behind it, `inspect.clearance`, does all of that in one call for any number of bodies,
 which suits scripts and agents checking a whole assembly:
 
@@ -44,7 +62,10 @@ body in `bodies` and the other in `against`, and `skip_within` leaves out pairs 
 occurrence (`"occurrence"`) or one placed component, its subcomponents included
 (`"component"`): the parts of a bought component that touch by design. Distances are measured on
 the exact faces and edges; the meshes only rule out pairs that are too far apart, and the pairs
-left are checked in parallel. `inspect.interference` remains for the overlaps alone.
+left are checked in parallel. `inspect.interference` remains for the overlaps alone: it clears
+pairs whose meshes stay apart without intersecting them, intersects the rest in parallel, and
+returns after `budget_s` seconds (default 240) at most, listing the pairs it had no time for as
+not checked.
 
 **Gear**, **Rack and Pinion** and **Screw** (on the **ASSEMBLE** panel) are motion links whose
 ratio comes from the parts rather than a typed number:
@@ -147,8 +168,11 @@ it where it is), and it moves.
 `joint.drive` answers the joint's values as `joint.list` gives them, in degrees and millimetres
 with their units and limits, and `moved` says whether any part moved. A joint's origins are mated
 by default: B's z axis is turned against A's, as two faces meet. `flip: true` lines them up
-instead, so two origins given at one point with the same z stay as they are. For scripts that
-drive many steps, `quiet: true` leaves the per-part degrees of freedom out of joint answers, and
+instead, so two origins given at one point with the same z stay as they are. Without an
+`angle`, a new joint takes no turn or a half turn about its axis, whichever turns B less: two
+faces that already meet, a plate under a panel, stay as they are instead of B spinning about
+their shared normal. For scripts that drive many steps, `quiet: true` leaves the per-part
+degrees of freedom out of joint answers, and
 `motion.play` with `quiet: true` gives the poses of only the parts that moved.
 
 **Motion Trace** (`motion.trace`, on the **ASSEMBLE** panel) draws the path a point of a part
@@ -228,6 +252,22 @@ After the part file changes, **Update Links** (`component.update_links`) reads i
 `component.links` lists the links and whether their files are found. A linked component holds
 the part's bodies only: its timeline, parameters and sheet-metal data (flat pattern, bend
 table) stay in the part's own design.
+
+If a source file moves or is renamed, right-click its linked component or occurrence in the
+Browser and choose **Relink Source (All Instances)…**. Choose the saved `.solidcraft` design
+to use. Relinking updates that component's stored path and solid bodies for **all its
+instances**, keeping their identities and placements. Cancelling or choosing a missing,
+invalid, empty or self-referencing design leaves the assembly unchanged. The operation is
+one undo step and the new path is saved relative to the assembly when possible.
+
+Scripts use `component.relink {component, path}`. The reply includes `previous_path`, `path`,
+`warnings`, `joint_errors` and `joint_conflicts`. Changed geometry can invalidate a joint's
+face reference: relinking reports those joints in the reply and UI status/message history;
+repair the joint or undo the relink. Relink does not repair or verify the intended meaning of
+existing joints.
+When linked geometry changes and the component has joints, a reminder to check those joints
+is also shown even if the solver reports no error: a successful solve does not prove that a
+joint still describes the intended connection.
 
 STEP export writes the component tree as an assembly.
 

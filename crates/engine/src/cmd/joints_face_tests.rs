@@ -265,3 +265,31 @@ fn origins_on_a_body_placed_by_an_offset_agree_named_or_not() {
     assert!(near(named.0, unnamed.0) && near(named.1, unnamed.1), "{named:?} {unnamed:?}");
     assert!(near(named.0, at(Vec3::new(20.0, 20.0, 5.0))) && near(named.1, up), "{named:?}");
 }
+
+#[test]
+fn a_round_origin_keeps_its_end_when_the_face_it_opens_onto_gets_other_neighbours() {
+    // A plate `T` thick with a groove across its top (so the top face is in pieces, each named
+    // by the faces round it), a small hole and a 6 mm hole in the left piece. The origin is
+    // picked on the 6 mm hole's wall near the top, and names the top piece as its end.
+    let mut s = Session::default();
+    run(&mut s, "parameters.change", json!({"name": "T", "expression": "2 mm"}));
+    run(&mut s, "component.create", json!({"name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 60, "width": 100, "height": "T", "corner": [0, 0, 0]}));
+    run(&mut s, "solid.box", json!({"length": 4, "width": 100, "height": 1, "corner": [28, 0, "T - 1 mm"], "operation": "cut"}));
+    run(&mut s, "solid.hole", json!({"position": [10, 50, "T"], "diameter": 4}));
+    let small = s.doc.features.last().map_or(0, |f| f.id);
+    run(&mut s, "solid.hole", json!({"position": [20, 50, "T"], "diameter": 6}));
+    run(&mut s, "component.activate", json!({"component": "root"}));
+    run(&mut s, "joint.origin", json!({"occurrence": "Plate", "circle": [23, 50, 1.6], "name": "O"}));
+    let top = |s: &Session| {
+        let o = s.doc.assembly.origins.iter().find(|o| o.name == "O").map(|o| o.origin.clone());
+        o.and_then(|o| solidcraft_doc::joints::resolve_origin(&s.doc, &s.model.state(), &o).ok()).map(|m| (m[3][2], m[2][2]))
+    };
+    assert_eq!(top(&s), Some((2.0, 1.0)));
+    // Thicker, the pick is nearer the bottom; without the small hole the top piece is named by
+    // fewer faces. The origin stays on the top.
+    run(&mut s, "parameters.change", json!({"name": "T", "expression": "4 mm"}));
+    run(&mut s, "timeline.suppress", json!({"feature": small, "suppressed": true}));
+    let (z, dz) = top(&s).unwrap_or_default();
+    assert!((z - 4.0).abs() < 1e-9 && (dz - 1.0).abs() < 1e-9, "{z} {dz}");
+}

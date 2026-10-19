@@ -148,6 +148,8 @@ the most complete description of the house style.
 A geometry change that changes the robustness goldens re-records them in the same pull request:
 `ROBUSTNESS_GOLDENS_BLESS="why it changed" cargo test --profile ci -p solidcraft-engine --lib robustness_goldens::`
 (see [docs/robustness.md](docs/robustness.md)); CI runs every seed on pull requests that touch geometry.
+[docs/mutation-testing.md](docs/mutation-testing.md) shows how to find kernel behaviour these
+black-box suites miss.
 
 **UI scenarios** drive the real app headless: start a tool, click a plane or a sketch point,
 press keys, then assert on the result.
@@ -189,17 +191,17 @@ the same commit; otherwise it runs the full suite.
 **CI shards the tests.** One job builds them into a cargo-nextest archive; two shards run on
 pull requests and four during full validation. Every test runs in its own process: don't rely
 on state left by another test.
-Pull requests skip a few heavy tests (one to four minutes each), which run in full validation
+Pull requests skip a few heavy tests (one to twelve minutes each), which run in full validation
 (the merge queue, nightly, manual runs and pushes to `main` not already tested by the queue).
 Check that validation after merging. They are listed in
 `.config/nextest.toml` and the [testing page](docs/book/src/dev/testing.md):
 
 - `solidcraft-engine`: `tests::hostile_params_never_panic`, everything in `tests::robustness` and
-  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests matching the workflow's geometry paths run all seeds),
+  the seeds of `tests::robustness_goldens` (`seed_00` … `seed_95`; pull requests matching the workflow's geometry paths run all but the slowest, `SLOW_SEEDS` in `ci.yml`),
   `pattern_suppress_tests::enclosure_arc_extinction_keeps_a_real_sharp_inner_lip_after_resize_and_reopen`,
   `pattern_suppress_tests::enclosure_datums_follow_wall_height_and_board_depth_with_material_proofs`,
   `cmd::plastic::tests::enclosure_snap_fit_follows_resized_front_wall`, the `atomic_commands` contract tests
-- `solidcraft-kernel`: `tests::boolean_identity_on_tangent_primitives`, and the `boolean_props` property tests
+- `solidcraft-kernel`: `tests::boolean_identity_on_tangent_primitives`, `tspline::tests::hostile_tsplines_never_panic`, and the `boolean_props` property tests
   (these run only in the nightly "Property tests" job: their inputs are random, so main skips them too)
 - `solidcraft-ui-egui` scenarios: `acceptance_sensor_enclosure`
 
@@ -283,6 +285,10 @@ and a fresh CI run:
 2. Branch from `main` and keep the PR to one topic.
 3. Run `cargo xtask ci` before pushing. It runs fmt, the asset, licence and layer checks,
    clippy (`-D warnings`), then the tests with the wasm build check alongside. A PR has to pass it.
+   Heavy CI runs after review: a pull request gets the formatting and repository checks and a
+   quick compile (`cargo check`) when you push. Once a maintainer has reviewed it they add the
+   `approved-for-ci` label, which runs the full CI (build, tests, goldens, Clippy); every push
+   after that runs the full set again.
 4. Reference the issue (`Fixes #12`). In the PR, say what you tested and how. For geometry work, include the measured numbers (and
    the expected ones).
 
@@ -356,6 +362,20 @@ In order of how much they'd help users:
    through without a kernel error. Each failing seed is a reproducible bug.
 3. **Drawings, CAM and mesh tools.** These are out of scope for now (see
    [ROADMAP.md](ROADMAP.md)), but anyone who wants to own one is welcome.
+
+## Updating the generated feature list
+
+After adding or renaming commands, run `cargo xtask features`. The registry is the
+source of truth for `docs/features.md`; do not hand-edit the generated rows.
+The generator sorts commands by ID and omits global and per-section counters,
+so additions to unrelated areas no longer rewrite shared summary lines.
+
+If two branches still conflict in this file (for example, adjacent additions in
+the same area), first resolve the command registry and source conflicts, then run
+`cargo xtask features` again and stage the regenerated file. Do not use Git's
+`union` merge driver: it can silently retain stale or duplicate command rows.
+The generator tests cover stable ordering and additions that leave existing lines
+unchanged. The initial switch to sorted rows is a one-time larger diff.
 
 ## Licence
 

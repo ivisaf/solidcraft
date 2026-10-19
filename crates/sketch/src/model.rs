@@ -53,6 +53,32 @@ pub struct SPoint {
     /// Projected (linked) reference geometry: the id of the link that owns this point.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// A point placed by expressions over the design's parameters: it is `fixed` where they
+    /// come to (`Document::apply_point_values` works them out before each solve).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exprs: Option<Box<PointExprs>>,
+}
+
+/// The expressions of a point placed by parameters, over the design's parameters; a coordinate
+/// without one keeps the number stored in the point (mm).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PointExprs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<String>,
+}
+
+impl PointExprs {
+    /// The expressions set, each with what it sets.
+    pub fn list(&self) -> Vec<(&'static str, &String)> {
+        [("Point X", &self.x), ("Point Y", &self.y)].into_iter().filter_map(|(what, e)| e.as_ref().map(|e| (what, e))).collect()
+    }
+
+    /// Mutable view of [`PointExprs::list`], for renaming the parameters they refer to.
+    pub fn list_mut(&mut self) -> Vec<&mut String> {
+        [&mut self.x, &mut self.y].into_iter().filter_map(Option::as_mut).collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -390,7 +416,7 @@ impl ConstraintKind {
     pub fn is_angle(&self) -> bool {
         matches!(self, ConstraintKind::Angle { .. } | ConstraintKind::LineAngle { .. } | ConstraintKind::ArcSweep { .. })
     }
-    /// Short type name (Fusion-like) for listings.
+    /// Short type name for listings.
     pub fn name(&self) -> &'static str {
         use ConstraintKind::*;
         match self {
@@ -615,7 +641,7 @@ impl Default for Sketch {
 impl Sketch {
     pub fn new() -> Self {
         Sketch {
-            points: vec![SPoint { id: "origin".into(), pos: Vec2::ZERO, fixed: true, link: None }],
+            points: vec![SPoint { id: "origin".into(), pos: Vec2::ZERO, fixed: true, link: None, exprs: None }],
             curves: Vec::new(),
             constraints: Vec::new(),
             patterns: Vec::new(),
@@ -712,7 +738,7 @@ impl Sketch {
             Some(i) => i.to_string(),
             None => self.fresh("p")?,
         };
-        self.points.push(SPoint { id, pos: p, fixed: false, link: None });
+        self.points.push(SPoint { id, pos: p, fixed: false, link: None, exprs: None });
         Ok(self.points.len() - 1)
     }
 

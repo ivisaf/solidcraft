@@ -6,11 +6,11 @@
 //! described.
 
 use mt::builder;
-use solidcraft_geom::{Plane, Region2, Seg2, Vec2, Vec3};
+use solidcraft_geom::{Grid, Plane, Region2, Seg2, Vec2, Vec3};
 use truck_modeling as mt;
 
 use crate::body::{Body, p3};
-use crate::build::{cap_and_close, close_sweep, interpolate_cubic, smooth_loft_faces, uniform_wire};
+use crate::build::{NetFit, cap_and_close, close_sweep, interpolate_net, smooth_loft_faces, uniform_wire};
 use crate::numbered::{NumberedLoop, NumberedRegion};
 use crate::record::{self, Side};
 use crate::{KernelError, Result, guard};
@@ -686,32 +686,9 @@ pub(crate) fn smooth_sheet(plane: &Plane, chains: &[Vec<Seg2>], path: &[Vec3], c
         // and end, and the wall surface.
         let mut data = Vec::with_capacity(chain.len());
         for s in chain {
-            let mut station_curves = Vec::with_capacity(n + 1);
-            for i in 0..=n {
-                let q: Vec<Vec3> = (0..SEG_SAMPLES).map(|j| at(i, s.point_at(j as f64 / (SEG_SAMPLES - 1) as f64))).collect();
-                station_curves.push(interpolate_cubic(&q).ok_or_else(|| fail("profile curve"))?);
-            }
-            let kv = station_curves.first().map(|c| c.knot_vec().clone()).ok_or_else(|| fail("no stations"))?;
-            let mut columns = Vec::with_capacity(SEG_SAMPLES);
-            for j in 0..SEG_SAMPLES {
-                let q: Vec<Vec3> = station_curves
-                    .iter()
-                    .map(|c| {
-                        let p = c.control_point(j);
-                        Vec3::new(p.x, p.y, p.z)
-                    })
-                    .collect();
-                columns.push(interpolate_cubic(&q).ok_or_else(|| fail("path curve"))?);
-            }
-            let ku = columns.first().map(|c| c.knot_vec().clone()).ok_or_else(|| fail("no columns"))?;
-            let net: Vec<Vec<mt::Point3>> = (0..=n).map(|m| columns.iter().map(|c| *c.control_point(m)).collect()).collect();
-            let surf = mt::BSplineSurface::try_new((ku, kv), net).map_err(|e| fail(&e.to_string()))?;
-            let (Some(c0), Some(c1), Some(first), Some(last)) =
-                (station_curves.first().cloned(), station_curves.last().cloned(), columns.first().cloned(), columns.last().cloned())
-            else {
-                return Err(fail("stations"));
-            };
-            data.push((c0, c1, first, last, surf));
+            let samples =
+                Grid::from_fn([n + 1, SEG_SAMPLES], |i, j| at(i, s.point_at(j as f64 / (SEG_SAMPLES - 1) as f64))).ok_or_else(|| fail("samples"))?;
+            data.push(interpolate_net(&samples).ok_or_else(|| fail("wall surface"))?);
         }
         let walls: Vec<mt::Face> = guard("path sweep", || {
             let m = chain.len();
@@ -725,13 +702,13 @@ pub(crate) fn smooth_sheet(plane: &Plane, chains: &[Vec<Seg2>], path: &[Vec3], c
                 // The column through each corner: the start column of the segment leaving it, or
                 // the end column of the last segment.
                 let col = match data.get(k) {
-                    Some((_, _, first, _, _)) => first,
-                    None => data.last().map(|d| &d.3).ok_or_else(|| fail("seam"))?,
+                    Some(NetFit { v_ends: [first, _], .. }) => first,
+                    None => data.last().map(|NetFit { v_ends: [_, last], .. }| last).ok_or_else(|| fail("seam"))?,
                 };
                 seams.push(mt::Edge::try_new(a, b, mt::Curve::BSplineCurve(col.clone())).map_err(|e| fail(&e.to_string()))?);
             }
             let mut walls = Vec::with_capacity(m);
-            for (j, (c0, c1, _, _, surf)) in data.iter().enumerate() {
+            for (j, NetFit { surface: surf, u_ends: [c0, c1], .. }) in data.iter().enumerate() {
                 let (Some(a0), Some(b0), Some(a1), Some(b1), Some(sa), Some(sb)) =
                     (start.get(j), start.get(next(j)), end.get(j), end.get(next(j)), seams.get(j), seams.get(next(j)))
                 else {
@@ -826,35 +803,15 @@ fn smooth_walls(plane: &Plane, profile: &NumberedLoop, st: &[Station], expected:
     let n = st.len() - 1;
     let mut data = Vec::with_capacity(nseg);
     for s in &lp.segs {
-        let mut station_curves = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            let pts: Vec<Vec3> = (0..SEG_SAMPLES).map(|j| at(i, s.point_at(j as f64 / (SEG_SAMPLES - 1) as f64))).collect();
-            station_curves.push(interpolate_cubic(&pts).ok_or_else(|| fail("profile curve"))?);
-        }
-        let kv = station_curves.first().map(|c| c.knot_vec().clone()).ok_or_else(|| fail("no stations"))?;
-        let mut columns = Vec::with_capacity(SEG_SAMPLES);
-        for j in 0..SEG_SAMPLES {
-            let pts: Vec<Vec3> = station_curves
-                .iter()
-                .map(|c| {
-                    let p = c.control_point(j);
-                    Vec3::new(p.x, p.y, p.z)
-                })
-                .collect();
-            columns.push(interpolate_cubic(&pts).ok_or_else(|| fail("path curve"))?);
-        }
-        let ku = columns.first().map(|c| c.knot_vec().clone()).ok_or_else(|| fail("no columns"))?;
-        let net: Vec<Vec<mt::Point3>> = (0..=n).map(|m| columns.iter().map(|c| *c.control_point(m)).collect()).collect();
-        let surf = mt::BSplineSurface::try_new((ku, kv), net).map_err(|e| fail(&e.to_string()))?;
-        let (Some(first), Some(last)) = (station_curves.first().cloned(), station_curves.last().cloned()) else { return Err(fail("stations")) };
-        let seam = columns.first().cloned().ok_or_else(|| fail("seam"))?;
-        data.push((first, last, seam, surf));
+        let samples =
+            Grid::from_fn([n + 1, SEG_SAMPLES], |i, j| at(i, s.point_at(j as f64 / (SEG_SAMPLES - 1) as f64))).ok_or_else(|| fail("samples"))?;
+        data.push(interpolate_net(&samples).ok_or_else(|| fail("wall surface"))?);
     }
     guard("path sweep", || {
         let start: Vec<mt::Vertex> = lp.segs.iter().map(|s| builder::vertex(p3(at(0, s.start())))).collect();
         let end: Vec<mt::Vertex> = lp.segs.iter().map(|s| builder::vertex(p3(at(n, s.start())))).collect();
         let (mut e0, mut e1, mut seams) = (Vec::with_capacity(nseg), Vec::with_capacity(nseg), Vec::with_capacity(nseg));
-        for (j, (c0, c1, seam, _)) in data.iter().enumerate() {
+        for (j, NetFit { u_ends: [c0, c1], v_ends: [seam, _], .. }) in data.iter().enumerate() {
             let (Some(a0), Some(b0), Some(a1), Some(b1)) = (start.get(j), start.get((j + 1) % nseg), end.get(j), end.get((j + 1) % nseg)) else {
                 return Err(fail("vertices"));
             };
@@ -863,7 +820,7 @@ fn smooth_walls(plane: &Plane, profile: &NumberedLoop, st: &[Station], expected:
             seams.push(mt::Edge::try_new(a0, a1, mt::Curve::BSplineCurve(seam.clone())).map_err(|e| fail(&e.to_string()))?);
         }
         let mut walls = Vec::with_capacity(nseg);
-        for (j, (_, _, _, surf)) in data.iter().enumerate() {
+        for (j, NetFit { surface: surf, .. }) in data.iter().enumerate() {
             let (Some(a), Some(b), Some(sa), Some(sb)) = (e0.get(j), e1.get(j), seams.get(j), seams.get((j + 1) % nseg)) else {
                 return Err(fail("edges"));
             };

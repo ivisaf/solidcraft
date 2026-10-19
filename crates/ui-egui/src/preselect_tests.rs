@@ -898,7 +898,7 @@ fn shell_direction_and_tangent_chain_round_trip() {
     let mut app = boxed();
     let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
     let mut d = start(&mut app, vec![top], "solid.shell");
-    // Tangent Chain is on, as in Fusion; Direction Outside.
+    // Tangent Chain is on; Direction Outside.
     assert_eq!(d.extra.get("tangent_chain"), Some(&json!(true)));
     d.extra.insert("direction".into(), json!("outside"));
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
@@ -1080,6 +1080,97 @@ fn thread_size_suggestion_can_be_cleared_and_edited_in_the_dialog() {
     h.app.dialog.as_mut().unwrap().pick(&h.app.session, pick);
     h.frames(2);
     assert_eq!(apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap()[0].1["designation"], "M8");
+}
+
+#[test]
+fn modeled_thread_survives_timeline_double_click_and_ok() {
+    for (analytic_pick, change_length) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.apply_off_thread = Some(std::time::Duration::ZERO);
+        h.app.run("solid.cylinder", json!({"radius":4,"height":4})).unwrap();
+        let smooth_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        let Sel::Face { point, .. } = thread_face(&h.app, "Body1") else { panic!("face") };
+        let point = if analytic_pick { Vec3::new(4.0, 0.0, 2.0) } else { point };
+        let id = h.app.run("solid.thread", json!({"face":point,"designation":"M8x1","modeled":true})).unwrap()["feature"].as_u64().unwrap();
+        let threaded_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!(smooth_volume - threaded_volume > 1.0);
+        h.frames(4);
+        h.step(&json!({"click":{"handle":"timeline:Thread1"},"double":true})).unwrap();
+        h.frames(4);
+        assert_eq!(h.app.dialog.as_ref().unwrap().extra["modeled"], true);
+        assert_eq!(h.app.dialog.as_ref().unwrap().editing, Some((id, None)));
+        assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 1, "the cylinder stays selected");
+        if change_length {
+            h.step(&json!({"click":{"handle":"dialog:Full Length"}})).unwrap();
+            h.step(&json!({"click":{"handle":"dialog:Length"}})).unwrap();
+            h.step(&json!({"key":"A","cmd":true})).unwrap();
+            h.step(&json!({"text":"2 mm"})).unwrap();
+        }
+        if h.app.dialog.as_ref().unwrap().previews() {
+            wait_feature_preview(&mut h);
+            assert_eq!(h.app.preview.replaced, ["Body1"]);
+        }
+        h.step(&json!({"widget":"OK"})).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while h.app.applying.is_some() && std::time::Instant::now() < deadline {
+            h.frames(1);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        h.frames(4);
+        assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+        assert!(h.app.applying.is_none() && !h.app.preview.active && h.app.preview.replaced.is_empty());
+        assert_eq!(h.app.session.doc.marker, None);
+        assert!(matches!(h.app.session.doc.feature(id).unwrap().kind, solidcraft_engine::doc::FeatureKind::Thread { modeled: true, .. }));
+        let result = h.app.session.model.result(id).unwrap();
+        assert!(!result.skipped && result.error.is_none(), "{result:?}");
+        let edited_volume = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!(smooth_volume - edited_volume > 1.0, "the modeled cut disappeared: {smooth_volume} -> {edited_volume}");
+        if change_length {
+            assert!(edited_volume - threaded_volume > 1.0, "shortening the thread restores some material");
+        } else {
+            assert!((edited_volume - threaded_volume).abs() < 1e-6);
+        }
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.doc.marker, None);
+        let restored = h.app.session.world_state().body("Body1").unwrap().mesh().measure().volume;
+        assert!((restored - threaded_volume).abs() < 1e-6, "one undo restores the original modeled thread");
+    }
+}
+
+#[test]
+fn planar_face_reopen_keeps_the_tight_pick_tolerance() {
+    for (command, mut params, point) in [
+        ("solid.box", json!({"length":100,"width":100,"height":100}), Vec3::new(50.0, 50.0, 100.0)),
+        ("solid.cylinder", json!({"radius":50,"height":100}), Vec3::new(0.0, 0.0, 100.0)),
+    ] {
+        let mut h = crate::scenario::Harness::new();
+        let base = h.app.run(command, params.clone()).unwrap()["feature"].clone();
+        let feature = h.app.run("solid.offset_face", json!({"faces":[point],"distance":2})).unwrap()["feature"].as_u64().unwrap();
+        h.app.edit_feature(feature);
+        assert_eq!(h.app.dialog.as_ref().unwrap().inputs[0].items.len(), 1, "an unchanged planar pick reopens");
+        crate::dialogs::cancel(&mut h.app);
+
+        // Move the upstream face away from its saved pick, but by less than the body's
+        // display tolerance. The cylinder case also checks planar caps on curved bodies.
+        params["height"] = json!(99.99);
+        h.app.run("timeline.redefine", json!({"feature":base,"command":command,"params":params})).unwrap();
+        h.app.edit_feature(feature);
+        assert!(h.app.session.world_state().body("Body1").unwrap().display_tol() > 0.01);
+        assert!(crate::dialogs::face_sel(&h.app.session, point - Vec3::Z * 0.01).is_some());
+        assert!(h.app.dialog.as_ref().unwrap().inputs[0].items.is_empty(), "{command}: a stale planar pick must stay empty");
+    }
+}
+
+#[test]
+fn curved_face_refill_keeps_its_pick_but_rejects_points_outside_the_mesh_tolerance() {
+    let mut app = app_with(json!([]));
+    app.run("solid.cylinder", json!({"radius":4,"height":4})).unwrap();
+    let point = Vec3::new(4.0, 0.0, 2.0);
+    let pick = crate::dialogs::face_sel(&app.session, point).unwrap();
+    assert!(matches!(pick, Sel::Face { point: kept, .. } if kept == point));
+    assert!(crate::dialogs::face_sel(&app.session, Vec3::new(4.1, 0.0, 2.0)).is_none());
+    assert!(crate::dialogs::face_sel(&app.session, Vec3::new(f64::NAN, 0.0, 2.0)).is_none());
 }
 
 #[test]
@@ -1716,4 +1807,75 @@ fn midplane_asks_for_two_planes_then_builds_the_one_between_them() {
         solidcraft_engine::view::construction_planes(&h.app.session).into_iter().find(|(_, name, _)| name != "Shelf").expect("the midplane");
     assert!(pl.normal().cross(Vec3::Z).len() < 1e-6, "{pl:?}");
     assert!((pl.origin.z - 10.0).abs() < 1e-6, "{pl:?}");
+}
+
+/// #2474, #2494: every construct tool asks for what it needs. Started from the toolbar with
+/// nothing selected, none of them runs its command and reports that `a` (or `face`, `edge`…)
+/// is required; a construct command added later without a dialog fails here too.
+#[test]
+fn every_construct_tool_opens_a_dialog_instead_of_failing() {
+    let mut h = crate::scenario::Harness::new();
+    // A body, so the tools that need one are enabled.
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+    let commands = h.app.session.execute("engine.commands", &json!({})).unwrap();
+    let ids: Vec<String> =
+        commands.as_array().unwrap().iter().filter_map(|c| c["id"].as_str()).filter(|id| id.starts_with("construct.")).map(String::from).collect();
+    assert!(ids.len() >= 17, "{ids:?}");
+    for id in &ids {
+        h.app.session.selection.clear();
+        h.app.status = None;
+        h.app.start(id);
+        h.frames(1);
+        let status = h.app.status.as_ref().map(|s| s.0.clone()).unwrap_or_default();
+        assert!(!status.contains("is required"), "{id}: {status}");
+        assert!(h.app.dialog.as_ref().is_some_and(|d| !d.inputs.is_empty()), "{id} opens a dialog that asks for picks");
+        crate::dialogs::cancel(&mut h.app);
+    }
+}
+
+/// #2494: two planes selected first, Axis Through Two Planes takes both and makes the axis
+/// where they meet.
+#[test]
+fn axis_through_two_preselected_planes_builds_their_intersection() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.session.selection = vec![Sel::Plane { name: "XY".into() }, Sel::Plane { name: "XZ".into() }];
+    h.app.start("construct.axis.two_planes");
+    h.frames(1);
+    let d = h.app.dialog.as_ref().unwrap();
+    assert!(matches!(d.kind, Kind::Construct { .. }));
+    assert_eq!((d.inputs[0].items.len(), d.inputs[1].items.len()), (1, 1), "each plane fills one input");
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let axes = solidcraft_engine::view::construction_axes(&h.app.session);
+    let (_, _, _, dir) = axes.first().expect("the axis");
+    assert!(dir.cross(Vec3::X).len() < 1e-6, "XY and XZ meet along X: {dir:?}");
+}
+
+/// #2474: Plane Through Two Edges takes two edges picked in the dialog.
+#[test]
+fn plane_through_two_picked_edges() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":20})).unwrap();
+    h.app.start("construct.plane.two_edges");
+    h.frames(1);
+    let edge = |p: Vec3| Sel::Edge { body: "Body1".into(), index: 0, point: p };
+    let d = h.app.dialog.as_mut().unwrap();
+    d.inputs[0].items = vec![edge(Vec3::new(10.0, 0.0, 20.0))];
+    d.inputs[1].items = vec![edge(Vec3::new(0.0, 10.0, 20.0))];
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let (_, _, pl) = solidcraft_engine::view::construction_planes(&h.app.session).into_iter().next().expect("the plane");
+    assert!(pl.normal().cross(Vec3::Z).len() < 1e-6 && (pl.origin.z - 20.0).abs() < 1e-6, "the top face's plane: {pl:?}");
+}
+
+/// Point Along Path asks for its position too, and a missing pick names the input.
+#[test]
+fn point_along_path_has_its_position_and_missing_picks_are_named() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.start("construct.point.along_path");
+    h.frames(1);
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Construct { t: Some(t), .. } if t == "0.5"));
+    h.step(&json!({"key":"Enter"})).unwrap();
+    let e = h.app.dialog.as_ref().and_then(|d| d.error.clone()).unwrap_or_default();
+    assert!(e.contains("path"), "{e}");
 }

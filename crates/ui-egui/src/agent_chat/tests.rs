@@ -1348,6 +1348,34 @@ fn files_dropped_on_the_chat_attach_and_the_app_does_not_open_them() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The chat popped out into its own window takes drops too, and says so while files are dragged
+/// over it (#2812). Here the window floats inside the app, as it does where the system can't open
+/// one: a drop on the window is the chat's, one elsewhere is not.
+#[test]
+fn files_dropped_on_the_popped_out_chat_attach() {
+    use crate::scenario::rect_of;
+    let d = attachable("popdrop");
+    let mut h = narrow_chat();
+    h.call("ui.resize", json!({"width": 1600, "height": 1000}));
+    h.app.preferences.agent_chat_popped = true;
+    h.frames(4);
+    let window = rect_of("agent_chat:window").expect("popped out");
+    let hovered = || vec![egui::HoveredFile { path: Some(d.join("target.png")), mime: String::new() }];
+    h.drag_files(window.center(), hovered(), Vec::new());
+    assert!(rect_of("agent_chat:drop_hint").is_some_and(|r| window.contains(r.center())), "the hint over the window");
+    let outside = egui::pos2(5.0, 500.0);
+    assert!(!window.contains(outside));
+    h.drag_files(outside, hovered(), Vec::new());
+    assert!(rect_of("agent_chat:drop_hint").is_none(), "no hint away from it");
+    drop_files(&mut h, window.center(), &[d.join("target.png"), d.join("brief.md")]);
+    settle_chat(&mut h);
+    assert_eq!(status(&h.app)["attachments"], json!(["target.png", "brief.md"]));
+    assert!(!h.app.file_load.busy(), "the app doesn't open them as well");
+    drop_files(&mut h, outside, &[d.join("brief.md")]);
+    assert_eq!(status(&h.app)["attachments"].as_array().map(Vec::len), Some(2), "away from the window: not the chat's");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// Many files and a long message in a narrow chat: the chips wrap onto more rows and the text box
 /// keeps to the chat (a row of chips wider than the chat would widen everything under it).
 #[test]

@@ -424,7 +424,7 @@ fn canvas_menu_hides_renames_calibrates_and_deletes() {
     assert!(app.session.doc.canvases.is_empty());
 }
 
-/// The canvas and browser menus keep Fusion's items in Fusion's order (the ones we have).
+/// The canvas and browser menus keep their items in a fixed order.
 #[test]
 fn menus_follow_fusion_order() {
     let mut app = sample_app();

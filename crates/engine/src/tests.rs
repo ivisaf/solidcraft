@@ -325,6 +325,7 @@ mod primitive_points;
 mod rim_cut;
 mod robustness;
 mod robustness_goldens;
+mod sphere_lens;
 mod spiral_join;
 mod step_import_options;
 mod xz_plane;
@@ -652,7 +653,7 @@ fn sketch_tools_and_constraints() {
     assert!(s.execute("sketch.line", &json!({"points": [[0, 0], [1, 1]]})).is_err(), "needs an active sketch");
 }
 
-/// The recipe format of the Fusion oracle (01-box) drives the same commands.
+/// The recipe format of the 01-box reference drives the same commands.
 #[test]
 fn script_runs_commands() {
     let mut s = Session::default();
@@ -2688,6 +2689,34 @@ fn unequal_chamfers() {
     let d2 = 3.0 * (30f64).to_radians().tan();
     assert!(rel(volume(&mut s), 24000.0 - 160.0 - 0.5 * 3.0 * d2 * 40.0) < 1e-6, "{}", volume(&mut s));
     assert!(s.execute("solid.chamfer", &json!({"edges": [[0, 15, 20]], "distance": 1, "distance2": 2, "angle": "30 deg"})).is_err());
+}
+
+/// Unequal chamfers of a cylinder's circular rims: each cross-section is a right triangle
+/// revolved about the axis (Pappus: area × the path of its centroid).
+#[test]
+fn unequal_chamfers_on_circular_rims() {
+    use std::f64::consts::PI;
+    let ring = |r: [f64; 3], legs: (f64, f64)| 2.0 * PI * (r[0] + r[1] + r[2]) / 3.0 * 0.5 * legs.0 * legs.1;
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 10, "height": 20}));
+    // The measured volume is of the meshed cylinder: compare what each chamfer takes away.
+    let full = volume(&mut s);
+    assert!(rel(full, PI * 100.0 * 20.0) < 1e-3);
+    // Top rim: 2 across the top (the face facing up), 3 down the wall.
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3}));
+    let top = ring([10.0, 8.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), top) < 5e-3, "{} vs {top}", full - volume(&mut s));
+    // Bottom rim: 2 along the bottom at 30° from it (flipped: the wall would be first).
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 0]], "distance": 2, "angle": "30 deg", "flip": true}));
+    let d2 = 2.0 * 30f64.to_radians().tan();
+    let bottom = ring([10.0, 8.0, 10.0], (2.0, d2));
+    assert!(rel(full - volume(&mut s), top + bottom) < 5e-3, "{} vs {}", full - volume(&mut s), top + bottom);
+    // Flipped on the top rim instead: 2 down the wall, 3 across the top (a different solid).
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 20]], "distance": 2, "distance2": 3, "flip": true}));
+    let flipped = ring([10.0, 7.0, 10.0], (2.0, 3.0));
+    assert!(rel(full - volume(&mut s), flipped) < 5e-3, "{} vs {flipped}", full - volume(&mut s));
 }
 
 /// An enclosure built in the usual order: shell, bosses, then the lip on the rim.

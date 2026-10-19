@@ -10,6 +10,7 @@ use solidcraft_geom::Vec3;
 use solidcraft_kernel::CylinderFace;
 
 use super::{Snap, XRef, component_bodies};
+use crate::history_names::Match;
 use crate::{DocError, Document, IDENTITY, Mat, ModelBody, ModelState, Result, apply_point, apply_vector, mat_inverse};
 
 /// Rim points sampled to find the face across a cylinder's rim.
@@ -71,7 +72,7 @@ impl NamedFace<'_> {
 
 /// A cylinder of a body's own coordinates placed by the body's (rigid) offset.
 pub(super) fn placed(m: &Mat, c: CylinderFace) -> CylinderFace {
-    CylinderFace { axis_point: apply_point(m, c.axis_point), axis: apply_vector(m, c.axis), ..c }
+    CylinderFace { axis_point: apply_point(m, c.axis_point), axis: apply_vector(m, *c.axis).unit().unwrap_or(c.axis), ..c }
 }
 
 /// The face across the rim at the `at` end (along the axis) of cylinder `c`, face `face` of `b`
@@ -170,19 +171,30 @@ impl Round {
 pub(super) fn named_round(doc: &Document, st: &ModelState, pick: Vec3, face: &str, end: Option<&str>) -> Result<Option<Round>> {
     let nf = named_face(doc, st, pick, face)?;
     let Some(own) = nf.own_cylinder() else { return Ok(None) };
-    let chosen = end
-        .and_then(|name| {
-            let hits: Vec<(f64, f64)> = ends(&own)
-                .into_iter()
-                .filter(|(at, _)| rim_neighbour(nf.body, nf.face, &own, *at).is_some_and(|f| crate::name_lookup::face_has_name(nf.body, f, name)))
-                .collect();
-            match hits[..] {
-                [one] => Some(one),
-                _ => None,
-            }
-        })
-        .unwrap_or_else(|| end_by_pick(&nf, &own));
+    let chosen = end.and_then(|name| end_named(nf.body, nf.face, &own, name)).unwrap_or_else(|| end_by_pick(&nf, &own));
     Ok(Some(Round::at(placed(&nf.offset, own), chosen)))
+}
+
+/// The end of cylinder `own` (face `face` of `b`) whose rim meets the face called `name` better
+/// than the other end's rim does: the very face, or one merged into it, else a piece of it whose
+/// neighbours have changed (the face round a hole in a sheet is told apart from its other pieces
+/// by the faces around it, and those change when the hole moves). `None` when neither rim, or
+/// both, meet it as well.
+fn end_named(b: &ModelBody, face: usize, own: &CylinderFace, name: &str) -> Option<(f64, f64)> {
+    let names = crate::naming::names(b);
+    let how = |at: f64| {
+        let f = rim_neighbour(b, face, own, at)?;
+        if crate::name_lookup::legacy_name(name).is_some() {
+            return crate::name_lookup::face_has_name(b, f, name).then_some(Match::Exact);
+        }
+        crate::history_names::matches(&names, f, name)
+    };
+    let [start, end] = ends(own);
+    match (how(start.0), how(end.0)) {
+        (s, e) if s > e => Some(start),
+        (s, e) if e > s => Some(end),
+        _ => None,
+    }
 }
 
 /// The x axis an x reference gives a frame at `o` with axis `z` (`None`: no reference).

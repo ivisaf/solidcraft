@@ -179,7 +179,8 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
                 }
             }
             let all: Vec<&str> = all.iter().map(String::as_str).collect();
-            let future = file_parent.clone().add_filter(label, &all).pick_file();
+            // Any other file attaches by reference, so the list is not the only choice.
+            let future = file_parent.clone().add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
             Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
         })),
         pick_program: Some(Box::new(move || {

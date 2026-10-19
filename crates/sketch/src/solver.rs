@@ -21,6 +21,10 @@ use crate::linalg::{Mat, determined_vars, solve as lin_solve};
 use crate::model::{ConstraintKind, CurveKind, Sketch};
 use crate::union_find::{find, union};
 
+#[path = "cursor.rs"]
+mod cursor;
+pub use cursor::move_point_towards;
+
 #[path = "redundancy.rs"]
 mod redundancy;
 pub use redundancy::{CONSISTENT, constraint_residual, determined_by};
@@ -945,6 +949,26 @@ fn lm_capped(
     col: &[usize],
     max_iters: usize,
 ) -> (usize, f64) {
+    // Without a work budget the initial residual is always evaluated.
+    lm_capped_with_budget(sk, lay, blocks, vars, x, col, max_iters, None).unwrap_or((0, f64::INFINITY))
+}
+
+/// Deterministic work units, shared with the frame's decomposition budget. Estimates bound
+/// dense arithmetic; they are not a wall-clock deadline. None means no residual was evaluated.
+fn lm_capped_with_budget(
+    sk: &Sketch,
+    lay: &Layout,
+    blocks: &[(Block, Vec<usize>)],
+    vars: &[usize],
+    x: &mut Vec<f64>,
+    col: &[usize],
+    max_iters: usize,
+    mut budget: Option<&mut Budget>,
+) -> Option<(usize, f64)> {
+    let evaluation_work = if budget.is_some() { residual_work(lay, blocks) } else { 0 };
+    if !within_budget(&mut budget, evaluation_work) {
+        return None;
+    }
     let n = vars.len();
     #[cfg(test)]
     lm_vars::add(n);
@@ -953,7 +977,12 @@ fn lm_capped(
     let mut f = norm2(&r);
     for it in 0..max_iters {
         if max_abs(&r) < TOL {
-            return (it, max_abs(&r));
+            return Some((it, max_abs(&r)));
+        }
+        let normal_work =
+            n.saturating_mul(n).saturating_mul(r.len()).saturating_add(evaluation_work.saturating_mul(n.saturating_mul(2).saturating_add(1)));
+        if !within_budget(&mut budget, normal_work) {
+            return Some((it, max_abs(&r)));
         }
         let (_, j, _) = local_system(sk, lay, blocks, x, col, n);
         // Normal equations of this component.
@@ -979,7 +1008,11 @@ fn lm_capped(
         // the point sliding along it.) A point held on a curve is cheaper still, so it slides
         // rather than the curve's ends moving.
         let weight: Vec<f64> = vars.iter().map(|&v| if lay.slide.get(v).copied().unwrap_or(false) { SLIDE_WEIGHT } else { 1.0 }).collect();
-        for _ in 0..30 {
+        for _attempt in 0..30 {
+            let linear_work = n.saturating_mul(n).saturating_mul(n).saturating_add(evaluation_work);
+            if !within_budget(&mut budget, linear_work) {
+                return Some((it, max_abs(&r)));
+            }
             let mut m = a.clone();
             for (i, w) in weight.iter().enumerate() {
                 m.add(i, i, lambda * w + 1e-12);
@@ -1011,10 +1044,18 @@ fn lm_capped(
             }
         }
         if !improved {
-            return (it, max_abs(&r));
+            return Some((it, max_abs(&r)));
         }
     }
-    (max_iters, max_abs(&r))
+    Some((max_iters, max_abs(&r)))
+}
+
+fn within_budget(budget: &mut Option<&mut Budget>, work: usize) -> bool {
+    budget.as_deref_mut().is_none_or(|b| b.try_charge(work))
+}
+
+fn residual_work(lay: &Layout, blocks: &[(Block, Vec<usize>)]) -> usize {
+    blocks.iter().fold(lay.n.max(1), |work, (_, vars)| work.saturating_add(vars.len().max(1)))
 }
 
 /// The variables LM was given and its runs on this thread, for tests that count what the
@@ -2222,17 +2263,7 @@ fn solve_inner(
         Some(v) => vdet(Some(v)) && vdet(Some(v + 1)),
         None => true,
     };
-    // Driven dimensions measure the solved geometry.
-    let fixed_lay = Layout { pvar: vec![None; sk.points.len()], rvar: vec![None; sk.curves.len()], n: 0, points: 0, slide: Vec::new() };
-    let measured: Vec<Option<f64>> =
-        sk.constraints.iter().map(|c| if c.driven { measure(&State { sk, lay: &fixed_lay, x: &[] }, &c.kind) } else { None }).collect();
-    for (c, m) in sk.constraints.iter_mut().zip(measured) {
-        if let Some(v) = m
-            && v.is_finite()
-        {
-            c.kind.set_value(v);
-        }
-    }
+    refresh_driven_dimensions(sk);
     let (dof, point_determined, curve_determined) = match analysis {
         Analysis::Full => (
             lay.n.saturating_sub(rank),
@@ -2252,6 +2283,21 @@ fn solve_inner(
         point_determined,
         curve_determined,
         redundant,
+    }
+}
+
+/// Geometry can also be finalized by feasible cursor motion, without another solve.
+/// Both paths must measure reference dimensions from the pose they publish.
+fn refresh_driven_dimensions(sk: &mut Sketch) {
+    let fixed_lay = Layout { pvar: vec![None; sk.points.len()], rvar: vec![None; sk.curves.len()], n: 0, points: 0, slide: Vec::new() };
+    let measured: Vec<Option<f64>> =
+        sk.constraints.iter().map(|c| if c.driven { measure(&State { sk, lay: &fixed_lay, x: &[] }, &c.kind) } else { None }).collect();
+    for (c, m) in sk.constraints.iter_mut().zip(measured) {
+        if let Some(v) = m
+            && v.is_finite()
+        {
+            c.kind.set_value(v);
+        }
     }
 }
 

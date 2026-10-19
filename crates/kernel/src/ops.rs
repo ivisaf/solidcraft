@@ -15,6 +15,9 @@ use crate::{KernelError, Result, guard, record};
 #[path = "bore_union_tests.rs"]
 mod bore_union_tests;
 
+#[path = "tool_reseam.rs"]
+mod tool_reseam;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BoolOp {
@@ -572,6 +575,13 @@ fn boolean_untimed(a: &Body, b: &Body, op: BoolOp) -> Result<Option<Body>> {
         }
     }
     let r = boolean_via(a, b, op, &boolean_whole);
+    if r.is_err()
+        && op == BoolOp::Cut
+        && !APART.with(|c| c.get())
+        && let Some(result) = tool_reseam::cut(a, b)
+    {
+        return Ok(Some(result));
+    }
     if r.is_ok() || !crate::tangent_cylinders::needed(a, b) {
         return r;
     }
@@ -1186,6 +1196,18 @@ fn boolean_whole_with_refinement(a: &Body, b: &Body, op: BoolOp, refine: bool) -
                 return Ok(Some(body));
             }
         }
+        // A lens cut from a sphere's projected outline carries a redundant cylinder
+        // tangent to the sphere (#2750). Remove it only after proving that it
+        // encloses the entire target, keeping the other wall and both caps exact.
+        if attempt == 1 && op == BoolOp::Cut {
+            let (lens, diagnostics) = capture_boolean_diagnostics(|| crate::sphere_lens::cut(a, b, &boolean_whole));
+            if let Some(Ok(result)) = lens
+                && result.as_ref().is_none_or(|body| check(body).0)
+            {
+                merge(diagnostics);
+                return Ok(result);
+            }
+        }
         // A whole turn of a cylinder or cone bounded by one wire along its seam (as STEP files
         // write them) can't be divided by a loop lying inside it, and the tries below end in a
         // nudged tool, or fail: the same boolean with such faces in two halves, which is exact.
@@ -1676,7 +1698,7 @@ fn det3(m: &[[f64; 4]; 4]) -> f64 {
 }
 
 /// Whether the linear part is a rigid motion (rotation or reflection: no scale or shear).
-fn rigid_placement(m: &[[f64; 4]; 4]) -> bool {
+pub(crate) fn rigid_placement(m: &[[f64; 4]; 4]) -> bool {
     let r = [Vec3::new(m[0][0], m[0][1], m[0][2]), Vec3::new(m[1][0], m[1][1], m[1][2]), Vec3::new(m[2][0], m[2][1], m[2][2])];
     (0..3).all(|i| (r[i].dot(r[i]) - 1.0).abs() < 1e-9) && r[0].dot(r[1]).abs() < 1e-9 && r[0].dot(r[2]).abs() < 1e-9 && r[1].dot(r[2]).abs() < 1e-9
 }

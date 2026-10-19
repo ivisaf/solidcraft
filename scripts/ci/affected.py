@@ -28,6 +28,8 @@ FULL_FILES = ("Cargo.toml", "Cargo.lock")
 IGNORED_PREFIXES = ("docs/", "packaging/")
 # Root files that a crate embeds (include_str!), so they are not ignorable documentation.
 EMBEDDED = {"ATTRIBUTION.md": "solidcraft-ui-egui"}
+# Asset folders that only some packages read: the UI embeds the catalogs, xtask checks them.
+EMBEDDED_PREFIXES = {"assets/locales/": ("solidcraft-ui-egui", "xtask")}
 
 
 def load_metadata(path):
@@ -76,6 +78,8 @@ def select(meta, paths):
             hit.add(by_dir[max(owners, key=len)])
         elif path in EMBEDDED:
             hit.add(EMBEDDED[path])
+        elif any(path.startswith(p) for p in EMBEDDED_PREFIXES):
+            hit.update(next(v for p, v in EMBEDDED_PREFIXES.items() if path.startswith(p)))
         elif path.startswith(IGNORED_PREFIXES) or ("/" not in path and path.endswith(".md")):
             continue
         else:

@@ -40,6 +40,7 @@ mod component_link;
 mod config;
 mod file;
 mod inspect;
+mod interference;
 pub(crate) mod joints;
 mod libraries;
 mod material_properties;

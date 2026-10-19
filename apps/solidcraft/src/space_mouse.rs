@@ -362,25 +362,31 @@ fn reader(ctx: Context, shared: Arc<Mutex<Reading>>) {
 fn start_driver_client(ctx: &Context, shared: &Arc<Mutex<Reading>>) {
     use solidcraft_3dx_client::Event;
     let (ctx, shared) = (ctx.clone(), Arc::clone(shared));
-    let started = solidcraft_3dx_client::start("SolidCraft", move |event| match event {
-        Event::DeviceAdded => DRIVER_CONNECTED.store(true, Ordering::Relaxed),
-        Event::DeviceRemoved => {
-            DRIVER_CONNECTED.store(false, Ordering::Relaxed);
-            reset(&ctx, &shared);
-        }
-        Event::Axes { translation, rotation } => {
-            if let Ok(mut reading) = shared.lock() {
-                let now = Instant::now();
-                reading.axes = Axes { translation, rotation };
-                reading.at = [now; 6];
-                ctx.request_repaint();
+    let started = solidcraft_3dx_client::start(
+        "SolidCraft",
+        move |event| match event {
+            Event::DeviceAdded => DRIVER_CONNECTED.store(true, Ordering::Relaxed),
+            Event::DeviceRemoved => {
+                DRIVER_CONNECTED.store(false, Ordering::Relaxed);
+                reset(&ctx, &shared);
             }
-        }
-        Event::Buttons(_) => {}
-    });
-    match started {
-        Ok(()) => DRIVER_REGISTERED.store(true, Ordering::Relaxed),
-        Err(error) => log::info!("3D mouse: no driver client: {error}"),
+            Event::Axes { translation, rotation } => {
+                if let Ok(mut reading) = shared.lock() {
+                    let now = Instant::now();
+                    reading.axes = Axes { translation, rotation };
+                    reading.at = [now; 6];
+                    ctx.request_repaint();
+                }
+            }
+            Event::Buttons(_) => {}
+        },
+        |connected| match connected {
+            Ok(()) => DRIVER_REGISTERED.store(true, Ordering::Relaxed),
+            Err(error) => log::info!("3D mouse: no driver client: {error}"),
+        },
+    );
+    if let Err(error) = started {
+        log::info!("3D mouse: no driver client: {error}");
     }
 }
 
@@ -619,7 +625,10 @@ mod tests {
             wheel: WheelGuard::default(),
             started: now,
         };
-        mouse.tick_at(&mut app, &Context::default(), now);
+        // A window that has run a frame with focus, as the app's always has by now.
+        let ctx = Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        mouse.tick_at(&mut app, &ctx, now);
         let DeviceMotion { motion, seconds } = app.viewport.device_motion.expect("the frame hands the page its motion");
         assert_eq!(motion, Motion { translation: [0.0; 3], rotation: [0.0, 0.0, -1.0] });
         assert!(seconds > 0.0);

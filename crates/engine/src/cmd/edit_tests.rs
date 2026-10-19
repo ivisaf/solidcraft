@@ -8,6 +8,28 @@ fn run(s: &mut Session, id: &str, params: Value) -> Value {
     s.execute(id, &params).unwrap_or_else(|e| panic!("{id} {params}: {e}"))
 }
 
+/// `timeline.roll_to` takes a number of features or "end"; any other value is refused instead of
+/// silently moving the marker to the end.
+#[test]
+fn roll_to_takes_a_number_or_end_and_refuses_anything_else() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 20, "operation": "join"}));
+    for cmd in ["timeline.roll_to", "timeline.rollback"] {
+        assert_eq!(run(&mut s, cmd, json!({"position": 1}))["marker"], 1);
+        assert_eq!(run(&mut s, cmd, json!({"position": "end"}))["marker"], 2);
+        assert_eq!(run(&mut s, cmd, json!({"position": "1"}))["marker"], 1, "a number in a string is still a number");
+        assert_eq!(run(&mut s, cmd, json!({"position": "END"}))["marker"], 2);
+        run(&mut s, cmd, json!({"position": 1}));
+        for bad in [json!("start"), json!("first"), json!([1]), json!({"n": 1}), json!(true), json!("NaN")] {
+            let e = s.execute(cmd, &json!({"position": bad})).unwrap_err().to_string();
+            assert!(e.contains("`position` must be a number") && e.contains("\"end\""), "{bad}: {e}");
+            assert_eq!(s.doc.marker, Some(1), "{bad}: the refused call left the marker where it was");
+        }
+        assert_eq!(run(&mut s, cmd, json!({}))["marker"], 2, "omitted: the end");
+    }
+}
+
 #[test]
 fn g2_fillet_survives_edit_undo_and_reopen() {
     use solidcraft_doc::{Document, FeatureKind, FilletStyle};
@@ -521,4 +543,134 @@ fn edit_refuses_unknown_fields() {
     assert!(e.contains("unknown field `flip`") && e.contains("`combine`") && e.contains("`plane.name`"), "{e}");
     let def = run(&mut s, "timeline.inspect", json!({"feature": "Twin"}))["definition"].clone();
     assert_eq!(def["combine"], json!(true), "{def}");
+}
+
+fn suppressed(s: &Session, name: &str) -> bool {
+    s.doc.find_feature(name).unwrap().suppressed
+}
+
+/// timeline.suppress takes `features: [..]` as timeline.delete does, as one undo step; it used to
+/// refuse it ("`feature` must be an id or name").
+#[test]
+fn suppress_takes_a_list_of_features_as_one_undo_step() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "name": "A"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [20, 0, 0], "name": "B"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 10, "height": 10, "corner": [40, 0, 0], "name": "C"}));
+    let id = |s: &Session, name: &str| s.doc.find_feature(name).unwrap().id;
+    let undo = s.undo.len();
+    let a = id(&s, "A");
+    let r = run(&mut s, "timeline.suppress", json!({"features": [a, "B"], "suppressed": true}));
+    assert_eq!(r, json!({"features": [id(&s, "A"), id(&s, "B")], "suppressed": true}));
+    assert!(suppressed(&s, "A") && suppressed(&s, "B") && !suppressed(&s, "C"));
+    assert_eq!(s.undo.len(), undo + 1, "one undo step");
+    assert_eq!(s.model.state().bodies.len(), 1);
+    run(&mut s, "edit.undo", json!({}));
+    assert!(!suppressed(&s, "A") && !suppressed(&s, "B"));
+    assert_eq!(s.model.state().bodies.len(), 3);
+
+    // Toggling several: all suppressed unless all already are, then all unsuppressed.
+    run(&mut s, "timeline.suppress", json!({"feature": "A"}));
+    run(&mut s, "timeline.suppress", json!({"features": ["A", "B", "C"]}));
+    assert!(suppressed(&s, "A") && suppressed(&s, "B") && suppressed(&s, "C"));
+    run(&mut s, "timeline.suppress", json!({"features": ["A", "B", "C"]}));
+    assert!(!suppressed(&s, "A") && !suppressed(&s, "B") && !suppressed(&s, "C"));
+    // `feature` and `features` together; a repeat counts once.
+    let r = run(&mut s, "timeline.suppress", json!({"feature": "C", "features": ["C", "B"], "suppressed": true}));
+    assert_eq!(r["features"], json!([id(&s, "C"), id(&s, "B")]), "{r}");
+    assert!(!suppressed(&s, "A") && suppressed(&s, "B") && suppressed(&s, "C"));
+    // A single `feature` replies as before.
+    let r = run(&mut s, "timeline.suppress", json!({"feature": "C", "suppressed": false}));
+    assert_eq!(r, json!({"feature": id(&s, "C"), "suppressed": false}));
+
+    // An unknown feature in the list refuses the whole command, as do no features at all.
+    let before = (*s.doc).clone();
+    let undo = s.undo.len();
+    for bad in [
+        json!({"features": ["A", "Nope"], "suppressed": true}),
+        json!({"features": []}),
+        json!({}),
+        json!({"features": [{}]}),
+        json!({"features": ["A"], "suppressed": "yes"}),
+    ] {
+        assert!(s.execute("timeline.suppress", &bad).is_err(), "{bad}");
+    }
+    assert_eq!(*s.doc, before);
+    assert_eq!(s.undo.len(), undo);
+    // timeline.delete takes either.
+    run(&mut s, "timeline.delete", json!({"feature": "C"}));
+    run(&mut s, "timeline.delete", json!({"features": ["B"]}));
+    assert!(s.doc.find_feature("B").is_none() && s.doc.find_feature("C").is_none());
+}
+
+/// The value at a dotted path of a definition.
+fn dotted<'a>(def: &'a Value, path: &str) -> &'a Value {
+    path.split('.').fold(def, |v, k| &v[k])
+}
+
+/// The lowest Z of the design's first body.
+fn low_z(s: &mut Session) -> f64 {
+    let m = run(s, "inspect.measure", json!({}));
+    let min = &m["bodies"][0]["bbox"]["min"];
+    min[2].as_f64().or_else(|| min["z"].as_f64()).unwrap_or_else(|| panic!("{m}"))
+}
+
+/// timeline.edit takes the dotted keys its unknown-field message lists (`plane.distance`), and
+/// numbers for expressions, as the feature commands do; both used to be refused.
+#[test]
+fn edit_takes_dotted_keys_and_numbers_for_expressions() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 5, "name": "S"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5, "name": "Pad"}));
+    let def = |s: &mut Session, f: &str| run(s, "timeline.inspect", json!({"feature": f}))["definition"].clone();
+
+    run(&mut s, "timeline.edit", json!({"feature": "S", "set": {"plane.distance": "8 mm"}}));
+    assert_eq!(def(&mut s, "S")["plane"]["distance"], json!("8 mm"));
+    assert!((low_z(&mut s) - 8.0).abs() < 1e-9);
+    // A bare number is mm, as in sketch.create's `offset`.
+    run(&mut s, "timeline.edit", json!({"feature": "S", "set": {"plane.distance": 12}}));
+    assert_eq!(def(&mut s, "S")["plane"]["distance"], json!("12"));
+    assert!((low_z(&mut s) - 12.0).abs() < 1e-9);
+    run(&mut s, "timeline.edit", json!({"feature": "S", "set": {"plane": {"distance": 3.5}}}));
+    assert_eq!(def(&mut s, "S")["plane"]["distance"], json!("3.5"));
+    // The nested form works as before.
+    run(&mut s, "timeline.edit", json!({"feature": "S", "set": {"plane": {"distance": "4"}}}));
+    assert!((low_z(&mut s) - 4.0).abs() < 1e-9);
+
+    // Every field the unknown-field message lists is accepted as it is written there.
+    let e = s.execute("timeline.edit", &json!({"feature": "S", "set": {"plane.dist": "1"}})).unwrap_err().to_string();
+    assert!(e.contains("unknown field `plane.dist`") && e.contains("`plane.distance`"), "{e}");
+    let e = s.execute("timeline.edit", &json!({"feature": "S", "set": {"nope": "1"}})).unwrap_err().to_string();
+    let listed: Vec<&str> = e.split('`').skip(3).step_by(2).collect();
+    assert!(listed.contains(&"plane.distance") && listed.contains(&"plane.type"), "{e}");
+    // Not the sketch geometry, which timeline.inspect leaves out and the sketch commands edit.
+    assert!(!listed.iter().any(|k| k.starts_with("sketch")), "{e}");
+    let now = def(&mut s, "S");
+    for key in listed {
+        let value = dotted(&now, key).clone();
+        run(&mut s, "timeline.edit", json!({"feature": "S", "set": {key: value}}));
+    }
+    assert_eq!(def(&mut s, "S"), now);
+
+    // Numbers on an extrude, also for an expression the definition leaves out.
+    run(&mut s, "timeline.edit", json!({"feature": "Pad", "set": {"extent.distance": 20, "extent": {"taper": 0}}}));
+    let d = def(&mut s, "Pad");
+    assert_eq!((&d["extent"]["distance"], &d["extent"]["taper"]), (&json!("20"), &json!("0")), "{d}");
+    let volume = run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((volume - 2000.0).abs() < 1e-6, "{volume}");
+
+    // Still refused: a field given twice, unknown dotted fields, a number for a name.
+    let before = (*s.doc).clone();
+    for (set, says) in [
+        (json!({"plane.distance": "1", "plane": {"distance": "2"}}), "given twice"),
+        (json!({"plane.wobble": "1"}), "unknown field `plane.wobble`"),
+        (json!({"plane.distance.x": "1"}), "invalid feature"),
+        (json!({"plane.base.name": 5}), "invalid feature"),
+    ] {
+        let e = s.execute("timeline.edit", &json!({"feature": "S", "set": set})).unwrap_err().to_string();
+        assert!(e.contains(says), "{set}: {e}");
+    }
+    assert_eq!(*s.doc, before);
 }

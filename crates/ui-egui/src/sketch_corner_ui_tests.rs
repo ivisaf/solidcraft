@@ -226,6 +226,86 @@ fn corner_window_takes_the_corner_then_applies_the_typed_size() {
     }
 }
 
+/// #2420: the shared corner window shows the design unit, including both chamfer legs.
+#[test]
+fn corner_defaults_show_design_units() {
+    for units in ["mm", "cm", "m", "in", "ft"] {
+        for command in ["sketch.fillet", "sketch.chamfer.equal_distance", "sketch.chamfer.two_distance", "sketch.chamfer.distance_angle"] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.run("document.units", json!({"units": units})).unwrap();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.step(&json!({"start":command})).unwrap();
+            let Some(crate::dialogs::Kind::SketchModify(crate::sketch_modify_ui::Mod::Corner { size, distance2, angle, .. })) =
+                h.app.dialog.as_ref().map(|d| &d.kind)
+            else {
+                panic!("{command}: no corner window");
+            };
+            assert_eq!(size, &format!("2 {units}"), "{command}");
+            assert_eq!(distance2, &format!("2 {units}"), "{command}");
+            assert_eq!(angle, "45 deg", "length units must not change angles");
+        }
+    }
+}
+
+/// A typed inch radius must reach both corner selection routes as a persistent dimension.
+#[test]
+fn fillet_window_reads_design_units_and_preserves_explicit_units_and_parameters() {
+    for (units, text, radius) in
+        [("in", "0.25", 6.35), ("cm", "0.25", 2.5), ("mm", "0.25", 0.25), ("in", "2 mm", 2.0), ("mm", "0.25 in", 6.35), ("in", "rounding", 3.0)]
+    {
+        for lines in [false, true] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.preferences.length_decimals = 4;
+            h.app.run("document.units", json!({"units":units})).unwrap();
+            h.app.run("parameters.add", json!({"name":"rounding", "expression":"3 mm"})).unwrap();
+            h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+            h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
+            // Keep the outer size fixed when the driving radius changes.
+            h.app.run("sketch.dimension", json!({"entities":["l1"],"value":"40 mm"})).unwrap();
+            h.app.run("sketch.dimension", json!({"entities":["l2"],"value":"30 mm"})).unwrap();
+            h.frames(2);
+            h.step(&json!({"start":"sketch.fillet"})).unwrap();
+            if lines {
+                for point in [[25, 0, 0], [40, 15, 0]] {
+                    h.step(&json!({"click":{"world":point}})).unwrap();
+                }
+            } else {
+                h.step(&json!({"click":{"world":[40,0,0]}})).unwrap();
+            }
+            retype(&mut h, "dialog:Radius", text);
+            apply(&mut h);
+            assert!(h.app.dialog.is_none(), "{units}, {text}, lines {lines}: {:?}", h.app.status);
+            let check = |session: &solidcraft_engine::Session, expected: f64| {
+                let state = session.world_state();
+                let ss = state.sketch(1).unwrap();
+                let arc = ss
+                    .sketch
+                    .curves
+                    .iter()
+                    .find_map(|c| match c.kind {
+                        CurveKind::Arc { c: center, a: start, .. } => Some(ss.sketch.point(center).unwrap().dist(ss.sketch.point(start).unwrap())),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!((arc - expected).abs() < 1e-6, "{units}, {text}, lines {lines}: radius {arc}, expected {expected}");
+                let area = 1200.0 - expected * expected * (1.0 - std::f64::consts::PI / 4.0);
+                assert!(
+                    (ss.profiles[0].area - area).abs() < 1e-6,
+                    "{units}, {text}, lines {lines}: area {}, expected {area}, radius {expected}",
+                    ss.profiles[0].area
+                );
+            };
+            check(&h.app.session, radius);
+            if text == "rounding" {
+                h.app.run("parameters.change", json!({"name":"rounding", "expression":"4 mm"})).unwrap();
+                check(&h.app.session, 4.0);
+            }
+            let reopened = solidcraft_engine::Session::new(solidcraft_engine::doc::Document::from_json(&h.app.session.doc.to_json()).unwrap());
+            check(&reopened, if text == "rounding" { 4.0 } else { radius });
+        }
+    }
+}
+
 /// The window's reason to exist: a chamfer angle other than the 45 degrees the command used to
 /// receive hard-coded. 10 mm along the first line at 30 degrees puts the second cut at
 /// 10 * sin 30 / sin 60 mm, where 45 degrees would put it at 10 mm.
