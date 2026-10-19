@@ -864,6 +864,15 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         }
         // Facing the stock: from its top down to the top of the part.
         (CamOperationKind::Face { .. }, Some((_, hi))) if matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
+        // A sketch below the part's top (an outline drawn on its floor): cut from the top of the
+        // material, the stock's or else the part's, down to the sketch.
+        (_, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) && at.part.is_some_and(|(_, hi)| g.z < hi.z - 1e-6) => {
+            (stock_top.or(at.part.map(|(_, hi)| hi.z)).map(|t| t.max(g.z)), Some(g.z))
+        }
+        // A sketch on the part's top: a contour or holes go through the part; a pocket's depth is the user's.
+        (CamOperationKind::Contour { .. } | CamOperationKind::Drill { .. }, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) => {
+            (Some(g.z), at.part.map(|(lo, _)| lo.z).filter(|lo| *lo < g.z - 1e-6))
+        }
         _ => (Some(g.z), None),
     };
     let height = |what: &str, given: &Option<Expr>, auto: Option<f64>| match given {
@@ -871,7 +880,23 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
     };
     let top = height("top", &op.top, auto_top)?;
-    let bottom = height("bottom", &op.bottom, auto_bottom)?;
+    let shown = |z: f64| format!("{} mm", (z * 1e3).round() / 1e3);
+    let bottom = match (&op.bottom, auto_bottom) {
+        (None, None) => {
+            return Err(fail(format!(
+                "`bottom` is required: how deep it cuts, in the setup's Z (zero at its work origin; the top is at {})",
+                shown(top)
+            )));
+        }
+        _ => height("bottom", &op.bottom, auto_bottom)?,
+    };
+    if bottom > top + 1e-9 {
+        return Err(fail(format!(
+            "the bottom ({}) is above the top ({}); heights are in the setup's Z, zero at its work origin",
+            shown(bottom),
+            shown(top)
+        )));
+    }
     let heights = Heights {
         clearance: height("clearance", &op.clearance, Some(g.body_z.map_or(top, |(_, hi)| hi.max(top)).max(stock_top.unwrap_or(top)) + 10.0))?,
         retract: height("retract", &op.retract, Some(top + 2.0))?,

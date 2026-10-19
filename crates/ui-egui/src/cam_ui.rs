@@ -418,7 +418,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             editing: None,
             name: String::new(),
             // Faces, and the stock a facing operation covers, give the heights themselves.
-            bottom: if faces.is_empty() && !(kind == OpKind::Face && has_bodies) { "-5 mm".into() } else { String::new() },
+            // With a body, heights come from it and the sketch; without one, a first depth to change.
+            bottom: if faces.is_empty() && !has_bodies { "-5 mm".into() } else { String::new() },
             faces,
             sketch,
             tool: first_tool.clone(),
@@ -1204,7 +1205,8 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             let (top, bottom) = match (from_faces, on_stock) {
                 (true, _) => ("from the faces", "from the faces"),
                 (_, true) => ("the stock's top", "the part's top"),
-                _ => ("the sketch plane", "-5 mm"),
+                _ if f.kind == OpKind::Pocket => ("the sketch plane", "required: the pocket's floor"),
+                _ => ("the sketch, or the material's top above it", "the sketch, or through the part"),
             };
             field(ui, "Top", &mut f.top, top);
             field(ui, "Bottom", &mut f.bottom, bottom);

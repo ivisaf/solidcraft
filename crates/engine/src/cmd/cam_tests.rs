@@ -861,3 +861,33 @@ fn hostile_cam_params_never_panic() {
         }
     }
 }
+
+/// Heights from a sketch follow the part and the work origin: an outline on the part's floor is
+/// cut from the material's top down to it, holes sketched on its top go through it, and a pocket
+/// asks for its depth; heights out of order say what they are.
+#[test]
+fn sketch_heights_follow_the_part_and_the_work_origin() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Outline"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Holes"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [15, 20], "radius": 6}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "drill", "diameter": 5, "spindle_rpm": 3000, "feed": 150}));
+    // Work origin on the top of the stock, 1 mm above the part: the part spans -11 … -1.
+    run(&mut s, "cam.setup.create", json!({"stock": {"top": 1}, "origin": {"of": "stock"}}));
+
+    let contour = run(&mut s, "cam.op.contour", json!({"sketch": "Outline", "tool": 1}));
+    close(contour["lowest_z"].as_f64().unwrap(), -11.0, 1e-9);
+    let drill = run(&mut s, "cam.op.drill", json!({"sketch": "Holes", "tool": 2}));
+    close(drill["lowest_z"].as_f64().unwrap(), -11.0, 1e-9);
+
+    let err = s.execute("cam.op.pocket", &json!({"sketch": "Holes", "tool": 1})).unwrap_err().to_string();
+    assert!(err.contains("`bottom` is required") && err.contains("-1 mm"), "{err}");
+    let err = s.execute("cam.op.pocket", &json!({"sketch": "Holes", "tool": 1, "bottom": -0.5})).unwrap_err().to_string();
+    assert!(err.contains("the bottom (-0.5 mm) is above the top (-1 mm)"), "{err}");
+    close(run(&mut s, "cam.op.pocket", json!({"sketch": "Holes", "tool": 1, "bottom": -4}))["lowest_z"].as_f64().unwrap(), -4.0, 1e-9);
+}
