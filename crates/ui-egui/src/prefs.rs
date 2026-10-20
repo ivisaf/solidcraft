@@ -336,6 +336,11 @@ pub struct Prefs {
     /// Draw the parts browser on a translucent card over the 3D view instead of a column of its
     /// own, so the workspace keeps the whole window width.
     pub browser_float: bool,
+    /// Manufacture: how finely a simulation looks at the stock, and how toolpaths are drawn
+    /// (line width and colour), as indices into the Manufacture panel's choices.
+    pub cam_sim_detail: usize,
+    pub cam_path_width: usize,
+    pub cam_path_colour: usize,
     /// The wheel zooms toward the point under the cursor (else toward the view's centre).
     pub zoom_to_cursor: bool,
     /// Spread discrete wheel input across frames (off: apply each event immediately).
@@ -474,6 +479,9 @@ impl Default for Prefs {
             timeline_left_browser_collapsed: false,
             browser_width: DEFAULT_BROWSER_WIDTH,
             browser_float: false,
+            cam_sim_detail: 1,
+            cam_path_width: 1,
+            cam_path_colour: 0,
             zoom_to_cursor: true,
             smooth_wheel_zoom: true,
             trackpad_pan: true,

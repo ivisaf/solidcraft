@@ -315,7 +315,8 @@ pub struct Comparison {
 /// How each column of the cut `stock` stands against the `part` (both over the same columns):
 /// negative, the depth cut into the part; positive, the thickness left on it; zero, neither.
 /// A column is compared with the part's columns around it too, so an edge that falls one column
-/// over is neither a gouge nor leftover.
+/// over is neither a gouge nor leftover; past the field's border there is no part (its floor),
+/// so a part edge on the border is treated the same.
 pub fn deviations(stock: &HeightField, part: &HeightField) -> Result<Vec<f64>> {
     if stock.nx != part.nx || stock.ny != part.ny || stock.z.len() != part.z.len() {
         return invalid("the stock and the part are not on the same columns");
@@ -328,11 +329,10 @@ pub fn deviations(stock: &HeightField, part: &HeightField) -> Result<Vec<f64>> {
             let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
             for (di, dj) in (-1i64..=1).flat_map(|di| (-1i64..=1).map(move |dj| (di, dj))) {
                 let (ni, nj) = (i as i64 + di, j as i64 + dj);
-                if ni < 0 || nj < 0 {
-                    continue;
-                }
-                if let Some(p) = part.get(ni as usize, nj as usize) {
-                    (lowest, highest) = (lowest.min(p), highest.max(p));
+                let p = if ni < 0 || nj < 0 { None } else { part.get(ni as usize, nj as usize) };
+                match p {
+                    Some(p) => (lowest, highest) = (lowest.min(p), highest.max(p)),
+                    None => lowest = lowest.min(part.floor),
                 }
             }
             out.push(if h < lowest - tol {

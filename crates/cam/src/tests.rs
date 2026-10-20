@@ -820,3 +820,23 @@ fn reader_reports_what_it_cannot_read() {
     assert_eq!(parse("%\n(a comment) ; another\nN10 g0 x1 y2 (inline) z3\n").unwrap(), vec![Move::Rapid { to: Vec3::new(1.0, 2.0, 3.0) }]);
     assert_eq!(parse("G20 G0 X1 Y0 Z0\nG1 X2 F10").unwrap().last(), Some(&Move::Feed { to: Vec3::new(50.8, 0.0, 0.0), feed: 254.0 }));
 }
+
+#[test]
+fn a_part_edge_on_the_stock_s_border_is_no_gouge() {
+    // A part as large as the stock: its last row of columns has its centre on the part's edge.
+    let mut part = HeightField::block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(10.0, 10.0, 0.0), 1.0).unwrap();
+    part.z.iter_mut().for_each(|z| *z = 0.0);
+    // A contour round it took the border row down to the floor.
+    let mut stock = part.clone();
+    for i in 0..stock.nx {
+        if let Some(z) = stock.z.get_mut((stock.ny - 1) * stock.nx + i) {
+            *z = -10.0;
+        }
+    }
+    assert_eq!(compare(&stock, &part).unwrap().max_gouge, 0.0);
+    // Two rows in, it is one.
+    if let Some(z) = stock.z.get_mut((stock.ny - 3) * stock.nx + 5) {
+        *z = -10.0;
+    }
+    assert_eq!(compare(&stock, &part).unwrap().max_gouge, 10.0);
+}

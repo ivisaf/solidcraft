@@ -24,6 +24,33 @@ const AXES: [&str; 7] = ["+z", "-z", "+x", "-x", "+y", "-y", "custom"];
 const ANCHORS: [&str; 3] = ["min", "center", "max"];
 /// What the work origin is on.
 const ORIGINS: [&str; 3] = ["stock box", "part box", "world point"];
+/// Toolpath line widths: a name and the cutting moves' width in points (rapids are thinner).
+const PATH_WIDTHS: [(&str, f32); 3] = [("thin", 1.0), ("normal", 1.5), ("thick", 2.5)];
+/// Toolpath colours, from the theme (rapids keep the warning colour, so it is not offered).
+const PATH_COLOURS: [&str; 3] = ["blue", "green", "white"];
+
+/// The colour of cutting moves.
+fn path_colour(index: usize) -> egui::Color32 {
+    let t = Tokens::get();
+    match index {
+        1 => t.sketch_accent,
+        2 => t.text,
+        _ => t.accent,
+    }
+}
+
+/// A small drop-down of `options` after a label; `true` when the choice changed.
+fn small_choice(ui: &mut egui::Ui, id: &str, label: &str, help_label: &str, index: &mut usize, options: &[&str]) -> bool {
+    let before = *index;
+    explained(ui.label(label), help_label, None);
+    egui::ComboBox::from_id_salt(id).selected_text(options.get(*index).copied().unwrap_or_default()).width(70.0).show_ui(ui, |ui| {
+        for (i, o) in options.iter().enumerate() {
+            ui.selectable_value(index, i, *o);
+        }
+    });
+    *index != before
+}
+
 /// The simulation's detail: a name and how many columns along the stock's longer side.
 const SIM_DETAIL: [(&str, u32); 3] = [("coarse", 150), ("normal", 300), ("fine", 700)];
 /// Most toolpath segments drawn.
@@ -333,8 +360,12 @@ pub struct CamUi {
     pub show_stock: bool,
     /// Counts changes of `stock` (the viewport redraws when it moves on).
     stock_stamp: u64,
-    /// How finely the simulation looks at the stock: index into [`SIM_DETAIL`].
+    /// How finely the simulation looks at the stock: index into [`SIM_DETAIL`]. Kept with the
+    /// preferences, like the toolpaths' width and colour (indices into [`PATH_WIDTHS`] and
+    /// [`PATH_COLOURS`]).
     pub sim_detail: usize,
+    pub path_width: usize,
+    pub path_colour: usize,
     /// The setup last simulated (simulated again when the detail changes).
     simulated: Option<u64>,
     /// The design revision a program was last written at, and whether that is the revision now.
@@ -382,6 +413,8 @@ impl Default for CamUi {
             show_stock: true,
             stock_stamp: 0,
             sim_detail: 1,
+            path_width: 1,
+            path_colour: 0,
             simulated: None,
             posted_at: None,
             posted_now: false,
@@ -1119,13 +1152,17 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
         _ => None,
     };
     let back = if preview.is_some() { 0.3 } else { 1.0 };
+    let prefs = &app.preferences;
+    let (width, colour) = (PATH_WIDTHS.get(prefs.cam_path_width).map_or(1.5, |w| w.1), path_colour(prefs.cam_path_colour));
+    // Rapids stay thin and in the warning colour.
+    let rapid = (width * 0.66).max(1.0);
     for (from, to, cutting) in segments(app, proj) {
-        let stroke = if cutting { Stroke::new(1.5, t.accent.gamma_multiply(back)) } else { Stroke::new(1.0, t.warning.gamma_multiply(0.7 * back)) };
+        let stroke = if cutting { Stroke::new(width, colour.gamma_multiply(back)) } else { Stroke::new(rapid, t.warning.gamma_multiply(0.7 * back)) };
         painter.line_segment([from, to], stroke);
     }
     for (a, b) in preview.into_iter().flat_map(|path| path.iter().zip(path.iter().skip(1))).take(MAX_SEGMENTS) {
         if let (Some(from), Some(to)) = (proj.to_screen(a.0), proj.to_screen(b.0)) {
-            let stroke = if b.1 { Stroke::new(2.5, t.accent) } else { Stroke::new(1.2, t.warning) };
+            let stroke = if b.1 { Stroke::new(width + 1.0, colour) } else { Stroke::new(rapid + 0.2, t.warning) };
             painter.line_segment([from, to], stroke);
         }
     }
@@ -1170,6 +1207,8 @@ fn help(label: &str) -> Option<&'static str> {
         "Faces" => "Picked faces of the part: they give the outline and the heights.",
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
+        "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
+        "Toolpath width" => "How thick toolpaths are drawn. Kept for the next start.",
         "Simulation detail" => "How finely the simulation looks at the stock. Fine shows the cut closer to the toolpaths and takes longer.",
         "Bottom" => "How deep it cuts: the lowest height, in the setup's Z (zero at the work zero; below it is negative).",
         "Cut" => "Whether the tool may run over the boundary or stays inside it.",
@@ -2034,27 +2073,20 @@ fn manufacture_window(
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Tool Library…").clicked() {
                     cam.tools_open = true;
                 }
                 ui.checkbox(&mut cam.show_paths, "Toolpaths");
+                let widths = PATH_WIDTHS.map(|w| w.0);
+                small_choice(ui, "sc_cam_path_colour", "Colour", "Toolpath colour", &mut cam.path_colour, &PATH_COLOURS);
+                small_choice(ui, "sc_cam_path_width", "Width", "Toolpath width", &mut cam.path_width, &widths);
                 ui.checkbox(&mut cam.show_setups, "Stock and origin");
                 if cam.stock.is_some() {
                     ui.checkbox(&mut cam.show_stock, "Simulated stock");
                     // Finer shows the cut stock closer to the toolpaths, and takes longer.
-                    let before = cam.sim_detail;
                     let detail = SIM_DETAIL.map(|d| d.0);
-                    explained(ui.label("Detail"), "Simulation detail", None);
-                    egui::ComboBox::from_id_salt("sc_cam_sim_detail")
-                        .selected_text(detail.get(cam.sim_detail).copied().unwrap_or_default())
-                        .width(80.0)
-                        .show_ui(ui, |ui| {
-                            for (i, d) in detail.iter().enumerate() {
-                                ui.selectable_value(&mut cam.sim_detail, i, *d);
-                            }
-                        });
-                    if cam.sim_detail != before {
+                    if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
                         asked.simulate = cam.simulated;
                     }
                 }
@@ -2199,6 +2231,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if app.manufacture.form.is_none() {
         app.manufacture.form_seen = None;
     }
+    // The display choices are preferences, kept between runs.
+    let prefs = &app.preferences;
+    (app.manufacture.sim_detail, app.manufacture.path_width, app.manufacture.path_colour) =
+        (prefs.cam_sim_detail, prefs.cam_path_width, prefs.cam_path_colour);
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
         manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
@@ -2208,6 +2244,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         let beside = if cam.open { right - cam.panel.map_or(crate::frame::DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
         tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
     }
+    (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =
+        (cam.sim_detail, cam.path_width, cam.path_colour);
     app.manufacture = cam;
     answer(app, asked);
 }

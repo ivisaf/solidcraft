@@ -848,3 +848,21 @@ fn an_operation_on_picked_faces_opens_again_with_them() {
     assert_eq!(f.faces.len(), 1);
     assert!(missing(&form, &Choices::default()).iter().all(|n| n.field != "Sketch"), "{:?}", missing(&form, &Choices::default()));
 }
+
+#[test]
+fn display_choices_are_kept_with_the_preferences() {
+    let mut h = sketched();
+    h.app.start("cam.list");
+    h.frames(1);
+    assert_eq!((h.app.manufacture.sim_detail, h.app.manufacture.path_width, h.app.manufacture.path_colour), (1, 1, 0));
+    // They are preferences: saved and read again, the panel has them.
+    (h.app.preferences.cam_sim_detail, h.app.preferences.cam_path_width, h.app.preferences.cam_path_colour) = (2, 2, 1);
+    h.frames(1);
+    assert_eq!((h.app.manufacture.sim_detail, h.app.manufacture.path_width, h.app.manufacture.path_colour), (2, 2, 1));
+    let saved = serde_json::to_value(&h.app.preferences).unwrap();
+    let mut again = Harness::new();
+    again.app.load_prefs(&json!({ "preferences": saved }).to_string());
+    again.app.start("cam.list");
+    again.frames(1);
+    assert_eq!((again.app.manufacture.sim_detail, again.app.manufacture.path_width, again.app.manufacture.path_colour), (2, 2, 1));
+}
