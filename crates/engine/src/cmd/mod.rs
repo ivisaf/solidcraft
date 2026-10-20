@@ -23,7 +23,7 @@ macro_rules! planned {
 mod bom;
 mod browser;
 mod cam;
-pub use cam::cam_heights;
+pub use cam::{cam_heights, cam_selection_heights};
 pub(crate) mod clearance;
 mod clipboard;
 mod compare;

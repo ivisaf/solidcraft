@@ -915,3 +915,43 @@ fn forms_learn_which_heights_an_operation_finds_by_itself() {
     assert!(crate::cam_heights(&s, "cam.setup.create", &json!({})).is_err());
     assert!(s.doc.manufacture.setups[0].operations.is_empty());
 }
+
+#[test]
+fn a_hole_s_wall_gives_its_circle_and_its_depth() {
+    let mut s = machined_plate();
+    // The through hole of 4 mm at (5, 35): its wall runs from the top (0) to the bottom (-10).
+    let wall = json!([{"point": [7, 35, -5]}]);
+    let um = |v: Option<f64>| v.map(|v| (v * 1e3).round() / 1e3);
+    let (top, bottom) = crate::cam_heights(&s, "cam.op.drill", &json!({"faces": wall})).unwrap();
+    assert_eq!((um(top), um(bottom)), (Some(0.0), Some(-10.0)));
+    let (top, bottom) = crate::cam_heights(&s, "cam.op.pocket", &json!({"faces": wall})).unwrap();
+    assert_eq!((um(top), um(bottom)), (Some(0.0), Some(-10.0)));
+    // Nothing typed: the drill goes to the wall's foot at the hole's centre.
+    run(&mut s, "cam.op.drill", json!({"faces": wall, "tool": 2, "spindle_rpm": 3000, "feed": 200}));
+    let path = run(&mut s, "cam.toolpath", json!({}));
+    let cuts: Vec<[f64; 3]> = path["operations"][0]["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p[3].as_bool() == Some(true))
+        .map(|p| [p[0].as_f64().unwrap(), p[1].as_f64().unwrap(), p[2].as_f64().unwrap()])
+        .collect();
+    let low = cuts.iter().fold([0.0, 0.0, f64::INFINITY], |m, p| if p[2] < m[2] { *p } else { m });
+    assert!((low[0] - 5.0).abs() < 1e-6 && (low[1] - 35.0).abs() < 1e-6 && (low[2] + 10.0).abs() < 1e-3, "{low:?}");
+}
+
+#[test]
+fn a_selection_s_heights_are_read_in_the_setup() {
+    let mut s = machined_plate();
+    let heights = |s: &Session, sel: Vec<crate::Sel>| crate::cam_selection_heights(s, &json!({}), &sel).unwrap();
+    let v = |x: f64, y: f64, z: f64| crate::Sel::Vertex { body: "Body1".into(), point: solidcraft_geom::Vec3::new(x, y, z) };
+    assert_eq!(heights(&s, vec![v(0.0, 0.0, -10.0)]), Some((-10.0, -10.0)));
+    assert_eq!(heights(&s, vec![v(0.0, 0.0, -10.0), v(10.0, 10.0, -4.0)]), Some((-10.0, -4.0)));
+    // A whole body reaches from its foot to its top; things that are not geometry give nothing.
+    let body = heights(&s, vec![crate::Sel::Body { name: "Body1".into() }]).unwrap();
+    assert!((body.0 + 10.0).abs() < 1e-6 && body.1.abs() < 1e-6, "{body:?}");
+    assert_eq!(heights(&s, vec![crate::Sel::Feature { id: 1 }]), None);
+    // In a setup whose zero is at the part's bottom, the same point is 10 mm higher.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "origin": {"of": "part", "x": "min", "y": "min", "z": "min"}}));
+    assert_eq!(heights(&s, vec![v(0.0, 0.0, -10.0)]).map(|(lo, _)| (lo * 1e3).round() / 1e3), Some(0.0));
+}

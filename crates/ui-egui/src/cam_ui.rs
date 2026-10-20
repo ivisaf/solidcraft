@@ -335,6 +335,8 @@ pub struct CamUi {
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
     /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
     heights: Option<(u64, &'static str, Value, Heights)>,
+    /// How high the selection reaches, for the design revision and the setup and selection asked about.
+    selection_heights: Option<(u64, Value, Option<(f64, f64)>)>,
 }
 
 impl Default for CamUi {
@@ -363,6 +365,7 @@ impl Default for CamUi {
             stock_stamp: 0,
             cache: None,
             heights: None,
+            selection_heights: None,
         }
     }
 }
@@ -889,6 +892,27 @@ fn form_heights(app: &mut SolveApp) -> Option<Heights> {
     Some(h)
 }
 
+/// How high the selection reaches in the open operation form's setup, worked out again when the
+/// design or the selection changes.
+fn picked_heights(app: &mut SolveApp) -> Option<(f64, f64)> {
+    let Some(Form::Op(f)) = &app.manufacture.form else { return None };
+    if app.session.selection.is_empty() {
+        return None;
+    }
+    let setup = f.editing.as_ref().map_or(json!({}), |e| json!({ "setup": e.setup }));
+    let key = json!({ "setup": setup, "selection": app.session.selection });
+    let revision = app.session.revision;
+    if let Some((r, k, h)) = &app.manufacture.selection_heights
+        && *r == revision
+        && *k == key
+    {
+        return *h;
+    }
+    let h = solidcraft_engine::cam_selection_heights(&app.session, &setup, &app.session.selection).ok().flatten();
+    app.manufacture.selection_heights = Some((revision, key, h));
+    h
+}
+
 /// Simulates the first setup (what the toolbar's Simulate does).
 pub fn simulate(app: &mut SolveApp) {
     match app.session.doc.manufacture.setups.first().map(|s| s.id) {
@@ -1077,6 +1101,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Faces" => "Picked faces of the part: they give the outline and the heights.",
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
+        "From selection" => {
+            "Click an edge, a point or a face of the model (the bottom circle of a hole, say), then take its height for Top or Bottom here."
+        }
         "Bottom" => "How deep it cuts: the lowest height, in the setup's Z (zero at the work zero; below it is negative).",
         "Cut" => "Whether the tool may run over the boundary or stays inside it.",
         "Over by" | "Inside by" => "How far over or inside the boundary the tool goes.",
@@ -1218,6 +1245,8 @@ struct Choices {
     /// The top and bottom the open operation form's geometry gives by itself (`None`: to be
     /// given), or why there are none; not known while the form names no geometry.
     heights: Option<Heights>,
+    /// How high the selection reaches in the open operation form's setup: lowest and highest point.
+    picked: Option<(f64, f64)>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -1257,7 +1286,7 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             },
         ));
     }
-    Choices { sketches, tools, data, heights: None }
+    Choices { sketches, tools, data, heights: None, picked: None }
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
@@ -1361,6 +1390,25 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             let given = lists_heights(choices);
             field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)));
             field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)));
+            // Heights taken from the model: whatever is selected (an edge, a point, a face).
+            row_label(ui, "From selection", None);
+            match choices.picked {
+                Some((lo, hi)) => {
+                    let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
+                    ui.horizontal(|ui| {
+                        if ui.small_button(format!("Top {}", mm(hi))).on_hover_text("Start cutting at the highest point of the selection").clicked() {
+                            f.top = mm(hi);
+                        }
+                        if ui.small_button(format!("Bottom {}", mm(lo))).on_hover_text("Cut down to the lowest point of the selection").clicked() {
+                            f.bottom = mm(lo);
+                        }
+                    });
+                }
+                None => {
+                    explained(ui.label(RichText::new("select an edge, a point or a face").color(Tokens::get().text_dim)), "From selection", None);
+                }
+            }
+            ui.end_row();
             if f.kind != OpKind::Drill {
                 field(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter");
             }
@@ -1932,6 +1980,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let library = library_listing(app, false);
     let mut lists = choices(app, &listed, &library);
     lists.heights = form_heights(app);
+    lists.picked = picked_heights(app);
     // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());

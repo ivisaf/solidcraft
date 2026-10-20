@@ -646,7 +646,7 @@ fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
 fn missing_rows_follow_the_form() {
     let tools = vec![("1".to_string(), "T1  D6 flat".to_string())];
     let data = vec![("1".to_string(), ToolData { diameter: 6.0, flutes: 2, ..ToolData::default() })];
-    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None };
+    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None, picked: None };
     let fields = |form: &Form, lists: &Choices| missing(form, lists).into_iter().map(|n| n.field).collect::<Vec<_>>();
     // No sketch to cut, and a tool without speed or feed of its own.
     let mut h = sketched();
@@ -663,7 +663,7 @@ fn missing_rows_follow_the_form() {
     op.chip_load = "0.03".into();
     op.flutes = 2;
     op.sketch = "Pocket".into();
-    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())) };
+    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())), picked: None };
     let need = missing(&Form::Op(op), &failing);
     assert_eq!(need, vec![Need { field: "", why: "no closed profile".into() }]);
     assert_eq!(need_text(&need), "no closed profile");
@@ -679,4 +679,26 @@ fn missing_rows_follow_the_form() {
     setup.origin = 2;
     setup.point[1].clear();
     assert_eq!(fields(&Form::Setup(setup), &lists), ["Origin Y"]);
+}
+
+#[test]
+fn heights_are_taken_from_the_selection() {
+    let mut h = lab();
+    h.app.run("sketch.create", json!({"plane": "XY", "name": "Plate"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.pocket");
+    h.frames(2);
+    assert!(h.widget("select an edge, a point or a face").is_some(), "with nothing selected the row says what to do");
+    // A corner at the plate's foot: Bottom takes its height.
+    let corner = solidcraft_engine::geom::Vec3::new(0.0, 0.0, -10.0);
+    h.app.session.selection = vec![solidcraft_engine::Sel::Vertex { body: "Body1".into(), point: corner }];
+    h.frames(2);
+    h.step(&json!({"widget": "Bottom -10 mm"})).unwrap();
+    h.frames(1);
+    let Some(Form::Op(op)) = &h.app.manufacture.form else { panic!("the form stays open") };
+    assert_eq!(op.bottom, "-10 mm");
 }

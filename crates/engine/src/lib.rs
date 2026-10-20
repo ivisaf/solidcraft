@@ -33,7 +33,7 @@ use serde_json::Value;
 use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
-pub use cmd::{CommandInfo, CommandSpec, auto_operation, cam_heights, command_specs, extrude_reach, find_command};
+pub use cmd::{CommandInfo, CommandSpec, auto_operation, cam_heights, cam_selection_heights, command_specs, extrude_reach, find_command};
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
 pub use solidcraft_doc::Visibility;
