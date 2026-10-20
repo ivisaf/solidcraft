@@ -1930,6 +1930,15 @@ fn manufacture_window(
                                 asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
                             }
                         });
+                        // On a line of its own, under the operation's buttons.
+                        if let Some(w) = op.get("warning").and_then(Value::as_str) {
+                            ui.horizontal(|ui| {
+                                ui.add_space(24.0);
+                                ui.label(RichText::new(w).color(t.warning)).on_hover_text(
+                                    "The toolpath runs into the part. Simulate shows where; change the operation's heights or geometry.",
+                                );
+                            });
+                        }
                     }
                     // The setup's whole program: the one thing everything here leads to.
                     ui.add_space(6.0);

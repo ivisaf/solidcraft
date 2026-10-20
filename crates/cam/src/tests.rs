@@ -278,6 +278,54 @@ fn ramps_replace_plunges_into_material() {
     assert!(pocket(&regions, &tool(6.0), &PocketParams { ramp_angle: 2.0, ..params }, &c).is_err());
 }
 
+/// A 60 × 40 plate with its top at 0 and a boss of radius 12 at (30, 20) rising to 12, seen from above.
+fn plate_with_boss(cell: f64) -> HeightField {
+    let p = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    let mut tris = vec![[p(0.0, 0.0, 0.0), p(60.0, 0.0, 0.0), p(60.0, 40.0, 0.0)], [p(0.0, 0.0, 0.0), p(60.0, 40.0, 0.0), p(0.0, 40.0, 0.0)]];
+    let n = 64;
+    for k in 0..n {
+        let at = |k: usize| {
+            let a = 2.0 * PI * k as f64 / n as f64;
+            p(30.0 + 12.0 * a.cos(), 20.0 + 12.0 * a.sin(), 12.0)
+        };
+        tris.push([p(30.0, 20.0, 12.0), at(k), at(k + 1)]);
+    }
+    HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), cell, -1.0, &tris).unwrap()
+}
+
+#[test]
+fn facing_goes_round_what_rises_above_its_passes() {
+    let part = plate_with_boss(0.25);
+    assert_eq!(part.at(v(30.0, 20.0)), 12.0);
+    assert_eq!(part.at(v(5.0, 5.0)), 0.0);
+    assert_eq!(part.at(v(70.0, 5.0)), -1.0);
+    // From a stock top at 13 down to the plate's top, passes 4.33 apart.
+    let c = Cut {
+        heights: Heights { clearance: 25.0, retract: 15.0, top: 13.0, bottom: 0.0 },
+        feeds: Feeds { cut: 800.0, plunge: 300.0 },
+        stepdown: 5.0,
+    };
+    let params = FaceParams { stepover: 4.0, inside: false, margin: 3.0 };
+    let t = tool(6.0);
+    // Facing alone runs through the boss; round it, the tool's edge stays off it.
+    let straight = face(v(0.0, 0.0), v(60.0, 40.0), &t, &params, &c).unwrap();
+    assert!(gouge(&straight, &t, &part) > 8.0);
+    let around = face_around(v(0.0, 0.0), v(60.0, 40.0), &t, &params, &c, &part).unwrap();
+    assert_eq!(gouge(&around, &t, &part), 0.0);
+    let near = cutting_points(&around, 12.0).iter().map(|q| v(q.x, q.y).dist(v(30.0, 20.0))).fold(f64::INFINITY, f64::min);
+    assert!((15.0..16.0).contains(&near), "{near}");
+    // The plate round the boss is cut down to its top, out to the area's edges.
+    assert_eq!(around.stats().lowest_z, Some(0.0));
+    let floor: Vec<Vec3> = cutting_points(&around, 0.1).into_iter().filter(|q| q.z == 0.0).collect();
+    assert!(floor.iter().any(|q| q.x <= -2.9) && floor.iter().any(|q| q.x >= 62.9), "{}", floor.len());
+    // With the part below the bottom, it is facing as it was.
+    let level = Cut { heights: Heights { top: 13.0, bottom: 12.0, ..c.heights }, ..c };
+    assert_eq!(
+        face_around(v(0.0, 0.0), v(60.0, 40.0), &t, &params, &level, &part).unwrap(),
+        face(v(0.0, 0.0), v(60.0, 40.0), &t, &params, &level).unwrap()
+    );
+}
+
 #[test]
 fn face_cuts_over_the_boundary_or_stays_inside_it() {
     let c =

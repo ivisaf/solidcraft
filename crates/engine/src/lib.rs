@@ -234,6 +234,9 @@ pub struct Session {
     world_cache: std::sync::Mutex<Option<WorldCache>>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
+    /// `cam.list` as it was last worked out, for the revision and the document it was for: the
+    /// Manufacture panel asks for it every frame, and it builds every toolpath.
+    cam_list_cache: std::sync::Mutex<Option<(u64, Arc<solidcraft_doc::Document>, serde_json::Value)>>,
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
     /// scratch copies): a body that did not change or move is not measured again.
     clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
@@ -375,6 +378,7 @@ impl Session {
             world_cache: Default::default(),
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
+            cam_list_cache: Default::default(),
             clearance_cache: Default::default(),
             clipboard: Vec::new(),
             sketch_clipboard: None,
@@ -847,6 +851,7 @@ impl Session {
             world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
             occurrence_visibility_cache: Default::default(),
             removed_later_cache: Default::default(),
+            cam_list_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),

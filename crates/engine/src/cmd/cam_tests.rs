@@ -955,3 +955,48 @@ fn a_selection_s_heights_are_read_in_the_setup() {
     run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "origin": {"of": "part", "x": "min", "y": "min", "z": "min"}}));
     assert_eq!(heights(&s, vec![v(0.0, 0.0, -10.0)]).map(|(lo, _)| (lo * 1e3).round() / 1e3), Some(0.0));
 }
+
+/// A 60 × 40 plate with its top at 0, a boss of radius 12 at (30, 20) up to 12, a 6 mm end
+/// mill, and a setup with a millimetre of stock on top.
+fn plate_with_boss() -> Session {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Boss"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [30, 20], "radius": 12}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Boss", "distance": 12, "operation": "join"}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.setup.create", json!({"stock": {"top": "1 mm"}}));
+    s
+}
+
+#[test]
+fn facing_below_the_part_s_top_goes_round_it_and_cuts_into_it_are_reported() {
+    let mut s = plate_with_boss();
+    // Facing the stock down to the plate: the boss stays, the plate round it is cut to its top.
+    run(&mut s, "cam.op.face", json!({"tool": 1, "bottom": 0, "stepover": 4}));
+    let points = run(&mut s, "cam.toolpath", json!({}))["operations"][0]["points"].clone();
+    let cuts: Vec<[f64; 3]> = points
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p[3].as_bool() == Some(true))
+        .map(|p| [p[0].as_f64().unwrap(), p[1].as_f64().unwrap(), p[2].as_f64().unwrap()])
+        .collect();
+    let near = cuts.iter().filter(|p| p[2] < 12.0).map(|p| (p[0] - 30.0).hypot(p[1] - 20.0)).fold(f64::INFINITY, f64::min);
+    assert!(near >= 15.0, "{near}");
+    assert!(cuts.iter().any(|p| p[2].abs() < 1e-9), "down to the plate's top");
+    // A pocket over the boss's sketch box goes through it: the listing says so; facing does not.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Over"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 5], "p1": [50, 35]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Over", "tool": 1, "top": 12, "bottom": 2}));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let ops = listed["setups"][0]["operations"].as_array().unwrap();
+    assert!(ops[0].get("warning").is_none(), "{}", ops[0]);
+    let warning = ops[1]["warning"].as_str().unwrap();
+    assert!(warning.starts_with("cuts up to 10.") && warning.ends_with("mm into the part"), "{warning}");
+}

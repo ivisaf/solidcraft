@@ -18,6 +18,8 @@ const MAX_TOOLS: usize = toollib::MAX_TOOLS;
 const MAX_SETUPS: usize = 100;
 const MAX_OPERATIONS: usize = 1000;
 const MAX_NAME: usize = 128;
+/// Least depth into the part `cam.list` warns of (mm): a column of the part's height field either way.
+const GOUGE_REPORTED: f64 = 0.05;
 /// Most selected items a form's heights are read from.
 const MAX_SELECTED: usize = 10_000;
 /// Chord error allowed where spline profiles are followed (mm).
@@ -93,7 +95,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "ACTIONS")
         .icon("cam_setup")
         .noundo()
-        .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it"),
+        .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it; warning: how deep it cuts into the part, when it does"),
     CommandSpec::new("cam.toolpath", "Show Toolpaths", toolpath).at("MANUFACTURE", "ACTIONS").icon("cam_contour").noundo().params(
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
@@ -858,6 +860,28 @@ fn round_wall(body: &solidcraft_doc::ModelBody, index: usize) -> Option<solidcra
     solidcraft_kernel::cylinder_face(&body.body, &body.mesh(), index)
 }
 
+/// The bodies seen from above in a setup, over `lo`–`hi` in its work coordinates; `floor` where
+/// there is nothing. `None` without bodies, or when the bodies are too detailed to look at.
+fn part_field(s: &Session, at: &Resolved, lo: Vec2, hi: Vec2, floor: f64) -> Option<cam::HeightField> {
+    let state = s.model.state();
+    let mut triangles = Vec::new();
+    for body in &state.bodies {
+        let mesh = body.mesh();
+        for t in &mesh.triangles {
+            let corner = |k: usize| t.get(k).and_then(|v| mesh.positions.get(*v as usize)).map(|p| at.frame.local(*p));
+            if let (Some(a), Some(b), Some(c)) = (corner(0), corner(1), corner(2)) {
+                triangles.push([a, b, c]);
+            }
+        }
+    }
+    if triangles.is_empty() || !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let size = (hi.x - lo.x).max(hi.y - lo.y);
+    let cell = (size / 300.0).max(0.05);
+    cam::HeightField::of_triangles(lo, hi, cell, floor, &triangles).ok()
+}
+
 /// What an operation cuts, as far as the heights it finds by itself go.
 #[derive(Clone, Copy)]
 enum OpShape {
@@ -977,7 +1001,14 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 None if *inside => 0.0,
                 None => tool.radius(),
             };
-            cam::face(min, max, tool, &cam::FaceParams { stepover: len("stepover", stepover)?, inside: *inside, margin }, &cut)
+            let params = cam::FaceParams { stepover: len("stepover", stepover)?, inside: *inside, margin };
+            // The part seen from above round the area, so that passes below its top go round it.
+            let reach = margin + tool.diameter;
+            let around = Vec2::new(reach, reach);
+            match part_field(s, at, min - around, max + around, cut.heights.bottom - 1.0) {
+                Some(part) => cam::face_around(min, max, tool, &params, &cut, &part),
+                None => cam::face(min, max, tool, &params, &cut),
+            }
         }
         CamOperationKind::Contour { side, climb, stock_to_leave, ramp_angle } => {
             let params = ContourParams {
@@ -1444,11 +1475,33 @@ fn op_remove(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
+    if let Ok(cache) = s.cam_list_cache.lock()
+        && let Some((revision, doc, listed)) = cache.as_ref()
+        && *revision == s.revision
+        && std::sync::Arc::ptr_eq(doc, &s.doc)
+    {
+        return Ok(listed.clone());
+    }
+    let listed = list_now(s);
+    if let Ok(mut cache) = s.cam_list_cache.lock() {
+        *cache = Some((s.revision, s.doc.clone(), listed.clone()));
+    }
+    Ok(listed)
+}
+
+fn list_now(s: &Session) -> Value {
     let m = &s.doc.manufacture;
     let setups: Vec<Value> = m
         .setups
         .iter()
         .map(|setup| {
+            // The part seen from above, to tell an operation that cuts into it.
+            let part = resolve(s, setup).ok().and_then(|at| {
+                let (lo, hi) = at.part?;
+                let reach = m.tools.iter().map(|t| t.diameter).fold(1.0, f64::max);
+                let around = Vec2::new(reach, reach);
+                part_field(s, &at, Vec2::new(lo.x, lo.y) - around, Vec2::new(hi.x, hi.y) + around, lo.z - 1.0)
+            });
             let ops: Vec<Value> = setup
                 .operations
                 .iter()
@@ -1458,7 +1511,16 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     v["inputs"] = v["kind"].take();
                     v["kind"] = json!(op.kind.label());
                     match build(s, setup, op) {
-                        Ok(path) => v["toolpath"] = stats_json(&path),
+                        Ok(path) => {
+                            v["toolpath"] = stats_json(&path);
+                            let depth = match (&part, m.tool(op.tool)) {
+                                (Some(part), Some(tool)) => cam::gouge(&path, tool, part),
+                                _ => 0.0,
+                            };
+                            if depth > GOUGE_REPORTED {
+                                v["warning"] = json!(format!("cuts up to {depth:.2} mm into the part"));
+                            }
+                        }
                         Err(e) => v["error"] = json!(e.to_string()),
                     }
                     v
@@ -1479,7 +1541,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
             v
         })
         .collect();
-    Ok(json!({ "tools": m.tools.iter().map(tool_json).collect::<Vec<_>>(), "setups": setups, "posts": Post::BUILTIN }))
+    json!({ "tools": m.tools.iter().map(tool_json).collect::<Vec<_>>(), "setups": setups, "posts": Post::BUILTIN })
 }
 
 fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {

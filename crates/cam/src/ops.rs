@@ -10,6 +10,7 @@ use crate::check::verify;
 use crate::offset::{Shape, reversed};
 use crate::path::{MAX_MOVES, Move, Toolpath};
 use crate::piece::Piece;
+use crate::sim::HeightField;
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
 
@@ -305,6 +306,111 @@ pub struct FaceParams {
 /// past) and the outer passes have the tool's edge on the area's edge. Inside it, the tool
 /// never leaves the area.
 pub fn face(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -> Result<Toolpath> {
+    let rows = face_rows(min, max, tool, params, cut)?;
+    let mut b = Builder::new(cut);
+    for z in cut.levels()? {
+        b.travel_to(Vec2::new(rows.x0, rows.y(0)))?;
+        b.plunge_to(z)?;
+        for k in 0..rows.count {
+            let y = rows.y(k);
+            let (from, to) = if k % 2 == 0 { (rows.x0, rows.x1) } else { (rows.x1, rows.x0) };
+            b.cut_to(Vec2::new(from, y), z)?;
+            b.cut_to(Vec2::new(to, y), z)?;
+        }
+        b.retract()?;
+    }
+    b.finish()
+}
+
+/// Where a facing operation's passes run: along X from `x0` to `x1`, `count` rows from `y0` up.
+struct FaceRows {
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    height: f64,
+    count: usize,
+}
+
+impl FaceRows {
+    fn y(&self, k: usize) -> f64 {
+        self.y0 + self.height * k as f64 / (self.count - 1).max(1) as f64
+    }
+}
+
+/// [`face`] staying out of a part: `part` holds its top seen from above. On each depth pass the
+/// tool's axis keeps out of the columns that rise above the pass within the tool's radius (and
+/// a column's width more), lifting over them along a pass and going round them, or over them
+/// at the clearance height, between passes. Where the part is nowhere above the bottom, this is
+/// [`face`].
+pub fn face_around(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut, part: &HeightField) -> Result<Toolpath> {
+    let rows = face_rows(min, max, tool, params, cut)?;
+    let keep_out = part.dilated(tool.radius() + part.cell)?;
+    const ABOVE: f64 = 1e-4;
+    let bottom = cut.heights.bottom;
+    // Seen along the passes' area: does the part rise above the bottom anywhere?
+    let lo = Vec2::new(rows.x0.min(rows.x1), rows.y0);
+    let hi = Vec2::new(rows.x0.max(rows.x1), rows.y0 + rows.height);
+    let (is, js) = keep_out.range(lo, hi);
+    let intrudes = js.into_iter().any(|j| is.clone().any(|i| keep_out.get(i, j).is_some_and(|z| z > bottom + ABOVE)));
+    if !intrudes {
+        return face(min, max, tool, params, cut);
+    }
+    let step = (part.cell * 0.5).max(1e-3);
+    let clear = |p: Vec2, z: f64| keep_out.at(p) <= z + ABOVE;
+    let line_clear = |a: Vec2, b: Vec2, z: f64| {
+        let n = ((a.dist(b) / step).ceil()).clamp(1.0, 1.0e5) as usize;
+        (0..=n).all(|k| clear(a.lerp(b, k as f64 / n as f64), z))
+    };
+    let span = rows.x1 - rows.x0;
+    let samples = ((span.abs() / step).ceil()).clamp(1.0, 1.0e5) as usize;
+    let mut b = Builder::new(cut);
+    for z in cut.levels()? {
+        let mut down = false;
+        for k in 0..rows.count {
+            let y = rows.y(k);
+            // The stretches of this pass the tool may cut, in the pass's direction.
+            let mut stretches: Vec<(f64, f64)> = Vec::new();
+            let mut open: Option<f64> = None;
+            for n in 0..=samples {
+                let x = rows.x0 + span * n as f64 / samples as f64;
+                match (clear(Vec2::new(x, y), z), open) {
+                    (true, None) => open = Some(x),
+                    (false, Some(start)) => {
+                        // Back to the last clear sample.
+                        let end = x - span / samples as f64;
+                        if (end - start) * span.signum() >= 0.0 {
+                            stretches.push((start, end));
+                        }
+                        open = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = open {
+                stretches.push((start, rows.x1));
+            }
+            if k % 2 == 1 {
+                stretches = stretches.into_iter().rev().map(|(start, end)| (end, start)).collect();
+            }
+            for (from, to) in stretches {
+                let (from, to) = (Vec2::new(from, y), Vec2::new(to, y));
+                let joined = down && b.pos.is_some_and(|q| line_clear(Vec2::new(q.x, q.y), from, z));
+                if !joined {
+                    b.retract()?;
+                    b.travel_to(from)?;
+                    b.plunge_to(z)?;
+                }
+                b.cut_to(from, z)?;
+                b.cut_to(to, z)?;
+                down = true;
+            }
+        }
+        b.retract()?;
+    }
+    b.finish()
+}
+
+fn face_rows(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -> Result<FaceRows> {
     tool.validate()?;
     cut.validate()?;
     check_point(min)?;
@@ -336,20 +442,7 @@ pub fn face(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -
     if !(rows <= MAX_ROWS as f64) {
         return Err(CamError::TooLarge(format!("more than {MAX_ROWS} passes")));
     }
-    let rows = rows as usize;
-    let mut b = Builder::new(cut);
-    for z in cut.levels()? {
-        b.travel_to(Vec2::new(x0, y0))?;
-        b.plunge_to(z)?;
-        for k in 0..rows {
-            let y = y0 + height * k as f64 / (rows - 1).max(1) as f64;
-            let (from, to) = if k % 2 == 0 { (x0, x1) } else { (x1, x0) };
-            b.cut_to(Vec2::new(from, y), z)?;
-            b.cut_to(Vec2::new(to, y), z)?;
-        }
-        b.retract()?;
-    }
-    b.finish()
+    Ok(FaceRows { x0, x1, y0, height, count: rows as usize })
 }
 
 /// Follows the boundaries of `regions` on the chosen side, one loop after the other, each

@@ -17,6 +17,8 @@ use crate::{CamError, Result, invalid};
 pub const MAX_CELLS: usize = 4_000_000;
 /// Most column updates of one simulated toolpath.
 const MAX_WORK: u64 = 4_000_000_000;
+/// Most columns a dilation keeps maxima of (one field per width).
+const MAX_DILATION: usize = 16_000_000;
 /// Half the point angle of a drill (118°), measured from its axis.
 const DRILL_HALF_ANGLE: f64 = 59.0;
 
@@ -59,7 +61,7 @@ impl HeightField {
     }
 
     /// Columns whose centres lie in `lo`–`hi`: index ranges, clipped to the field.
-    fn range(&self, lo: Vec2, hi: Vec2) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+    pub(crate) fn range(&self, lo: Vec2, hi: Vec2) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         let index = |v: f64, n: usize| ((v / self.cell).floor().clamp(0.0, n as f64)) as usize;
         let (i0, i1) = (index(lo.x - self.origin.x, self.nx), index(hi.x - self.origin.x + self.cell, self.nx));
         let (j0, j1) = (index(lo.y - self.origin.y, self.ny), index(hi.y - self.origin.y + self.cell, self.ny));
@@ -70,6 +72,158 @@ impl HeightField {
     pub fn volume(&self) -> f64 {
         self.z.iter().map(|z| (z - self.floor).max(0.0)).sum::<f64>() * self.cell * self.cell
     }
+
+    /// The top of `triangles` seen from above, on columns `cell` wide over `min`–`max`; `floor`
+    /// where none is. A column takes the highest triangle over its centre, and the corners and
+    /// edges of every triangle mark the columns they pass through, so that walls seen edge-on
+    /// are not lost between centres.
+    pub fn of_triangles(min: Vec2, max: Vec2, cell: f64, floor: f64, triangles: &[[Vec3; 3]]) -> Result<HeightField> {
+        let mut f = HeightField::block(min.extend(floor), max.extend(floor + 1.0), cell)?;
+        f.z.iter_mut().for_each(|z| *z = floor);
+        if !(triangles.len() as f64 * 64.0 <= MAX_WORK as f64) {
+            return Err(CamError::TooLarge("the part has too many triangles to look at from above".into()));
+        }
+        let mut work: u64 = 0;
+        for tri in triangles {
+            if !tri.iter().all(|v| v.is_finite()) {
+                continue;
+            }
+            let [a, b, c] = *tri;
+            let lo = Vec2::new(a.x.min(b.x).min(c.x), a.y.min(b.y).min(c.y));
+            let hi = Vec2::new(a.x.max(b.x).max(c.x), a.y.max(b.y).max(c.y));
+            let (is, js) = f.range(lo - Vec2::new(cell, cell), hi);
+            work = work.saturating_add((is.len() * js.len()) as u64);
+            if work > MAX_WORK {
+                return Err(CamError::TooLarge("the part is too detailed to look at from above at this cell size".into()));
+            }
+            // Over each column centre inside the triangle: its height there.
+            let d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+            if d.abs() > 1e-12 {
+                for j in js.clone() {
+                    for i in is.clone() {
+                        let p = f.centre(i, j);
+                        let l1 = ((b.y - c.y) * (p.x - c.x) + (c.x - b.x) * (p.y - c.y)) / d;
+                        let l2 = ((c.y - a.y) * (p.x - c.x) + (a.x - c.x) * (p.y - c.y)) / d;
+                        let l3 = 1.0 - l1 - l2;
+                        if l1 >= -1e-9 && l2 >= -1e-9 && l3 >= -1e-9 {
+                            f.raise(i, j, l1 * a.z + l2 * b.z + l3 * c.z);
+                        }
+                    }
+                }
+            }
+            // Along each edge, at half a column: the columns it passes through.
+            for (p, q) in [(a, b), (b, c), (c, a)] {
+                let n = ((Vec2::new(p.x, p.y).dist(Vec2::new(q.x, q.y)) / (cell * 0.5)).ceil()).clamp(1.0, 1.0e5) as usize;
+                for k in 0..=n {
+                    let t = k as f64 / n as f64;
+                    let v = p + (q - p) * t;
+                    if let Some((i, j)) = f.column(Vec2::new(v.x, v.y)) {
+                        f.raise(i, j, v.z);
+                    }
+                }
+                work = work.saturating_add(n as u64);
+            }
+        }
+        Ok(f)
+    }
+
+    /// The column whose square holds `p`.
+    pub fn column(&self, p: Vec2) -> Option<(usize, usize)> {
+        let (u, v) = ((p.x - self.origin.x) / self.cell, (p.y - self.origin.y) / self.cell);
+        (u >= 0.0 && v >= 0.0 && u < self.nx as f64 && v < self.ny as f64).then_some((u as usize, v as usize))
+    }
+
+    /// The height of the column under `p`; the floor off the field.
+    pub fn at(&self, p: Vec2) -> f64 {
+        self.column(p).and_then(|(i, j)| self.get(i, j)).unwrap_or(self.floor)
+    }
+
+    fn raise(&mut self, i: usize, j: usize, z: f64) {
+        if let Some(c) = self.z.get_mut(j * self.nx + i) {
+            *c = c.max(z);
+        }
+    }
+
+    /// Each column raised to the highest column within `radius` of it: where a tool's axis
+    /// may not go below to stay out of what the field holds.
+    pub fn dilated(&self, radius: f64) -> Result<HeightField> {
+        let reach = (radius / self.cell).ceil().max(0.0);
+        // A row of maxima per width is kept: at most this many columns in all.
+        if !(reach * (self.nx * self.ny) as f64 <= MAX_DILATION as f64) {
+            return Err(CamError::TooLarge("the tool is too large for this cell size".into()));
+        }
+        let reach = reach as usize;
+        // The disc's half-width in columns on the rows `dj` away.
+        let half: Vec<usize> = (0..=reach)
+            .map(|dj| {
+                let dy = (dj as f64 - 1.0).max(0.0) * self.cell;
+                (((radius * radius - dy * dy).max(0.0)).sqrt() / self.cell).ceil() as usize
+            })
+            .collect();
+        // Each row's highest within w columns either side, for every w the disc needs, built one
+        // width from the last: the window w + 1 wide is the windows w wide one column either side.
+        let widest = half.iter().copied().max().unwrap_or(0);
+        let (nx, ny) = (self.nx, self.ny);
+        let mut rows: Vec<Vec<f64>> = vec![self.z.clone()];
+        for _ in 0..widest {
+            let last = rows.last().cloned().unwrap_or_default();
+            let mut next = last.clone();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let left = if i > 0 { last.get(j * nx + i - 1).copied() } else { None };
+                    let right = last.get(j * nx + i + 1).filter(|_| i + 1 < nx).copied();
+                    if let Some(c) = next.get_mut(j * nx + i) {
+                        *c = c.max(left.unwrap_or(f64::NEG_INFINITY)).max(right.unwrap_or(f64::NEG_INFINITY));
+                    }
+                }
+            }
+            rows.push(next);
+        }
+        let mut out = self.clone();
+        for j in 0..ny {
+            for i in 0..nx {
+                let mut top = self.floor;
+                for (dj, w) in half.iter().enumerate() {
+                    let Some(row) = rows.get(*w) else { continue };
+                    for jj in [j.checked_sub(dj), Some(j + dj).filter(|jj| *jj < ny)].into_iter().flatten() {
+                        if let Some(z) = row.get(jj * nx + i) {
+                            top = top.max(*z);
+                        }
+                    }
+                }
+                if let Some(c) = out.z.get_mut(j * nx + i) {
+                    *c = top;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// How deep `path` cuts into the part `part` holds (mm; 0 when it never does): the deepest a
+/// cutting move's tool end goes below the part's top within its radius, less a column's width
+/// either way so that a tool running along a wall is not counted.
+pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
+    let r = (tool.radius() - part.cell * 1.5).max(0.0);
+    let Ok(reach) = part.dilated(r) else { return 0.0 };
+    let step = (part.cell * 0.5).max(1e-3);
+    let mut deepest: f64 = 0.0;
+    let mut samples: u64 = 0;
+    let points = path.points(part.cell * 0.25);
+    for pair in points.windows(2) {
+        let &[(a, _), (b, true)] = pair else { continue };
+        let n = ((Vec2::new(a.x, a.y).dist(Vec2::new(b.x, b.y)) / step).ceil()).clamp(1.0, 1.0e5) as usize;
+        for k in 0..=n {
+            samples += 1;
+            if samples > 2_000_000 {
+                return deepest;
+            }
+            let q = a + (b - a) * (k as f64 / n as f64);
+            let top = reach.at(Vec2::new(q.x, q.y));
+            deepest = deepest.max(top - q.z);
+        }
+    }
+    deepest
 }
 
 /// What one toolpath did to the stock.
