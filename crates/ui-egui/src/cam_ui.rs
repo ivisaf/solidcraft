@@ -366,6 +366,9 @@ pub struct CamUi {
     pub sim_detail: usize,
     pub path_width: usize,
     pub path_colour: usize,
+    /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
+    pub look: PanelLook,
+    pub tools_look: PanelLook,
     /// The setup last simulated (simulated again when the detail changes).
     simulated: Option<u64>,
     /// The design revision a program was last written at, and whether that is the revision now.
@@ -417,6 +420,8 @@ impl Default for CamUi {
             sim_detail: 1,
             path_width: 1,
             path_colour: 0,
+            look: PanelLook { width: 0.0, fade: 1, resizing: false },
+            tools_look: PanelLook { width: 0.0, fade: 1, resizing: false },
             simulated: None,
             posted_at: None,
             posted_now: false,
@@ -1232,6 +1237,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
+        "Panel fade" => {
+            "How see-through these panels' background gets while the pointer is in the 3D view; over a panel, or typing in it, it is solid again. Kept for the next start."
+        }
         "Toolpath width" => "How thick toolpaths are drawn. Kept for the next start.",
         "Simulation detail" => "How finely the simulation looks at the stock. Fine shows the cut closer to the toolpaths and takes longer.",
         "Bottom" => "How deep it cuts: the lowest height, in the setup's Z (zero at the work zero; below it is negative).",
@@ -1774,6 +1782,7 @@ fn drag_header(ui: &egui::Ui, id: &str, band: egui::Rect, offset: &mut egui::Vec
 /// bar, a header row with "−" to fold it, its name and "×" to close it, and a body that scrolls
 /// when it is taller than the viewport. Its header drags it away from the dock (`offset`).
 /// → whether it stays open, and where it was drawn.
+#[allow(clippy::too_many_arguments)]
 fn docked_panel(
     ctx: &egui::Context,
     id: &str,
@@ -1781,11 +1790,23 @@ fn docked_panel(
     dock: Dock,
     folded: &mut bool,
     offset: &mut egui::Vec2,
+    look: &mut PanelLook,
     body: impl FnOnce(&mut egui::Ui),
 ) -> (bool, Option<egui::Rect>) {
     use crate::frame::{DIALOG_WIDE_MAX_W, Side, Width};
     let t = Tokens::get();
-    let frame = crate::frame::dock_frame(ctx, Side::Right);
+    let mut frame = crate::frame::dock_frame(ctx, Side::Right);
+    // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
+    let widest = (dock.viewport.width() - 40.0).max(PANEL_MIN_W);
+    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { DIALOG_WIDE_MAX_W.min(widest) };
+    // The background fades while the pointer is elsewhere and nothing in the panel is being typed into.
+    let last = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
+    let over = ctx.pointer_latest_pos().is_some_and(|p| last.is_some_and(|r| r.expand(6.0).contains(p)));
+    let solid = ctx.animate_bool(egui::Id::new((id, "solid")), over || ctx.egui_wants_keyboard_input() || look.resizing);
+    let faded = PANEL_FADES.get(look.fade).map_or(1.0, |f| f.1);
+    let alpha = faded + (1.0 - faded) * solid;
+    frame.fill = frame.fill.gamma_multiply(alpha);
+    frame.shadow.color = frame.shadow.color.gamma_multiply(alpha);
     let margin = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
     // Kept inside the viewport, as wide as it was last drawn (its top right corner is the anchor).
     let width = ctx.memory(|m| m.area_rect(egui::Id::new(id))).map_or(crate::frame::DIALOG_MIN_W, |r| r.width());
@@ -1797,14 +1818,16 @@ fn docked_panel(
     let max_height = dock.max_height - (anchor.y - dock.anchor.y);
     let mut keep = true;
     let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), anchor, max_height, Width::Wide)
+        .max_width(w)
         .frame(frame)
         .show(ctx, |ui| {
             // Long texts (errors, notes) wrap instead of widening the panel.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            let min_w = 480.0 - margin;
+            let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
             ui.set_min_width(min_w);
-            ui.set_max_width(DIALOG_WIDE_MAX_W - margin);
-            let total = crate::frame::content_width(ui, egui::Id::new((id, "w")), min_w);
+            ui.set_max_width(w - margin);
+            // What it was last frame, but never more than the panel's width now (once dragged narrower).
+            let total = crate::frame::content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
             let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
             drag_header(ui, id, band, offset, anchor - dock.anchor);
             ui.horizontal(|ui| {
@@ -1835,8 +1858,42 @@ fn docked_panel(
             egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
             crate::frame::remember_width(ui, egui::Id::new((id, "w")));
         });
-    (keep, response.map(|r| r.response.rect))
+    let rect = response.map(|r| r.response.rect);
+    // A grip along the left edge: drag to make the panel wider or narrower, double-click for its usual width.
+    look.resizing = false;
+    if let Some(rect) = rect {
+        let grip = egui::Rect::from_min_max(egui::pos2(rect.left() - 4.0, rect.top()), egui::pos2(rect.left() + 3.0, rect.bottom()));
+        egui::Area::new(egui::Id::new((id, "grip"))).order(egui::Order::Foreground).fixed_pos(grip.min).show(ctx, |ui| {
+            let (_, r) = ui.allocate_exact_size(grip.size(), egui::Sense::click_and_drag());
+            if r.hovered() || r.dragged() {
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            if r.dragged() {
+                look.width = (rect.width() - r.drag_delta().x).clamp(PANEL_MIN_W, widest);
+                look.resizing = true;
+            }
+            if r.double_clicked() {
+                look.width = 0.0;
+            }
+            r.on_hover_text("Drag to make the panel wider or narrower; double-click for its usual width");
+        });
+    }
+    (keep, rect)
 }
+
+/// How a panel is shown: its width as dragged (0: its usual width), how far its background
+/// fades while the pointer is elsewhere (index into [`PANEL_FADES`]), and whether it is being resized.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PanelLook {
+    pub width: f32,
+    pub fade: usize,
+    resizing: bool,
+}
+
+/// How far a panel's background fades while the pointer is elsewhere: a name and its opacity.
+const PANEL_FADES: [(&str, f32); 3] = [("off", 1.0), ("light", 0.5), ("strong", 0.25)];
+/// Narrowest a panel is dragged to (points).
+const PANEL_MIN_W: f32 = 400.0;
 
 /// What a window asks for once it has been drawn.
 #[derive(Default)]
@@ -1996,7 +2053,8 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
     let t = Tokens::get();
     let mut folded = cam.tools_folded;
     let mut offset = cam.tools_offset;
-    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, &mut offset, |ui| {
+    let mut look = cam.tools_look;
+    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, &mut offset, &mut look, |ui| {
         {
             // Everything is as wide as the panel, never wider: tables scroll inside it.
             ui.set_max_width(ui.available_width());
@@ -2083,6 +2141,7 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
     });
     cam.tools_folded = folded;
     cam.tools_offset = offset;
+    (cam.tools_look.width, cam.tools_look.resizing) = (look.width, look.resizing);
     cam.tools_open = open;
 }
 
@@ -2099,7 +2158,8 @@ fn manufacture_window(
     let t = Tokens::get();
     let mut folded = cam.folded;
     let mut offset = cam.offset;
-    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, &mut offset, |ui| {
+    let mut look = cam.look;
+    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, &mut offset, &mut look, |ui| {
         {
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
@@ -2112,6 +2172,8 @@ fn manufacture_window(
                 let widths = PATH_WIDTHS.map(|w| w.0);
                 small_choice(ui, "sc_cam_path_colour", "Colour", "Toolpath colour", &mut cam.path_colour, &PATH_COLOURS);
                 small_choice(ui, "sc_cam_path_width", "Width", "Toolpath width", &mut cam.path_width, &widths);
+                let fades = PANEL_FADES.map(|f| f.0);
+                small_choice(ui, "sc_cam_panel_fade", "Fade", "Panel fade", &mut cam.look.fade, &fades);
                 ui.checkbox(&mut cam.show_setups, "Stock and origin");
                 if cam.stock.is_some() {
                     ui.checkbox(&mut cam.show_stock, "Simulated stock");
@@ -2232,6 +2294,8 @@ fn manufacture_window(
     });
     cam.folded = folded;
     cam.offset = offset;
+    // The panel's own changes (its width); the fade is chosen inside it, on `cam` itself.
+    (cam.look.width, cam.look.resizing) = (look.width, look.resizing);
     cam.panel = rect;
     cam.open = open;
 }
@@ -2266,6 +2330,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let prefs = &app.preferences;
     (app.manufacture.sim_detail, app.manufacture.path_width, app.manufacture.path_colour) =
         (prefs.cam_sim_detail, prefs.cam_path_width, prefs.cam_path_colour);
+    (app.manufacture.look.width, app.manufacture.tools_look.width) = (prefs.cam_panel_width, prefs.cam_tools_width);
+    (app.manufacture.look.fade, app.manufacture.tools_look.fade) = (prefs.cam_panel_fade, prefs.cam_panel_fade);
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
         manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
@@ -2277,6 +2343,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =
         (cam.sim_detail, cam.path_width, cam.path_colour);
+    (app.preferences.cam_panel_width, app.preferences.cam_tools_width, app.preferences.cam_panel_fade) =
+        (cam.look.width, cam.tools_look.width, cam.look.fade);
     app.manufacture = cam;
     answer(app, asked);
 }

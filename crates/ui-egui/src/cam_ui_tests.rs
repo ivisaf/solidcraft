@@ -886,3 +886,24 @@ fn an_import_says_what_it_took_and_left_out() {
     assert!(h.widget("Left out tool 3 (V-bit 60°): a vbit is not a kind of tool SolidCraft has yet").is_some());
     assert!(h.widget("T1  6 mm flat end mill").is_some(), "the tool is in the table");
 }
+
+#[test]
+fn panels_are_dragged_wider_and_keep_their_width() {
+    let mut h = sketched();
+    h.app.start("cam.list");
+    h.frames(3);
+    let usual = h.app.manufacture.panel.unwrap();
+    // The grip on the left edge drags the panel 150 wider; its right edge stays docked.
+    let y = usual.center().y as f64;
+    h.step(&json!({"drag": [[usual.left() as f64, y], [usual.left() as f64 - 150.0, y]], "steps": 6})).unwrap();
+    h.frames(3);
+    let wider = h.app.manufacture.panel.unwrap();
+    assert!((wider.width() - usual.width() - 150.0).abs() < 8.0, "{} → {}", usual.width(), wider.width());
+    assert!((wider.right() - usual.right()).abs() < 1.0);
+    assert!((h.app.preferences.cam_panel_width - wider.width()).abs() < 1.0, "kept with the preferences");
+    // A double-click on the grip gives it its usual width again.
+    h.step(&json!({"click": [wider.left() as f64, y], "double": true})).unwrap();
+    h.frames(3);
+    assert_eq!(h.app.preferences.cam_panel_width, 0.0);
+    assert!(h.app.manufacture.panel.unwrap().width() <= crate::frame::DIALOG_WIDE_MAX_W + 1.0);
+}

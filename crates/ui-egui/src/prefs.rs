@@ -341,6 +341,11 @@ pub struct Prefs {
     pub cam_sim_detail: usize,
     pub cam_path_width: usize,
     pub cam_path_colour: usize,
+    /// The Manufacture and Tool Library panels' widths as dragged (0: their docked width), and
+    /// how far their background fades while the pointer is elsewhere (index into the panel's choices).
+    pub cam_panel_width: f32,
+    pub cam_tools_width: f32,
+    pub cam_panel_fade: usize,
     /// The wheel zooms toward the point under the cursor (else toward the view's centre).
     pub zoom_to_cursor: bool,
     /// Spread discrete wheel input across frames (off: apply each event immediately).
@@ -482,6 +487,9 @@ impl Default for Prefs {
             cam_sim_detail: 1,
             cam_path_width: 1,
             cam_path_colour: 0,
+            cam_panel_width: 0.0,
+            cam_tools_width: 0.0,
+            cam_panel_fade: 1,
             zoom_to_cursor: true,
             smooth_wheel_zoom: true,
             trackpad_pan: true,
