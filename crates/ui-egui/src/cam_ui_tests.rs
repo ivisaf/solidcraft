@@ -866,3 +866,23 @@ fn display_choices_are_kept_with_the_preferences() {
     again.frames(1);
     assert_eq!((again.app.manufacture.sim_detail, again.app.manufacture.path_width, again.app.manufacture.path_colour), (2, 2, 1));
 }
+
+#[test]
+fn an_import_says_what_it_took_and_left_out() {
+    let mut h = lab();
+    let file = std::env::temp_dir().join(format!("solidcraft-ui-rp23cnc-{}.json", std::process::id()));
+    let rp = json!({"Tools": [
+        {"Number": 1, "Name": "6 mm flat end mill", "Type": "EndMill", "DiameterMm": 6, "FluteCount": 2},
+        {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1}
+    ]});
+    std::fs::write(&file, rp.to_string()).unwrap();
+    h.app.start("cam.tool.define");
+    h.app.manufacture.form = None;
+    let result = run(&mut h.app, "cam.library.import", json!({ "path": file }));
+    let _ = std::fs::remove_file(&file);
+    imported(&mut h.app, result);
+    h.frames(2);
+    assert!(h.widget("Imported 1 tool(s)").is_some());
+    assert!(h.widget("Left out tool 3 (V-bit 60°): a vbit is not a kind of tool SolidCraft has yet").is_some());
+    assert!(h.widget("T1  6 mm flat end mill").is_some(), "the tool is in the table");
+}

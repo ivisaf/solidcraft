@@ -68,7 +68,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.library.export", "Export Library", library_export).icon("export").noundo().params("path: a file to write the machine's library to; library?"),
     CommandSpec::new("cam.library.import", "Import Library", library_import).icon("import")
         .noundo()
-        .params("path: a tool library file; replace?: bool (default false: tools whose number is taken are skipped); library? → added, replaced, skipped"),
+        .params("path: a tool library file (ours, or an RP23CNC toollibrary.json: its end mills, ball end mills and drills, with their first preset's cutting data); replace?: bool (default false: tools whose number is taken are skipped); library? → added, replaced, skipped, notes: what was left out"),
     CommandSpec::new("cam.tool.export", "Export Tools", tool_export).icon("export").noundo().params("path: a JSON file to write the tool library to"),
     CommandSpec::new("cam.tool.import", "Import Tools", tool_import).icon("import")
         .params("path: a tool library written by cam.tool.export; replace?: bool (default false: tools whose number is taken are skipped) → added, replaced, skipped: tool numbers"),
@@ -369,9 +369,10 @@ fn tool_update(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Reads a library file a command was pointed at.
-fn read_library(path: &str, cmd: &str) -> Result<Vec<Tool>> {
+/// The tools of a library file (ours, or another program's we read), and notes on what was left out.
+fn read_library(path: &str, cmd: &str) -> Result<(Vec<Tool>, Vec<String>)> {
     let bytes = solidcraft_io::vfs::read(path, 16 << 20).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    toollib::parse(&bytes).map_err(|e| bad(cmd, format!("{path}: {e}")))
+    toollib::parse_any(&bytes).map_err(|e| bad(cmd, format!("{path}: {e}")))
 }
 
 /// `incoming` merged into `library`: tools whose number is taken replace it or are skipped. → added, replaced, skipped.
@@ -408,10 +409,11 @@ fn tool_export(s: &mut Session, p: &Value) -> Result<Value> {
 fn tool_import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.tool.import";
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
-    let incoming = read_library(path, cmd)?;
+    let (incoming, notes) = read_library(path, cmd)?;
     let mut library = s.doc.manufacture.tools.clone();
-    let out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
+    let mut out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
     s.doc_mut().manufacture.tools = library;
+    out["notes"] = json!(notes);
     Ok(out)
 }
 
@@ -426,11 +428,12 @@ fn library_export(_: &mut Session, p: &Value) -> Result<Value> {
 fn library_import(_: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.library.import";
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
-    let incoming = read_library(path, cmd)?;
+    let (incoming, notes) = read_library(path, cmd)?;
     let file = library_path(p, cmd)?;
     let mut library = toollib::load(&file)?;
-    let out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
+    let mut out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
     toollib::save(&file, &library)?;
+    out["notes"] = json!(notes);
     Ok(out)
 }
 

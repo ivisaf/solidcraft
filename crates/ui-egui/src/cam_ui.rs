@@ -373,6 +373,8 @@ pub struct CamUi {
     posted_now: bool,
     /// The title of the form last shown (one that opens is scrolled into view).
     form_seen: Option<&'static str>,
+    /// What the last tool import took and left out, shown in the Tool Library window.
+    pub import_notes: Vec<String>,
     /// Setups and operations whose toolpaths are not drawn (the browser's eyes).
     pub hidden: std::collections::BTreeSet<u64>,
     /// The setup and the operation of each toolpath in `cache`, in the same order.
@@ -419,6 +421,7 @@ impl Default for CamUi {
             posted_at: None,
             posted_now: false,
             form_seen: None,
+            import_notes: Vec::new(),
             hidden: Default::default(),
             path_ids: Vec::new(),
             preview: None,
@@ -844,6 +847,27 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         dwell: inputs["dwell"].as_f64().filter(|d| *d > 0.0).map(|d| d.to_string()).unwrap_or_default(),
         coolant: op["coolant"].as_bool().unwrap_or(false),
     })))
+}
+
+/// Says in the Tool Library window what an import took and what it left out.
+pub fn imported(app: &mut SolveApp, result: Result<Value, String>) {
+    match result {
+        Ok(v) => {
+            let count = |k: &str| v[k].as_array().map_or(0, Vec::len);
+            let mut lines = vec![format!("Imported {} tool(s)", count("added") + count("replaced"))];
+            if count("skipped") > 0 {
+                let numbers: Vec<String> = v["skipped"].as_array().into_iter().flatten().map(|n| format!("T{n}")).collect();
+                lines.push(format!("Skipped {}: the library has these numbers already", numbers.join(", ")));
+            }
+            lines.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|n| format!("Left out {n}")));
+            app.manufacture.error = None;
+            app.manufacture.import_notes = lines;
+        }
+        Err(e) => {
+            app.manufacture.error = Some(e);
+            app.manufacture.import_notes.clear();
+        }
+    }
 }
 
 /// Runs a command with this window's tool library, if it has one of its own.
@@ -2042,9 +2066,16 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                     ui.label(RichText::new("Pick a tool to change or remove it").color(t.text_dim));
                 }
                 ui.separator();
-                asked.import = ui.button("Import…").on_hover_text("Add the tools of a library file to this machine's library").clicked();
+                asked.import = ui
+                    .button("Import…")
+                    .on_hover_text("Add the tools of a library file to this machine's library: SolidCraft's own, or an RP23CNC toollibrary.json")
+                    .clicked();
                 asked.export = ui.button("Export…").on_hover_text("Write this machine's library to a file").clicked();
             });
+            for (k, line) in cam.import_notes.iter().enumerate() {
+                let colour = if k == 0 { t.text_dim } else { t.warning };
+                ui.add(egui::Label::new(RichText::new(line).color(colour)).wrap());
+            }
             if matches!(cam.form, Some(Form::Tool(_))) {
                 asked.apply |= form_block(ui, cam, &[], lists);
             }
@@ -2278,7 +2309,8 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
     if asked.import {
         app.pick_open(|app, path| {
             if let Some(path) = path {
-                app.manufacture.error = run(app, "cam.library.import", json!({ "path": path })).err();
+                let result = run(app, "cam.library.import", json!({ "path": path }));
+                imported(app, result);
             }
         });
     }

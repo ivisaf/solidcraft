@@ -1055,3 +1055,33 @@ fn a_contour_round_a_picked_boss_top_stops_at_the_floor_it_stands_on() {
     let over = crate::cam_preview(&s, "cam.op.pocket", &json!({"sketch": "Over", "tool": 1, "top": 12, "bottom": 2})).unwrap();
     assert!(over.warning.is_some_and(|w| w.starts_with("cuts up to 10.")));
 }
+
+#[test]
+fn an_rp23cnc_tool_library_is_imported_with_its_cutting_data() {
+    let mut s = Session::default();
+    let library = library_file("rp23cnc");
+    let file = std::env::temp_dir().join(format!("solidcraft-rp23cnc-{}.json", std::process::id()));
+    let rp = json!({
+        "Tools": [
+            {"Number": 1, "Name": "6 mm flat end mill", "Type": "EndMill", "DiameterMm": 6, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
+            {"Number": 2, "Name": "3 mm flat end mill", "Type": "EndMill", "DiameterMm": 3, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
+            {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1, "VeeAngleDeg": 60, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null}
+        ],
+        "Materials": [{"Name": "Plywood", "Notes": null}],
+        "Presets": [{"Name": "6 mm in plywood", "ToolNumber": 1, "Material": null, "FeedMmMin": 1200, "PlungeMmMin": 400, "SpindleRpm": 18000, "DepthOfCutMm": 3, "StepoverPercent": 40, "Notes": null}]
+    });
+    std::fs::write(&file, rp.to_string()).unwrap();
+    let out = run(&mut s, "cam.library.import", json!({"library": library, "path": file}));
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(out["added"], json!([1, 2]));
+    let notes = out["notes"].as_array().unwrap();
+    assert!(notes.len() == 1 && notes[0].as_str().unwrap().starts_with("tool 3 (V-bit 60°): a vbit"), "{notes:?}");
+    // The preset is tool 1's cutting data; its stepover, 40% of 6 mm.
+    let tools = crate::toollib::load(std::path::Path::new(&library)).unwrap();
+    let t1 = &tools[0];
+    assert_eq!((t1.description.as_str(), t1.diameter, t1.flutes, t1.flute_length), ("6 mm flat end mill", 6.0, 2, 18.0));
+    assert_eq!((t1.spindle_rpm, t1.feed, t1.plunge_feed, t1.stepdown), (Some(18000.0), Some(1200.0), Some(400.0), Some(3.0)));
+    assert!((t1.stepover.unwrap() - 2.4).abs() < 1e-9);
+    assert_eq!((tools[1].diameter, tools[1].feed), (3.0, None));
+    let _ = std::fs::remove_file(&library);
+}
