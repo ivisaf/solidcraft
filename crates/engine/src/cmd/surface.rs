@@ -51,7 +51,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("surface.loft", "Surface Loft", surface_loft)
         .at("SURFACE", "CREATE")
         .icon("surface_loft")
-        .params("sections: [{sketch, curves?: [curve ids], profiles?} | {body, edges: [[x,y,z]]}] (2…50 in order; each one chain: a profile without holes, or curves meeting end to end; all open or all closed; a body edge chain takes the face the chain bounds as the surface the end repeats); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g0: how much of the surface at the first and last section the loft repeats — the tangent plane, the curvature, or how that curvature changes); crown?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); name?, body_name? (a surface body: ruled between two sections, smooth through three or more; no caps)"),
+        .params("sections: [{sketch, curves?: [curve ids], profiles?} | {body, edges: [[x,y,z]]}] (2…50 in order; each one chain: a profile without holes, or curves meeting end to end; all open or all closed; a body edge chain takes the face the chain bounds as the surface the end repeats); continuity?: [g0|g1|g2|g3, g0|g1|g2|g3] (each end, default g0: how much of the surface at the first and last section the loft repeats — the tangent plane, the curvature, or how that curvature changes); crown?: [number, number] (default 0: how full each end leaves, -0.9 flattest to 3 fullest); rails?, rail_fit? (as solid.loft; sketch sections only, both ends g0); name?, body_name? (a surface body: ruled between two sections, smooth through three or more; no caps)"),
     CommandSpec::new("surface.offset", "Offset Surface", offset)
         .at("SURFACE", "CREATE")
         .icon("surface_offset")
@@ -431,7 +431,8 @@ fn surface_loft(s: &mut Session, p: &Value) -> Result<Value> {
             [one(list.first())?, one(list.get(1))?]
         }
     };
-    add_feature(s, p, FeatureKind::SurfaceLoft { sections, continuity, crown })
+    let (rails, rail_fit) = super::features::guide_rails(s, p, cmd, "loft", None)?;
+    add_feature(s, p, FeatureKind::SurfaceLoft { sections, continuity, crown, rails, rail_fit })
 }
 
 fn offset(s: &mut Session, p: &Value) -> Result<Value> {

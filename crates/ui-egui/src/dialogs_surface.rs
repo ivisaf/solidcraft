@@ -27,7 +27,11 @@ pub enum Surf {
         axis: Option<Value>,
     },
     Sweep(crate::dialogs_sweep::SweepOpts),
-    Loft,
+    /// `rail_fit`: how the guide rails reshape the sections (an index into the sweep dialog's
+    /// rail fits).
+    Loft {
+        rail_fit: usize,
+    },
     /// `continuity`: an index into [`PATCH_CONTINUITY`] (for a loop of sketch curves, how much of
     /// the sketch's plane each side repeats; for picked edges, how the surface meets the faces
     /// beside them); `join`: sew the surface into the body of its edges.
@@ -86,7 +90,7 @@ impl Surf {
             Surf::Extrude { .. } => "SURFACE EXTRUDE",
             Surf::Revolve { .. } => "SURFACE REVOLVE",
             Surf::Sweep(_) => "SURFACE SWEEP",
-            Surf::Loft => "SURFACE LOFT",
+            Surf::Loft { .. } => "SURFACE LOFT",
             Surf::Boundary { .. } => "BOUNDARY SURFACE",
             Surf::Patch { .. } => "PATCH",
             Surf::Unstitch => "UNSTITCH",
@@ -144,7 +148,10 @@ fn inputs(k: &Surf) -> Vec<SelInput> {
                 rail2,
             ]
         }
-        Surf::Loft => vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true)],
+        Surf::Loft { .. } => {
+            let [rail, rail2] = crate::dialogs_sweep::rail_inputs();
+            vec![SelInput::new("Sections (one sketch each)", PROFILES | CURVES, true), rail, rail2]
+        }
         Surf::Boundary { .. } => vec![SelInput::new("Curves", CURVES | EDGES, true), SelInput::new("Cross curves", CURVES | EDGES, true)],
         Surf::Patch { .. } => vec![SelInput::new("Boundary", PROFILES | EDGES, true), SelInput::new("Pass through", VERTICES | FACES, true)],
         Surf::Unstitch => vec![SelInput::new("Body, or faces to take out", BODIES | FACES, true)],
@@ -174,7 +181,7 @@ pub fn start(_app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
         "surface.extrude" => Surf::Extrude { distance: "10 mm".into(), direction: 0 },
         "surface.revolve" => Surf::Revolve { angle: "360 deg".into(), symmetric: false, axis: None },
         "surface.sweep" => Surf::Sweep(crate::dialogs_sweep::SweepOpts::default()),
-        "surface.loft" => Surf::Loft,
+        "surface.loft" => Surf::Loft { rail_fit: 0 },
         "surface.boundary" => Surf::Boundary { continuity: 1, join: false },
         "surface.patch" => Surf::Patch { continuity: 0 },
         "surface.unstitch" => Surf::Unstitch,
@@ -304,7 +311,8 @@ pub fn rows(ui: &mut egui::Ui, k: &mut Surf) -> bool {
             ui.end_row();
         }
         Surf::Sweep(opts) => enter |= crate::dialogs_sweep::rows(ui, opts, "ss"),
-        Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal | Surf::Loft => {}
+        Surf::Loft { rail_fit } => crate::dialogs_sweep::rail_fit_row(ui, "sl", rail_fit),
+        Surf::SplitFace | Surf::Unstitch | Surf::ReverseNormal => {}
     }
     enter
 }
@@ -510,7 +518,7 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
             crate::dialogs_sweep::params(app, opts, items(inputs, 2).first(), [items(inputs, 3), items(inputs, 4)], &mut p)?;
             ("surface.sweep", p)
         }
-        Surf::Loft => {
+        Surf::Loft { rail_fit } => {
             need(0, "the sections, one sketch each")?;
             // One section per sketch, in the order the sketches were first picked.
             let st = app.session.world_state();
@@ -536,7 +544,9 @@ pub fn commands(app: &SolveApp, k: &Surf, inputs: &[SelInput], extra: &Map<Strin
                     sheet_picks(app, &picks)
                 })
                 .collect::<Result<_, String>>()?;
-            ("surface.loft", json!({ "sections": sections }))
+            let mut p = json!({ "sections": sections });
+            crate::dialogs_sweep::rail_params(app, *rail_fit, [items(inputs, 1), items(inputs, 2)], &mut p)?;
+            ("surface.loft", p)
         }
         Surf::Boundary { continuity, join } => {
             need(0, "the curves (sketch curves or edges)")?;
@@ -876,8 +886,10 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind, frame: &Mat) -> Option<(K
             let index = PATCH_CONTINUITY.iter().position(|(_, w)| *w == g.as_str()).unwrap_or(0);
             (Surf::Boundary { continuity: index, join: *operation == solidcraft_engine::doc::Operation::Join }, vec![sels(u), sels(v)])
         }
-        FeatureKind::SurfaceLoft { sections, .. } => {
-            (Surf::Loft, vec![sections.iter().flat_map(|sec| sheet_sels(app, sec.sketch.0, sec.profiles.as_ref(), &sec.curves)).collect()])
+        FeatureKind::SurfaceLoft { sections, rails, rail_fit, .. } => {
+            let [rail, rail2] = crate::dialogs_sweep::rail_sels(rails);
+            let picked = sections.iter().flat_map(|sec| sheet_sels(app, sec.sketch.0, sec.profiles.as_ref(), &sec.curves)).collect();
+            (Surf::Loft { rail_fit: crate::dialogs_sweep::rail_fit_index(*rail_fit) }, vec![picked, rail, rail2])
         }
         FeatureKind::SurfaceExtrude { sketch, profiles, curves, extent } => {
             let sels = sheet_sels(app, sketch.0, profiles.as_ref(), curves);
