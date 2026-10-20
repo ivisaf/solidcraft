@@ -19,8 +19,6 @@ pub const MAX_CELLS: usize = 4_000_000;
 const MAX_WORK: u64 = 4_000_000_000;
 /// Most columns a dilation keeps maxima of (one field per width).
 const MAX_DILATION: usize = 16_000_000;
-/// Half the point angle of a drill (118°), measured from its axis.
-const DRILL_HALF_ANGLE: f64 = 59.0;
 
 /// Column heights over a rectangle. Column `(i, j)` is centred at `origin + (i + ½, j + ½) × cell`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -245,7 +243,8 @@ fn profile(tool: &Tool, d: f64) -> f64 {
     match tool.kind {
         ToolKind::FlatEndmill => 0.0,
         ToolKind::BallEndmill => r - (r * r - d * d).max(0.0).sqrt(),
-        ToolKind::Drill => d / DRILL_HALF_ANGLE.to_radians().tan(),
+        ToolKind::Drill => d / (tool.point_angle() * 0.5).to_radians().tan(),
+        ToolKind::VBit => (d - tool.tip() * 0.5).max(0.0) / (tool.point_angle() * 0.5).to_radians().tan(),
     }
 }
 

@@ -13,7 +13,9 @@ use crate::SolveApp;
 use crate::theme::Tokens;
 use crate::viewport::Proj;
 
-const TOOL_KINDS: [&str; 3] = ["flat", "ball", "drill"];
+const TOOL_KINDS: [&str; 4] = ["flat", "ball", "drill", "vbit"];
+/// What each of [`TOOL_KINDS`] is called in the tool assistant.
+const TOOL_KIND_NAMES: [&str; 4] = ["Flat end mill", "Ball end mill", "Drill", "V-bit"];
 const SIDES: [&str; 3] = ["outside", "inside", "on"];
 /// What a facing operation's boundary is, when no faces are picked.
 const FACE_BOUNDS: [&str; 3] = ["stock", "part", "sketch"];
@@ -111,6 +113,14 @@ pub struct ToolForm {
     pub stepover: String,
     /// Feed per tooth (mm), kept in step with the feed: feed = speed × flutes × chip load.
     pub chip_load: String,
+    /// The point (a V-bit's, a drill's: its included angle in degrees; a V-bit's flat in mm),
+    /// and the shank's diameter and the length out of the holder (mm). Empty: the defaults.
+    pub tip_angle: String,
+    pub tip_diameter: String,
+    pub shank_diameter: String,
+    pub length: String,
+    /// The assistant's step: 0 the kind, 1 the shape, 2 the cutting data.
+    pub step: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -535,6 +545,11 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 stepdown: String::new(),
                 stepover: String::new(),
                 chip_load: String::new(),
+                tip_angle: String::new(),
+                tip_diameter: String::new(),
+                shank_diameter: String::new(),
+                length: String::new(),
+                step: 0,
             })))
         }
         "cam.setup.create" => Some(Form::Setup(Box::new(SetupForm {
@@ -607,6 +622,20 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             ] {
                 if !text.trim().is_empty() {
                     p.insert(k.into(), json!(number(what, text)?));
+                } else if f.editing {
+                    p.insert(k.into(), Value::Null);
+                }
+            }
+            // The point and the picture's shank and length; units typed after a number are dropped.
+            for (k, what, text) in [
+                ("tip_angle", "The point angle", &f.tip_angle),
+                ("tip_diameter", "The tip diameter", &f.tip_diameter),
+                ("shank_diameter", "The shank diameter", &f.shank_diameter),
+                ("length", "The length", &f.length),
+            ] {
+                let plain = text.trim().trim_end_matches("mm").trim_end_matches("deg").trim_end_matches('°').trim();
+                if !plain.is_empty() {
+                    p.insert(k.into(), json!(number(what, plain)?));
                 } else if f.editing {
                     p.insert(k.into(), Value::Null);
                 }
@@ -759,6 +788,7 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
     let kind = match tool["kind"].as_str()? {
         "ball_endmill" => 1,
         "drill" => 2,
+        "v_bit" => 3,
         _ => 0,
     };
     Some(Form::Tool(Box::new(ToolForm {
@@ -776,6 +806,12 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         stepdown: number("stepdown"),
         stepover: number("stepover"),
         chip_load: tool["chip_load"].as_f64().map(|c| shown(c, 4)).unwrap_or_default(),
+        tip_angle: number("tip_angle"),
+        tip_diameter: number("tip_diameter"),
+        shank_diameter: number("shank_diameter"),
+        length: number("length"),
+        // A tool that exists opens on its shape.
+        step: 1,
     })))
 }
 
@@ -1225,6 +1261,10 @@ fn help(label: &str) -> Option<&'static str> {
         "Kind" => "Flat: a flat end mill. Ball: a rounded end. Drill: only plunges straight down.",
         "Diameter" => "How wide the tool cuts.",
         "Description" => "Your own words for the tool, shown in the lists.",
+        "Length" => "How far the tool reaches out of its holder: shank and cutting part together.",
+        "Shank diameter" => "How thick the part the holder grips is. Empty: as thick as the tool cuts.",
+        "Point angle" => "The angle between the point's two flanks: a V-bit's (often 60° or 90°) or a drill's (118°).",
+        "Tip diameter" => "A V-bit's small flat at its point. Empty: a sharp point.",
         "Flute length" => "How deep the cutting edges reach. Deeper cuts need a longer tool.",
         "Flutes" => "How many cutting edges the tool has. Together with the speed it sets the feed.",
         "Spindle" => "How fast the spindle turns. Empty: the tool's own speed.",
@@ -1365,9 +1405,9 @@ enum HeightLine {
 
 /// The heights of an operation as a side view: the material with the cut in it, its depth
 /// passes, the tool above it, and a line at each height with its value. `lit` is drawn stronger.
-fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit: Option<HeightLine>) {
+fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit: Option<HeightLine>, height: f32) {
     let t = Tokens::get();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(PICTURE_W, 230.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(PICTURE_W, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     // Z from a little below the bottom to a little above the clearance, onto the picture's height.
     let depth = (h.top - h.bottom).max(1e-3);
@@ -1554,29 +1594,310 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
     // A form's labels stay on one line each.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    if let Form::Tool(f) = form {
+        tool_assistant(ui, f, need);
+        return;
+    }
     // An operation form's heights, as a picture beside the rows (or under them in a narrow panel).
-    let mut picture: Option<(Option<solidcraft_engine::PreviewHeights>, Option<HeightLine>)> = None;
+    let mut picture: Option<Picture> = None;
     let below = ui
         .horizontal_top(|ui| {
+            let top = ui.cursor().top();
             form_grid(ui, form, selected, choices, need, &mut picture);
-            let Some((seen, lit)) = &picture else { return false };
+            let Some(p) = &picture else { return false };
             if ui.available_width() < PICTURE_W + 12.0 {
                 return true;
             }
             ui.add_space(12.0);
-            ui.vertical(|ui| heights_or_note(ui, seen.as_ref(), *lit));
+            // Level with the height rows, from Clearance down to the last of them.
+            let (from, to) = p.rows;
+            ui.vertical(|ui| {
+                ui.add_space((from - top).max(0.0));
+                heights_or_note(ui, p.seen.as_ref(), p.lit, (to - from).max(120.0));
+            });
             false
         })
         .inner;
-    if below && let Some((seen, lit)) = &picture {
-        heights_or_note(ui, seen.as_ref(), *lit);
+    if below && let Some(p) = &picture {
+        heights_or_note(ui, p.seen.as_ref(), p.lit, 160.0);
     }
 }
 
+/// An operation form's heights picture: what it shows, the row lit, and where the height rows are (their top and bottom).
+struct Picture {
+    seen: Option<solidcraft_engine::PreviewHeights>,
+    lit: Option<HeightLine>,
+    rows: (f32, f32),
+}
+
+/// A dimension of a tool's picture, lit while its row is pointed at or typed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dim {
+    Diameter,
+    Flutes,
+    Length,
+    Shank,
+    Angle,
+    Tip,
+}
+
+/// A tool's shape for its picture: from a form's text (what is not typed takes its default).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ToolShape {
+    kind: usize,
+    diameter: f64,
+    flute_length: f64,
+    shank: f64,
+    length: f64,
+    angle: f64,
+    tip: f64,
+}
+
+impl ToolShape {
+    fn of(f: &ToolForm) -> ToolShape {
+        let mm = |s: &str| {
+            s.trim()
+                .trim_end_matches("mm")
+                .trim_end_matches("deg")
+                .trim_end_matches('°')
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        };
+        ToolShape::with(f.kind, mm(&f.diameter), mm(&f.flute_length), mm(&f.shank_diameter), mm(&f.length), mm(&f.tip_angle), mm(&f.tip_diameter))
+    }
+    /// A shape with `kind`'s defaults wherever a value is left out (or makes no tool).
+    fn with(kind: usize, d: Option<f64>, f: Option<f64>, s: Option<f64>, l: Option<f64>, a: Option<f64>, tip: Option<f64>) -> ToolShape {
+        let diameter = d.unwrap_or(6.0).min(1000.0);
+        let angle = a.filter(|a| *a < 179.0).unwrap_or(if kind == 2 { 118.0 } else { 90.0 });
+        let tip_d = tip.filter(|t| *t < diameter).unwrap_or(0.0);
+        // A V-bit cuts with its cone (as the engine takes it when left out).
+        let cone = ((diameter - tip_d) * 0.5 / (angle * 0.5).to_radians().tan()).max(0.01);
+        let flute_length = f.unwrap_or(if kind == 3 { cone } else { diameter * 3.0 }).min(10_000.0);
+        ToolShape {
+            kind,
+            diameter,
+            flute_length,
+            shank: s.unwrap_or(diameter).min(1000.0),
+            length: l.filter(|l| *l >= flute_length).unwrap_or(flute_length + diameter.max(4.0) * 2.0),
+            angle,
+            tip: tip_d,
+        }
+    }
+}
+
+/// A tool drawn upright, its point down, in `size`: shank, cutting part and point, and with
+/// `dims` its dimensions D, F, L, S (and α, d for a point), `lit` drawn stronger. Returns its response.
+fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: egui::Vec2, dims: bool) -> egui::Response {
+    let t = Tokens::get();
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let room = if dims { egui::vec2(40.0, 38.0) } else { egui::vec2(8.0, 8.0) };
+    let inner = rect.shrink2(room);
+    let widest = shape.diameter.max(shape.shank);
+    let scale = (f64::from(inner.height()) / shape.length).min(f64::from(inner.width()) / widest) as f32;
+    let (cx, top) = (inner.center().x, inner.center().y - (shape.length as f32 * scale) * 0.5);
+    let tip_y = top + shape.length as f32 * scale;
+    let cut_top = tip_y - shape.flute_length as f32 * scale;
+    let (r, rs) = ((shape.diameter * 0.5) as f32 * scale, (shape.shank * 0.5) as f32 * scale);
+    let ink = Stroke::new(1.2, t.text);
+    // The shank, then the cutting part with its point: a polygon down one side and up the other.
+    painter.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(cx - rs, top), egui::pos2(cx + rs, top), egui::pos2(cx + rs, cut_top), egui::pos2(cx - rs, cut_top)],
+        t.text_dim.gamma_multiply(0.45),
+        ink,
+    ));
+    let half_angle = (shape.angle * 0.5).to_radians();
+    // How tall a point is over `half_width` (both in points).
+    let point = |half_width: f32| (f64::from(half_width) / half_angle.tan()) as f32;
+    let mut side: Vec<egui::Pos2> = vec![egui::pos2(cx + r, cut_top)];
+    match shape.kind {
+        // Ball: down the side to a radius above the end, round the end.
+        1 => {
+            side.push(egui::pos2(cx + r, tip_y - r));
+            for k in 1..=16 {
+                let a = std::f32::consts::FRAC_PI_2 * k as f32 / 16.0;
+                side.push(egui::pos2(cx + r * a.cos(), tip_y - r + r * a.sin()));
+            }
+        }
+        // Drill: down to the point's cone.
+        2 => {
+            let h = point(r).min(tip_y - cut_top);
+            side.push(egui::pos2(cx + r, tip_y - h));
+            side.push(egui::pos2(cx, tip_y));
+        }
+        // V-bit: the cone narrows to the tip's flat.
+        3 => {
+            let tip = (shape.tip * 0.5) as f32 * scale;
+            let h = point(r - tip).min(tip_y - cut_top);
+            side.push(egui::pos2(cx + r, tip_y - h));
+            side.push(egui::pos2(cx + tip, tip_y));
+        }
+        _ => side.push(egui::pos2(cx + r, tip_y)),
+    }
+    let mirrored: Vec<egui::Pos2> = side.iter().rev().map(|p| egui::pos2(2.0 * cx - p.x, p.y)).collect();
+    let outline: Vec<egui::Pos2> = side.iter().copied().chain(mirrored).collect();
+    painter.add(egui::Shape::convex_polygon(outline, t.accent.gamma_multiply(0.45), ink));
+    if !dims {
+        return response;
+    }
+    // Dimensions: thin lines with ticks, the lit one in the accent colour.
+    let colour = |d: Dim| if lit == Some(d) { t.accent } else { t.text_dim };
+    let width = |d: Dim| if lit == Some(d) { 2.0 } else { 1.0 };
+    let font = |d: Dim| egui::FontId::proportional(if lit == Some(d) { 16.0 } else { 13.5 });
+    let dim_line = |a: egui::Pos2, b: egui::Pos2, d: Dim, label: &str, at: egui::Pos2| {
+        let stroke = Stroke::new(width(d), colour(d));
+        painter.line_segment([a, b], stroke);
+        let along = (b - a).normalized();
+        let tick = egui::vec2(-along.y, along.x) * 4.0;
+        painter.line_segment([a - tick, a + tick], stroke);
+        painter.line_segment([b - tick, b + tick], stroke);
+        painter.text(at, egui::Align2::CENTER_CENTER, label, font(d), colour(d));
+    };
+    let below = tip_y + 16.0;
+    dim_line(egui::pos2(cx - r, below), egui::pos2(cx + r, below), Dim::Diameter, "D", egui::pos2(cx, below + 11.0));
+    let above = top - 12.0;
+    dim_line(egui::pos2(cx - rs, above), egui::pos2(cx + rs, above), Dim::Shank, "S", egui::pos2(cx + rs + 12.0, above));
+    let left = cx - r.max(rs) - 16.0;
+    dim_line(egui::pos2(left, top), egui::pos2(left, tip_y), Dim::Length, "L", egui::pos2(left - 12.0, (top + tip_y) * 0.5));
+    let right = cx + r.max(rs) + 16.0;
+    dim_line(egui::pos2(right, cut_top), egui::pos2(right, tip_y), Dim::Flutes, "F", egui::pos2(right + 12.0, (cut_top + tip_y) * 0.5));
+    if matches!(shape.kind, 2 | 3) {
+        // The point's angle between its two flanks, below the point.
+        let d = Dim::Angle;
+        let stroke = Stroke::new(width(d), colour(d));
+        let reach = (r * 0.9).max(10.0);
+        let (dl, dr) =
+            (egui::vec2(-half_angle.sin() as f32, -half_angle.cos() as f32), egui::vec2(half_angle.sin() as f32, -half_angle.cos() as f32));
+        let apex = egui::pos2(cx, tip_y);
+        painter.add(egui::Shape::dashed_line(&[apex, apex + dl * reach * 1.4], stroke, 3.0, 2.0));
+        painter.add(egui::Shape::dashed_line(&[apex, apex + dr * reach * 1.4], stroke, 3.0, 2.0));
+        // Inside the point, just over its tip.
+        let inside = if lit == Some(d) { t.accent } else { t.text };
+        painter.text(apex + egui::vec2(0.0, -(r * 0.45).clamp(10.0, 26.0)), egui::Align2::CENTER_CENTER, "α", font(d), inside);
+    }
+    if shape.kind == 3 {
+        let d = Dim::Tip;
+        let tip = ((shape.tip * 0.5) as f32 * scale).max(2.0);
+        dim_line(egui::pos2(cx - tip, tip_y + 5.0), egui::pos2(cx + tip, tip_y + 5.0), d, "d", egui::pos2(cx + tip + 12.0, tip_y + 5.0));
+    }
+    response
+}
+
+/// The tool assistant: the kind (tiles), the shape (with its dimensioned picture), the cutting data.
+fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need]) {
+    let t = Tokens::get();
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    // Where it is: three steps, each a button back to it.
+    ui.horizontal(|ui| {
+        for (k, name) in ["1  Kind", "2  Shape", "3  Cutting data"].iter().enumerate() {
+            if k > 0 {
+                ui.label(RichText::new("→").color(t.text_dim));
+            }
+            let caption = RichText::new(*name);
+            let b = if f.step == k { egui::Button::new(caption.strong()).stroke(Stroke::new(1.5, t.accent)) } else { egui::Button::new(caption) };
+            if ui.add(b).clicked() {
+                f.step = k;
+            }
+        }
+    });
+    ui.add_space(6.0);
+    match f.step {
+        0 => {
+            ui.label(RichText::new("What kind of tool is it?").color(t.text_dim));
+            ui.horizontal_wrapped(|ui| {
+                for (k, name) in TOOL_KIND_NAMES.iter().enumerate() {
+                    // Stubby, so that each kind's end shows: (diameter, cutting length, shank, length).
+                    let (d, fl, sh, l) = [(10.0, 14.0, 8.0, 24.0), (10.0, 14.0, 8.0, 24.0), (8.0, 18.0, 8.0, 26.0), (14.0, 7.0, 7.0, 22.0)]
+                        .get(k)
+                        .copied()
+                        .unwrap_or((10.0, 14.0, 8.0, 24.0));
+                    let shape = ToolShape::with(k, Some(d), Some(fl), Some(sh), Some(l), None, if k == 3 { Some(0.6) } else { None });
+                    // A tile of its own size: the tool drawn, its name under it; the whole tile is the button.
+                    let (rect, r) = ui.allocate_exact_size(egui::vec2(112.0, 132.0), egui::Sense::click());
+                    let chosen = f.kind == k;
+                    let edge = if chosen || r.hovered() { t.accent } else { t.border };
+                    ui.painter().rect_filled(rect, 4.0, if r.hovered() { t.hover } else { egui::Color32::TRANSPARENT });
+                    ui.painter().rect_stroke(rect, 4.0, Stroke::new(if chosen { 1.5 } else { 1.0 }, edge), egui::StrokeKind::Inside);
+                    let mut inside =
+                        ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(6.0)).layout(egui::Layout::top_down(egui::Align::Center)));
+                    tool_picture(&mut inside, &shape, None, egui::vec2(96.0, 96.0), false);
+                    // Not selectable: a click on the name is a click on the tile.
+                    inside.add(egui::Label::new(*name).selectable(false));
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *name));
+                    if r.clicked() {
+                        f.kind = k;
+                        f.step = 1;
+                    }
+                }
+            });
+        }
+        1 => {
+            let mut lit = None;
+            ui.horizontal_top(|ui| {
+                egui::Grid::new("sc_cam_tool_shape").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    if f.editing {
+                        row_label(ui, "Number", None);
+                        ui.label(format!("T{}", f.number));
+                        ui.end_row();
+                    } else {
+                        field(ui, need, "Number", &mut f.number, "1");
+                    }
+                    row_label(ui, "Kind", None);
+                    ui.label(TOOL_KIND_NAMES.get(f.kind).copied().unwrap_or_default());
+                    ui.end_row();
+                    field(ui, need, "Description", &mut f.description, "");
+                    let mut row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, d: Dim| {
+                        if field_seen(ui, need, label, value, hint).0 {
+                            lit = Some(d);
+                        }
+                    };
+                    row(ui, "Diameter (D)", &mut f.diameter, "6 mm", Dim::Diameter);
+                    row(ui, "Flute length (F)", &mut f.flute_length, if f.kind == 3 { "the cone's height" } else { "3 × D" }, Dim::Flutes);
+                    row(ui, "Length (L)", &mut f.length, "F + 2 × D", Dim::Length);
+                    row(ui, "Shank diameter (S)", &mut f.shank_diameter, "D", Dim::Shank);
+                    if matches!(f.kind, 2 | 3) {
+                        row(ui, "Point angle (α)", &mut f.tip_angle, if f.kind == 2 { "118°" } else { "90°" }, Dim::Angle);
+                    }
+                    if f.kind == 3 {
+                        row(ui, "Tip diameter (d)", &mut f.tip_diameter, "0 mm (a sharp point)", Dim::Tip);
+                    }
+                    field(ui, need, "Flutes", &mut f.flutes, "2");
+                });
+                ui.add_space(12.0);
+                tool_picture(ui, &ToolShape::of(f), lit, egui::vec2(170.0, 250.0), true);
+            });
+        }
+        _ => {
+            egui::Grid::new("sc_cam_tool_cutting").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                // Speed, flutes, chip load and feed belong together: feed = speed × flutes × chip load.
+                let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
+                let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
+                let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "speed × flutes × chip load");
+                let flutes = parsed(&f.flutes);
+                link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
+                field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
+                field(ui, need, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
+                field(ui, need, "Stepover (mm)", &mut f.stepover, "by operation");
+            });
+        }
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(f.step > 0, egui::Button::new("< Back")).clicked() {
+            f.step -= 1;
+        }
+        if ui.add_enabled(f.step < 2, egui::Button::new("Next >")).clicked() {
+            f.step += 1;
+        }
+    });
+}
+
 /// The heights picture, or what it waits for.
-fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHeights>, lit: Option<HeightLine>) {
+fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHeights>, lit: Option<HeightLine>, height: f32) {
     match seen {
-        Some(h) => heights_picture(ui, h, lit),
+        Some(h) => heights_picture(ui, h, lit, height),
         None => {
             ui.set_max_width(PICTURE_W);
             ui.add(egui::Label::new(RichText::new("A picture of the heights shows once nothing is missing").color(Tokens::get().text_dim)).wrap());
@@ -1588,38 +1909,10 @@ fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHe
 const PICTURE_W: f32 = 170.0;
 
 /// The form's rows; an operation form leaves its heights in `picture` for beside them.
-fn form_grid(
-    ui: &mut egui::Ui,
-    form: &mut Form,
-    selected: &[(String, Vec3)],
-    choices: &Choices,
-    need: &[Need],
-    picture: &mut Option<(Option<solidcraft_engine::PreviewHeights>, Option<HeightLine>)>,
-) {
+fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need], picture: &mut Option<Picture>) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
-        Form::Tool(f) => {
-            if f.editing {
-                row_label(ui, "Number", None);
-                ui.label(format!("T{}", f.number));
-                ui.end_row();
-            } else {
-                field(ui, need, "Number", &mut f.number, "1");
-            }
-            choice(ui, need, "sc_cam_tool_kind", "Kind", &mut f.kind, &TOOL_KINDS);
-            field(ui, need, "Diameter", &mut f.diameter, "6 mm");
-            field(ui, need, "Description", &mut f.description, "");
-            field(ui, need, "Flute length", &mut f.flute_length, "3 × diameter");
-            // Speed, flutes, chip load and feed belong together: feed = speed × flutes × chip load.
-            let flutes_changed = field(ui, need, "Flutes", &mut f.flutes, "2");
-            let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
-            let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
-            let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "speed × flutes × chip load");
-            let flutes = parsed(&f.flutes);
-            link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed || flutes_changed, feed_changed, chip_changed);
-            field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
-            field(ui, need, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
-            field(ui, need, "Stepover (mm)", &mut f.stepover, "by operation");
-        }
+        // Tools have an assistant of their own (`tool_assistant`).
+        Form::Tool(_) => {}
         Form::Setup(f) => {
             field(ui, need, "Name", &mut f.name, "automatic");
             choice(ui, need, "sc_cam_setup_axis", "Tool axis", &mut f.axis, &AXES);
@@ -1699,6 +1992,8 @@ fn form_grid(
             // Known from the preview: the value; else how it is found.
             let automatic = |z: Option<f64>, what: &str| z.map_or_else(|| what.to_string(), |z| format!("{} mm (automatic)", shown(z, 3)));
             let mut lit = None;
+            // Where the height rows are: the picture beside them stands as tall as they are.
+            let first_row = ui.cursor().top();
             if height_field(ui, need, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high) {
                 lit = Some(HeightLine::Clearance);
             }
@@ -1715,8 +2010,9 @@ fn form_grid(
             if f.kind != OpKind::Drill && field_seen(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter").0 {
                 lit = Some(HeightLine::Passes);
             }
+            let last_row = ui.cursor().top() - ui.spacing().item_spacing.y;
             // The picture of these heights goes beside the form.
-            *picture = Some((seen.cloned(), lit));
+            *picture = Some(Picture { seen: seen.cloned(), lit, rows: (first_row, last_row) });
             match f.kind {
                 OpKind::Face => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or half its diameter");

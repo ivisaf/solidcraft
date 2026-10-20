@@ -49,7 +49,7 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
-            "number: 1–9999; kind: flat|ball|drill; diameter: expr; flute_length?: expr (default 3 × diameter); description?; flutes?: 1–100 \
+            "number: 1–9999; kind: flat|ball|drill|vbit; diameter: expr; tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
@@ -177,13 +177,25 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         Some("flat" | "flat_endmill" | "endmill") => ToolKind::FlatEndmill,
         Some("ball" | "ball_endmill") => ToolKind::BallEndmill,
         Some("drill") => ToolKind::Drill,
-        _ => return Err(bad(cmd, "`kind` must be flat, ball or drill")),
+        Some("vbit" | "v_bit" | "v-bit") => ToolKind::VBit,
+        _ => return Err(bad(cmd, "`kind` must be flat, ball, drill or vbit")),
     };
     let diameter = length(s, cmd, "diameter", &req_expr(cmd, p, "diameter")?)?;
     // What is not named stays as the tool had it.
     let flute_length = match expr(p, "flute_length") {
         Some(e) => length(s, cmd, "flute_length", &e)?,
-        None => was.map_or(diameter * 3.0, |t| t.flute_length),
+        None => was.map_or_else(
+            || match kind {
+                // A V-bit cuts with its cone: as long as the cone is high.
+                ToolKind::VBit => {
+                    let angle = num(p, "tip_angle").filter(|a| *a > 0.0 && *a < 180.0).unwrap_or(90.0);
+                    let tip = num(p, "tip_diameter").filter(|t| *t >= 0.0 && *t < diameter).unwrap_or(0.0);
+                    ((diameter - tip) * 0.5 / (angle * 0.5).to_radians().tan()).max(0.01)
+                }
+                _ => diameter * 3.0,
+            },
+            |t| t.flute_length,
+        ),
     };
     let description: String = match p.get("description") {
         None => was.map(|t| t.description.clone()).unwrap_or_default(),
@@ -228,6 +240,18 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         plunge_feed: data("plunge_feed", was.and_then(|t| t.plunge_feed))?,
         stepdown: data("stepdown", was.and_then(|t| t.stepdown))?,
         stepover: data("stepover", was.and_then(|t| t.stepover))?,
+        // The point (a V-bit's, a drill's) and the picture's shank and length: kept as they were when not named.
+        tip_angle: data("tip_angle", was.and_then(|t| t.tip_angle))?,
+        tip_diameter: match p.get("tip_diameter") {
+            None => was.and_then(|t| t.tip_diameter),
+            Some(Value::Null) => None,
+            Some(_) => {
+                Some(num(p, "tip_diameter").filter(|d| *d >= 0.0 && d.is_finite()).ok_or_else(|| bad(cmd, "`tip_diameter` must be 0 or more"))?)
+                    .filter(|d| *d > 0.0)
+            }
+        },
+        shank_diameter: data("shank_diameter", was.and_then(|t| t.shank_diameter))?,
+        length: data("length", was.and_then(|t| t.length))?,
     };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(tool)
@@ -1076,6 +1100,17 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
     let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
+    // A V-bit cuts wider the deeper it goes: it engraves on a line or spots a hole; pockets,
+    // facing and contours beside a line assume a tool as wide all the way down.
+    if tool.kind == ToolKind::VBit {
+        match &op.kind {
+            CamOperationKind::Contour { side: Side::On, .. } | CamOperationKind::Drill { .. } => {}
+            CamOperationKind::Contour { .. } => {
+                return Err(fail("a V-bit engraves on the line: set the side to `on`".into()));
+            }
+            _ => return Err(fail("a V-bit engraves along a line (2D Contour, side `on`) or spots holes (Drill)".into())),
+        }
+    }
     let g = geometry(s, at, &op.geometry).map_err(fail)?;
     let picked = matches!(op.geometry, CamGeometry::Faces { .. });
     // Only a contour can use the outline of a face on the far side.

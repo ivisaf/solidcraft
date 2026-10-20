@@ -82,6 +82,7 @@ fn from_rp23cnc(tools: &[Value], presets: Option<&Value>) -> std::result::Result
             "endmill" | "flatendmill" | "flat" => ToolKind::FlatEndmill,
             "ballendmill" | "ballnose" | "ball" => ToolKind::BallEndmill,
             "drill" => ToolKind::Drill,
+            "vbit" | "v-bit" | "v_bit" => ToolKind::VBit,
             other => {
                 notes.push(format!("{which}: a {other} is not a kind of tool SolidCraft has yet"));
                 continue;
@@ -95,6 +96,11 @@ fn from_rp23cnc(tools: &[Value], presets: Option<&Value>) -> std::result::Result
         tool.description = name;
         if let Some(n) = t.get("FluteCount").and_then(Value::as_u64).filter(|n| (1..=100).contains(n)) {
             tool.flutes = n as u32;
+        }
+        // A V-bit's point: its angle and the flat at its tip.
+        if kind == ToolKind::VBit {
+            tool.tip_angle = t.get("VeeAngleDeg").and_then(Value::as_f64).filter(|a| *a > 0.0 && *a < 180.0);
+            tool.tip_diameter = t.get("TipDiameterMm").and_then(Value::as_f64).filter(|d| *d > 0.0 && *d < diameter);
         }
         if t.get("CornerRadiusMm").and_then(Value::as_f64).is_some_and(|r| r > 0.0) && kind == ToolKind::FlatEndmill {
             notes.push(format!("{which}: taken as a flat end mill, without its corner radius"));

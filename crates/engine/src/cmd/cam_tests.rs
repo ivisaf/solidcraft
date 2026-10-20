@@ -1073,9 +1073,8 @@ fn an_rp23cnc_tool_library_is_imported_with_its_cutting_data() {
     std::fs::write(&file, rp.to_string()).unwrap();
     let out = run(&mut s, "cam.library.import", json!({"library": library, "path": file}));
     let _ = std::fs::remove_file(&file);
-    assert_eq!(out["added"], json!([1, 2]));
-    let notes = out["notes"].as_array().unwrap();
-    assert!(notes.len() == 1 && notes[0].as_str().unwrap().starts_with("tool 3 (V-bit 60°): a vbit"), "{notes:?}");
+    assert_eq!(out["added"], json!([1, 2, 3]));
+    assert_eq!(out["notes"], json!([]));
     // The preset is tool 1's cutting data; its stepover, 40% of 6 mm.
     let tools = crate::toollib::load(std::path::Path::new(&library)).unwrap();
     let t1 = &tools[0];
@@ -1083,5 +1082,52 @@ fn an_rp23cnc_tool_library_is_imported_with_its_cutting_data() {
     assert_eq!((t1.spindle_rpm, t1.feed, t1.plunge_feed, t1.stepdown), (Some(18000.0), Some(1200.0), Some(400.0), Some(3.0)));
     assert!((t1.stepover.unwrap() - 2.4).abs() < 1e-9);
     assert_eq!((tools[1].diameter, tools[1].feed), (3.0, None));
+    // The V-bit with its point.
+    assert_eq!((tools[2].kind, tools[2].tip_angle, tools[2].tip_diameter), (solidcraft_cam::ToolKind::VBit, Some(60.0), None));
     let _ = std::fs::remove_file(&library);
+}
+
+#[test]
+fn a_v_bit_engraves_on_a_line_and_its_groove_is_a_v() {
+    // A flat plate, its top at 0 and the stock's too.
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 5, "direction": "negative"}));
+    run(&mut s, "cam.setup.create", json!({}));
+    // A 90° V-bit, 6 mm across, with a 0.2 mm flat at its point.
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 5, "kind": "vbit", "diameter": 6, "tip_angle": 90, "tip_diameter": 0.2, "flutes": 2, "spindle_rpm": 18000, "feed": 800}),
+    );
+    let tool = s.doc.manufacture.tools.iter().find(|t| t.number == 5).unwrap().clone();
+    assert_eq!((tool.kind, tool.point_angle(), tool.tip()), (solidcraft_cam::ToolKind::VBit, 90.0, 0.2));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Line"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [2, 2], "p1": [12, 8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    // Engraving on the outline, 1 mm deep: allowed; a pocket or a contour beside the line is not.
+    run(&mut s, "cam.op.contour", json!({"sketch": "Line", "tool": 5, "side": "on", "top": 0, "bottom": -1, "name": "Engrave"}));
+    for (cmd, extra) in [("cam.op.pocket", json!({})), ("cam.op.contour", json!({"side": "outside"}))] {
+        let mut p = json!({"sketch": "Line", "tool": 5, "top": 0, "bottom": -1});
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let e = s.execute(cmd, &p).unwrap_err().to_string();
+        assert!(e.contains("V-bit"), "{cmd}: {e}");
+    }
+    // The groove the simulation cuts on the line is 1 mm deep in the middle and 1 mm up 1 mm aside.
+    let sim = run(&mut s, "cam.simulate", json!({"field": true, "columns": 600}));
+    let f = &sim["field"];
+    let (nx, cell) = (f["nx"].as_u64().unwrap() as usize, f["cell"].as_f64().unwrap());
+    let (ox, oy) = (f["origin"][0].as_f64().unwrap(), f["origin"][1].as_f64().unwrap());
+    let z = |x: f64, y: f64| {
+        let (i, j) = (((x - ox) / cell) as usize, ((y - oy) / cell) as usize);
+        f["z"][j * nx + i].as_f64().unwrap()
+    };
+    // On the line, 1 mm deep; half a millimetre beside it, 0.6 mm (a 90° V with a 0.2 mm flat);
+    // 1.2 mm beside it, untouched.
+    close(z(7.0, 5.0), 0.0, 1e-9);
+    close(z(7.0, 2.0), -1.0, 0.05);
+    close(z(7.0, 2.5), -0.6, 0.05);
+    close(z(7.0, 3.2), 0.0, 1e-9);
 }

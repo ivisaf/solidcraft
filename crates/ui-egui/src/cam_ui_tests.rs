@@ -877,7 +877,8 @@ fn an_import_says_what_it_took_and_left_out() {
     let file = std::env::temp_dir().join(format!("solidcraft-ui-rp23cnc-{}.json", std::process::id()));
     let rp = json!({"Tools": [
         {"Number": 1, "Name": "6 mm flat end mill", "Type": "EndMill", "DiameterMm": 6, "FluteCount": 2},
-        {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1}
+        {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1},
+        {"Number": 4, "Name": "Dovetail", "Type": "Dovetail", "DiameterMm": 10, "FluteCount": 4}
     ]});
     std::fs::write(&file, rp.to_string()).unwrap();
     h.app.start("cam.tool.define");
@@ -886,8 +887,8 @@ fn an_import_says_what_it_took_and_left_out() {
     let _ = std::fs::remove_file(&file);
     imported(&mut h.app, result);
     h.frames(2);
-    assert!(h.widget("Imported 1 tool(s)").is_some());
-    assert!(h.widget("Left out tool 3 (V-bit 60°): a vbit is not a kind of tool SolidCraft has yet").is_some());
+    assert!(h.widget("Imported 2 tool(s)").is_some());
+    assert!(h.widget("Left out tool 4 (Dovetail): a dovetail is not a kind of tool SolidCraft has yet").is_some());
     assert!(h.widget("T1  6 mm flat end mill").is_some(), "the tool is in the table");
 }
 
@@ -941,4 +942,37 @@ fn the_form_knows_every_height_it_cuts_at() {
     let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
     let Some(Form::Op(f)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][0]) else { panic!("no form") };
     assert_eq!((f.clearance.as_str(), f.retract.as_str()), ("15 mm", "5 mm"));
+}
+
+#[test]
+fn the_tool_assistant_makes_a_v_bit() {
+    let mut h = lab();
+    h.app.start("cam.tool.define");
+    h.frames(2);
+    // Step one: the kinds as tiles; the V-bit's opens its shape.
+    for name in ["Flat end mill", "Ball end mill", "Drill", "V-bit"] {
+        assert!(h.widget(name).is_some(), "{name}");
+    }
+    h.step(&json!({"widget": "V-bit"})).unwrap();
+    h.frames(2);
+    let Some(Form::Tool(f)) = &mut h.app.manufacture.form else { panic!("no tool form") };
+    assert_eq!((f.kind, f.step), (3, 1));
+    assert!(h.widget("Point angle (α)").is_some() && h.widget("Tip diameter (d)").is_some());
+    if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+        (f.tip_angle, f.tip_diameter, f.length) = ("60°".into(), "0.2 mm".into(), "40".into());
+    }
+    h.step(&json!({"widget": "Next >"})).unwrap();
+    h.frames(1);
+    assert!(h.widget("Spindle (rev/min)").is_some(), "step three: the cutting data");
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    // It is in the machine's library as a V-bit, and opens again as one.
+    let library = library_listing(&mut h.app, true);
+    let tool = &library["tools"][0];
+    assert_eq!(
+        (tool["kind"].as_str(), tool["tip_angle"].as_f64(), tool["tip_diameter"].as_f64(), tool["length"].as_f64()),
+        (Some("v_bit"), Some(60.0), Some(0.2), Some(40.0))
+    );
+    let Some(Form::Tool(again)) = tool_form(tool, true) else { panic!("no form") };
+    assert_eq!((again.kind, again.tip_angle.as_str(), again.step), (3, "60", 1));
 }

@@ -15,6 +15,8 @@ pub enum ToolKind {
     FlatEndmill,
     BallEndmill,
     Drill,
+    /// A cone to a point (or a small flat), for engraving along a line.
+    VBit,
 }
 
 impl ToolKind {
@@ -23,6 +25,7 @@ impl ToolKind {
             ToolKind::FlatEndmill => "flat end mill",
             ToolKind::BallEndmill => "ball end mill",
             ToolKind::Drill => "drill",
+            ToolKind::VBit => "V-bit",
         }
     }
 }
@@ -53,6 +56,17 @@ pub struct Tool {
     pub stepdown: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stepover: Option<f64>,
+    /// The point's included angle (degrees): a V-bit's (90 when left out) or a drill's (118).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_angle: Option<f64>,
+    /// A V-bit's flat at its point (mm; none when left out).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip_diameter: Option<f64>,
+    /// The shank's diameter and the tool's length out of the holder (mm): what its picture shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shank_diameter: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<f64>,
 }
 
 fn two() -> u32 {
@@ -73,6 +87,25 @@ impl Tool {
             plunge_feed: None,
             stepdown: None,
             stepover: None,
+            tip_angle: None,
+            tip_diameter: None,
+            shank_diameter: None,
+            length: None,
+        }
+    }
+    /// The point's included angle (degrees): 180 for a flat or ball end.
+    pub fn point_angle(&self) -> f64 {
+        match self.kind {
+            ToolKind::VBit => self.tip_angle.unwrap_or(90.0),
+            ToolKind::Drill => self.tip_angle.unwrap_or(118.0),
+            ToolKind::FlatEndmill | ToolKind::BallEndmill => 180.0,
+        }
+    }
+    /// A V-bit's flat at its point (mm).
+    pub fn tip(&self) -> f64 {
+        match self.kind {
+            ToolKind::VBit => self.tip_diameter.unwrap_or(0.0),
+            _ => 0.0,
         }
     }
     pub fn radius(&self) -> f64 {
@@ -93,6 +126,18 @@ impl Tool {
         }
         if [self.spindle_rpm, self.feed, self.plunge_feed, self.stepdown, self.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
             return invalid("a tool's spindle speed, feeds, stepdown and stepover must be above 0");
+        }
+        if self.tip_angle.is_some_and(|a| !(a > 0.0 && a < 180.0)) {
+            return invalid("a point angle must be between 0 and 180 degrees");
+        }
+        if self.tip_diameter.is_some_and(|d| !(0.0..self.diameter).contains(&d)) {
+            return invalid("a V-bit's tip diameter must be 0 or more and less than its diameter");
+        }
+        if self.shank_diameter.is_some_and(|d| !(d > 0.0 && d <= MAX_TOOL_DIAMETER)) {
+            return invalid("the shank diameter must be above 0 and at most 1000 mm");
+        }
+        if self.length.is_some_and(|l| !(l >= self.flute_length && l <= 10.0 * MAX_TOOL_DIAMETER)) {
+            return invalid("a tool's length must be at least its flute length");
         }
         Ok(())
     }
