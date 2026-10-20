@@ -692,13 +692,97 @@ fn heights_are_taken_from_the_selection() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.pocket");
     h.frames(2);
-    assert!(h.widget("select an edge, a point or a face").is_some(), "with nothing selected the row says what to do");
+    assert!(h.widget("Bottom from the selection").is_some(), "the button is there, off while nothing is selected");
     // A corner at the plate's foot: Bottom takes its height.
     let corner = solidcraft_engine::geom::Vec3::new(0.0, 0.0, -10.0);
     h.app.session.selection = vec![solidcraft_engine::Sel::Vertex { body: "Body1".into(), point: corner }];
     h.frames(2);
-    h.step(&json!({"widget": "Bottom -10 mm"})).unwrap();
+    h.step(&json!({"widget": "Bottom from the selection"})).unwrap();
     h.frames(1);
     let Some(Form::Op(op)) = &h.app.manufacture.form else { panic!("the form stays open") };
     assert_eq!(op.bottom, "-10 mm");
+}
+
+#[test]
+fn the_steps_lead_from_a_setup_to_a_program() {
+    // A 40 × 30 block 10 high, its top the pocket's sketch.
+    let mut h = sketched();
+    h.app.run("solid.extrude", json!({"sketch": "Pocket", "distance": 10, "direction": "negative"})).unwrap();
+    define_tool(&mut h);
+    h.app.start("cam.list");
+    h.frames(2);
+    assert!(h.widget("Next: make a setup: where the raw block is, and the zero the machine is set to.").is_some());
+    // Step 1 makes a setup.
+    h.step(&json!({"widget": "1  Setup"})).unwrap();
+    h.frames(1);
+    assert!(matches!(h.app.manufacture.form, Some(Form::Setup(_))));
+    apply(&mut h.app);
+    h.frames(2);
+    assert!(h.widget("Next: add an operation: what to cut, and with which tool.").is_some());
+    // Step 2 offers the operations; a 2D Pocket's form opens.
+    h.step(&json!({"widget": "2  Operation"})).unwrap();
+    h.frames(1);
+    h.step(&json!({"widget": "2D Pocket"})).unwrap();
+    h.frames(1);
+    let Some(Form::Op(op)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    assert_eq!(op.kind, OpKind::Pocket);
+    op.bottom = "-3 mm".into();
+    apply(&mut h.app);
+    h.frames(2);
+    assert!(h.widget("Next: simulate, to check the toolpaths against the part.").is_some());
+    // Step 3 simulates.
+    h.step(&json!({"widget": "3  Simulate"})).unwrap();
+    h.frames(2);
+    assert!(h.app.manufacture.simulation.is_some());
+    assert!(h.widget("Next: write the G-code for the machine.").is_some());
+    // A setup's program written finishes the steps, until the design changes.
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    let path = std::env::temp_dir().join(format!("solidcraft-steps-{}.nc", std::process::id()));
+    post_to(&mut h.app, setup, None, &path.to_string_lossy());
+    let _ = std::fs::remove_file(&path);
+    h.frames(2);
+    assert!(h.widget("Done: the G-code is written. A change to the design or the operations starts the checks again.").is_some());
+    h.app.run("parameters.add", json!({"name": "w", "expression": "1 mm"})).unwrap();
+    h.frames(2);
+    assert!(h.widget("Next: simulate, to check the toolpaths against the part.").is_some());
+}
+
+#[test]
+fn eyes_hide_a_setup_s_or_an_operation_s_toolpaths() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    for bottom in ["-2 mm", "-4 mm"] {
+        fill(&mut h, "cam.op.pocket", |f| {
+            let Form::Op(op) = f else { panic!("not an operation form") };
+            op.bottom = bottom.into();
+        });
+    }
+    h.frames(2);
+    let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
+    let drawn = |h: &mut Harness| {
+        paths(&mut h.app);
+        segments(&h.app, &proj).len()
+    };
+    let all = drawn(&mut h);
+    let m = &h.app.session.doc.manufacture;
+    let (setup, first) = (m.setups[0].id, m.setups[0].operations[0].id);
+    // One operation hidden: only the other's toolpath is drawn; the setup hidden: none.
+    toggle_hidden(&mut h.app, first);
+    let one = drawn(&mut h);
+    assert!(one > 0 && one < all, "{one} of {all}");
+    toggle_hidden(&mut h.app, setup);
+    assert_eq!(drawn(&mut h), 0);
+    toggle_hidden(&mut h.app, setup);
+    toggle_hidden(&mut h.app, first);
+    assert_eq!(drawn(&mut h), all);
+    h.frames(2);
+}
+
+#[test]
+fn shown_numbers_have_no_negative_zero() {
+    assert_eq!(shown(-1e-12, 3), "0");
+    assert_eq!(shown(-0.0004, 3), "0");
+    assert_eq!(shown(-14.0, 3), "-14");
+    assert_eq!(shown(2.5, 3), "2.5");
 }

@@ -337,6 +337,15 @@ pub struct CamUi {
     pub sim_detail: usize,
     /// The setup last simulated (simulated again when the detail changes).
     simulated: Option<u64>,
+    /// The design revision a program was last written at, and whether that is the revision now.
+    posted_at: Option<u64>,
+    posted_now: bool,
+    /// The title of the form last shown (one that opens is scrolled into view).
+    form_seen: Option<&'static str>,
+    /// Setups and operations whose toolpaths are not drawn (the browser's eyes).
+    pub hidden: std::collections::BTreeSet<u64>,
+    /// The setup and the operation of each toolpath in `cache`, in the same order.
+    path_ids: Vec<(u64, u64)>,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
     /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
@@ -371,6 +380,11 @@ impl Default for CamUi {
             stock_stamp: 0,
             sim_detail: 1,
             simulated: None,
+            posted_at: None,
+            posted_now: false,
+            form_seen: None,
+            hidden: Default::default(),
+            path_ids: Vec::new(),
             cache: None,
             heights: None,
             selection_heights: None,
@@ -962,7 +976,7 @@ fn refresh(app: &mut SolveApp) {
         return;
     }
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
-    let (mut all, mut views) = (Vec::new(), Vec::new());
+    let (mut all, mut views, mut ids) = (Vec::new(), Vec::new(), Vec::new());
     for setup in listed["setups"].as_array().into_iter().flatten() {
         let f = &setup["frame"];
         if let (Some(o), Some(x), Some(y), Some(z)) = (point(&f["origin"]), point(&f["x"]), point(&f["y"]), point(&f["z"])) {
@@ -972,6 +986,7 @@ fn refresh(app: &mut SolveApp) {
         // A setup with an operation that cannot be cut draws no toolpath; the window says why.
         let Ok(v) = app.session.execute("cam.toolpath", &json!({ "setup": setup["id"] })) else { continue };
         for op in v["operations"].as_array().into_iter().flatten() {
+            ids.push((setup["id"].as_u64().unwrap_or(0), op["id"].as_u64().unwrap_or(0)));
             let path: Path = op["points"]
                 .as_array()
                 .into_iter()
@@ -987,6 +1002,7 @@ fn refresh(app: &mut SolveApp) {
     app.manufacture.stock_stamp += 1;
     // These commands are not changes, but keep the key the revision as it is now.
     app.manufacture.cache = Some((app.session.revision, all, views));
+    app.manufacture.path_ids = ids;
 }
 
 /// The toolpaths to draw.
@@ -1034,7 +1050,9 @@ pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, boo
     if !paths_drawn(app) {
         return out;
     }
-    for path in app.manufacture.cache.iter().flat_map(|(_, p, _)| p) {
+    let cam = &app.manufacture;
+    let paths = cam.cache.iter().flat_map(|(_, p, _)| p).zip(&cam.path_ids);
+    for (path, _) in paths.filter(|(_, (setup, op))| !cam.hidden.contains(setup) && !cam.hidden.contains(op)) {
         for (a, b) in path.iter().zip(path.iter().skip(1)) {
             if out.len() >= MAX_SEGMENTS {
                 return out;
@@ -1112,9 +1130,6 @@ fn help(label: &str) -> Option<&'static str> {
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Simulation detail" => "How finely the simulation looks at the stock. Fine shows the cut closer to the toolpaths and takes longer.",
-        "From selection" => {
-            "Click an edge, a point or a face of the model (the bottom circle of a hole, say), then take its height for Top or Bottom here."
-        }
         "Bottom" => "How deep it cuts: the lowest height, in the setup's Z (zero at the work zero; below it is negative).",
         "Cut" => "Whether the tool may run over the boundary or stays inside it.",
         "Over by" | "Inside by" => "How far over or inside the boundary the tool goes.",
@@ -1169,6 +1184,35 @@ fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
     }
 }
 
+/// [`field`] for a height, with a button beside it that takes `picked`: the selection's height
+/// (its highest point for a top, its lowest for a bottom; `None` with nothing selected).
+fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) {
+    let need = needed(need, label);
+    row_label(ui, label, need);
+    ui.horizontal(|ui| {
+        let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
+        mark(ui, &r, need);
+        let r = explained(r, label, need);
+        crate::params_dialog::complete(ui, &r, value);
+        let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
+        let b = ui.add_enabled(picked.is_some(), egui::Button::new("").min_size(egui::vec2(24.0, 20.0)));
+        crate::icons::paint_icon(ui.painter(), b.rect.shrink(2.0), "select", if picked.is_some() { 1.0 } else { 0.35 });
+        let name = format!("{label} from the selection");
+        b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, picked.is_some(), &name));
+        let tip = match picked {
+            Some(z) => format!("Take the height from the selection: {}", mm(z)),
+            None => String::new(),
+        };
+        let b = b
+            .on_hover_text(tip)
+            .on_disabled_hover_text("Click an edge, a point or a face of the model first (the bottom circle of a hole, say); this takes its height.");
+        if let (true, Some(z)) = (b.clicked(), picked) {
+            *value = mm(z);
+        }
+    });
+    ui.end_row();
+}
+
 /// A labelled text box in a form's grid; `true` when its text changed this frame.
 fn field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> bool {
     let need = needed(need, label);
@@ -1184,7 +1228,9 @@ fn field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint
 /// A number as forms show it: at most `decimals` decimals, none wasted.
 fn shown(v: f64, decimals: usize) -> String {
     let s = format!("{v:.decimals$}");
-    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+    let s = if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s };
+    // A value that rounds to nothing has no sign.
+    if s == "-0" { "0".to_string() } else { s }
 }
 
 fn parsed(s: &str) -> Option<f64> {
@@ -1399,27 +1445,10 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
                 None => what.to_string(),
             };
             let given = lists_heights(choices);
-            field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)));
-            field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)));
-            // Heights taken from the model: whatever is selected (an edge, a point, a face).
-            row_label(ui, "From selection", None);
-            match choices.picked {
-                Some((lo, hi)) => {
-                    let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
-                    ui.horizontal(|ui| {
-                        if ui.small_button(format!("Top {}", mm(hi))).on_hover_text("Start cutting at the highest point of the selection").clicked() {
-                            f.top = mm(hi);
-                        }
-                        if ui.small_button(format!("Bottom {}", mm(lo))).on_hover_text("Cut down to the lowest point of the selection").clicked() {
-                            f.bottom = mm(lo);
-                        }
-                    });
-                }
-                None => {
-                    explained(ui.label(RichText::new("select an edge, a point or a face").color(Tokens::get().text_dim)), "From selection", None);
-                }
-            }
-            ui.end_row();
+            // Beside each, a button that takes the height from what is selected in the model.
+            let (low, high) = (choices.picked.map(|p| p.0), choices.picked.map(|p| p.1));
+            height_field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high);
+            height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low);
             if f.kind != OpKind::Drill {
                 field(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter");
             }
@@ -1559,7 +1588,7 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
     let t = Tokens::get();
     let mut ok = false;
     let mut cancel = false;
-    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+    let shown = egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
         ui.label(RichText::new(title).strong());
         ui.add_space(4.0);
         form_ui(ui, form, selected, lists, &need);
@@ -1574,6 +1603,11 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
             ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
         }
     });
+    // A form that has just opened is scrolled into view, its title at the panel's top.
+    if cam.form_seen != Some(title) {
+        shown.response.scroll_to_me_animation(Some(egui::Align::TOP), egui::style::ScrollAnimation::none());
+        cam.form_seen = Some(title);
+    }
     if cancel {
         cam.form = None;
         cam.error = None;
@@ -1694,6 +1728,8 @@ fn docked_panel(
 #[derive(Default)]
 struct Asked {
     run: Vec<(&'static str, Value)>,
+    /// A toolbar command to start (its form opens).
+    start: Option<&'static str>,
     new_tool: bool,
     form: Option<Form>,
     /// An operation to open for editing: its setup and itself, as listed.
@@ -1708,6 +1744,88 @@ struct Asked {
 
 /// Why Simulate and Post Process are off on a setup without operations.
 const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket or Drill)";
+
+/// The operations the toolbar offers, by their command and label.
+const OPERATIONS: [(&str, &str); 4] =
+    [("cam.op.face", "Face"), ("cam.op.contour", "2D Contour"), ("cam.op.pocket", "2D Pocket"), ("cam.op.drill", "Drill")];
+
+/// How far along the way to a program the job is: a setup, an operation, a simulation, a
+/// program written (until the design changes). Each step is a button that does it; the line
+/// under them says what comes next.
+fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
+    let t = Tokens::get();
+    let has_ops = |s: &&Value| s["operations"].as_array().is_some_and(|o| !o.is_empty());
+    // The setup the steps work on: the first with operations, else the first.
+    let target = setups.iter().find(has_ops).or(setups.first());
+    let id = target.and_then(|s| s["id"].as_u64());
+    let done = [target.is_some(), target.is_some_and(|s| has_ops(&s)), cam.simulation.is_some(), cam.posted_now];
+    let next = done.iter().position(|d| !d);
+    const NAMES: [&str; 4] = ["Setup", "Operation", "Simulate", "G-code"];
+    const NEXT: [&str; 4] = [
+        "Next: make a setup: where the raw block is, and the zero the machine is set to.",
+        "Next: add an operation: what to cut, and with which tool.",
+        "Next: simulate, to check the toolpaths against the part.",
+        "Next: write the G-code for the machine.",
+    ];
+    ui.horizontal(|ui| {
+        for (k, name) in NAMES.iter().enumerate() {
+            if k > 0 {
+                ui.label(RichText::new("→").color(t.text_dim));
+            }
+            let is_done = done.get(k).copied().unwrap_or(false);
+            let is_next = next == Some(k);
+            // Each step needs the ones before it.
+            let open = done.iter().take(k).all(|d| *d);
+            let caption = RichText::new(format!("{}  {name}", k + 1));
+            let button = match (is_done, is_next) {
+                (true, _) => egui::Button::new(caption.color(t.text)).fill(t.accent_soft),
+                (_, true) => egui::Button::new(caption.strong().color(t.text)).stroke(Stroke::new(1.5, t.accent)),
+                _ => egui::Button::new(caption.color(t.text_dim)),
+            };
+            let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
+            let tip = [
+                "The raw block and the work zero. Click to make one, or to change it.",
+                "Face, 2D Contour, 2D Pocket or Drill: click to choose one.",
+                "Cut the raw block with every operation and see what is left, or cut into the part.",
+                "Write the setup's program for the machine.",
+            ];
+            let r = ui
+                .add_enabled(open, button)
+                .on_hover_text(tip.get(k).copied().unwrap_or_default())
+                .on_disabled_hover_text(why.get(k).copied().unwrap_or_default());
+            if k == 1 {
+                // The operations to choose from, under the step.
+                egui::Popup::menu(&r).show(|ui| {
+                    for (cmd, label) in OPERATIONS {
+                        if ui.button(label).clicked() {
+                            asked.start = Some(cmd);
+                        }
+                    }
+                });
+                continue;
+            }
+            if r.clicked() {
+                match k {
+                    0 => match target {
+                        Some(setup) => asked.form = setup_form(setup),
+                        None => asked.start = Some("cam.setup.create"),
+                    },
+                    2 => asked.simulate = id,
+                    _ => {
+                        if let (Some(id), Some(setup)) = (id, target) {
+                            asked.post = Some((id, None, text(setup, "post")));
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let line = match next {
+        Some(k) => NEXT.get(k).copied().unwrap_or_default(),
+        None => "Done: the G-code is written. A change to the design or the operations starts the checks again.",
+    };
+    ui.label(RichText::new(line).color(if next.is_some() { t.text } else { t.text_dim }));
+}
 
 /// The tool table's columns.
 const TOOL_HEADS: [&str; 8] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Chip load", "Feed", "Design"];
@@ -1892,6 +2010,8 @@ fn manufacture_window(
             });
             ui.add_space(4.0);
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
+            steps(ui, cam, &setups, asked);
+            ui.add_space(4.0);
             if setups.is_empty() {
                 ui.label(RichText::new("No setup yet: New Setup on the toolbar makes the first").color(t.text_dim));
             }
@@ -2023,6 +2143,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let right = app.viewport.dialog_rect.filter(|_| app.dialog.is_some()).map_or(vp.right(), |r| r.left() - 6.0);
     let max_height = vp.bottom() - top - 8.0;
     let mut asked = Asked::default();
+    app.manufacture.posted_now = app.manufacture.posted_at == Some(app.session.revision);
+    if app.manufacture.form.is_none() {
+        app.manufacture.form_seen = None;
+    }
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
         manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
@@ -2038,6 +2162,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 
 /// Does what a panel, the browser or a menu asked for.
 fn answer(app: &mut SolveApp, mut asked: Asked) {
+    if let Some(id) = asked.start.take() {
+        start(app, id);
+    }
     for (id, p) in std::mem::take(&mut asked.run) {
         app.manufacture.error = run(app, id, p).err();
     }
@@ -2141,6 +2268,8 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             &Row {
                 depth: depth + 1,
                 fold: (!ops.is_empty()).then_some(sopen),
+                eye: Some(!app.manufacture.hidden.contains(&id)),
+                dim: app.manufacture.hidden.contains(&id),
                 icon: "cam_setup",
                 label: &name,
                 name: true,
@@ -2148,11 +2277,14 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 ..Default::default()
             },
         );
+
         if let Some(resp) = &r.resp {
             let hover = setup.get("error").and_then(Value::as_str).map_or_else(|| format!("post: {}", text(setup, "post")), str::to_string);
             resp.clone().on_hover_text(hover);
         }
-        if r.fold {
+        if r.eye {
+            toggle_hidden(app, id);
+        } else if r.fold {
             toggle(app, &skey, true);
         } else if r.clicked {
             app.manufacture.picked = Some((id, None));
@@ -2178,6 +2310,8 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 ui.id().with(("cam_op", id, op_id)),
                 &Row {
                     depth: depth + 2,
+                    eye: Some(!app.manufacture.hidden.contains(&op_id)),
+                    dim: app.manufacture.hidden.contains(&op_id) || app.manufacture.hidden.contains(&id),
                     icon: &icon,
                     label: &label,
                     name: true,
@@ -2186,6 +2320,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                     ..Default::default()
                 },
             );
+
             if let Some(resp) = &r.resp {
                 let hover = error.map_or_else(
                     || {
@@ -2200,7 +2335,9 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 );
                 resp.clone().on_hover_text(hover);
             }
-            if r.clicked {
+            if r.eye {
+                toggle_hidden(app, op_id);
+            } else if r.clicked {
                 app.manufacture.picked = Some((id, Some(op_id)));
             }
             if r.double {
@@ -2214,6 +2351,14 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         }
     }
     answer(app, asked);
+}
+
+/// Shows or hides the toolpaths of a setup or an operation (by its id).
+fn toggle_hidden(app: &mut SolveApp, id: u64) {
+    let hidden = &mut app.manufacture.hidden;
+    if !hidden.remove(&id) {
+        hidden.insert(id);
+    }
 }
 
 /// A menu entry that `menu_action` does: `what` to the setup, or to one operation of it.
@@ -2290,6 +2435,10 @@ pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
     match app.run("cam.post", p) {
         Ok(v) => {
             app.manufacture.error = None;
+            // A whole setup's program finishes the steps (until the design changes).
+            if op.is_none() {
+                app.manufacture.posted_at = Some(app.session.revision);
+            }
             app.set_status(format!("Wrote {} lines of G-code", v["lines"].as_u64().unwrap_or(0)), false);
         }
         Err(e) => app.manufacture.error = Some(e),
