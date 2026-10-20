@@ -781,6 +781,9 @@ struct Geometry {
     walls: Option<(f64, f64)>,
     /// The picked walls of holes, as circles: what a drill drills.
     bores: Vec<(Vec2, f64)>,
+    /// Picked faces: the highest the part reaches just outside their outlines, below the faces
+    /// (the floor a boss stands on); `None` where nothing of the part is there.
+    rim: Option<f64>,
 }
 
 fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Result<Geometry, String> {
@@ -798,6 +801,7 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
                 facing_away: false,
                 walls: None,
                 bores: Vec::new(),
+                rim: None,
             })
         }
         CamGeometry::Sketch { sketch, profiles } => {
@@ -805,7 +809,15 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
                 state.sketches.iter().find(|k| k.feature == *sketch).ok_or("its sketch is not built (deleted, rolled back, suppressed or failed)")?;
             let regions = solidcraft_doc::select_profiles(sketch, profiles).map_err(|e| e.to_string())?;
             let regions = to_setup(&sketch.plane, frame, &regions).map_err(|e| e.to_string())?;
-            Ok(Geometry { regions, z: frame.local(sketch.plane.origin).z, body_z: None, facing_away: false, walls: None, bores: Vec::new() })
+            Ok(Geometry {
+                regions,
+                z: frame.local(sketch.plane.origin).z,
+                body_z: None,
+                facing_away: false,
+                walls: None,
+                bores: Vec::new(),
+                rim: None,
+            })
         }
         CamGeometry::Faces { faces } => {
             let mut regions = Vec::new();
@@ -850,7 +862,8 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
             }
             // Round walls alone: the plane they are cut from is their top.
             let z = z.or(walls.map(|(_, hi)| hi)).ok_or("no face is picked")?;
-            Ok(Geometry { regions, z, body_z, facing_away, walls, bores })
+            let rim = rim_floor(s, at, &regions, z, body_z.map(|(lo, _)| lo));
+            Ok(Geometry { regions, z, body_z, facing_away, walls, bores, rim })
         }
     }
 }
@@ -863,13 +876,65 @@ fn round_wall(body: &solidcraft_doc::ModelBody, index: usize) -> Option<solidcra
 /// The bodies seen from above in a setup, over `lo`–`hi` in its work coordinates; `floor` where
 /// there is nothing. `None` without bodies, or when the bodies are too detailed to look at.
 fn part_field(s: &Session, at: &Resolved, lo: Vec2, hi: Vec2, floor: f64) -> Option<cam::HeightField> {
+    part_field_with(s, at, lo, hi, floor, true)
+}
+
+/// [`part_field`]; `edges`: the triangles' edges mark the columns they cross too (see
+/// [`cam::HeightField::of_triangles`]).
+fn part_field_with(s: &Session, at: &Resolved, lo: Vec2, hi: Vec2, floor: f64, edges: bool) -> Option<cam::HeightField> {
     let triangles = part_triangles(s, at);
     if triangles.is_empty() || !lo.is_finite() || !hi.is_finite() {
         return None;
     }
     let size = (hi.x - lo.x).max(hi.y - lo.y);
     let cell = (size / 300.0).max(0.05);
-    cam::HeightField::of_triangles(lo, hi, cell, floor, &triangles, true).ok()
+    cam::HeightField::of_triangles(lo, hi, cell, floor, &triangles, edges).ok()
+}
+
+/// How far outside an outline the part is looked at for the floor next to it (mm).
+const RIM: f64 = 1.5;
+
+/// The highest the part reaches just outside the outer outlines of `regions` (within [`RIM`]),
+/// below `top` and above the part's foot `lowest`: the floor a picked boss's top stands on.
+/// `None` where nothing of the part is next to the outlines (the part's own outline).
+fn rim_floor(s: &Session, at: &Resolved, regions: &[Region2], top: f64, lowest: Option<f64>) -> Option<f64> {
+    let lowest = lowest?;
+    let outlines: Vec<Vec<Vec2>> = regions.iter().map(|r| r.outer.polyline(TOLERANCE).into_vec()).filter(|p| p.len() > 2).collect();
+    let all = outlines.iter().flatten();
+    let lo = all.clone().fold(Vec2::new(f64::INFINITY, f64::INFINITY), |m, p| Vec2::new(m.x.min(p.x), m.y.min(p.y)));
+    let hi = all.fold(Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY), |m, p| Vec2::new(m.x.max(p.x), m.y.max(p.y)));
+    let around = Vec2::new(RIM * 2.0, RIM * 2.0);
+    let field = part_field_with(s, at, lo - around, hi + around, lowest - 1.0, false)?;
+    let inside = |p: Vec2| regions.iter().any(|r| r.outer.contains(p));
+    let near = |p: Vec2| {
+        outlines.iter().any(|line| {
+            line.iter().zip(line.iter().cycle().skip(1)).take(line.len()).any(|(a, b)| {
+                let ab = *b - *a;
+                let t = if ab.dot(ab) > 1e-18 { ((p - *a).dot(ab) / ab.dot(ab)).clamp(0.0, 1.0) } else { 0.0 };
+                p.dist(*a + ab * t) <= RIM
+            })
+        })
+    };
+    let mut floor: Option<f64> = None;
+    for j in 0..field.ny {
+        for i in 0..field.nx {
+            let (Some(h), c) = (field.get(i, j), field.centre(i, j)) else { continue };
+            if h > lowest - 0.5 && h < top - 1e-3 && !inside(c) && near(c) {
+                floor = Some(floor.map_or(h, |f| f.max(h)));
+            }
+        }
+    }
+    floor
+}
+
+/// The part seen from above over a setup's part box, wide enough round it for any tool of the
+/// design: what an operation's toolpath is checked against.
+fn setup_part(s: &Session, at: &Resolved) -> Option<cam::HeightField> {
+    let (lo, hi) = at.part?;
+    let reach = s.doc.manufacture.tools.iter().map(|t| t.diameter).fold(1.0, f64::max);
+    let around = Vec2::new(reach, reach);
+    // Each column as its centre sees the part: a tool along a wall is not in it.
+    part_field_with(s, at, Vec2::new(lo.x, lo.y) - around, Vec2::new(hi.x, hi.y) + around, lo.z - 1.0, false)
 }
 
 /// The bodies' triangles in a setup's work coordinates.
@@ -930,7 +995,8 @@ fn auto_heights_of_part(at: &Resolved, g: &Geometry, shape: OpShape, source: &Ca
     }
     match (shape, g.body_z) {
         (OpShape::Pocket, Some((_, hi))) if picked => (Some(hi), Some(g.z)),
-        (OpShape::Contour, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
+        // Round a picked face down to the floor beside it (a boss's), or through the part.
+        (OpShape::Contour, Some((lo, hi))) if picked => (Some(hi), Some(g.rim.unwrap_or(lo))),
         (OpShape::Drill, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
         (OpShape::Face, _) if picked => (Some(g.z), Some(g.z)),
         // Facing a sketch's box: down to the sketch's plane, from the top of the stock if that is above it.
@@ -1133,6 +1199,44 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
     let source = geometry_param(s, p, cmd)?;
     let g = geometry(s, &at, &source).map_err(|e| bad(cmd, e))?;
     Ok(auto_heights(&at, &g, shape, &source))
+}
+
+/// What an operation command would cut, with nothing in the design changed: `cmd` (a
+/// `cam.op.*` command, or `cam.op.edit`) runs with `p` on a scratch copy of the session, and the
+/// toolpath it makes comes back as points in world coordinates, each with whether the tool cuts
+/// on the way to it. Forms show it before OK.
+pub fn cam_preview(s: &Session, cmd: &str, p: &Value) -> Result<CamPreview> {
+    if !cmd.starts_with("cam.op.") || matches!(cmd, "cam.op.move" | "cam.op.remove") {
+        return Err(bad(cmd, "not an operation to preview"));
+    }
+    let mut copy = s.scratch();
+    let made = copy.execute(cmd, p)?;
+    let ask = json!({ "setup": made["setup"], "op": made["operation"] });
+    let path = copy.execute("cam.toolpath", &ask)?;
+    let points = path["operations"].get(0).and_then(|o| o["points"].as_array()).cloned().unwrap_or_default();
+    let points = points
+        .iter()
+        .filter_map(|q| Some((Vec3::new(q.get(0)?.as_f64()?, q.get(1)?.as_f64()?, q.get(2)?.as_f64()?), q.get(3)?.as_bool()?)))
+        .collect();
+    // How deep it would cut into the part, as the listing would say once it is added.
+    let listed = copy.execute("cam.list", &json!({}))?;
+    let gouge = listed["setups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| x["id"] == made["setup"])
+        .flat_map(|x| x["operations"].as_array().cloned().unwrap_or_default())
+        .find(|o| o["id"] == made["operation"])
+        .and_then(|o| o["warning"].as_str().map(str::to_string));
+    Ok(CamPreview { points, warning: gouge })
+}
+
+/// What [`cam_preview`] finds: the toolpath's points in world coordinates, each with whether the
+/// tool cuts on the way to it, and a warning when it would cut into the part.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CamPreview {
+    pub points: Vec<(Vec3, bool)>,
+    pub warning: Option<String>,
 }
 
 /// How high the selection reaches in a setup: the lowest and highest point of the selected
@@ -1515,12 +1619,7 @@ fn list_now(s: &Session) -> Value {
         .iter()
         .map(|setup| {
             // The part seen from above, to tell an operation that cuts into it.
-            let part = resolve(s, setup).ok().and_then(|at| {
-                let (lo, hi) = at.part?;
-                let reach = m.tools.iter().map(|t| t.diameter).fold(1.0, f64::max);
-                let around = Vec2::new(reach, reach);
-                part_field(s, &at, Vec2::new(lo.x, lo.y) - around, Vec2::new(hi.x, hi.y) + around, lo.z - 1.0)
-            });
+            let part = resolve(s, setup).ok().and_then(|at| setup_part(s, &at));
             let ops: Vec<Value> = setup
                 .operations
                 .iter()

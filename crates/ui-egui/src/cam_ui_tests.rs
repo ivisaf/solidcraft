@@ -786,3 +786,65 @@ fn shown_numbers_have_no_negative_zero() {
     assert_eq!(shown(-14.0, 3), "-14");
     assert_eq!(shown(2.5, 3), "2.5");
 }
+
+#[test]
+fn an_operation_form_shows_its_toolpath_before_ok() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.pocket");
+    // Nothing while the depth is missing.
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        op.bottom.clear();
+    }
+    h.frames(2);
+    assert!(h.app.manufacture.preview.is_none());
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        op.bottom = "-3 mm".into();
+    }
+    h.frames(2);
+    let low = |h: &Harness| match &h.app.manufacture.preview {
+        Some((_, _, Ok(preview))) => preview.points.iter().filter(|p| p.1).map(|p| p.0.z).fold(f64::INFINITY, f64::min),
+        other => panic!("no preview: {other:?}"),
+    };
+    assert_eq!(low(&h), -3.0);
+    assert!(h.app.session.doc.manufacture.setups[0].operations.is_empty(), "a preview adds nothing");
+    // A change shows at once; what stops it is said before OK.
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        op.bottom = "-5 mm".into();
+    }
+    h.frames(2);
+    assert_eq!(low(&h), -5.0);
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        op.top = "-6 mm".into();
+    }
+    h.frames(2);
+    assert!(
+        matches!(&h.app.manufacture.preview, Some((_, _, Err(e))) if e.contains("above the top")),
+        "{:?}",
+        h.app.manufacture.preview.as_ref().map(|p| &p.2)
+    );
+    // Closed, the form leaves no preview behind.
+    h.app.manufacture.form = None;
+    h.frames(2);
+    assert!(h.app.manufacture.preview.is_none());
+}
+
+#[test]
+fn an_operation_on_picked_faces_opens_again_with_them() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
+    h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
+    fill(&mut h, "cam.op.contour", |_| {});
+    h.app.session.selection.clear();
+    // Edited, the form has the face it was made on, and nothing is missing.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let (setup, op) = (&listed["setups"][0], &listed["setups"][0]["operations"][0]);
+    let form = edit_form(&h.app, setup, op).unwrap();
+    let Form::Op(f) = &form else { panic!("not an operation form") };
+    assert_eq!(f.faces.len(), 1);
+    assert!(missing(&form, &Choices::default()).iter().all(|n| n.field != "Sketch"), "{:?}", missing(&form, &Choices::default()));
+}

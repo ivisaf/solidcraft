@@ -202,10 +202,11 @@ impl HeightField {
 }
 
 /// How deep `path` cuts into the part `part` holds (mm; 0 when it never does): the deepest a
-/// cutting move's tool end goes below the part's top within its radius, less a column's width
-/// either way so that a tool running along a wall is not counted.
+/// cutting move's tool end goes below the part's top within its radius, less a few columns'
+/// width (the field's own rounding of a wall, either way) so that a tool running along a wall
+/// is not counted.
 pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
-    let r = (tool.radius() - part.cell * 1.5).max(0.0);
+    let r = (tool.radius() - part.cell * 2.5).max(0.0);
     let Ok(reach) = part.dilated(r) else { return 0.0 };
     let step = (part.cell * 0.5).max(1e-3);
     let mut deepest: f64 = 0.0;

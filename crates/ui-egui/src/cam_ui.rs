@@ -346,6 +346,9 @@ pub struct CamUi {
     pub hidden: std::collections::BTreeSet<u64>,
     /// The setup and the operation of each toolpath in `cache`, in the same order.
     path_ids: Vec<(u64, u64)>,
+    /// The open operation form's toolpath before OK (or why there is none), for the design
+    /// revision and the command it was worked out for.
+    preview: Option<(u64, Value, Result<solidcraft_engine::CamPreview, String>)>,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
     /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
@@ -385,6 +388,7 @@ impl Default for CamUi {
             form_seen: None,
             hidden: Default::default(),
             path_ids: Vec::new(),
+            preview: None,
             cache: None,
             heights: None,
             selection_heights: None,
@@ -767,12 +771,8 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
     let number = |v: &Value| v.as_f64().map(|x| x.to_string()).unwrap_or_default();
     let flutes = op["tool"].as_u64().and_then(|n| app.session.doc.manufacture.tool(n as u32)).map_or(0, |t| t.flutes);
     let sketch = op["geometry"]["sketch"].as_u64().and_then(|id| app.session.doc.feature(id)).map(|f| f.name.clone()).unwrap_or_default();
-    let faces: Vec<(String, Vec3)> = op["geometry"]["faces"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| Some((f["body"].as_str()?.to_string(), Vec3::new(f["at"]["x"].as_f64()?, f["at"]["y"].as_f64()?, f["at"]["z"].as_f64()?))))
-        .collect();
+    let faces: Vec<(String, Vec3)> =
+        op["geometry"]["faces"].as_array().into_iter().flatten().filter_map(|f| Some((f["body"].as_str()?.to_string(), point(&f["at"])?))).collect();
     let inputs = &op["inputs"];
     let boundary = match op["geometry"]["type"].as_str() {
         Some("part") => 1,
@@ -935,6 +935,33 @@ fn picked_heights(app: &mut SolveApp) -> Option<(f64, f64)> {
     h
 }
 
+/// Works out the open operation form's toolpath again when its command or the design changed;
+/// none while the form still misses something.
+fn update_preview(app: &mut SolveApp, lists: &Choices) {
+    let wanted = match &app.manufacture.form {
+        Some(form @ Form::Op(_)) if missing(form, lists).is_empty() => command(form).ok().map(|(id, p)| (id, json!({ "command": id, "params": p }))),
+        _ => None,
+    };
+    let Some((id, key)) = wanted else {
+        app.manufacture.preview = None;
+        return;
+    };
+    let revision = app.session.revision;
+    if app.manufacture.preview.as_ref().is_some_and(|(r, k, _)| *r == revision && *k == key) {
+        return;
+    }
+    let path = solidcraft_engine::cam_preview(&app.session, id, &key["params"]).map_err(|e| e.to_string());
+    app.manufacture.preview = Some((revision, key, path));
+}
+
+/// The operation an open form edits, whose own toolpath the preview stands in for.
+fn previewed_op(cam: &CamUi) -> Option<u64> {
+    match (&cam.form, &cam.preview) {
+        (Some(Form::Op(f)), Some((_, _, Ok(_)))) => f.editing.as_ref().map(|e| e.op),
+        _ => None,
+    }
+}
+
 /// Simulates the first setup (what the toolbar's Simulate does).
 pub fn simulate(app: &mut SolveApp) {
     match app.session.doc.manufacture.setups.first().map(|s| s.id) {
@@ -1052,7 +1079,9 @@ pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, boo
     }
     let cam = &app.manufacture;
     let paths = cam.cache.iter().flat_map(|(_, p, _)| p).zip(&cam.path_ids);
-    for (path, _) in paths.filter(|(_, (setup, op))| !cam.hidden.contains(setup) && !cam.hidden.contains(op)) {
+    let edited = previewed_op(cam);
+    let shown = |(setup, op): &(u64, u64)| !cam.hidden.contains(setup) && !cam.hidden.contains(op) && edited != Some(*op);
+    for (path, _) in paths.filter(|(_, ids)| shown(ids)) {
         for (a, b) in path.iter().zip(path.iter().skip(1)) {
             if out.len() >= MAX_SEGMENTS {
                 return out;
@@ -1084,9 +1113,21 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             }
         }
     }
+    // While a form shows its toolpath, the others step back.
+    let preview = match &app.manufacture.preview {
+        Some((_, _, Ok(p))) if paths_drawn(app) => Some(&p.points),
+        _ => None,
+    };
+    let back = if preview.is_some() { 0.3 } else { 1.0 };
     for (from, to, cutting) in segments(app, proj) {
-        let stroke = if cutting { Stroke::new(1.5, t.accent) } else { Stroke::new(1.0, t.warning.gamma_multiply(0.7)) };
+        let stroke = if cutting { Stroke::new(1.5, t.accent.gamma_multiply(back)) } else { Stroke::new(1.0, t.warning.gamma_multiply(0.7 * back)) };
         painter.line_segment([from, to], stroke);
+    }
+    for (a, b) in preview.into_iter().flat_map(|path| path.iter().zip(path.iter().skip(1))).take(MAX_SEGMENTS) {
+        if let (Some(from), Some(to)) = (proj.to_screen(a.0), proj.to_screen(b.0)) {
+            let stroke = if b.1 { Stroke::new(2.5, t.accent) } else { Stroke::new(1.2, t.warning) };
+            painter.line_segment([from, to], stroke);
+        }
     }
 }
 
@@ -1601,6 +1642,16 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
         });
         if !need.is_empty() {
             ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
+        }
+        // What stops the toolpath, said before OK.
+        match (&*form, &cam.preview) {
+            (Form::Op(_), Some((_, _, Err(e)))) => {
+                ui.add(egui::Label::new(RichText::new(format!("Cannot be cut: {e}")).color(t.error)).wrap());
+            }
+            (Form::Op(_), Some((_, _, Ok(solidcraft_engine::CamPreview { warning: Some(w), .. })))) => {
+                ui.add(egui::Label::new(RichText::new(format!("This toolpath {w}: check Top, Bottom and the geometry")).color(t.warning)).wrap());
+            }
+            _ => {}
         }
     });
     // A form that has just opened is scrolled into view, its title at the panel's top.
@@ -2136,6 +2187,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut lists = choices(app, &listed, &library);
     lists.heights = form_heights(app);
     lists.picked = picked_heights(app);
+    update_preview(app, &lists);
     // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());

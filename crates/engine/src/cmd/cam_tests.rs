@@ -1015,3 +1015,43 @@ fn a_picked_face_under_standing_stock_is_cut_from_the_stock_s_top() {
     assert!(op["max_engagement"].as_f64().unwrap() <= 3.0 + 1e-6, "{sim}");
     assert_eq!(sim["max_gouge"], 0.0);
 }
+
+#[test]
+fn a_preview_shows_the_toolpath_and_changes_nothing() {
+    let mut s = plate_with_boss();
+    run(&mut s, "cam.op.face", json!({"tool": 1, "bottom": 12, "stepover": 4}));
+    let (doc, revision) = (s.doc.clone(), s.revision);
+    let started = std::time::Instant::now();
+    let new = crate::cam_preview(&s, "cam.op.contour", &json!({"faces": [{"point": [42, 20, 6]}], "tool": 1})).unwrap().points;
+    let edited = crate::cam_preview(&s, "cam.op.edit", &json!({"op": "Face1", "bottom": 11})).unwrap().points;
+    eprintln!("two previews in {:?}", started.elapsed());
+    // Round the boss's wall, from the stock's top down to its foot.
+    let low = new.iter().filter(|p| p.1).map(|p| p.0.z).fold(f64::INFINITY, f64::min);
+    let near = new.iter().filter(|p| p.1).map(|p| (p.0.x - 30.0).hypot(p.0.y - 20.0)).fold(f64::INFINITY, f64::min);
+    assert!(low.abs() < 1e-6 && (near - 15.0).abs() < 1e-3, "{low} {near}");
+    assert!(edited.iter().any(|p| p.1 && (p.0.z - 11.0).abs() < 1e-6));
+    // Nothing of it is in the design.
+    assert!(std::sync::Arc::ptr_eq(&doc, &s.doc) && s.revision == revision);
+    assert_eq!(s.doc.manufacture.setups[0].operations.len(), 1);
+    assert!(crate::cam_preview(&s, "cam.op.remove", &json!({"op": "Face1"})).is_err());
+    assert_eq!(s.doc.manufacture.setups[0].operations.len(), 1);
+}
+
+#[test]
+fn a_contour_round_a_picked_boss_top_stops_at_the_floor_it_stands_on() {
+    let mut s = plate_with_boss();
+    // Round the boss's top face: down to the plate's top (0), not through the plate (-10).
+    let top = json!({"faces": [{"point": [30, 26, 12]}], "tool": 1});
+    let (t, b) = crate::cam_heights(&s, "cam.op.contour", &top).unwrap();
+    assert_eq!((t.map(|v| (v * 1e3).round() / 1e3), b.map(|v| (v * 1e3).round() / 1e3)), (Some(13.0), Some(0.0)));
+    let preview = crate::cam_preview(&s, "cam.op.contour", &top).unwrap();
+    assert_eq!(preview.warning, None);
+    // Round the plate's own top: through it, as before; a pocket over the boss is warned of before it is added.
+    let (_, b) = crate::cam_heights(&s, "cam.op.contour", &json!({"faces": [{"point": [5, 5, 0]}]})).unwrap();
+    assert_eq!(b.map(|v| (v * 1e3).round() / 1e3), Some(-10.0));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Over"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 5], "p1": [50, 35]}));
+    run(&mut s, "sketch.finish", json!({}));
+    let over = crate::cam_preview(&s, "cam.op.pocket", &json!({"sketch": "Over", "tool": 1, "top": 12, "bottom": 2})).unwrap();
+    assert!(over.warning.is_some_and(|w| w.starts_with("cuts up to 10.")));
+}
