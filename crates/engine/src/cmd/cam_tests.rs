@@ -891,3 +891,27 @@ fn sketch_heights_follow_the_part_and_the_work_origin() {
     assert!(err.contains("the bottom (-0.5 mm) is above the top (-1 mm)"), "{err}");
     close(run(&mut s, "cam.op.pocket", json!({"sketch": "Holes", "tool": 1, "bottom": -4}))["lowest_z"].as_f64().unwrap(), -4.0, 1e-9);
 }
+
+#[test]
+fn forms_learn_which_heights_an_operation_finds_by_itself() {
+    let mut s = machined_plate();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": -4, "name": "Floor"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [12, 12], "p1": [48, 28]}));
+    run(&mut s, "sketch.finish", json!({}));
+    // Rounded to a micrometre: the part's box is measured, not exact.
+    let um = |v: Option<f64>| v.map(|v| (v * 1e3).round() / 1e3);
+    let heights = |s: &Session, cmd: &str, p: Value| {
+        let (top, bottom) = crate::cam_heights(s, cmd, &p).unwrap();
+        (um(top), um(bottom))
+    };
+    // A pocket sketched on the part's top: its depth is the user's to give.
+    assert_eq!(heights(&s, "cam.op.pocket", json!({"sketch": "PocketSketch"})), (Some(0.0), None));
+    // A contour on the top goes through the part; an outline on a floor cuts down to it.
+    assert_eq!(heights(&s, "cam.op.contour", json!({"sketch": "Plate"})), (Some(0.0), Some(-10.0)));
+    assert_eq!(heights(&s, "cam.op.pocket", json!({"sketch": "Floor"})), (Some(0.0), Some(-4.0)));
+    // What stops the geometry is said, and nothing is added.
+    let none = crate::cam_heights(&s, "cam.op.pocket", &json!({"sketch": "Nowhere"}));
+    assert!(none.is_err());
+    assert!(crate::cam_heights(&s, "cam.setup.create", &json!({})).is_err());
+    assert!(s.doc.manufacture.setups[0].operations.is_empty());
+}

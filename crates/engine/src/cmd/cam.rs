@@ -826,6 +826,51 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
     }
 }
 
+/// What an operation cuts, as far as the heights it finds by itself go.
+#[derive(Clone, Copy)]
+enum OpShape {
+    Face,
+    Contour,
+    Pocket,
+    Drill,
+}
+
+impl OpShape {
+    fn of(kind: &CamOperationKind) -> Self {
+        match kind {
+            CamOperationKind::Face { .. } => OpShape::Face,
+            CamOperationKind::Contour { .. } => OpShape::Contour,
+            CamOperationKind::Pocket { .. } => OpShape::Pocket,
+            CamOperationKind::Drill { .. } => OpShape::Drill,
+        }
+    }
+}
+
+/// The top and bottom an operation takes from its geometry (see [`build`]); `None` where it has none.
+fn auto_heights(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
+    let picked = matches!(source, CamGeometry::Faces { .. });
+    let on_sketch = matches!(source, CamGeometry::Sketch { .. });
+    let stock_top = at.stock.map(|(_, hi)| hi.z);
+    match (shape, g.body_z) {
+        (OpShape::Pocket, Some((_, hi))) if picked => (Some(hi), Some(g.z)),
+        (OpShape::Contour, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
+        (OpShape::Drill, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
+        (OpShape::Face, _) if picked => (Some(g.z), Some(g.z)),
+        // Facing a sketch's box: down to the sketch's plane, from the top of the stock if that is above it.
+        (OpShape::Face, _) if on_sketch => (Some(at.stock.map_or(g.z, |(_, hi)| hi.z.max(g.z))), Some(g.z)),
+        // Facing the stock: from its top down to the top of the part.
+        (OpShape::Face, Some((_, hi))) if matches!(source, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
+        // A sketch below the part's top (an outline drawn on its floor): cut from the top of the
+        // material, the stock's or else the part's, down to the sketch.
+        (_, _) if on_sketch && at.part.is_some_and(|(_, hi)| g.z < hi.z - 1e-6) => {
+            (stock_top.or(at.part.map(|(_, hi)| hi.z)).map(|t| t.max(g.z)), Some(g.z))
+        }
+        // A sketch on the part's top: a contour or holes go through the part; a pocket's depth is the user's.
+        (OpShape::Contour | OpShape::Drill, _) if on_sketch => (Some(g.z), at.part.map(|(lo, _)| lo.z).filter(|lo| *lo < g.z - 1e-6)),
+        _ => (Some(g.z), None),
+    }
+}
+
 /// The toolpath of `op` in its setup's work coordinates, from the model as it is now.
 ///
 /// Heights the operation leaves out follow its geometry. A sketch gives the top (its plane).
@@ -853,28 +898,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         return Err(fail("a picked face points away from the tool; machine it in a setup whose axis faces it".into()));
     }
     let stock_top = at.stock.map(|(_, hi)| hi.z);
-    let (auto_top, auto_bottom) = match (&op.kind, g.body_z) {
-        (CamOperationKind::Pocket { .. }, Some((_, hi))) if picked => (Some(hi), Some(g.z)),
-        (CamOperationKind::Contour { .. }, Some((lo, hi))) if picked => (Some(hi), Some(lo)),
-        (CamOperationKind::Drill { .. }, Some((lo, _))) if picked => (Some(g.z), Some(lo)),
-        (CamOperationKind::Face { .. }, _) if picked => (Some(g.z), Some(g.z)),
-        // Facing a sketch's box: down to the sketch's plane, from the top of the stock if that is above it.
-        (CamOperationKind::Face { .. }, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) => {
-            (Some(at.stock.map_or(g.z, |(_, hi)| hi.z.max(g.z))), Some(g.z))
-        }
-        // Facing the stock: from its top down to the top of the part.
-        (CamOperationKind::Face { .. }, Some((_, hi))) if matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part) => (Some(g.z), Some(hi)),
-        // A sketch below the part's top (an outline drawn on its floor): cut from the top of the
-        // material, the stock's or else the part's, down to the sketch.
-        (_, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) && at.part.is_some_and(|(_, hi)| g.z < hi.z - 1e-6) => {
-            (stock_top.or(at.part.map(|(_, hi)| hi.z)).map(|t| t.max(g.z)), Some(g.z))
-        }
-        // A sketch on the part's top: a contour or holes go through the part; a pocket's depth is the user's.
-        (CamOperationKind::Contour { .. } | CamOperationKind::Drill { .. }, _) if matches!(op.geometry, CamGeometry::Sketch { .. }) => {
-            (Some(g.z), at.part.map(|(lo, _)| lo.z).filter(|lo| *lo < g.z - 1e-6))
-        }
-        _ => (Some(g.z), None),
-    };
+    let (auto_top, auto_bottom) = auto_heights(at, &g, OpShape::of(&op.kind), &op.geometry);
     let height = |what: &str, given: &Option<Expr>, auto: Option<f64>| match given {
         Some(e) => len(what, e),
         None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
@@ -993,13 +1017,9 @@ fn stats_json(path: &Toolpath) -> Value {
 }
 
 /// Reads what every operation takes and adds the operation once its toolpath has been worked out.
-fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(&Tool) -> CamOperationKind) -> Result<Value> {
-    let si = setup_index(s, p, cmd)?;
-    let setup = s.doc.manufacture.setups.get(si).ok_or_else(|| bad(cmd, "no such setup"))?.clone();
-    if setup.operations.len() >= MAX_OPERATIONS {
-        return Err(bad(cmd, "the setup has too many operations"));
-    }
-    let geometry = match (p.get("faces"), p.get("sketch")) {
+/// Where an operation cuts, as `cmd` names it: a sketch, picked faces, or (facing) a boundary.
+fn geometry_param(s: &Session, p: &Value, cmd: &str) -> Result<CamGeometry> {
+    Ok(match (p.get("faces"), p.get("sketch")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
         (None, None) if cmd == "cam.op.face" => boundary_param(p, cmd)?,
@@ -1007,7 +1027,34 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
             sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
             profiles: super::features::profiles(p, cmd)?,
         },
+    })
+}
+
+/// The heights an operation of `cmd` (a `cam.op.*` command) finds by itself: its top and bottom
+/// in the setup's Z, `None` where it has to be given. `p` names the setup and the geometry as
+/// `cmd` takes them. Forms show these heights and tell from them what is still missing.
+pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Option<f64>)> {
+    let shape = match cmd {
+        "cam.op.face" => OpShape::Face,
+        "cam.op.contour" => OpShape::Contour,
+        "cam.op.pocket" => OpShape::Pocket,
+        "cam.op.drill" => OpShape::Drill,
+        _ => return Err(bad(cmd, "not an operation")),
     };
+    let setup = setup(s, p, cmd)?;
+    let at = resolve(s, setup).map_err(|e| bad(cmd, format!("setup `{}`: {e}", setup.name)))?;
+    let source = geometry_param(s, p, cmd)?;
+    let g = geometry(s, &at, &source).map_err(|e| bad(cmd, e))?;
+    Ok(auto_heights(&at, &g, shape, &source))
+}
+
+fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(&Tool) -> CamOperationKind) -> Result<Value> {
+    let si = setup_index(s, p, cmd)?;
+    let setup = s.doc.manufacture.setups.get(si).ok_or_else(|| bad(cmd, "no such setup"))?.clone();
+    if setup.operations.len() >= MAX_OPERATIONS {
+        return Err(bad(cmd, "the setup has too many operations"));
+    }
+    let geometry = geometry_param(s, p, cmd)?;
     let number = p.get("tool").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "`tool` must be a tool number"))?;
     // The design's own copy of the tool, else the machine library's, which the design then keeps a copy of.
     let own = s.doc.manufacture.tools.iter().find(|t| u64::from(t.number) == number).cloned();

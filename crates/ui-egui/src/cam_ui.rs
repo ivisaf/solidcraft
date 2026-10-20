@@ -333,6 +333,8 @@ pub struct CamUi {
     stock_stamp: u64,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
+    /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
+    heights: Option<(u64, &'static str, Value, Heights)>,
 }
 
 impl Default for CamUi {
@@ -360,6 +362,7 @@ impl Default for CamUi {
             show_stock: true,
             stock_stamp: 0,
             cache: None,
+            heights: None,
         }
     }
 }
@@ -850,6 +853,42 @@ pub fn apply(app: &mut SolveApp) {
     }
 }
 
+/// What the engine asks about an operation form's heights: its setup and its geometry, as its
+/// command names them (`None` while the form names no geometry).
+fn heights_query(f: &OpForm) -> Option<Value> {
+    let mut p = serde_json::Map::new();
+    if let Some(e) = &f.editing {
+        p.insert("setup".into(), json!(e.setup));
+    }
+    if !f.faces.is_empty() {
+        let faces: Vec<Value> = f.faces.iter().map(|(body, at)| json!({"body": body, "point": [at.x, at.y, at.z]})).collect();
+        p.insert("faces".into(), json!(faces));
+    } else if f.kind == OpKind::Face && f.boundary < 2 {
+        p.insert("boundary".into(), json!(FACE_BOUNDS.get(f.boundary).copied().unwrap_or("stock")));
+    } else if f.sketch.trim().is_empty() {
+        return None;
+    } else {
+        p.insert("sketch".into(), json!(f.sketch.trim()));
+    }
+    Some(Value::Object(p))
+}
+
+/// The open operation form's own heights, worked out again when the design or its geometry changes.
+fn form_heights(app: &mut SolveApp) -> Option<Heights> {
+    let Some(Form::Op(f)) = &app.manufacture.form else { return None };
+    let query = heights_query(f)?;
+    let (cmd, revision) = (f.kind.command(), app.session.revision);
+    if let Some((r, c, q, h)) = &app.manufacture.heights
+        && (*r, *c) == (revision, cmd)
+        && *q == query
+    {
+        return Some(h.clone());
+    }
+    let h = solidcraft_engine::cam_heights(&app.session, cmd, &query).map_err(|e| e.to_string());
+    app.manufacture.heights = Some((revision, cmd, query, h.clone()));
+    Some(h)
+}
+
 /// Simulates the first setup (what the toolbar's Simulate does).
 pub fn simulate(app: &mut SolveApp) {
     match app.session.doc.manufacture.setups.first().map(|s| s.id) {
@@ -999,10 +1038,106 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     }
 }
 
+/// A value a form still needs before OK can run its command: the row it belongs to (empty: the
+/// form as a whole) and what is wanted there.
+#[derive(Clone, Debug, PartialEq)]
+struct Need {
+    field: &'static str,
+    why: String,
+}
+
+/// A row label without its unit: "Feed (mm/min)" is "Feed".
+fn base(label: &str) -> &str {
+    label.split(" (").next().unwrap_or(label)
+}
+
+/// What a form's row is for, shown when the pointer rests on it.
+fn help(label: &str) -> Option<&'static str> {
+    Some(match base(label) {
+        "Number" => "The tool's number: the T word in the program and the pocket of a tool changer.",
+        "Kind" => "Flat: a flat end mill. Ball: a rounded end. Drill: only plunges straight down.",
+        "Diameter" => "How wide the tool cuts.",
+        "Description" => "Your own words for the tool, shown in the lists.",
+        "Flute length" => "How deep the cutting edges reach. Deeper cuts need a longer tool.",
+        "Flutes" => "How many cutting edges the tool has. Together with the speed it sets the feed.",
+        "Spindle" => "How fast the spindle turns. Empty: the tool's own speed.",
+        "Chip load" => "How thick a chip each edge takes. Feed = speed × flutes × chip load: change one and the feed follows.",
+        "Feed" => "How fast the tool moves sideways while cutting. Empty: the tool's own feed.",
+        "Plunge feed" => "How fast the tool moves down into the material.",
+        "Stepdown" => "How deep the tool goes per pass. Deep cuts are made in several passes.",
+        "Stepover" => "How far apart the side-by-side passes are. Smaller is cleaner but slower.",
+        "Name" => "Your own name for it. Empty: one is made up.",
+        "Tool axis" => "The direction the tool comes from. +z: from above.",
+        "Stock on the sides" | "Stock on top" | "Stock below" => "Extra material round the part: the raw block is the part's box plus these.",
+        "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
+        "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
+        "Post" => "Which machine dialect the G-code is written in.",
+        "Boundary" => "The area to face: the raw block, the part's outline, or a sketch's outline.",
+        "Sketch" => "The sketch whose closed profiles are cut.",
+        "Faces" => "Picked faces of the part: they give the outline and the heights.",
+        "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
+        "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
+        "Bottom" => "How deep it cuts: the lowest height, in the setup's Z (zero at the work zero; below it is negative).",
+        "Cut" => "Whether the tool may run over the boundary or stays inside it.",
+        "Over by" | "Inside by" => "How far over or inside the boundary the tool goes.",
+        "Side" => "Outside: the profile is the part. Inside: it is a hole. On: the tool's centre follows the line.",
+        "Stock to leave" => "Material left on the walls, for a finishing pass later.",
+        "Ramp angle" => "How steeply the tool goes down into each pass. 0: straight down.",
+        "Direction" => "Climb milling cuts with the tool's turning. Off: conventional milling.",
+        "Coolant" => "Switch the coolant on for this operation.",
+        "Peck depth" => "Drill this deep, pull back to clear the chips, and go on. Empty: in one go.",
+        "Dwell" => "Seconds to wait at the bottom of each hole.",
+        _ => return None,
+    })
+}
+
+/// What `field` of a form still needs, if anything.
+fn needed<'a>(need: &'a [Need], label: &str) -> Option<&'a Need> {
+    need.iter().find(|n| n.field == base(label))
+}
+
+/// A form row's label: in the error colour while its value is still needed, with what the row
+/// is for (and what it needs) on hover.
+fn row_label(ui: &mut egui::Ui, label: &str, need: Option<&Need>) {
+    let t = Tokens::get();
+    let text = if need.is_some() { RichText::new(label).color(t.error) } else { RichText::new(label) };
+    let r = ui.label(text);
+    explained(r, label, need);
+}
+
+/// `r` with what its row is for, and what it needs, on hover.
+fn explained(r: egui::Response, label: &str, need: Option<&Need>) -> egui::Response {
+    let mut tip = help(label).unwrap_or_default().to_string();
+    if let Some(n) = need {
+        if !tip.is_empty() {
+            tip.push_str("\n\n");
+        }
+        tip.push_str(&format!("Needed: {}", n.why));
+    }
+    if tip.is_empty() {
+        return r;
+    }
+    // Wrapped: a panel at the screen's edge must not push its tips off it.
+    r.on_hover_ui(|ui| {
+        ui.set_max_width(320.0);
+        ui.add(egui::Label::new(tip).wrap());
+    })
+}
+
+/// A frame in the error colour round a row's control while its value is still needed.
+fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
+    if need.is_some() {
+        ui.painter().rect_stroke(r.rect.expand(1.0), 2.0, Stroke::new(1.5, Tokens::get().error), egui::StrokeKind::Outside);
+    }
+}
+
 /// A labelled text box in a form's grid; `true` when its text changed this frame.
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
-    ui.label(label);
+fn field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> bool {
+    let need = needed(need, label);
+    row_label(ui, label, need);
     let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
+    mark(ui, &r, need);
+    let r = explained(r, label, need);
     let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
     ui.end_row();
     changed
@@ -1033,25 +1168,29 @@ fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut 
     }
 }
 
-fn choice(ui: &mut egui::Ui, id: &str, label: &str, index: &mut usize, options: &[&str]) {
-    ui.label(label);
-    egui::ComboBox::from_id_salt(id).selected_text(options.get(*index).copied().unwrap_or_default()).show_ui(ui, |ui| {
+fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut usize, options: &[&str]) {
+    row_label(ui, label, needed(need, label));
+    let r = egui::ComboBox::from_id_salt(id).selected_text(options.get(*index).copied().unwrap_or_default()).show_ui(ui, |ui| {
         for (i, o) in options.iter().enumerate() {
             ui.selectable_value(index, i, *o);
         }
     });
+    explained(r.response, label, None);
     ui.end_row();
 }
 
 /// A text value chosen from a list (`(value, label)`); a value not in the list is shown as it is.
-fn pick(ui: &mut egui::Ui, id: &str, label: &str, value: &mut String, options: &[(String, String)]) {
-    ui.label(label);
+fn pick(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, value: &mut String, options: &[(String, String)]) {
+    let need = needed(need, label);
+    row_label(ui, label, need);
     let shown = options.iter().find(|(v, _)| v == value).map_or(value.clone(), |(_, l)| l.clone());
-    egui::ComboBox::from_id_salt(id).selected_text(shown).width(140.0).show_ui(ui, |ui| {
+    let r = egui::ComboBox::from_id_salt(id).selected_text(shown).width(140.0).show_ui(ui, |ui| {
         for (v, l) in options {
             ui.selectable_value(value, v.clone(), l);
         }
     });
+    mark(ui, &r.response, need);
+    explained(r.response, label, need);
     ui.end_row();
 }
 
@@ -1076,7 +1215,12 @@ struct Choices {
     tools: Vec<(String, String)>,
     /// Each tool's cutting data, by number.
     data: Vec<(String, ToolData)>,
+    /// The top and bottom the open operation form's geometry gives by itself (`None`: to be
+    /// given), or why there are none; not known while the form names no geometry.
+    heights: Option<Heights>,
 }
+
+type Heights = Result<(Option<f64>, Option<f64>), String>;
 
 fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
     let sketches = app
@@ -1113,69 +1257,69 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             },
         ));
     }
-    Choices { sketches, tools, data }
+    Choices { sketches, tools, data, heights: None }
 }
 
-fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices) {
+fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
     // A form's labels stay on one line each.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
         Form::Tool(f) => {
             if f.editing {
-                ui.label("Number");
+                row_label(ui, "Number", None);
                 ui.label(format!("T{}", f.number));
                 ui.end_row();
             } else {
-                field(ui, "Number", &mut f.number, "1");
+                field(ui, need, "Number", &mut f.number, "1");
             }
-            choice(ui, "sc_cam_tool_kind", "Kind", &mut f.kind, &TOOL_KINDS);
-            field(ui, "Diameter", &mut f.diameter, "6 mm");
-            field(ui, "Description", &mut f.description, "");
-            field(ui, "Flute length", &mut f.flute_length, "3 × diameter");
+            choice(ui, need, "sc_cam_tool_kind", "Kind", &mut f.kind, &TOOL_KINDS);
+            field(ui, need, "Diameter", &mut f.diameter, "6 mm");
+            field(ui, need, "Description", &mut f.description, "");
+            field(ui, need, "Flute length", &mut f.flute_length, "3 × diameter");
             // Speed, flutes, chip load and feed belong together: feed = speed × flutes × chip load.
-            let flutes_changed = field(ui, "Flutes", &mut f.flutes, "2");
-            let speed_changed = field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
-            let chip_changed = field(ui, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
-            let feed_changed = field(ui, "Feed (mm/min)", &mut f.feed, "speed × flutes × chip load");
+            let flutes_changed = field(ui, need, "Flutes", &mut f.flutes, "2");
+            let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
+            let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
+            let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "speed × flutes × chip load");
             let flutes = parsed(&f.flutes);
             link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed || flutes_changed, feed_changed, chip_changed);
-            field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
-            field(ui, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
-            field(ui, "Stepover (mm)", &mut f.stepover, "by operation");
+            field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
+            field(ui, need, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
+            field(ui, need, "Stepover (mm)", &mut f.stepover, "by operation");
         }
         Form::Setup(f) => {
-            field(ui, "Name", &mut f.name, "automatic");
-            choice(ui, "sc_cam_setup_axis", "Tool axis", &mut f.axis, &AXES);
-            field(ui, "Stock on the sides", &mut f.side, "0 mm");
-            field(ui, "Stock on top", &mut f.top, "0 mm");
-            field(ui, "Stock below", &mut f.bottom, "0 mm");
-            choice(ui, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
+            field(ui, need, "Name", &mut f.name, "automatic");
+            choice(ui, need, "sc_cam_setup_axis", "Tool axis", &mut f.axis, &AXES);
+            field(ui, need, "Stock on the sides", &mut f.side, "0 mm");
+            field(ui, need, "Stock on top", &mut f.top, "0 mm");
+            field(ui, need, "Stock below", &mut f.bottom, "0 mm");
+            choice(ui, need, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
             if f.origin == 2 {
                 let [x, y, z] = &mut f.point;
-                field(ui, "Origin X", x, "0");
-                field(ui, "Origin Y", y, "0");
-                field(ui, "Origin Z", z, "0");
+                field(ui, need, "Origin X", x, "0");
+                field(ui, need, "Origin Y", y, "0");
+                field(ui, need, "Origin Z", z, "0");
             } else {
                 // Where on the box, along each of the setup's own axes.
                 let [x, y, z] = &mut f.anchors;
-                choice(ui, "sc_cam_setup_x", "Origin X", x, &["min", "center", "max"]);
-                choice(ui, "sc_cam_setup_y", "Origin Y", y, &["min", "center", "max"]);
-                choice(ui, "sc_cam_setup_z", "Origin Z", z, &["bottom", "middle", "top"]);
+                choice(ui, need, "sc_cam_setup_x", "Origin X", x, &["min", "center", "max"]);
+                choice(ui, need, "sc_cam_setup_y", "Origin Y", y, &["min", "center", "max"]);
+                choice(ui, need, "sc_cam_setup_z", "Origin Z", z, &["bottom", "middle", "top"]);
             }
-            choice(ui, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
+            choice(ui, need, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
         }
         Form::Op(f) => {
-            field(ui, "Name", &mut f.name, "automatic");
+            field(ui, need, "Name", &mut f.name, "automatic");
             if f.faces.is_empty() {
                 // Facing covers a box: the stock's, the part's, or the one round a sketch's profiles.
                 if f.kind == OpKind::Face {
-                    choice(ui, "sc_cam_face_boundary", "Boundary", &mut f.boundary, &FACE_BOUNDS);
+                    choice(ui, need, "sc_cam_face_boundary", "Boundary", &mut f.boundary, &FACE_BOUNDS);
                 }
                 if f.kind != OpKind::Face || f.boundary == 2 {
-                    pick(ui, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
+                    pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
                 }
             } else {
-                ui.label("Faces");
+                row_label(ui, "Faces", None);
                 ui.horizontal(|ui| {
                     ui.label(format!("{} picked", f.faces.len()));
                     if ui.small_button("Use a sketch").clicked() {
@@ -1192,62 +1336,152 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
                 ui.end_row();
             }
             let from_faces = !f.faces.is_empty();
-            pick(ui, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
+            pick(ui, need, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
             // Another tool brings its own speed, feeds, stepdown and stepover; all stay editable here.
             prefill(f, choices);
-            let speed_changed = field(ui, "Spindle (rev/min)", &mut f.spindle_rpm, "the tool's");
-            let chip_changed = field(ui, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
-            let feed_changed = field(ui, "Feed (mm/min)", &mut f.feed, "the tool's");
+            let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "the tool's");
+            let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
+            let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "the tool's");
             let flutes = Some(f64::from(f.flutes));
             link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
-            field(ui, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
+            field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
             let on_stock = f.kind == OpKind::Face && !from_faces && f.boundary < 2;
             let (top, bottom) = match (from_faces, on_stock) {
                 (true, _) => ("from the faces", "from the faces"),
                 (_, true) => ("the stock's top", "the part's top"),
-                _ if f.kind == OpKind::Pocket => ("the sketch plane", "required: the pocket's floor"),
+                _ if f.kind == OpKind::Pocket => ("the sketch plane", "the pocket's floor"),
                 _ => ("the sketch, or the material's top above it", "the sketch, or through the part"),
             };
-            field(ui, "Top", &mut f.top, top);
-            field(ui, "Bottom", &mut f.bottom, bottom);
+            // Heights the geometry gives are shown as they are; one it does not give is asked for.
+            let auto = |what: &str, z: Option<Option<f64>>| match z {
+                Some(Some(z)) => format!("{} mm: {what}", shown(z, 3)),
+                Some(None) => "required: type it in".to_string(),
+                None => what.to_string(),
+            };
+            let given = lists_heights(choices);
+            field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)));
+            field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)));
             if f.kind != OpKind::Drill {
-                field(ui, "Stepdown", &mut f.stepdown, "half the tool diameter");
+                field(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter");
             }
             match f.kind {
                 OpKind::Face => {
-                    field(ui, "Stepover", &mut f.stepover, "the tool's, or half its diameter");
-                    choice(ui, "sc_cam_face_limit", "Cut", &mut f.limit, &["over the boundary", "inside the boundary"]);
+                    field(ui, need, "Stepover", &mut f.stepover, "the tool's, or half its diameter");
+                    choice(ui, need, "sc_cam_face_limit", "Cut", &mut f.limit, &["over the boundary", "inside the boundary"]);
                     field(
                         ui,
+                        need,
                         if f.limit == 0 { "Over by" } else { "Inside by" },
                         &mut f.margin,
                         if f.limit == 0 { "the tool's radius" } else { "0 mm" },
                     );
                 }
                 OpKind::Contour => {
-                    choice(ui, "sc_cam_side", "Side", &mut f.side, &SIDES);
-                    field(ui, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    choice(ui, need, "sc_cam_side", "Side", &mut f.side, &SIDES);
+                    field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                 }
                 OpKind::Pocket => {
-                    field(ui, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
-                    field(ui, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    field(ui, need, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
+                    field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                 }
                 OpKind::Drill => {
-                    field(ui, "Peck depth", &mut f.peck, "one pass");
-                    field(ui, "Dwell (s)", &mut f.dwell, "0");
+                    field(ui, need, "Peck depth", &mut f.peck, "one pass");
+                    field(ui, need, "Dwell (s)", &mut f.dwell, "0");
                 }
             }
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
-                field(ui, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
-                ui.label("Direction");
+                field(ui, need, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
+                row_label(ui, "Direction", None);
                 ui.checkbox(&mut f.climb, "Climb");
                 ui.end_row();
             }
-            ui.label("Coolant");
+            row_label(ui, "Coolant", None);
             ui.checkbox(&mut f.coolant, "On");
             ui.end_row();
         }
     });
+}
+
+/// The heights the open operation form's geometry gives, when they are known.
+fn lists_heights(choices: &Choices) -> Option<(Option<f64>, Option<f64>)> {
+    choices.heights.as_ref().and_then(|h| h.as_ref().ok()).copied()
+}
+
+/// What a form still needs before its command can run: rows left empty that have no value of
+/// their own to fall back on, and what stops the operation's geometry. What the command could
+/// still refuse (a value out of range, say) it says when OK is pressed.
+fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
+    let mut need = Vec::new();
+    let mut want = |field: &'static str, why: &str| need.push(Need { field, why: why.into() });
+    let empty = |s: &str| s.trim().is_empty();
+    match form {
+        Form::Tool(f) => {
+            if !f.editing && empty(&f.number) {
+                want("Number", "the tool's number");
+            }
+            if empty(&f.diameter) {
+                want("Diameter", "the tool's diameter");
+            }
+        }
+        Form::Setup(f) => {
+            if f.origin == 2 {
+                for (field, value) in [("Origin X", &f.point[0]), ("Origin Y", &f.point[1]), ("Origin Z", &f.point[2])] {
+                    if empty(value) {
+                        want(field, "where the work zero is, in the world");
+                    }
+                }
+            }
+        }
+        Form::Op(f) => {
+            if f.faces.is_empty() && (f.kind != OpKind::Face || f.boundary == 2) && empty(&f.sketch) {
+                if lists.sketches.is_empty() {
+                    want("Sketch", "a sketch of what to cut: draw one first");
+                } else {
+                    want("Sketch", "the sketch whose profiles are cut");
+                }
+            }
+            let tool = lists.data.iter().find(|(n, _)| *n == f.tool.trim()).map(|(_, d)| *d);
+            if lists.tools.is_empty() {
+                want("Tool", "a tool: add one in the Tool Library first");
+            } else if empty(&f.tool) {
+                want("Tool", "the tool that cuts");
+            }
+            // A new operation takes speed and feed from its tool; an edit keeps what it had.
+            if let (Some(tool), None) = (tool, &f.editing) {
+                if empty(&f.spindle_rpm) && tool.spindle_rpm.is_none() {
+                    want("Spindle", "the spindle speed: this tool has none of its own");
+                }
+                let from_chip = parsed(&f.chip_load).is_some() && parsed(&f.spindle_rpm).is_some() && f.flutes > 0;
+                if empty(&f.feed) && !from_chip && tool.feed.is_none() {
+                    want("Feed", "the feed: this tool has none of its own");
+                }
+            }
+            match &lists.heights {
+                Some(Ok((top, bottom))) => {
+                    if empty(&f.top) && top.is_none() {
+                        want("Top", "where cutting starts");
+                    }
+                    if empty(&f.bottom) && bottom.is_none() {
+                        want("Bottom", "how deep it cuts (the geometry does not say)");
+                    }
+                }
+                Some(Err(e)) => want("", e),
+                None => {}
+            }
+        }
+    }
+    need
+}
+
+/// What is still missing, in words: under OK, and on it while it is off.
+fn need_text(need: &[Need]) -> String {
+    let rows: Vec<&str> = need.iter().filter(|n| !n.field.is_empty()).map(|n| n.field).collect();
+    let mut lines = Vec::new();
+    if !rows.is_empty() {
+        lines.push(format!("Still needed: {} (marked red; point at a row for more)", rows.join(", ")));
+    }
+    lines.extend(need.iter().filter(|n| n.field.is_empty()).map(|n| n.why.clone()));
+    lines.join("\n")
 }
 
 /// The form's title, grid and OK / Cancel; `true` when OK was pressed.
@@ -1262,17 +1496,24 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
         Form::Op(f) if f.editing.is_some() => "EDIT OPERATION",
         Form::Op(f) => f.kind.title(),
     };
+    let need = missing(form, lists);
+    let t = Tokens::get();
     let mut ok = false;
     let mut cancel = false;
     egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
         ui.label(RichText::new(title).strong());
         ui.add_space(4.0);
-        form_ui(ui, form, selected, lists);
+        form_ui(ui, form, selected, lists, &need);
         ui.add_space(6.0);
+        // OK stays off until nothing is missing; what is missing is said under it.
+        let wanted = need_text(&need);
         ui.horizontal(|ui| {
-            ok = ui.button("OK").clicked();
+            ok = ui.add_enabled(need.is_empty(), egui::Button::new("OK")).on_disabled_hover_text(&wanted).clicked();
             cancel = ui.button("Cancel").clicked();
         });
+        if !need.is_empty() {
+            ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
+        }
     });
     if cancel {
         cam.form = None;
@@ -1405,6 +1646,9 @@ struct Asked {
     import: bool,
     export: bool,
 }
+
+/// Why Simulate and Post Process are off on a setup without operations.
+const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket or Drill)";
 
 /// The tool table's columns.
 const TOOL_HEADS: [&str; 8] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Chip load", "Feed", "Design"];
@@ -1575,7 +1819,7 @@ fn manufacture_window(
             ui.add_space(4.0);
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
             if setups.is_empty() {
-                ui.label(RichText::new("No setup yet").color(t.text_dim));
+                ui.label(RichText::new("No setup yet: New Setup on the toolbar makes the first").color(t.text_dim));
             }
             for setup in &setups {
                 let id = setup["id"].as_u64().unwrap_or(0);
@@ -1588,7 +1832,12 @@ fn manufacture_window(
                             asked.form = setup_form(setup);
                         }
                         let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
-                        if ui.add_enabled(has_ops, egui::Button::new("Simulate").small()).clicked() {
+                        if ui
+                            .add_enabled(has_ops, egui::Button::new("Simulate").small())
+                            .on_hover_text("Cut the raw block with every operation and show what is left")
+                            .on_disabled_hover_text(NO_OPS)
+                            .clicked()
+                        {
                             asked.simulate = Some(id);
                         }
                         if ui.small_button("Remove").clicked() {
@@ -1623,6 +1872,7 @@ fn manufacture_window(
                             if ui
                                 .add_enabled(op.get("error").is_none(), egui::Button::new("Post").small())
                                 .on_hover_text("Write this operation alone as G-code")
+                                .on_disabled_hover_text("This operation cannot be cut: fix what it says first (Edit)")
                                 .clicked()
                                 && let Some(op_id) = op["id"].as_u64()
                             {
@@ -1638,7 +1888,11 @@ fn manufacture_window(
                     let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
                     let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(14.0).color(t.text);
                     let button = egui::Button::new(label).fill(t.accent_soft).min_size(egui::vec2(ui.available_width(), 32.0));
-                    if ui.add_enabled(has_ops, button).on_hover_text("Write every operation of this setup, in order, as one G-code program").clicked()
+                    if ui
+                        .add_enabled(has_ops, button)
+                        .on_hover_text("Write every operation of this setup, in order, as one G-code program")
+                        .on_disabled_hover_text(NO_OPS)
+                        .clicked()
                     {
                         asked.post = Some((id, None, text(setup, "post")));
                     }
@@ -1676,7 +1930,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
     let selected = selected_faces(app);
     let library = library_listing(app, false);
-    let lists = choices(app, &listed, &library);
+    let mut lists = choices(app, &listed, &library);
+    lists.heights = form_heights(app);
     // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());

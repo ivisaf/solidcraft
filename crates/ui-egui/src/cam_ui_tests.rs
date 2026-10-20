@@ -600,3 +600,83 @@ fn browser_lists_setups_and_operations_with_their_menus() {
     h.frames(2);
     assert!(!rows(&h).iter().any(|r| r == "Manufacture"), "the folder goes with the last setup");
 }
+
+#[test]
+fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
+    let mut h = lab();
+    // A plate with a pocket sketched on its top: how deep it goes is the user's to say.
+    for (name, [p0, p1]) in [("Plate", [[0, 0], [60, 40]]), ("Top", [[10, 10], [50, 30]])] {
+        h.app.run("sketch.create", json!({"plane": "XY", "name": name})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0": p0, "p1": p1})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        if name == "Plate" {
+            h.app.run("solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"})).unwrap();
+        }
+    }
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.pocket");
+    h.frames(3);
+    assert!(h.widget("Still needed: Bottom (marked red; point at a row for more)").is_some());
+    // OK is off: pressing it adds nothing.
+    h.step(&json!({"widget": "OK"})).unwrap();
+    h.frames(2);
+    assert!(h.app.session.doc.manufacture.setups[0].operations.is_empty());
+    assert!(h.app.manufacture.form.is_some());
+
+    // A contour on the same sketch goes through the part: nothing is missing.
+    h.app.start("cam.op.contour");
+    h.frames(3);
+    assert!(h.widget("Still needed: Bottom (marked red; point at a row for more)").is_none());
+
+    // Back to the pocket: with the depth typed, OK runs.
+    h.app.start("cam.op.pocket");
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        op.bottom = "-3 mm".into();
+    }
+    h.frames(3);
+    assert!(h.widget("Still needed: Bottom (marked red; point at a row for more)").is_none());
+    h.step(&json!({"widget": "OK"})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.session.doc.manufacture.setups[0].operations.len(), 1);
+    assert!(h.app.manufacture.form.is_none());
+}
+
+#[test]
+fn missing_rows_follow_the_form() {
+    let tools = vec![("1".to_string(), "T1  D6 flat".to_string())];
+    let data = vec![("1".to_string(), ToolData { diameter: 6.0, flutes: 2, ..ToolData::default() })];
+    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None };
+    let fields = |form: &Form, lists: &Choices| missing(form, lists).into_iter().map(|n| n.field).collect::<Vec<_>>();
+    // No sketch to cut, and a tool without speed or feed of its own.
+    let mut h = sketched();
+    h.app.start("cam.op.contour");
+    let Some(Form::Op(mut op)) = h.app.manufacture.form.clone() else { panic!("not an operation form") };
+    op.sketch.clear();
+    op.tool = "1".into();
+    op.spindle_rpm.clear();
+    op.feed.clear();
+    let form = Form::Op(op.clone());
+    assert_eq!(fields(&form, &lists), ["Sketch", "Spindle", "Feed"]);
+    // A chip load with a speed gives the feed; what the geometry cannot give is said as it is.
+    op.spindle_rpm = "10000".into();
+    op.chip_load = "0.03".into();
+    op.flutes = 2;
+    op.sketch = "Pocket".into();
+    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())) };
+    let need = missing(&Form::Op(op), &failing);
+    assert_eq!(need, vec![Need { field: "", why: "no closed profile".into() }]);
+    assert_eq!(need_text(&need), "no closed profile");
+    // A tool needs its number and diameter; a setup on a world point needs all three of its coordinates.
+    if let Some(Form::Tool(mut tool)) = tool_form(&json!({"number": 3, "kind": "flat", "diameter": 6}), true) {
+        tool.editing = false;
+        tool.number.clear();
+        tool.diameter.clear();
+        assert_eq!(fields(&Form::Tool(tool), &lists), ["Number", "Diameter"]);
+    }
+    h.app.start("cam.setup.create");
+    let Some(Form::Setup(mut setup)) = h.app.manufacture.form.clone() else { panic!("not a setup form") };
+    setup.origin = 2;
+    setup.point[1].clear();
+    assert_eq!(fields(&Form::Setup(setup), &lists), ["Origin Y"]);
+}
