@@ -92,7 +92,7 @@ fn a_slanted_hole_stays_on_its_axis_when_its_face_moves() {
 // part: a 40 x 40 x 20 box at z 0..20 (32000 mm³).
 
 fn box_part(s: &mut Session) {
-    run(s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "name": "Part", "position": [20, 20, 0]}));
+    run(s, "solid.box", json!({"length": 40, "width": 40, "height": 20, "name": "Part"}));
 }
 
 /// A sketch named `Pts` on the XY plane lifted to `z`, holding the given points (ids p0, p1, ...).

@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::context_menu::{self, Target};
 use crate::scenario::Harness;
+use crate::test_support::click;
 
 fn harness() -> Harness {
     let mut h = Harness::new();
@@ -13,12 +14,6 @@ fn harness() -> Harness {
     h.app.ui.show_browser = true;
     h.frames(3);
     h
-}
-
-fn click(h: &mut Harness, handle: &str) {
-    assert!(crate::scenario::handle_at(handle).is_some(), "{handle} is not drawn: {:?}", crate::scenario::handles(""));
-    h.step(&json!({"click": {"handle": handle}})).unwrap();
-    h.frames(3);
 }
 
 fn menu(h: &mut Harness, label: &str) {

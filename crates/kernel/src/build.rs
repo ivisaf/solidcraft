@@ -1967,6 +1967,18 @@ fn loft_reversed(sections: &[(Plane, Loop2)]) -> Result<bool> {
     // loft touches the body along an edge: an internal panic, or "shell not oriented and
     // closed").
     let centre = |(p, l): &(Plane, Loop2)| p.to_world(l.centroid());
+    // Two consecutive sections in one plane span no volume between them: a loft through them
+    // used to build a flat, zero-volume body and report success.
+    for (i, w) in sections.windows(2).enumerate() {
+        let (a, b) = (&w[0], &w[1]);
+        let n = a.0.normal();
+        let size = (centre(a) - a.0.origin).len().max((centre(b) - b.0.origin).len()).max(1.0);
+        let parallel = n.cross(b.0.normal()).len() < 1e-9;
+        let in_plane = (centre(b) - centre(a)).dot(n).abs() < 1e-9 * size;
+        if parallel && in_plane {
+            return Err(KernelError::Invalid(format!("loft sections {} and {} lie in the same plane (no volume between them)", i + 1, i + 2)));
+        }
+    }
     let (Some(first), Some(last)) = (sections.first(), sections.last()) else { return Err(KernelError::Invalid("no sections".into())) };
     let step = centre(last) - centre(first);
     let big = [step.x, step.y, step.z].into_iter().max_by(|a, b| a.abs().total_cmp(&b.abs())).unwrap_or(0.0);

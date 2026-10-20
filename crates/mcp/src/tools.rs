@@ -73,6 +73,14 @@ pub fn tool_definitions() -> Vec<Value> {
             Effect::ReadOnly,
         ),
         tool(
+            "describe_command",
+            "Describe a command",
+            "One command's parameter docs and, for commands with a typed contract (solid.box, solid.extrude and engine.describe so far), the \
+             JSON Schemas (2020-12) of its parameters (`input`) and of a successful result (`output`); null for the others.",
+            obj(json!({"id": string("Command id, e.g. \"solid.extrude\"")}), &["id"]),
+            Effect::ReadOnly,
+        ),
+        tool(
             "execute",
             "Execute a command",
             "Run one command with JSON parameters, exactly as the toolbar, palette and scripts do. Never opens a dialog. \
@@ -124,11 +132,14 @@ pub fn tool_definitions() -> Vec<Value> {
             "The whole design: user parameters (expression, value, errors), the timeline (features with type, suppressed, \
              rolled back, error, warning, timing), bodies (volume, area, centre of mass, bounding box, face/edge/vertex \
              counts), sketches (curves with ids and coordinates, points, constraints, profiles, degrees of freedom, solve \
-             status), the active sketch, selection and undo depth.",
+             status), assembly joints (what each origin is attached to: occurrence, the feature, face, edge or sketch \
+             curve its face names refer to, whether it resolves and why not; `execute` `joint.inspect {joint}` gives one), \
+             the active sketch, selection and undo depth.",
             obj(
                 json!({
                     "measure": {"type": "boolean", "description": "Measure bodies (default true)"},
                     "sketches": {"type": "boolean", "description": "Full sketch contents (default true; false = summary only)"},
+                    "joints": {"type": "boolean", "description": "Joint definitions as joint.inspect gives them, when the design has joints (default true)"},
                 }),
                 &[],
             ),
@@ -388,6 +399,10 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
             };
             Ok(Value::Array(all.as_array().map(|v| v.iter().filter(|c| hit(c)).cloned().collect()).unwrap_or_default()))
         }
+        "describe_command" => {
+            let id = str_arg(a, "id").ok_or("`id` is required")?;
+            exec(b, "engine.describe", json!({"command": id}))
+        }
         "execute" => {
             let id = str_arg(a, "command").ok_or("`command` is required")?;
             let v = exec(b, id, a.get("params").cloned().filter(Value::is_object).unwrap_or(json!({})))?;
@@ -403,6 +418,13 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
                     .map(|id| exec(b, "sketch.inspect", json!({"sketch": id.clone()})).unwrap_or_else(|e| json!({"id": id, "error": e})))
                     .collect();
                 d["sketches"] = Value::Array(full);
+            }
+            // Joints: what each is attached to (left out when there are none, or the app is older).
+            if a.get("joints").and_then(Value::as_bool).unwrap_or(true)
+                && let Ok(j) = exec(b, "joint.inspect", json!({}))
+                && j["joints"].as_array().is_some_and(|v| !v.is_empty())
+            {
+                d["joints"] = j["joints"].clone();
             }
             Ok(d)
         }

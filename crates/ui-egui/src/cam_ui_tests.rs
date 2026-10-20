@@ -910,7 +910,7 @@ fn panels_are_dragged_wider_and_keep_their_width() {
     h.step(&json!({"click": [wider.left() as f64, y], "double": true})).unwrap();
     h.frames(3);
     assert_eq!(h.app.preferences.cam_panel_width, 0.0);
-    assert!(h.app.manufacture.panel.unwrap().width() <= crate::frame::DIALOG_WIDE_MAX_W + 1.0);
+    assert!(h.app.manufacture.panel.unwrap().width() <= DIALOG_WIDE_MAX_W + 1.0);
 }
 
 #[test]

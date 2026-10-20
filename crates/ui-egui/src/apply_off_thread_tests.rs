@@ -43,15 +43,12 @@ fn until_applied(h: &mut Harness) {
 fn ok_computes_off_the_window_thread_saying_so_then_applies() {
     let mut h = square_on_a_block();
     h.app.apply_off_thread = Some(Duration::ZERO);
+    // The evaluation is held until the dialog has been seen saying so (it is in the cache all
+    // the same), so no frame can apply it before the checks below.
+    let (finish, gate) = std::sync::mpsc::channel();
+    h.app.apply_gate = Some(std::sync::Arc::new(std::sync::Mutex::new(gate)));
     h.step(&json!({"key": "Enter"})).unwrap();
     assert!(h.app.applying.is_some() && h.app.dialog.is_some(), "computing, the dialog open");
-    // The evaluation may be in by the next frame: it is held until the dialog has been seen
-    // saying so (the evaluation itself is in the cache all the same).
-    let (finish, done) = std::sync::mpsc::channel();
-    if let Some(job) = h.app.applying.as_mut() {
-        let _ = job.done.recv();
-        job.done = done;
-    }
     h.frames(1);
     assert!(h.widget("Computing… 0 s").is_some(), "the dialog says it computes");
     // Enter again does not start it twice.

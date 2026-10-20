@@ -448,6 +448,34 @@ impl Mesh {
         rim.sort_unstable();
         rim
     }
+    /// Whether the two faces at edge `i` meet tangentially there (a smooth seam, with no corner).
+    fn smooth_seam(&self, i: usize, cos: f64) -> bool {
+        if self.sharp_edges.get(i).copied().unwrap_or(false) {
+            return false;
+        }
+        if self.smooth_edges.get(i).copied().unwrap_or(false) {
+            return true;
+        }
+        let Some([a, b]) = self.edge_faces.get(i).map(Vec::as_slice) else { return false };
+        if a == b {
+            return false;
+        }
+        let Some(p) = self.edges.get(i) else { return false };
+        let (Some(&first), Some(&mid)) = (p.first(), p.get(p.len() / 2)) else { return false };
+        let normal_near = |f: u32, q: Vec3| -> Option<Vec3> {
+            self.triangles
+                .iter()
+                .zip(&self.tri_face)
+                .filter(|(_, tf)| **tf == f)
+                .flat_map(|(t, _)| t.iter().copied())
+                .filter_map(|v| Some((self.positions.get(v as usize)?.dist(q), *self.normals.get(v as usize)?)))
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+                .and_then(|(_, n)| n.normalized())
+        };
+        let both = [first, mid];
+        let sample = if p.len() == 2 { &both[..] } else { std::slice::from_ref(&mid) };
+        sample.iter().all(|&q| matches!((normal_near(*a, q), normal_near(*b, q)), (Some(na), Some(nb)) if na.dot(nb) > cos))
+    }
     /// The edges reached from `e` through vertices where the next edge continues smoothly
     /// (angle between the end tangents below `max_angle`), including `e` itself.
     pub fn tangent_chain(&self, e: usize, max_angle: f64) -> Vec<usize> {
@@ -473,11 +501,14 @@ impl Mesh {
         let tol = size * 1e-7;
         let cos = max_angle.cos();
         let mut chain = vec![e];
+        if self.smooth_seam(e, cos) {
+            return chain;
+        }
         let mut todo = vec![e];
         while let Some(cur) = todo.pop() {
             let Some(ce) = ends(cur) else { continue };
             for (i, _) in self.edges.iter().enumerate() {
-                if chain.contains(&i) || !self.edge_pickable(i) {
+                if chain.contains(&i) || !self.edge_pickable(i) || self.smooth_seam(i, cos) {
                     continue;
                 }
                 let Some(ne) = ends(i) else { continue };

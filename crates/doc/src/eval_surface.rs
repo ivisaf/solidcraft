@@ -141,7 +141,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
             }
             Ok(())
         }
-        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, stitch } => {
+        FeatureKind::SurfaceBlend { from, to, continuity, bulge, align, seam, stitch } => {
             let a = st.body(&from.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", from.body)))?.body.clone();
             let b = st.body(&to.body).ok_or_else(|| DocError::Unknown(format!("body `{}`", to.body)))?.body.clone();
             if from.edges.is_empty() || to.edges.is_empty() {
@@ -155,6 +155,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
                 *continuity,
                 *bulge,
                 align.map(|[p, q]| [p.0, q.0]),
+                seam.map(|[p, q]| [p.0, q.0]),
                 BLEND_STATIONS,
                 *stitch,
             )?;

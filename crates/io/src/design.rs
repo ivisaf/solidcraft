@@ -113,7 +113,7 @@ pub fn write_design_container_with_cache(
     doc: &Document,
     compression: DesignCompression,
     preview: Option<&DesignPreview>,
-    geometry: Option<&solidcraft_doc::ModelState>,
+    geometry: Option<&solidcraft_doc::SavedModel>,
 ) -> Result<Vec<u8>> {
     write_design_container_with_thumbnail(doc, compression, preview, geometry, None)
 }
@@ -124,7 +124,7 @@ pub fn write_design_container_with_thumbnail(
     doc: &Document,
     compression: DesignCompression,
     preview: Option<&DesignPreview>,
-    geometry: Option<&solidcraft_doc::ModelState>,
+    geometry: Option<&solidcraft_doc::SavedModel>,
     thumbnail: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     write_container(doc, compression, preview, geometry, thumbnail, MAX_DESIGN_BYTES)
@@ -136,7 +136,7 @@ fn write_container(
     doc: &Document,
     compression: DesignCompression,
     preview: Option<&DesignPreview>,
-    geometry: Option<&solidcraft_doc::ModelState>,
+    geometry: Option<&solidcraft_doc::SavedModel>,
     thumbnail: Option<&[u8]>,
     budget: usize,
 ) -> Result<Vec<u8>> {
@@ -510,7 +510,7 @@ impl<R: Read + Seek> DesignContainerReader<R> {
         // fallback, generating a bounded provisional mesh without source imports.
         read_preview(&mut self.reader).ok().or_else(|| {
             let document = self.reader.document(16 << 20).ok()?;
-            native_cache::geometry_preview(&document, self.geometry()?).ok()
+            native_cache::geometry_preview(&document, &self.geometry()?).ok()
         })
     }
 
@@ -519,8 +519,8 @@ impl<R: Read + Seek> DesignContainerReader<R> {
         thumbnail::read(&mut self.reader).ok()
     }
 
-    /// The cached model state, when this build wrote it for exactly this document.
-    pub fn geometry(&mut self) -> Option<solidcraft_doc::ModelState> {
+    /// The saved model, when this build wrote it for exactly this document.
+    pub fn geometry(&mut self) -> Option<solidcraft_doc::SavedModel> {
         let document = self.reader.document(16 << 20).ok()?;
         native_cache::read_geometry_with(&mut self.reader, &document).ok()
     }
@@ -536,9 +536,11 @@ pub(super) fn read(bytes: &[u8]) -> Result<Document> {
 }
 
 /// Open from disk (or browser VFS), publishing only provisional display before
-/// authoritative blob hydration. Desktop keeps one seekable file handle instead
-/// of buffering the complete archive. JSON continues through the normal migrations.
-pub fn read_design_file(path: &str, notify: Option<impl FnOnce(DesignPreview)>) -> Result<Document> {
+/// authoritative blob hydration, with the model the file keeps when this build saved it for
+/// exactly this document ([`solidcraft_doc::Model::adopt`] takes it as the evaluation). Desktop
+/// keeps one seekable file handle instead of buffering the complete archive. JSON continues
+/// through the normal migrations.
+pub fn read_design_file(path: &str, notify: Option<impl FnOnce(DesignPreview)>) -> Result<(Document, Option<solidcraft_doc::SavedModel>)> {
     #[cfg(not(target_arch = "wasm32"))]
     let mut source = {
         crate::vfs::check(path).map_err(invalid)?;
@@ -569,16 +571,19 @@ pub fn read_design_file(path: &str, notify: Option<impl FnOnce(DesignPreview)>) 
     source.seek(SeekFrom::Start(0)).map_err(invalid)?;
     if is_design_container(&prefix) {
         let mut reader = DesignContainerReader::new(source)?;
+        // A design with its model opens without a picture first: the model is the session.
+        let model = reader.geometry();
         if let Some(notify) = notify
-            && let Some(preview) = reader.preview()
+            && model.is_none()
+            && let Ok(preview) = read_preview(&mut reader.reader)
         {
             notify(preview);
         }
-        reader.read_document()
+        Ok((reader.read_document()?, model))
     } else {
         let mut bytes = Vec::new();
         source.take(MAX_DESIGN_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(invalid)?;
-        crate::read_design(&bytes)
+        Ok((crate::read_design(&bytes)?, None))
     }
 }
 
@@ -717,15 +722,31 @@ mod tests {
     #[test]
     fn file_reader_refuses_nonfiles_before_notifying_preview() {
         let directory = std::env::temp_dir();
-        let result = read_design_file(directory.to_str().unwrap(), Some(|_| panic!("non-file supplied a preview")));
+        let result = read_design_file(directory.to_str().unwrap(), Some(|_| panic!("non-file supplied a preview"))).map(|(doc, _)| doc);
         assert!(result.is_err_and(|e| e.to_string().contains("not a regular file")));
     }
 
-    fn native_geometry() -> solidcraft_doc::ModelState {
-        let cube = solidcraft_kernel::box_solid(solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::new(10., 20., 30.)).unwrap();
-        let mut state = solidcraft_doc::ModelState::default();
-        state.bodies.push(solidcraft_doc::ModelBody::new("Cube".into(), cube, 1));
-        state
+    /// A saved model of one state holding `bodies` (no document evaluated it: enough for the
+    /// container, which stores whatever model it is given).
+    fn saved_model(bodies: Vec<solidcraft_kernel::Body>) -> solidcraft_doc::SavedModel {
+        let records: Vec<Value> = (0..bodies.len())
+            .map(|i| json!({"name": format!("Body{i}"), "feature": 1, "component": 0, "key": "0000000000000001", "names": 0, "body": i}))
+            .collect();
+        let state = json!({
+            "bodies": [[0, bodies.len()]], "sketches": [], "body_counter": 7, "sheets": [], "construct": [], "threads": [],
+            "sketch_keys": [], "blend_edges": {}, "fitted": {}, "tapered": {},
+        });
+        solidcraft_doc::SavedModel {
+            records: json!({
+                "features": [{"id": 1, "fingerprint": "0000000000000000", "ms": 0.0, "skipped": false, "state": 0}],
+                "states": [state], "model_bodies": records, "names": [{"faces": [], "info": []}], "sketches": [],
+            }),
+            bodies,
+        }
+    }
+
+    fn native_geometry() -> solidcraft_doc::SavedModel {
+        saved_model(vec![solidcraft_kernel::box_solid(solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::new(10., 20., 30.)).unwrap()])
     }
 
     #[test]
@@ -739,7 +760,7 @@ mod tests {
         let entries = parts(&bytes);
         assert!(entries.contains_key("cache/bodies.bin"));
         assert!(!entries.contains_key("cache/preview.bin"));
-        assert_eq!(read_design_geometry(&bytes).unwrap().bodies[0].body.face_count(), bodies.bodies[0].body.face_count());
+        assert_eq!(read_design_geometry(&bytes).unwrap().bodies[0].body.face_count(), bodies.bodies[0].face_count());
         assert_eq!(bytes, write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&bodies)).unwrap());
         let count = std::rc::Rc::new(std::cell::Cell::new(0));
         let mut reader = DesignContainerReader::new(CountingReader { source: Cursor::new(bytes), count: count.clone() }).unwrap();
@@ -754,34 +775,26 @@ mod tests {
         use solidcraft_geom::Vec3;
         let part = solidcraft_kernel::box_solid(Vec3::ZERO, Vec3::new(10., 20., 30.)).unwrap();
         let share = solidcraft_kernel::DisplayShare::new(part.clone());
-        let t = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [50., 0., 0., 1.]];
-        let mut state = solidcraft_doc::ModelState::default();
-        state.body_counter = 7;
-        for (i, body) in [part.clone(), part.clone()].into_iter().enumerate() {
-            state.bodies.push(solidcraft_doc::ModelBody::new(format!("Part {i}"), body, 1));
-        }
+        let mut bodies = vec![part.clone(), part.clone()];
         for x in [50., 90.] {
             let moved = solidcraft_kernel::transform(&part, Vec3::new(x, 0., 0.), Vec3::ZERO, Vec3::Z, 0.).unwrap();
-            let mut t = t;
-            t[3][0] = x;
-            let mut b = solidcraft_doc::ModelBody::new(format!("Copy {x}"), moved.with_display_share(&share, t), 2);
-            b.component = 3;
-            b.source_name = Some("Part".into());
-            state.bodies.push(b);
+            let t = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [x, 0., 0., 1.]];
+            bodies.push(moved.with_display_share(&share, t));
         }
+        let model = saved_model(bodies);
         let doc = document();
-        let bytes = write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&state)).unwrap();
+        let bytes = write_design_container_with_cache(&doc, DesignCompression::Fast, None, Some(&model)).unwrap();
         let manifest: Value = serde_json::from_slice(&parts(&bytes)["cache/model.json"]).unwrap();
-        assert_eq!(manifest["bodies"].as_array().unwrap().len(), 3, "the part and each placed copy, once each");
-        let read = read_design_geometry(&bytes).unwrap();
-        assert_eq!(read.body_counter, 7);
-        assert_eq!(read.bodies.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["Part 0", "Part 1", "Copy 50", "Copy 90"]);
-        let copies: Vec<_> = read.bodies[2..].iter().map(|b| b.body.display_share().unwrap()).collect();
+        assert_eq!(manifest["slices"].as_array().unwrap().len(), 3, "the part and each placed copy, once each");
+        let read = DesignContainerReader::new(Cursor::new(&bytes)).unwrap().geometry().unwrap();
+        assert_eq!(read.records, model.records);
+        assert_eq!(read_design_geometry(&bytes).unwrap().body_counter, 7);
+        let copies: Vec<_> = read.bodies[2..].iter().map(|b| b.display_share().unwrap()).collect();
         assert_eq!(copies[0].0.id(), copies[1].0.id(), "copies show one display again");
         assert_eq!(copies[1].1[3][0], 90.);
-        assert_eq!((read.bodies[3].component, read.bodies[3].source_name.as_deref(), read.bodies[3].feature), (3, Some("Part"), 2));
-        for (a, b) in state.bodies.iter().zip(&read.bodies) {
-            assert_eq!(solidcraft_kernel::encode_native_body(&a.body).unwrap(), solidcraft_kernel::encode_native_body(&b.body).unwrap());
+        assert!(read.bodies[0].display_share().is_none());
+        for (a, b) in model.bodies.iter().zip(&read.bodies) {
+            assert_eq!(solidcraft_kernel::encode_native_body(a).unwrap(), solidcraft_kernel::encode_native_body(b).unwrap());
         }
     }
 

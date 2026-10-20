@@ -36,6 +36,11 @@ Designs saved before imports made components keep their Import where it is (no c
 
 Read: manifold solid breps (with voids), faceted breps, shell-based surface models; planes, cylinders, cones, spheres, tori, B-spline and rational B-spline surfaces (with knots, Bézier, uniform, quasi-uniform), surfaces of revolution and linear extrusion, trimmed surfaces; lines, circles, ellipses, hyperbolas and parabolas (as exact rational curves, which export writes back as exact rational B-splines), B-spline curves, polylines, trimmed/surface/seam curves; length and angle units (SI prefixes, conversion-based units such as inches); product names (body names come from the solid's name, else the product's; `names` below chooses); surface colours; assemblies (next-assembly-usage occurrences placed by item-defined transformations, and mapped items) — the product tree is kept in the feature and becomes the import's components (above). Files are untrusted: sizes, entity counts and nesting are capped and every kernel call is guarded. What cannot be read becomes a warning on the feature (a face left out gives an open body); not read yet: offset surfaces, pcurve-only edges.
 
+Extruded circular and elliptical faces keep their profile's parameter seam outside
+the face trim, or on an explicit seam edge. Narrow faces such as rounded gear tooth
+tips therefore stay narrow through the full thickness instead of wrapping around
+the supporting ellipse in the middle.
+
 ## Files from other CAD systems
 
 Files from different systems differ in which way is up and in what they call their solids. `doc.open`, `file.insert_step` and the MCP `open` tool take two options for STEP and IGES files; without them a file comes in as written.

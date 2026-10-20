@@ -159,10 +159,16 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
                 "orientation": "parallel", "twist": "surface_sweep.twist", "scale": "surface_sweep.scale"}),
         ),
         ("surface_loft", json!({"type": "surface_loft", "sections": []})),
-        ("surface_blend", json!({"type": "surface_blend", "from": {"body": "B", "edges": [o]}, "to": {"body": "C", "edges": [o]}, "align": [o, o]})),
+        (
+            "surface_blend",
+            json!({"type": "surface_blend", "from": {"body": "B", "edges": [o]}, "to": {"body": "C", "edges": [o]}, "align": [o, o], "seam": [o, o]}),
+        ),
         ("surface_offset", json!({"type": "surface_offset", "faces": [o], "distance": "soff.distance", "tolerance": "soff.tolerance"})),
         // The Class-A surface family (surface.blend/boundary/match/fair).
-        ("surface_blend", json!({"type": "surface_blend", "from": {"body": "B", "edges": [o]}, "to": {"body": "C", "edges": [o]}, "align": [o, o]})),
+        (
+            "surface_blend",
+            json!({"type": "surface_blend", "from": {"body": "B", "edges": [o]}, "to": {"body": "C", "edges": [o]}, "align": [o, o], "seam": [o, o]}),
+        ),
         ("surface_boundary", json!({"type": "surface_boundary", "sketch": 1, "curves": ["l1", "l2"]})),
         (
             "surface_network",

@@ -11,13 +11,19 @@ use solidcraft_geom::Vec3;
 
 use super::{CommandSpec, not_in_sketch};
 use crate::params::{bad, bool_, expr, req_expr, str_, string_list, vec2, vec3};
+use crate::schema::{BoxParams, ExtrudeParams, FeatureResult, TypedContract, output_schema_for};
 use crate::{EngineError, Result, Session};
 
+const BOX_CONTRACT: TypedContract<BoxParams> = TypedContract::new();
+const EXTRUDE_CONTRACT: TypedContract<ExtrudeParams> = TypedContract::new();
+
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("solid.extrude", "Extrude", extrude)
+    CommandSpec::new("solid.extrude", "Extrude", crate::checked!("solid.extrude", EXTRUDE_CONTRACT, extrude))
         .at("SOLID", "CREATE")
         .icon("extrude")
         .key("E")
+        .contract(&EXTRUDE_CONTRACT)
+        .output(output_schema_for::<FeatureResult>)
         .params("distance: expr (or through_all: true); taper?: angle expr; sketch?: id|name (default: active or last sketch); profiles?: all | [index] | [{curves: [ids]}] (the profile whose outer loop is made of exactly these curves, or pieces of them; found again on every recompute, so it follows parameter changes; islands inside are its holes; an error when no profile or several match) | [{point:[x,y]}] (index and point picks are stored by their curves when that finds the same profile); face?: [x,y,z] (extrude a planar body face instead of a sketch profile); faces?: [[x,y,z],…] (coplanar faces of one body); face_body?: name (whose face, where faces of several bodies meet at the point); direction?: positive|negative|symmetric (distance is total thickness, split evenly around the start plane); convention?: total_distance|legacy_per_side (default total_distance; legacy preserves older symmetric extents); distance2?: expr (Two Sides: a second distance the other way from the first side, which may be through_all or to; with direction: negative the first side goes against the normal and distance2 along it); start_offset?: expr (along the sketch normal, also with direction: negative); to?: [x,y,z] (To Object: a face, vertex or point; to_offset?: expr past it); from?: [x,y,z] (From Object: start at that face or point); operation?: new|join|cut|intersect|auto (cut into a body, otherwise join existing solids; new in an empty component); targets?: [body] (Join from a face, or from a sketch on a body's face, defaults to that face's body; explicit targets or participants override); name?; body_name?; thin?: true (Thin: a wall along sketch curves instead of the profiles) with curves?: [curve ids] (open chains and closed loops, joined where they meet end to end; default: every drawn curve of the sketch), thickness: expr, side?: center|inside|outside|two_sides (a closed loop's inside is the area it encloses, an open chain's the side it bends toward, a straight line's the left of its first curve as drawn; default center), thickness2?: expr (two_sides: the thickness outside); corners are mitred, crossing walls are one"),
     CommandSpec::new("solid.revolve", "Revolve", revolve)
         .at("SOLID", "CREATE")
@@ -28,7 +34,12 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("sweep")
         .params("sketch: profile sketch; profiles?; path_sketch: sketch; path: [curve ids in order]; orientation?: perpendicular (default: square to the path, turning with it) | parallel (as drawn: the profile moves without turning; the path must keep crossing its plane) | [x,y,z] (square to the path, its turn about the path fixed by this direction); twist?: angle expr (the profile turns this much about the path over its length; within 4 turns); scale?: expr (the profile's scale at the end, linear along the path; 0.01…100); rails?: [{sketch?: sketch (default path_sketch), curves: [curve ids in order]}] (guide rails, one or two, each meeting every plane square to the path once along it, from the end nearest the path's start: one rail turns the profile so its point where the rail starts stays on the rail and scales it with the rail's distance from the path; two rails carry it between them, its points where they start staying on both; rails take the default orientation, no twist and no scale, and a path without sharp corners); rail_fit?: scale (default: the profile grows and shrinks evenly) | stretch (only across to the rail, between the rails); operation?, targets?, name?, body_name?"),
     CommandSpec::new("solid.loft", "Loft", loft).at("SOLID", "CREATE").icon("loft").params("sections: [{sketch, profiles?} | {sketch, point: id} (an apex)] (2…50, in order; matching hole counts, no holes at an apex); rails?: [{sketch, curves: [ids in order]}] (one or two guide rails from the first section to the last, through every section's outline: the loft follows them between the sections; not with sections that have holes); rail_fit?: scale|stretch (default scale: with one rail the sections grow evenly with the rail's distance from their middle, with two with the distance between the rails; stretch: only that way); operation?, targets?, name?, body_name?"),
-    CommandSpec::new("solid.box", "Box", prim_box).at("SOLID", "CREATE").icon("box").params("length, width, height: expr; corner?: [x,y,z] | center?: [x,y,z] (numbers in mm or length expressions; default: the origin); operation?, targets?: [body], name?, body_name?"),
+    CommandSpec::new("solid.box", "Box", crate::checked!("solid.box", BOX_CONTRACT, prim_box))
+        .at("SOLID", "CREATE")
+        .icon("box")
+        .contract(&BOX_CONTRACT)
+        .output(output_schema_for::<FeatureResult>)
+        .params("length, width, height: expr; corner?: [x,y,z] | center?: [x,y,z] (numbers in mm or length expressions; default: the origin); operation?, targets?: [body], name?, body_name?"),
     CommandSpec::new("solid.cylinder", "Cylinder", prim_cylinder).at("SOLID", "CREATE").icon("cylinder").params("radius | diameter, height: expr; base?: [x,y,z] (centre of the bottom: numbers in mm or length expressions; default: the origin); axis?: X|Y|Z|[x,y,z] (default Z); operation?, targets?: [body], name?, body_name?"),
     CommandSpec::new("solid.sphere", "Sphere", prim_sphere).at("SOLID", "CREATE").icon("sphere").params("radius | diameter: expr; center?: [x,y,z] (numbers in mm or length expressions; default: the origin); operation?, targets?: [body], name?, body_name?"),
     CommandSpec::new("solid.torus", "Torus", prim_torus).at("SOLID", "CREATE").icon("torus").params("major, minor: expr (radii); center?: [x,y,z] (numbers in mm or length expressions; default: the origin); operation?, targets?: [body], name?, body_name?"),
@@ -334,7 +345,7 @@ pub(super) fn stable_profiles(s: &Session, kind: &mut FeatureKind) -> Result<()>
     Ok(())
 }
 
-pub(super) fn profiles(p: &Value, cmd: &str) -> Result<ProfileSel> {
+pub(crate) fn profiles(p: &Value, cmd: &str) -> Result<ProfileSel> {
     let Some(v) = p.get("profiles") else { return Ok(ProfileSel::All) };
     match v {
         Value::Object(fields) => {
@@ -560,8 +571,19 @@ fn add_feature_in(s: &mut Session, p: &Value, kind: FeatureKind, world: bool) ->
     // A warning (a Boolean that needed a retry, a reference found again elsewhere) is part of
     // the reply: a script or an agent sees it without asking the timeline (#616).
     let warning = r.as_ref().and_then(|r| r.warning.clone());
-    Ok(json!({"feature": id, "name": fname, "bodies": bodies, "created_bodies": created, "changed_bodies": changed,
-        "removed_bodies": removed, "warning": warning, "ms": r.map(|r| r.ms)}))
+    let owned = |names: Vec<&str>| names.into_iter().map(str::to_string).collect();
+    let reply = FeatureResult {
+        feature: id,
+        name: fname,
+        bodies: owned(bodies),
+        created_bodies: owned(created),
+        changed_bodies: owned(changed),
+        removed_bodies: owned(removed),
+        warning,
+        ms: r.map(|r| r.ms),
+        param_warnings: Vec::new(),
+    };
+    serde_json::to_value(reply).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 fn extrude(s: &mut Session, p: &Value) -> Result<Value> {

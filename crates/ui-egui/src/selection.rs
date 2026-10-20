@@ -112,6 +112,54 @@ impl SelInput {
     }
 }
 
+/// Projections preserve pick order and repetitions; callers own any deduplication or frames.
+pub(crate) trait SelectionExt {
+    fn body_names(&self) -> Vec<String>;
+    fn curve_ids(&self) -> Vec<String>;
+    fn profiles(&self) -> Vec<(u64, usize)>;
+    fn edge_points(&self) -> Vec<Vec3>;
+    fn face_points(&self) -> Vec<Vec3>;
+}
+
+impl SelectionExt for [Sel] {
+    fn body_names(&self) -> Vec<String> {
+        self.iter().filter_map(|x| if let Sel::Body { name } = x { Some(name.clone()) } else { None }).collect()
+    }
+    fn curve_ids(&self) -> Vec<String> {
+        self.iter().filter_map(|x| if let Sel::SketchCurve { id } = x { Some(id.clone()) } else { None }).collect()
+    }
+    fn profiles(&self) -> Vec<(u64, usize)> {
+        self.iter().filter_map(|x| if let Sel::Profile { sketch, index } = x { Some((*sketch, *index)) } else { None }).collect()
+    }
+    fn edge_points(&self) -> Vec<Vec3> {
+        self.iter().filter_map(|x| if let Sel::Edge { point, .. } = x { Some(*point) } else { None }).collect()
+    }
+    fn face_points(&self) -> Vec<Vec3> {
+        self.iter().filter_map(|x| if let Sel::Face { point, .. } = x { Some(*point) } else { None }).collect()
+    }
+}
+
+pub(crate) fn items(inputs: &[SelInput], i: usize) -> &[Sel] {
+    inputs.get(i).map(|x| x.items.as_slice()).unwrap_or(&[])
+}
+
+pub(crate) fn point_value(v: Vec3) -> serde_json::Value {
+    serde_json::json!([v.x, v.y, v.z])
+}
+
+pub(crate) fn polyline_mid(pts: &[Vec3]) -> Vec3 {
+    let len: f64 = pts.windows(2).map(|w| w[0].dist(w[1])).sum();
+    let mut acc = 0.0;
+    for w in pts.windows(2) {
+        let l = w[0].dist(w[1]);
+        if acc + l >= len * 0.5 && l > 0.0 {
+            return w[0].lerp(w[1], (len * 0.5 - acc) / l);
+        }
+        acc += l;
+    }
+    pts.first().copied().unwrap_or_default()
+}
+
 /// World size of the origin widget: a fixed fraction of the viewport height, whatever the zoom
 /// (`half_height` is half the visible height in mm at the target).
 pub fn origin_size(half_height: f64) -> f64 {
@@ -265,5 +313,21 @@ mod tests {
         one.toggle(vec![Sel::Plane { name: "XY".into() }]);
         one.toggle(vec![Sel::Plane { name: "YZ".into() }]);
         assert_eq!(one.items, vec![Sel::Plane { name: "YZ".into() }]);
+    }
+}
+
+#[cfg(test)]
+mod shared_geometry_baseline_tests {
+    use super::*;
+
+    #[test]
+    fn polyline_mid_preserves_degenerate_and_unequal_segments() {
+        let p = Vec3::new(10.0, -3.0, 7.0);
+        assert_eq!(polyline_mid(&[]), Vec3::ZERO);
+        assert_eq!(polyline_mid(&[p]), p);
+        assert_eq!(polyline_mid(&[p, p, p]), p);
+        assert_eq!(polyline_mid(&[p, p + Vec3::X, p + Vec3::X * 10.0]), p + Vec3::X * 5.0);
+        assert_eq!(polyline_mid(&[p, p, p + Vec3::X * 2.0, p + Vec3::X * 2.0 + Vec3::Y * 6.0]), p + Vec3::X * 2.0 + Vec3::Y * 2.0);
+        assert_eq!(polyline_mid(&[p, Vec3::new(f64::NAN, 0.0, 0.0)]), p);
     }
 }

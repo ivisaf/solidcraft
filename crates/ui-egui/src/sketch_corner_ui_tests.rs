@@ -2,6 +2,32 @@ use super::*;
 use solidcraft_engine::sketch::CurveKind;
 
 #[test]
+fn three_point_arc_follows_its_snapped_through_point_after_dimension_change() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.line", json!({"points":[[-20,0],[20,0]],"ids":["base"]})).unwrap();
+    h.app.run("sketch.constraint.fix", json!({"entity":"base"})).unwrap();
+    h.app.run("sketch.line", json!({"points":["origin",[0,10]],"ids":["height"],"infer":true})).unwrap();
+    let dim = h.app.run("sketch.dimension", json!({"entities":["height"],"value":10})).unwrap();
+    h.settle();
+    h.step(&json!({"start":"sketch.arc.three_point"})).unwrap();
+    for point in [[-20, 0, 0], [20, 0, 0], [0, 10, 0]] {
+        h.step(&json!({"click":{"world":point}})).unwrap();
+    }
+    h.app.run("parameters.change", json!({"name":dim["param"],"expression":"15 mm"})).unwrap();
+    let sid = h.app.session.active_sketch.unwrap();
+    let state = h.app.session.model.state();
+    let ss = state.sketch(sid).unwrap();
+    let sk = &ss.sketch;
+    let arc = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Arc { .. })).unwrap();
+    let through = sk.point(sk.resolve_point("height.end").unwrap()).unwrap();
+    assert!(ss.report.ok());
+    assert!(through.dist(Vec2::new(0.0, 15.0)) < 1e-6, "{through:?}");
+    let distance = sk.shape(arc).unwrap().dist(through);
+    assert!(distance < 1e-6, "the arc misses its snapped through point by {distance} mm");
+}
+
+#[test]
 fn clicked_periodic_fit_closes_at_start_and_right_click_keeps_natural() {
     let mut h = crate::scenario::Harness::new();
     h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
@@ -469,6 +495,9 @@ fn fully_constrained_center_rectangle_corners_can_be_picked_and_filleted() {
     h.frames(2);
     h.step(&json!({"start":"sketch.fillet"})).unwrap();
     h.frames(2);
+    // Fit after opening the dialog so all four corners clear the shell and both panels.
+    h.app.fit_view();
+    h.settle();
     for corner in [[-20, -15, 0], [20, -15, 0], [20, 15, 0], [-20, 15, 0]] {
         h.step(&json!({"click":{"world":corner}})).unwrap();
         h.frames(2);

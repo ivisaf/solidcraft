@@ -28,6 +28,7 @@ mod boundary;
 mod boundary_network;
 mod bridge;
 mod build;
+mod candidate_reach;
 #[cfg(test)]
 mod chamfer_sides_curved_tests;
 mod clearance;
@@ -192,7 +193,7 @@ pub use native::{decode_native_body, encode_native_body, native_preview_mesh};
 pub use offset::with_same_surface;
 pub use ops::{
     BoolOp, boolean, can_join_all_touching_faces, can_join_touching_faces, compound_disjoint_extrusions, half_space, is_planar, join_apart,
-    split_by_plane, transform, transform_matrix, union_apart, with_attempt_budget,
+    place_matrix, split_by_plane, transform, transform_matrix, union_apart, with_attempt_budget,
 };
 pub use polybool::{faceted_boolean, planar_boolean};
 pub use polyhedron::{HalfSpace, convex_polyhedron, draft, offset_faces, shell};
@@ -271,3 +272,6 @@ pub fn guard<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod trimmed_face_mesh_tests;

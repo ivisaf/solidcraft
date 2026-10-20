@@ -79,7 +79,7 @@ fn ask(tx: &Sender<ControlRequest>, method: &str, params: Value) -> Receiver<Val
 }
 
 fn frame(app: &mut SolveApp) {
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     poll(app, &ctx);
     app.drain_control(&ctx);
 }
@@ -198,7 +198,7 @@ fn with_ai_features_off_nothing_of_the_chat_shows_or_runs() {
     let shortcut = json!({"key": "A", "shift": true, "cmd": true});
     h.app.preferences.ai_features = false;
     h.frames(3);
-    assert!(handle_at("toolbar:ai").is_none(), "no toolbar button");
+    assert!(handle_at("titlebar:assistant").is_none(), "no Assistant button");
     h.call("ui.key", shortcut.clone());
     h.frames(3);
     h.call("ui.agent_chat", json!({"open": true, "send": "hello", "connect": true}));
@@ -216,7 +216,7 @@ fn with_ai_features_off_nothing_of_the_chat_shows_or_runs() {
     // On (the default): the button shows; discovery waits until the panel opens.
     h.app.preferences.ai_features = true;
     h.frames(3);
-    assert!(handle_at("toolbar:ai").is_some(), "the toolbar button");
+    assert!(handle_at("titlebar:assistant").is_some(), "the Assistant button");
     assert!(h.app.agent_chat.detection.is_none() && h.app.agent_chat.detecting.is_none(), "nothing looked for yet");
     h.call("ui.key", shortcut.clone());
     h.frames(3);
@@ -227,7 +227,7 @@ fn with_ai_features_off_nothing_of_the_chat_shows_or_runs() {
     h.app.preferences.ai_toolbar_button = false;
     h.call("ui.key", shortcut);
     h.frames(3);
-    assert!(handle_at("toolbar:ai").is_none() && !h.app.agent_chat.open);
+    assert!(handle_at("titlebar:assistant").is_none() && !h.app.agent_chat.open);
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn app_with_script() -> (SolveApp, Script, egui::Context) {
     let script = Script::default();
     app.agent_chat.backend = Some(Box::new(script.clone()));
     app.agent_chat.state = Some(State::Ready);
-    (app, script, egui::Context::default())
+    (app, script, crate::fonts::test_context())
 }
 
 fn ended(script: &Script, reason: &str) {
@@ -631,7 +631,7 @@ done
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let until = |app: &mut SolveApp, what: &str, done: &dyn Fn(&SolveApp) -> bool| {
         let t = std::time::Instant::now();
         while !done(app) {
@@ -724,7 +724,7 @@ done
     let mut app = SolveApp::new(solidcraft_engine::Session::default(), crate::Services::default());
     app.agent_chat.backend = Some(Box::new(acp_client::AcpBackend::start(&argv, start).unwrap()));
     app.agent_chat.state = Some(State::Starting);
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let until = |app: &mut SolveApp, done: &dyn Fn(&SolveApp) -> bool| {
         let t = std::time::Instant::now();
         while !done(app) {
@@ -842,7 +842,7 @@ done
     app.agent_chat.state = Some(State::Starting);
     app.agent_chat.running_id = "fake".into();
     app.preferences.agent_models.insert("fake".into(), "smart".into());
-    let ctx = egui::Context::default();
+    let ctx = crate::fonts::test_context();
     let t = std::time::Instant::now();
     loop {
         poll(&mut app, &ctx);
@@ -1411,6 +1411,44 @@ fn an_agents_markdown_is_drawn_as_blocks() {
     // A hostile reply draws too (no panic, bounded work).
     h.app.agent_chat.items.push(Item::Agent { thought: false, text: "*".repeat(50_000) + &"[".repeat(5_000) + &"`a".repeat(5_000) });
     h.frames(3);
+}
+
+#[test]
+fn assistant_marks_follow_chat_login_turns_and_approvals() {
+    use AssistantMark::*;
+    let mark = |state, login, configured| assistant_mark_for(state, login, configured, 0, false, false);
+    assert_eq!(mark(State::Off, "", false), Quiet);
+    assert_eq!(mark(State::Off, "signed_in", false), Quiet);
+    for login in ["", "unknown"] {
+        assert_eq!(mark(State::Off, login, true), Quiet);
+    }
+    for login in ["signed_in", "key"] {
+        assert_eq!(mark(State::Off, login, true), Ready);
+    }
+    assert_eq!(mark(State::Off, "signed_out", true), NeedsAuth);
+    for login in ["", "signed_out", "unknown", "signed_in"] {
+        for (state, expected) in
+            [(State::Ready, Ready), (State::Busy, Busy), (State::Starting, Busy), (State::NeedsAuth, NeedsAuth), (State::Exited, Stopped)]
+        {
+            assert_eq!(mark(state, login, true), expected);
+            assert_eq!(assistant_mark_for(state, login, true, 12, false, false), Waiting(12));
+        }
+    }
+    assert_eq!(assistant_mark_for(State::Ready, "signed_in", true, 0, true, false), Stopped);
+    assert_eq!(assistant_mark_for(State::Ready, "signed_in", true, 0, false, true), Stopped);
+}
+
+#[test]
+fn assistant_click_and_shortcut_toggle_the_same_panel_without_a_connection() {
+    let mut h = crate::scenario::Harness::new();
+    h.frames(3);
+    assert_eq!(assistant_mark(&h.app), AssistantMark::Quiet);
+    assert!(crate::scenario::handle_at("toolbar:ai").is_none());
+    h.step(&json!({"click":{"handle":"titlebar:assistant"}})).unwrap();
+    assert!(h.app.agent_chat.open);
+    h.step(&json!({"key":"A", "shift":true,"cmd":true})).unwrap();
+    assert!(!h.app.agent_chat.open);
+    assert!(h.app.agent_chat.backend.is_none());
 }
 
 /// A long message scrolls inside its box: the buttons under the box stay in the window (#2224).

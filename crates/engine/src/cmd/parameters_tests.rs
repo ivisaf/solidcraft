@@ -655,3 +655,21 @@ fn several_parameters_change_in_one_rebuild_and_one_undo() {
     assert_eq!((expr_of(&mut s, "len"), expr_of(&mut s, "h")), ("60 mm".to_string(), "10 mm".to_string()));
     assert!(rel(volume(&mut s), 40.0 * 30.0 * 10.0) < 1e-9);
 }
+
+/// A sketch made with `flip` on an offset plane follows the offset's parameter (the parameter
+/// walk stopped at the flipped plane, so a change rebuilt nothing).
+#[test]
+fn flipped_offset_sketch_plane_follows_its_parameter() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "d", "expression": "30 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "name": "Near"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-10, -10], "p1": [10, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.create", json!({"plane": "XZ", "offset": "d", "flip": "x", "name": "Far"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-10, -10], "p1": [10, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.loft", json!({"sections": [{"sketch": "Near"}, {"sketch": "Far"}]}));
+    assert!((volume(&mut s) - 400.0 * 30.0).abs() < 1e-6);
+    run(&mut s, "parameters.change", json!({"name": "d", "expression": "50 mm"}));
+    assert!((volume(&mut s) - 400.0 * 50.0).abs() < 1e-6, "{}", volume(&mut s));
+}

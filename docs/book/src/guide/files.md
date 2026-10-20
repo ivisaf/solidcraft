@@ -164,18 +164,25 @@ copy its properties; Save As keeps them. A command script of the design
 
 ## Saving in the web app
 
-In the web app, **Save** and **Save As** keep designs in this browser's private storage;
-they do not open a dialog for choosing a folder on your computer. Clearing the site's data
+In Chrome, Edge and Opera, **Save As** opens your browser's save dialog and writes the
+`.solidcraft` file to the folder you choose, and **Open** opens the browser's open dialog.
+**Save** then writes back to that same file. The browser remembers the file, so after you
+reload the page the first **Save** asks once for permission to write to it, and carries on.
+A design you open from your computer saves back to the file you opened.
+
+In Firefox and Safari, which can't write to a folder, **Save** and **Save As** keep designs in
+this browser's private storage instead, and the app says so. Clearing the site's data
 can remove those designs. Download a copy to keep it outside the browser or move it to
 another device.
 
-1. Open the File menu and choose **Open** to show **Files in this browser**.
-2. Choose **Download open design** for the current design, including its unsaved changes,
-   or **Download** beside a stored file for its last saved contents.
-3. Find the `.solidcraft` file in your browser's downloads. Whether a folder chooser appears
-   depends on your browser's download settings.
+To get a copy as a download in any browser, choose **File → Download design**. It holds the
+current design, including its unsaved changes. In **File → Files in this browser…** (and in
+Firefox and Safari, **File → Open**), **Download open design** does the same, and **Download**
+beside a stored file gives its last saved contents. Whether a folder chooser appears depends
+on your browser's download settings.
 
-Use **Open from computer…** in the same panel to reopen a downloaded design. The web app
-works on a browser-stored copy; later saves do not update the original downloaded file.
-Use **Rename** beside a stored file to change its name. Exports such as STEP and STL are
-also downloaded.
+Use **Open from computer…** in the same window to open a design from your computer; where the
+browser can write to a folder it saves back to that file, otherwise it works on a copy kept
+in the browser. Use **Rename** beside a stored file to change its name. Autosave and recovery
+stay in the browser's private storage in every browser. Exports such as STEP and STL are
+downloaded.

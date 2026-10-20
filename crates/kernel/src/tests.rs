@@ -2980,3 +2980,35 @@ fn an_attempt_budget_stops_the_boolean_and_is_shared_by_nesting() {
     assert!(inner && !after);
     assert!(boolean(&a, &b, BoolOp::Intersect).unwrap().is_some());
 }
+
+/// Moving an assembly places every body of it again: a copy placed for showing keeps its
+/// revolved faces where its source turned them, so placing searches none of them again (that search was most
+/// of the time an occurrence move took on a large assembly, #3044), and the copy is the same
+/// solid as placing a freshly turned one.
+#[test]
+fn placing_a_body_does_not_turn_its_revolved_faces_again() {
+    let body = cylinder(Vec3::new(1.0, 2.0, 0.0), Vec3::Z, 3.0, 5.0).unwrap();
+    assert!(body.phased);
+    let m = [[0.0, 1.0, 0.0, 0.0], [-1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [10.0, 20.0, 30.0, 1.0]];
+    crate::body::REPHASED.with(|c| c.set(0));
+    let mut placed = body.clone();
+    for _ in 0..10 {
+        placed = crate::place_matrix(&placed, m).unwrap();
+    }
+    assert_eq!(crate::body::REPHASED.with(|c| c.get()), 0, "no placement searched the revolved faces again");
+    // A modelling move (a pattern's copy, a hole's tool) still turns them in its own frame.
+    let _ = crate::transform_matrix(&body, m).unwrap();
+    assert_eq!(crate::body::REPHASED.with(|c| c.get()), 1);
+    crate::body::REPHASED.with(|c| c.set(0));
+    assert!(placed.phased);
+    let unphased = Body { phased: false, ..body.clone() };
+    let mut turned = unphased;
+    for _ in 0..10 {
+        turned = crate::place_matrix(&turned, m).unwrap();
+    }
+    assert!(crate::body::REPHASED.with(|c| c.get()) > 0, "a body not known to be turned still is");
+    let (a, b) = (measure(&placed).unwrap(), measure(&turned).unwrap());
+    assert!((a.volume - b.volume).abs() < 1e-9 * a.volume && (a.area - b.area).abs() < 1e-9 * a.area);
+    assert_eq!(a.faces, b.faces);
+    assert!(a.bbox.min.dist(b.bbox.min) < 1e-9 && a.bbox.max.dist(b.bbox.max) < 1e-9);
+}

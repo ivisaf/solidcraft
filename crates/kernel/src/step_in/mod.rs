@@ -265,9 +265,11 @@ struct Reader {
     /// Items the file converts exactly once (see `index`): keeping their parts would hold a
     /// second copy of the whole import for nothing.
     once: HashSet<u64>,
-    /// An item placed more than once: its first instance's display, shared by the later ones
+    /// An item placed more than once: its first instance's display, shared by every instance
     /// (with the placement that first instance had), so the part is meshed once.
     shown: HashMap<u64, (Arc<crate::body::SharedDisplay>, mt::Matrix4)>,
+    /// How many planned solids place each item.
+    uses: HashMap<u64, usize>,
     /// An item placed more than once: read and oriented where the file defines it, so each
     /// later instance is only placed (orienting meshes the whole part).
     oriented: HashMap<u64, Arc<parallel::Part>>,
@@ -313,6 +315,7 @@ impl Reader {
             unreadable: HashMap::new(),
             once: HashSet::new(),
             shown: HashMap::new(),
+            uses: HashMap::new(),
             oriented: HashMap::new(),
             used_items: HashSet::new(),
             node_items: HashSet::new(),
@@ -650,6 +653,7 @@ impl Reader {
                         // The node lists the planned solid; it becomes a body index once converted.
                         out.push(self.plan.len());
                         self.plan.push(Planned { item, units: u, batch: id });
+                        *self.uses.entry(item).or_default() += 1;
                     }
                 }
                 "MAPPED_ITEM" => {
@@ -778,15 +782,16 @@ impl Reader {
                         .map(|face| Some(crate::FaceSource::Imported { item, face: *face, payload_sha256: None, producer: None }))
                         .collect();
                     let body = body.with_face_sources(Some(std::sync::Arc::new(identities)));
-                    // A later instance of an item shows its first instance's mesh, placed.
+                    // Every instance of a part placed more than once shows its first instance's
+                    // mesh, placed (the first one too: meshing its own would mesh the part twice).
                     let body = match self.shown.get(&item) {
                         Some((shared, first)) => body.with_display_of(shared.clone(), to_array(&mat_mul(&m, &rigid_inverse(first)))),
-                        None => {
-                            if !self.once.contains(&item) {
-                                self.shown.insert(item, (Arc::new(crate::body::SharedDisplay::new(body.clone())), m));
-                            }
-                            body
+                        None if self.uses.get(&item).is_some_and(|n| *n > 1) => {
+                            let shared = Arc::new(crate::body::SharedDisplay::new(body.clone()));
+                            self.shown.insert(item, (shared.clone(), m));
+                            body.with_display_of(shared, to_array(&mt::Matrix4::from_scale(1.0)))
                         }
+                        None => body,
                     };
                     self.bodies.push(ImportedBody {
                         name,

@@ -45,11 +45,7 @@ fn path_colour(index: usize) -> egui::Color32 {
 fn small_choice(ui: &mut egui::Ui, id: &str, label: &str, help_label: &str, index: &mut usize, options: &[&str]) -> bool {
     let before = *index;
     explained(ui.label(label), help_label, None);
-    egui::ComboBox::from_id_salt(id).selected_text(options.get(*index).copied().unwrap_or_default()).width(70.0).show_ui(ui, |ui| {
-        for (i, o) in options.iter().enumerate() {
-            ui.selectable_value(index, i, *o);
-        }
-    });
+    crate::ui_kit::dropdown(ui, id, index, options);
     *index != before
 }
 
@@ -1214,7 +1210,7 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             for ((a, b), (label, colour)) in arms.into_iter().zip([("X", t.error), ("Y", t.sketch_accent), ("Z", t.accent)]) {
                 if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
                     painter.line_segment([a, b], Stroke::new(2.0, colour));
-                    painter.text(b, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(12.0), colour);
+                    painter.text(b, egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(t.font_caption), colour);
                 }
             }
         }
@@ -1451,7 +1447,7 @@ fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit
         labels.push((place, format!("{name} {}", shown(*z, 2)), if on { t.text } else { *colour }, on));
     }
     for (ly, text, colour, on) in labels {
-        let font = egui::FontId::proportional(if on { 12.0 } else { 11.0 });
+        let font = egui::FontId::proportional(if on { t.font_caption } else { t.font_small });
         painter.text(egui::pos2(block_r + 8.0, ly), egui::Align2::LEFT_CENTER, text, font, colour);
     }
 }
@@ -1497,12 +1493,8 @@ fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut 
 
 fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut usize, options: &[&str]) {
     row_label(ui, label, needed(need, label));
-    let r = egui::ComboBox::from_id_salt(id).selected_text(options.get(*index).copied().unwrap_or_default()).show_ui(ui, |ui| {
-        for (i, o) in options.iter().enumerate() {
-            ui.selectable_value(index, i, *o);
-        }
-    });
-    explained(r.response, label, None);
+    let r = crate::ui_kit::dropdown(ui, id, index, options);
+    explained(r, label, None);
     ui.end_row();
 }
 
@@ -1510,14 +1502,21 @@ fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut u
 fn pick(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, value: &mut String, options: &[(String, String)]) {
     let need = needed(need, label);
     row_label(ui, label, need);
-    let shown = options.iter().find(|(v, _)| v == value).map_or(value.clone(), |(_, l)| l.clone());
-    let r = egui::ComboBox::from_id_salt(id).selected_text(shown).width(140.0).show_ui(ui, |ui| {
-        for (v, l) in options {
-            ui.selectable_value(value, v.clone(), l);
-        }
+    // Indexed for the kit's drop-down; a value not in the list shows as it is, chosen by none.
+    let mut labels: Vec<&str> = options.iter().map(|(_, l)| l.as_str()).collect();
+    let mut index = options.iter().position(|(v, _)| v == value).unwrap_or_else(|| {
+        labels.push(value.as_str());
+        labels.len() - 1
     });
-    mark(ui, &r.response, need);
-    explained(r.response, label, need);
+    let before = index;
+    let r = crate::ui_kit::dropdown(ui, id, &mut index, &labels);
+    if index != before
+        && let Some((v, _)) = options.get(index)
+    {
+        *value = v.clone();
+    }
+    mark(ui, &r, need);
+    explained(r, label, need);
     ui.end_row();
 }
 
@@ -1745,7 +1744,7 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
     // Dimensions: thin lines with ticks, the lit one in the accent colour.
     let colour = |d: Dim| if lit == Some(d) { t.accent } else { t.text_dim };
     let width = |d: Dim| if lit == Some(d) { 2.0 } else { 1.0 };
-    let font = |d: Dim| egui::FontId::proportional(if lit == Some(d) { 16.0 } else { 13.5 });
+    let font = |d: Dim| egui::FontId::proportional(if lit == Some(d) { t.font_heading } else { t.font_body });
     let dim_line = |a: egui::Pos2, b: egui::Pos2, d: Dim, label: &str, at: egui::Pos2| {
         let stroke = Stroke::new(width(d), colour(d));
         painter.line_segment([a, b], stroke);
@@ -2041,11 +2040,11 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
                 field(ui, need, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
                 row_label(ui, "Direction", None);
-                ui.checkbox(&mut f.climb, "Climb");
+                crate::ui_kit::checkbox(ui, "Climb", &mut f.climb);
                 ui.end_row();
             }
             row_label(ui, "Coolant", None);
-            ui.checkbox(&mut f.coolant, "On");
+            crate::ui_kit::checkbox(ui, "On", &mut f.coolant);
             ui.end_row();
         }
     });
@@ -2242,7 +2241,7 @@ fn docked_panel(
     look: &mut PanelLook,
     body: impl FnOnce(&mut egui::Ui),
 ) -> (bool, Option<egui::Rect>) {
-    use crate::frame::{DIALOG_WIDE_MAX_W, Side, Width};
+    use crate::frame::Side;
     let t = Tokens::get();
     let mut frame = crate::frame::dock_frame(ctx, Side::Right);
     // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
@@ -2266,47 +2265,45 @@ fn docked_panel(
     let anchor = egui::pos2(x, y);
     let max_height = dock.max_height - (anchor.y - dock.anchor.y);
     let mut keep = true;
-    let response = crate::frame::docked(RichText::new(title).strong().size(13.0), egui::Id::new(id), anchor, max_height, Width::Wide)
-        .max_width(w)
-        .frame(frame)
-        .show(ctx, |ui| {
-            // Long texts (errors, notes) wrap instead of widening the panel.
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
-            ui.set_min_width(min_w);
-            ui.set_max_width(w - margin);
-            // What it was last frame, but never more than the panel's width now (once dragged narrower).
-            let total = crate::frame::content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
-            let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
-            drag_header(ui, id, band, offset, anchor - dock.anchor);
-            ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new(if *folded { "+" } else { "−" }).size(14.0)).frame(false))
-                    .on_hover_text(if *folded { "Expand" } else { "Collapse" })
-                    .clicked()
-                {
-                    *folded = !*folded;
-                }
-                // Not selectable: a drag on the title moves the panel.
-                ui.add(egui::Label::new(RichText::new(title).strong().size(12.5)).selectable(false))
-                    .on_hover_text("Drag to move, double-click to dock again");
-                let width = ui.spacing().interact_size.x;
-                crate::frame::right_aligned(ui, total, width, |ui| {
-                    let close = egui::Button::new(RichText::new("×").size(14.0).color(t.text_dim)).frame(false).min_size(egui::vec2(width, 0.0));
-                    if ui.add(close).on_hover_text("Close").clicked() {
-                        keep = false;
-                    }
-                });
-            });
-            if *folded {
-                return;
+    let response = crate::ui_kit::Panel::new(title, egui::Id::new(id), anchor, dock.viewport, Side::Right, frame).width(w).window().show(ctx, |ui| {
+        // Long texts (errors, notes) wrap instead of widening the panel.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
+        ui.set_min_width(min_w);
+        ui.set_max_width(w - margin);
+        // What it was last frame, but never more than the panel's width now (once dragged narrower).
+        let total = content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
+        let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
+        drag_header(ui, id, band, offset, anchor - dock.anchor);
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(RichText::new(if *folded { "+" } else { "−" }).size(t.font_heading)).frame(false))
+                .on_hover_text(if *folded { "Expand" } else { "Collapse" })
+                .clicked()
+            {
+                *folded = !*folded;
             }
-            ui.add_space(2.0);
-            let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
-            // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
-            egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
-            crate::frame::remember_width(ui, egui::Id::new((id, "w")));
+            // Not selectable: a drag on the title moves the panel.
+            ui.add(egui::Label::new(RichText::new(title).strong().size(t.font_label)).selectable(false))
+                .on_hover_text("Drag to move, double-click to dock again");
+            let width = ui.spacing().interact_size.x;
+            right_aligned(ui, total, width, |ui| {
+                let close =
+                    egui::Button::new(RichText::new("×").size(t.font_heading).color(t.text_dim)).frame(false).min_size(egui::vec2(width, 0.0));
+                if ui.add(close).on_hover_text("Close").clicked() {
+                    keep = false;
+                }
+            });
         });
+        if *folded {
+            return;
+        }
+        ui.add_space(2.0);
+        let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
+        // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
+        egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
+        remember_width(ui, egui::Id::new((id, "w")));
+    });
     let rect = response.map(|r| r.response.rect);
     // A grip along the left edge: drag to make the panel wider or narrower, double-click for its usual width.
     look.resizing = false;
@@ -2328,6 +2325,28 @@ fn docked_panel(
         });
     }
     (keep, rect)
+}
+
+/// How wide a CAM panel is when docked (and the widest it gets without being dragged wider).
+const DIALOG_WIDE_MAX_W: f32 = 560.0;
+
+/// How wide a panel's content was last frame (at least `min`).
+fn content_width(ui: &egui::Ui, key: egui::Id, min: f32) -> f32 {
+    ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(min).max(min)
+}
+
+/// Remembers a panel's content width for the next frame (at the end of its content).
+fn remember_width(ui: &egui::Ui, key: egui::Id) {
+    let w = ui.min_rect().width();
+    ui.ctx().data_mut(|d| d.insert_temp(key, w));
+}
+
+/// In a row: pushes what `add` draws (`width` wide) to the right edge of a content `total` wide.
+fn right_aligned<R>(ui: &mut egui::Ui, total: f32, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let used = ui.min_rect().width();
+    let gap = (total - used - width - ui.spacing().item_spacing.x).max(0.0);
+    ui.add_space(gap);
+    add(ui)
 }
 
 /// How a panel is shown: its width as dragged (0: its usual width), how far its background
@@ -2471,7 +2490,7 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 };
                 let name = text(tool, "description");
                 let label = if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") };
-                if ui.selectable_label(*picked == Some((library, number)), label).clicked() {
+                if crate::ui_kit::list_picker(ui, &format!("cam_tool_{library}_{number}"), &label, *picked == Some((library, number))).clicked() {
                     *picked = if *picked == Some((library, number)) { None } else { Some((library, number)) };
                 }
                 ui.label(text(tool, "kind").replace('_', " "));
@@ -2617,15 +2636,15 @@ fn manufacture_window(
                 if ui.button("Tool Library…").clicked() {
                     cam.tools_open = true;
                 }
-                ui.checkbox(&mut cam.show_paths, "Toolpaths");
+                crate::ui_kit::checkbox(ui, "Toolpaths", &mut cam.show_paths);
                 let widths = PATH_WIDTHS.map(|w| w.0);
                 small_choice(ui, "sc_cam_path_colour", "Colour", "Toolpath colour", &mut cam.path_colour, &PATH_COLOURS);
                 small_choice(ui, "sc_cam_path_width", "Width", "Toolpath width", &mut cam.path_width, &widths);
                 let fades = PANEL_FADES.map(|f| f.0);
                 small_choice(ui, "sc_cam_panel_fade", "Fade", "Panel fade", &mut cam.look.fade, &fades);
-                ui.checkbox(&mut cam.show_setups, "Stock and origin");
+                crate::ui_kit::checkbox(ui, "Stock and origin", &mut cam.show_setups);
                 if cam.stock.is_some() {
-                    ui.checkbox(&mut cam.show_stock, "Simulated stock");
+                    crate::ui_kit::checkbox(ui, "Simulated stock", &mut cam.show_stock);
                     // Finer shows the cut stock closer to the toolpaths, and takes longer.
                     let detail = SIM_DETAIL.map(|d| d.0);
                     if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
@@ -2714,7 +2733,7 @@ fn manufacture_window(
                     // The setup's whole program: the one thing everything here leads to.
                     ui.add_space(6.0);
                     let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
-                    let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(14.0).color(t.text);
+                    let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(t.font_heading).color(t.text);
                     let button = egui::Button::new(label).fill(t.accent_soft).min_size(egui::vec2(ui.available_width(), 32.0));
                     if ui
                         .add_enabled(has_ops, button)
@@ -2791,7 +2810,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if cam.tools_open {
         // Beside where the Manufacture panel docks, wherever it was dragged to.
-        let beside = if cam.open { right - cam.panel.map_or(crate::frame::DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
+        let beside = if cam.open { right - cam.panel.map_or(DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
         tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
     }
     (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =

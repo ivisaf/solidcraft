@@ -1075,7 +1075,7 @@ fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     sort_group_features(&mut next);
     require_contiguous_groups(&next, cmd)?;
     // Everything that evaluated before must still evaluate.
-    let mut after = solidcraft_doc::Model::new();
+    let mut after = s.model.clone();
     after.evaluate(&next);
     let broken = newly_broken(&s.model, &after);
     if !broken.is_empty() {
@@ -1338,7 +1338,10 @@ fn dependents(s: &mut Session, p: &Value) -> Result<Value> {
     let id = feature_id(s, p.get("feature"), cmd)?;
     let mut next = (*s.doc).clone();
     let gone = next.delete_feature(id)?;
-    let mut after = solidcraft_doc::Model::new();
+    // On a copy of the session's model, which shares its evaluation cache (#2678): the features
+    // before this one are reused rather than recomputed, and the delete that usually follows
+    // finds the ones after it already computed.
+    let mut after = s.model.clone();
     after.evaluate(&next);
     let names = |ids: &[u64]| -> Vec<String> { ids.iter().filter(|x| **x != id).filter_map(|x| s.doc.feature(*x).map(|f| f.name.clone())).collect() };
     let broken: Vec<String> = newly_broken(&s.model, &after).into_iter().map(|(n, _)| n).collect();

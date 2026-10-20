@@ -24,7 +24,9 @@
 # result and runs the repository checks. Merge groups, the nightly run and Run workflow are not
 # pull requests and always run the full suite.
 # GitHub cannot filter `labeled` events by label name, so any other label starts a run whose jobs
-# are all skipped; it gets its own concurrency group (below) so it never cancels the real run.
+# are all skipped; it gets its own concurrency group (below) so it never cancels the real run. Its
+# `ci` job still runs and reports the commit's real result (see the `ci` job): the merge queue
+# reads `ci` from the newest run of a commit, so a run without it would block a PR that passed.
 # Cross-compilation is opt-in through Run workflow; release builds remain in release.yml.
 # Every Linux job runs on Blacksmith's Ubuntu 24.04 runners (blacksmith-<N>vcpu-ubuntu-2404), sized
 # per job: 16 vCPU for Build tests, Clippy and the merge queue's test shards, 8 for compiles, the
@@ -694,14 +696,45 @@ jobs:
 
   # Preserve the existing check name for branch protection, including docs-only PRs.
   ci:
-    # On the skipped run another label starts, this job is named differently, so that skipped job
-    # can never stand in for the required `ci` check of the pull request's real run.
-    name: ${{ github.event.action == 'labeled' && github.event.label.name != 'approved-for-ci' && 'ci (ignored label)' || 'ci' }}
+    # On a run another label starts (every other job skipped), this job reports the result of the
+    # commit's real run instead: the merge queue reads `ci` from the newest run of a commit, so a
+    # run without a passing `ci` would block a pull request that passed (#1850, #3182, #3252).
+    name: ci
     needs: [changes, checks, quick-compile, clippy, build-tests, tests, doc-tests, oracle, windows-fxc, windows-startup]
-    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event.action != 'labeled' || github.event.label.name == 'approved-for-ci')
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      # To read the commit's other runs of this workflow.
+      actions: read
     steps:
+      - name: Report the commit's real result (a run another label started)
+        if: github.event.action == 'labeled' && github.event.label.name != 'approved-for-ci'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # The other runs of ci.yml for this commit. While one is still going, wait for it (at
+          # most 90 minutes); then pass only when the newest one that ran its checks passed.
+          deadline=$((SECONDS + 5400))
+          while :; do
+            runs=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=pull_request&per_page=100" \
+              --jq "[.workflow_runs[] | select(.id != $RUN_ID)]")
+            pending=$(jq '[.[] | select(.status != "completed")] | length' <<<"$runs")
+            if [ "$pending" -eq 0 ] || [ "$SECONDS" -ge "$deadline" ]; then break; fi
+            echo "Waiting for $pending run(s) of this commit to finish."
+            sleep 30
+          done
+          # Runs with every job skipped (labels, before this job reported) are not a result.
+          latest=$(jq -r '[.[] | select(.status == "completed" and .conclusion != "skipped")]
+            | sort_by(.created_at) | last | "\(.conclusion) \(.html_url)"' <<<"$runs")
+          echo "The commit's latest run: $latest"
+          echo "A label started this run: \`ci\` repeats the commit's latest result ($latest)." >> "$GITHUB_STEP_SUMMARY"
+          test "${latest%% *}" = success
       - name: Verify required checks
+        if: github.event.action != 'labeled' || github.event.label.name == 'approved-for-ci'
         env:
           CHANGES: ${{ needs.changes.result }}
           CHECKS: ${{ needs.checks.result }}

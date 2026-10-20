@@ -1,17 +1,12 @@
 //! Context menu tests: what the menus offer for each target, and that their items act.
 
+use crate::test_support::sample_app;
 use egui::pos2;
 use serde_json::json;
 use solidcraft_engine::Session;
 
 use crate::context_menu::{self, Item, Target};
 use crate::{Services, SolveApp};
-
-fn sample_app() -> SolveApp {
-    let mut s = Session::default();
-    s.run_script(&solidcraft_engine::sample::script()).unwrap();
-    SolveApp::new(s, Services::default())
-}
 
 #[test]
 fn properties_leave_with_the_document_but_survive_a_failed_open() {
@@ -627,25 +622,25 @@ fn occurrence_moves_turn_about_their_origin_then_move() {
 fn toolbar_pins_removes_reorders_and_keeps_its_layout() {
     use crate::toolbar_custom as tc;
     let mut app = sample_app();
-    app.ui.tab = "SOLID".into();
+    app.ui.tab = "MODEL".into();
     let ids = |app: &SolveApp, panel: &str| -> Vec<&'static str> {
-        let lists = tc::panel_lists("SOLID");
+        let lists = tc::panel_lists("MODEL");
         let (_, cmds, n) = lists.iter().find(|(p, ..)| *p == panel).unwrap();
-        tc::buttons(app, "SOLID", panel, cmds, *n).iter().map(|c| c.id).collect()
+        tc::buttons(app, "MODEL", panel, cmds, *n).iter().map(|c| c.id).collect()
     };
     let create = ids(&app, "CREATE");
     // Pin a command that isn't a button yet: it lands at the end of its panel.
     let extra =
-        tc::panel_lists("SOLID").iter().find(|(p, ..)| *p == "CREATE").unwrap().1.iter().map(|c| c.id).find(|id| !create.contains(id)).unwrap();
+        tc::panel_lists("MODEL").iter().find(|(p, ..)| *p == "CREATE").unwrap().1.iter().map(|c| c.id).find(|id| !create.contains(id)).unwrap();
     act(&mut app, &Target::ToolbarCommand { id: extra.into() }, "Pin to Toolbar");
     assert_eq!(ids(&app, "CREATE").last(), Some(&extra));
     // Remove a default button.
     act(&mut app, &Target::ToolbarCommand { id: create[0].into() }, "Remove from Toolbar");
     assert!(!ids(&app, "CREATE").contains(&create[0]));
     // Reorder: the pinned one before the second default; then into another panel.
-    tc::reorder(&mut app, "SOLID", extra, "CREATE", Some(create[1]));
+    tc::reorder(&mut app, "MODEL", extra, "CREATE", Some(create[1]));
     assert_eq!(ids(&app, "CREATE")[0], extra);
-    tc::reorder(&mut app, "SOLID", extra, "MODIFY", None);
+    tc::reorder(&mut app, "MODEL", extra, "MODIFY", None);
     assert!(!ids(&app, "CREATE").contains(&extra) && ids(&app, "MODIFY").last() == Some(&extra));
     // Pin to Shortcuts goes to the S box's favourites.
     act(&mut app, &Target::ToolbarCommand { id: "solid.extrude".into() }, "Pin to Shortcuts");
@@ -857,4 +852,112 @@ fn contribution_unresolvable_face_does_not_edit_the_body_creator() {
     assert!(!find(&items, "Edit Feature").enabled);
     assert!(!find(&items, "Find in Timeline").enabled);
     assert!(!find(&items, "Find in Browser").enabled);
+}
+
+#[test]
+fn every_context_target_has_identified_icon_rows_including_submenus() {
+    fn check(rows: &[Item]) {
+        for row in rows {
+            assert!(!row.id.is_empty(), "missing menu identity: {row:?}");
+            let structural = row.id == "-" || row.id.starts_with('#');
+            let planned = row.id == "ui.workspace" && row.shortcut == "coming later";
+            assert!(structural || planned || !row.icon.is_empty(), "missing menu icon: {row:?}");
+            if !row.icon.is_empty() {
+                assert!(!crate::icon_svg::resolve(&row.icon).placeholder, "placeholder: {}", row.icon);
+            }
+            check(&row.children);
+        }
+    }
+    let mut app = sample_app();
+    let feature = app.session.doc.features[0].id;
+    app.run("construct.plane.offset", json!({"base":"XY","offset":5})).unwrap();
+    let plane = app.session.doc.features.last().unwrap().id;
+    let part = app.run("component.create", json!({"name":"Menu part"})).unwrap()["component"].as_u64().unwrap();
+    let occurrence = app.session.doc.occurrence_of(part).unwrap().id;
+    let group_id = app.run("browser.group", json!({"component":0,"folder":"bodies","items":[body(&app)]})).unwrap()["group"].as_u64().unwrap();
+    for target in [
+        Target::Viewport,
+        Target::Body { name: body(&app) },
+        Target::Sketch { id: feature },
+        Target::Plane { id: plane },
+        Target::Feature { id: feature },
+        Target::OriginPlane { name: "XY".into() },
+        Target::Component { id: part },
+        Target::Occurrence { path: vec![occurrence] },
+        Target::Group { id: group_id, scope: "c0".into() },
+        Target::Origin,
+        Target::Units,
+        Target::ToolbarCommand { id: "solid.extrude".into() },
+        Target::Toolbar,
+        Target::Workspace,
+        Target::NamedViews,
+        Target::NamedView { name: "Top".into() },
+        Target::Canvas { id: 1 },
+        Target::Section,
+        Target::Folder { component: 0, folder: "bodies".into(), scope: "c0".into() },
+    ] {
+        let rows = context_menu::items(&app, &target);
+        assert!(!rows.is_empty(), "unexercised target: {target:?}");
+        check(&rows);
+    }
+    let sample = solidcraft_engine::sample::samples().into_iter().find(|s| s.name == "Hinge Assembly").unwrap();
+    let mut assembly = SolveApp::new(Session::default(), Services::default());
+    assembly.session.run_script(&(sample.script)()).unwrap();
+    assert!(!assembly.session.doc.assembly.joints.is_empty());
+    for joint in &assembly.session.doc.assembly.joints {
+        let rows = context_menu::items(&assembly, &Target::Joint { id: joint.id });
+        assert!(!rows.is_empty());
+        check(&rows);
+    }
+    check(&context_menu::radial_items(&app));
+}
+
+#[test]
+fn appearance_submenu_swatches_apply_to_the_clicked_body_and_keep_library_action() {
+    let mut app = sample_app();
+    let name = body(&app);
+    let rows = context_menu::items(&app, &Target::Body { name: name.clone() });
+    let appearance = find(&rows, "Appearance");
+    assert_eq!(appearance.children[0].id, "ui.appearance");
+    assert_eq!(appearance.children[0].params, appearance.params);
+    let swatch = appearance.children.iter().find(|row| row.swatch.is_some()).unwrap();
+    context_menu::run_item(&mut app, swatch, pos2(0.0, 0.0));
+    assert_eq!(app.session.doc.appearances.bodies[&name].color, swatch.swatch.unwrap());
+}
+
+#[test]
+fn appearance_submenu_keyboard_opens_beside_parent_and_left_returns_to_it() {
+    use crate::scenario::{Harness, rect_of};
+    let mut h = Harness::new();
+    h.app = sample_app();
+    h.frames(3);
+    let target = Target::Body { name: body(&h.app) };
+    let rows = context_menu::items(&h.app, &target);
+    context_menu::open_for(&mut h.app, pos2(400.0, 180.0), target);
+    let index = rows.iter().position(|i| i.id == "ui.appearance").unwrap();
+    h.app.menu.key_row = Some(index);
+    h.frames(2);
+    h.step(&json!({"key":"ArrowRight"})).unwrap();
+    let parent = rect_of("menu:ui.appearance").unwrap();
+    let child = rect_of("menu:appearance.assign:Aluminum - Satin").unwrap();
+    assert!(child.left() >= parent.right() || child.right() <= parent.left(), "submenu overlaps parent: {parent:?}, {child:?}");
+    assert!(h.app.dialog.is_none(), "opening submenu must not execute its first child");
+    h.step(&json!({"key":"ArrowLeft"})).unwrap();
+    h.frames(2);
+    assert!(rect_of("menu:appearance.assign:Aluminum - Satin").is_none(), "Left closes the submenu");
+    h.step(&json!({"key":"Escape"})).unwrap();
+    assert!(h.app.viewport.context_menu.is_none());
+}
+
+#[test]
+fn narrow_overflow_submenu_keeps_opening_click_and_accepts_the_next_click() {
+    use crate::scenario::Harness;
+    let mut h = Harness::new();
+    h.call("ui.resize", json!({"width":200,"height":800}));
+    h.step(&json!({"click":{"handle":"toolbar:overflow"}})).unwrap();
+    h.step(&json!({"widget":"CREATE"})).unwrap();
+    assert!(h.app.dialog.is_none(), "opening a submenu must not run Extrude beneath its opener");
+    assert!(crate::scenario::handle_at("toolbar:solid.extrude").is_some());
+    h.step(&json!({"click":{"handle":"toolbar:solid.extrude"}})).unwrap();
+    assert!(matches!(h.app.dialog.as_ref().map(|d| &d.kind), Some(crate::dialogs::Kind::Extrude { .. })));
 }

@@ -1,10 +1,10 @@
 //! Autosave ticks and the "Recover unsaved design?" window shown at launch.
 
-use egui::RichText;
 use serde_json::json;
 use solidcraft_engine::recovery::{self, Autosaver, Entry};
 
 use crate::SolveApp;
+use crate::ui_kit;
 
 /// A command that ran at least this long counts as a big operation: autosave right after it.
 pub const BIG_OPERATION_MS: f64 = 1500.0;
@@ -43,10 +43,10 @@ fn ago(secs: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(secs);
     let d = now.saturating_sub(secs);
     match d {
-        0..=59 => "just now".into(),
-        60..=3599 => format!("{} min ago", d / 60),
-        3600..=86_399 => format!("{} h ago", d / 3600),
-        _ => format!("{} days ago", d / 86_400),
+        0..=59 => crate::i18n::tr("recovery.just_now").to_string(),
+        60..=3599 => crate::i18n::format("recovery.min_ago", &[("count", &(d / 60).to_string())]),
+        3600..=86_399 => crate::i18n::format("recovery.hours_ago", &[("count", &(d / 3600).to_string())]),
+        _ => crate::i18n::format("recovery.days_ago", &[("count", &(d / 86_400).to_string())]),
     }
 }
 
@@ -56,35 +56,31 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let dir = app.autosave.as_ref().map(|a| a.dir.clone()).or_else(recovery::default_dir);
     let mut act: Option<(Entry, bool)> = None;
-    let mut later = false;
-    crate::frame::window(ctx, RichText::new(crate::i18n::tr_label("Recover unsaved design?")).strong().size(13.0), crate::frame::Width::Normal)
-        .collapsible(false)
-        .resizable(false)
-        .min_width(420.0)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .show(ctx, |ui| {
-            ui.label(crate::i18n::tr_label("SolidCraft closed before these designs were saved. Their last autosave can be opened."));
-            ui.add_space(6.0);
-            for e in app.recoverable.iter().take(20) {
-                ui.label(RichText::new(&e.name).strong());
-                let file = e.path.clone().unwrap_or_else(|| "never saved".into());
-                ui.label(RichText::new(format!("{file} · {} features · autosaved {}", e.features, ago(e.saved_at))).small().weak());
-                ui.horizontal(|ui| {
-                    if ui.button(crate::i18n::tr_label("Recover")).clicked() {
+    let (closed, action) = ui_kit::Window::new(egui::Id::new("sc_recover_prompt"), "restore", crate::i18n::tr_label("Recover unsaved design?"))
+        .actions("", crate::i18n::tr_label("Later"), None)
+        .show(ctx, true, |ui| {
+            ui_kit::text(
+                ui,
+                crate::i18n::tr_label("SolidCraft closed before these designs were saved. Their last autosave can be opened."),
+                ui_kit::Text::Report("intro", false),
+            );
+            for (index, e) in app.recoverable.iter().take(20).enumerate() {
+                ui_kit::divider(ui, &format!("entry:{index}"));
+                ui_kit::label_actions(ui, &e.name, |ui| {
+                    if ui_kit::button(ui, crate::i18n::tr_label("Recover"), ui_kit::Button::Normal).clicked() {
                         act = Some((e.clone(), true));
                     }
-                    if ui.button(crate::i18n::tr_label("Discard")).clicked() {
+                    if ui_kit::button(ui, crate::i18n::tr_label("Discard"), ui_kit::Button::Normal).clicked() {
                         act = Some((e.clone(), false));
                     }
                 });
-                ui.separator();
+                let file = e.path.clone().unwrap_or_else(|| crate::i18n::tr("recovery.never_saved").to_string());
+                let detail =
+                    crate::i18n::format("recovery.detail", &[("file", &file), ("features", &e.features.to_string()), ("when", &ago(e.saved_at))]);
+                ui_kit::text(ui, &detail, ui_kit::Text::Note(&format!("detail:{index}")));
             }
-            ui.horizontal(|ui| {
-                if ui.button(crate::i18n::tr_label("Later")).on_hover_text("Keep them; ask again next launch").clicked() {
-                    later = true;
-                }
-            });
         });
+    let later = closed || action != ui_kit::Action::None;
     let dir_s = dir.map(|d| d.to_string_lossy().to_string());
     if let Some((e, recover)) = act {
         app.recoverable.retain(|x| x.id != e.id);
@@ -104,5 +100,30 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if later {
         app.recoverable.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use solidcraft_engine::recovery::Entry;
+
+    fn entry(id: &str, name: &str) -> Entry {
+        Entry { id: id.into(), path: None, name: name.into(), saved_at: 0, features: 3 }
+    }
+
+    #[test]
+    fn recovered_sessions_are_a_card_with_one_row_each_and_later_keeps_them_for_next_launch() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.recoverable = vec![entry("a", "Bracket"), entry("b", "Housing")];
+        h.frames(4);
+        assert!(crate::scenario::handle_at("dialog:close").is_some(), "a kit card");
+        assert!(h.widget("Recover").is_some() && h.widget("Discard").is_some() && h.widget("Later").is_some());
+        assert!(crate::scenario::handle_at("dialog:cell:Bracket").is_some(), "one row per design");
+        assert!(crate::scenario::handle_at("dialog:cell:Housing").is_some());
+        h.step(&json!({"widget": "Later"})).unwrap();
+        h.frames(2);
+        assert!(h.app.recoverable.is_empty(), "Later hides the card for this launch");
     }
 }

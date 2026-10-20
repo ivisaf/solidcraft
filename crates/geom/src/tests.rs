@@ -150,6 +150,18 @@ fn tangent_chains_follow_smooth_edges() {
     assert_eq!(c, vec![0, 1]);
     assert_eq!(m.tangent_chain(2, 5f64.to_radians()), vec![2]);
     assert_eq!(m.face_edges(1), vec![1, 2]);
+    // A smooth seam where two faces share the same normal along the edge is not a corner to round,
+    // so tangent chaining stops at it.
+    let seam = Mesh {
+        positions: vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0), Vec3::new(15.0, 5.0, 0.0)],
+        normals: vec![Vec3::Z; 4],
+        triangles: vec![[0, 1, 3], [1, 2, 3], [1, 2, 3]],
+        tri_face: vec![0, 1, 2],
+        edges: vec![vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0)], vec![Vec3::new(10.0, 0.0, 0.0), Vec3::new(20.0, 0.0, 0.0)]],
+        edge_faces: vec![vec![0], vec![1, 2]],
+        ..Default::default()
+    };
+    assert_eq!(seam.tangent_chain(0, 5f64.to_radians()), vec![0]);
 }
 
 #[test]

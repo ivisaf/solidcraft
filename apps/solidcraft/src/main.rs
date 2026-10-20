@@ -210,6 +210,8 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         http_download: Some(std::sync::Arc::new(http_download)),
         // Already an installed app: only the browser build offers to install.
         install_app: None,
+        download_design: None,
+        browser_files: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
         secrets: Some(std::sync::Arc::new(Keychain)),
         show_in_folder: Some(Box::new(|path| {

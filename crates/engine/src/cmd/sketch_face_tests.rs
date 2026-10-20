@@ -698,3 +698,28 @@ fn a_face_next_to_plane_is_refused_not_ignored() {
     let r = run(&mut s, "sketch.create", json!({"plane": {"face": [10, 10, 10]}}));
     assert_eq!(r["attachment"], "exact_face", "{r}");
 }
+
+/// #3248: a custom plane's `origin` that is present but not three numbers (an expression such as
+/// "w/2", a number with a unit, too few values) became [0, 0, 0] without a word. It is refused,
+/// like a bad `x_dir`, and nothing is added. A missing origin is still the world origin.
+#[test]
+fn a_custom_plane_origin_that_is_not_numbers_is_refused_not_zeroed() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "40 mm"}));
+    let features = s.doc.features.len();
+    for origin in [json!(["w/2", 0, 0]), json!(["20 mm", 0, 0]), json!([20, 0]), json!("w"), json!([20, 0, null])] {
+        let p = json!({"plane": {"origin": origin, "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]}});
+        let e = s.execute("sketch.create", &p).unwrap_err().to_string();
+        assert!(e.contains("origin"), "{p}: {e}");
+    }
+    assert_eq!(s.doc.features.len(), features);
+    assert!(s.active_sketch.is_none());
+    let origin_of = |s: &mut Session, plane: Value| {
+        run(s, "sketch.create", json!({"plane": plane}));
+        let r = run(s, "sketch.inspect", json!({}));
+        run(s, "sketch.finish", json!({}));
+        r["plane"]["origin"].clone()
+    };
+    assert_eq!(origin_of(&mut s, json!({"origin": [20, 0, 0], "x_dir": [0, 1, 0], "y_dir": [0, 0, 1]})), json!([20.0, 0.0, 0.0]));
+    assert_eq!(origin_of(&mut s, json!({"x_dir": [0, 1, 0], "y_dir": [0, 0, 1]})), json!([0.0, 0.0, 0.0]));
+}

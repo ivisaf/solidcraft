@@ -803,6 +803,7 @@ fn hostile_params_never_panic() {
         "kind",
         "prefix",
         "orientation",
+        "seam",
         "twist",
         "scale",
         "continuity",
@@ -1540,6 +1541,31 @@ fn section_analysis() {
     run(&mut s, "inspect.section", json!({"clear": true}));
     assert!(Arc::ptr_eq(&doc, &s.doc));
     assert_eq!(s.undo.len(), undo);
+}
+
+/// A section index finds the same cut segments, in the same order, as cutting every triangle:
+/// tilted and axis normals, cuts through vertices, at the ends and beyond the part.
+#[test]
+fn section_index_cuts_like_every_triangle() {
+    let mut s = Session::default();
+    run(&mut s, "solid.cylinder", json!({"radius": 12, "height": 30}));
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 8, "operation": "join"}));
+    let st = s.model.state();
+    let m = st.bodies.first().unwrap().mesh();
+    assert!(m.triangles.len() > 64, "enough triangles for several slabs: {}", m.triangles.len());
+    for n in [Vec3::Z, -Vec3::Y, Vec3::new(1.0, 2.0, 3.0).normalized().unwrap(), Vec3::new(-0.3, 0.1, 0.9).normalized().unwrap()] {
+        let index = view::SectionIndex::new(&m, n);
+        let heights: Vec<f64> = m.positions.iter().map(|p| n.dot(*p)).collect();
+        let (lo, hi) = heights.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), h| (a.min(*h), b.max(*h)));
+        let mut cuts: Vec<f64> = (0..=40).map(|k| lo - 1.0 + (hi - lo + 2.0) * k as f64 / 40.0).collect();
+        cuts.extend(heights.iter().step_by(7).copied());
+        cuts.extend([lo, hi]);
+        for at in cuts {
+            let o = n * at;
+            let segments = view::section_segments(&m, o, n);
+            assert_eq!(index.segments(&m, o), segments, "{n:?} at {at}");
+        }
+    }
 }
 
 /// Press Pull: positive pulls a face out, negative pushes it in (a cut), edges get a fillet.
@@ -3789,4 +3815,85 @@ fn a_tapered_side_drawn_in_two_collinear_pieces_is_one_face() {
     run(&mut s, "solid.extrude", json!({"distance": 5, "taper": "5 deg"}));
     let m = run(&mut s, "inspect.measure", json!({}));
     assert_eq!(m["bodies"][0]["kernel"]["faces"], 6, "{m}");
+}
+
+/// #3044: renaming a body of an imported assembly (a part placed twice, so the file has more
+/// solids than the part has bodies) evaluates nothing, not even the file again, and leaves the
+/// model evaluating the renamed design gives; undo does the same.
+#[test]
+fn renaming_an_imported_assembly_body_reads_nothing_again() {
+    let dir = std::env::temp_dir().join(format!("solidcraft-step-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut a = Session::default();
+    run(&mut a, "solid.box", json!({"length": 10, "width": 10, "height": 10, "body_name": "Cube"}));
+    run(&mut a, "solid.box", json!({"length": 4, "width": 4, "height": 4, "center": [30, 0, 2], "operation": "new", "body_name": "Pin"}));
+    run(&mut a, "component.from_bodies", json!({"bodies": ["Cube"]}));
+    run(&mut a, "occurrence.copy", json!({"component": "Cube", "translate": [0, 40, 0]}));
+    let p = dir.join("Assembly.step");
+    run(&mut a, "file.export", json!({"path": p.to_string_lossy()}));
+    let mut s = Session::default();
+    run(&mut s, "doc.open", json!({"path": p.to_string_lossy()}));
+    let names = |s: &Session| s.model.state().bodies.iter().map(|b| b.name.clone()).collect::<Vec<_>>();
+    let before = names(&s);
+    let body = before.first().cloned().unwrap();
+    s.evaluations = 0;
+    run(&mut s, "body.rename", json!({"body": body, "name": "Renamed"}));
+    assert_eq!(s.evaluations, 0, "a rename evaluates nothing");
+    let after = names(&s);
+    assert_eq!(after.first().map(String::as_str), Some("Renamed"));
+    assert_eq!(after.len(), before.len());
+    let mut fresh = Session::new((*s.doc).clone());
+    fresh.refresh();
+    assert_eq!(names(&fresh), after, "the same names as evaluating the renamed design");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(names(&s), before);
+    assert_eq!(s.evaluations, 0, "nor does its undo");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #3044: on a design with thousands of bodies the cheap commands stay cheap: showing, hiding,
+/// selecting, colouring and renaming a body or a feature, and undoing them, recompute no feature
+/// (renames don't even look over the timeline) and leave every body's display mesh as it was, so
+/// nothing is meshed or uploaded again.
+#[test]
+fn cheap_commands_on_thousands_of_bodies_evaluate_nothing() {
+    let mut s = Session::default();
+    for k in 0..2 {
+        run(
+            &mut s,
+            "solid.box",
+            json!({"length": 4, "width": 4, "height": 4, "center": [0, 6 * k, 2], "operation": "new", "name": format!("Seed{k}")}),
+        );
+        run(
+            &mut s,
+            "solid.pattern.rectangular",
+            json!({"features": [format!("Seed{k}")], "dir1": [1, 0, 0], "count1": 1000, "spacing1": 6, "name": format!("Row{k}")}),
+        );
+    }
+    let st = s.model.state();
+    assert_eq!(st.bodies.len(), 2000);
+    let meshes = |s: &Session| s.model.state().bodies.iter().map(|b| std::sync::Arc::as_ptr(&b.mesh())).collect::<Vec<_>>();
+    let shown = meshes(&s);
+    s.refresh();
+    for (command, params) in [
+        ("select.set", json!({"items": [{"type": "body", "name": "Body7"}]})),
+        ("browser.visibility", json!({"visible": false, "items": ["Body7"]})),
+        ("browser.visibility", json!({"visible": true, "items": ["Body7"]})),
+        ("appearance.assign", json!({"bodies": ["Body7"], "appearance": "Aluminum - Satin"})),
+        ("body.rename", json!({"body": "Body7", "name": "Renamed"})),
+        ("timeline.rename", json!({"feature": "Row1", "name": "Second row"})),
+        ("edit.undo", json!({})),
+        ("edit.undo", json!({})),
+        ("edit.redo", json!({})),
+    ] {
+        s.evaluations = 0;
+        run(&mut s, command, params);
+        // Renames are followed in the model; the rest may look over the timeline, which then
+        // finds every result as it was.
+        assert_eq!(s.model.last_recomputed, 0, "{command} recomputed a feature");
+        if command.ends_with("rename") {
+            assert_eq!(s.evaluations, 0, "{command} evaluated the design");
+        }
+    }
+    assert_eq!(meshes(&s), shown, "every body keeps its mesh");
 }

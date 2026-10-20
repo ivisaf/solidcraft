@@ -18,6 +18,47 @@ const CONTEXT: &str = "#90=ADVANCED_BREP_SHAPE_REPRESENTATION('',(#81),#91);\n#9
 /// Height of the cone pieces: the 45° cone `x² + y² = z²` up to `z = H`.
 const H: f64 = 10.0;
 
+#[test]
+fn extruded_ellipse_seam_uses_profile_angles_for_oblique_sweeps() {
+    use mt::{MetricSpace, ParametricSurface};
+
+    let text = format!(
+        "{HEAD}
+#1=CARTESIAN_POINT('',(10.,-20.,3.));
+#2=DIRECTION('',(0.,0.,1.));
+#3=DIRECTION('',(1.,0.,0.));
+#4=AXIS2_PLACEMENT_3D('',#1,#2,#3);
+#5=ELLIPSE('',#4,9.,4.);
+#6=DIRECTION('',(0.5,0.25,1.));
+#7=VECTOR('',#6,1.);
+#8=SURFACE_OF_LINEAR_EXTRUSION('',#5,#7);
+{TAIL}"
+    );
+    let ex = p21::parse(&text).unwrap();
+    let cx = Ctx { ex: &ex, len: 1.0, ang: 1.0, tol: 1e-6 };
+    let origin = mt::Point3::new(10.0, -20.0, 3.0);
+    let d = mt::Vector3::new(0.5, 0.25, 1.0).normalize();
+    let point = |angle: f64, h: f64| origin + mt::Vector3::new(9.0 * angle.cos(), 4.0 * angle.sin(), 0.0) + d * h;
+    let extent: Vec<_> = [-0.04, 0.0, 0.04].into_iter().flat_map(|a| [point(a, 0.0), point(a, 10.0)]).collect();
+    for seam in [Vec::new(), vec![point(-0.04, 0.0), point(-0.04, 10.0)]] {
+        let surface = geom::surface(&cx, 8, &extent, &seam, true, 0).unwrap();
+        for i in 0..=16 {
+            for j in 0..=4 {
+                let q = surface.subs(i as f64 / 16.0, j as f64 / 4.0) - origin;
+                let q = q - d * (q.z / d.z);
+                assert!(((q.x / 9.0).powi(2) + (q.y / 4.0).powi(2) - 1.0).abs() < 1e-12);
+            }
+        }
+        let start = surface.subs(0.0, 0.5);
+        let q = start - d * ((start.z - origin.z) / d.z);
+        if seam.is_empty() {
+            assert!(q.distance(point(std::f64::consts::PI, 0.0)) < 1e-9);
+        } else {
+            assert!(q.distance(point(-0.04, 0.0)) < 1e-9);
+        }
+    }
+}
+
 fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs().max(1e-9)
 }

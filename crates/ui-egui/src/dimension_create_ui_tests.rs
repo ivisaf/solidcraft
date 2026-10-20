@@ -66,8 +66,8 @@ fn dimension_editor_names_and_reference_picks_drive_new_and_existing_dimensions(
     crate::dim_view::cancel();
 }
 
-#[test]
-fn single_clicking_another_dimension_does_not_change_the_expression() {
+/// Two dimensioned lines, editing `d2` with `typed` in its value field.
+fn editing_d2(typed: &str) -> Harness {
     let mut h = line([20., 0.]);
     h.app.run("sketch.dimension", json!({"entities":["l1"],"value":20,"text_at":[10,8]})).unwrap();
     h.app.run("sketch.line", json!({"points":[[0,-10],[12,-10]],"infer":false})).unwrap();
@@ -75,11 +75,79 @@ fn single_clicking_another_dimension_does_not_change_the_expression() {
     h.settle();
     crate::dim_view::edit_param(&h.app, "d2");
     h.frames(5);
-    type_value(&mut h, "8");
+    type_value(&mut h, typed);
+    h
+}
+
+/// Click `d1`, check the editor stays focused, then apply and return d2's expression.
+fn click_d1_and_apply(h: &mut Harness) -> String {
     h.step(&json!({"click":{"dimension":"d1"}})).unwrap();
-    assert!(crate::dim_view::editing());
+    assert!(crate::dim_view::editing(), "a reference click keeps the editor open");
+    h.frames(2);
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(egui::Id::new("sc_dim_edit")), "the value field keeps the keyboard");
     h.step(&json!({"key":"Enter"})).unwrap();
-    assert_eq!(h.app.session.doc.param("d2").unwrap().expr, "8");
+    assert!(!crate::dim_view::editing(), "{}", h.call("ui.inspect", json!({})));
+    let expr = h.app.session.doc.param("d2").unwrap().expr.clone();
+    crate::dim_view::cancel();
+    expr
+}
+
+#[test]
+fn clicking_another_dimension_appends_its_name_to_the_typed_text() {
+    for (typed, expected) in [("2 * ", "2 * d1"), ("10 + ", "10 + d1")] {
+        let mut h = editing_d2(typed);
+        assert_eq!(click_d1_and_apply(&mut h), expected, "typed {typed:?}");
+    }
+}
+
+#[test]
+fn clicking_another_dimension_replaces_a_lone_value() {
+    for typed in ["10", "10 mm", "-3.5"] {
+        let mut h = editing_d2(typed);
+        assert_eq!(click_d1_and_apply(&mut h), "d1", "typed {typed:?}");
+    }
+    // The cursor inside the number does not matter: the whole value goes.
+    let mut h = editing_d2("125");
+    h.step(&json!({"key":"Home"})).unwrap();
+    h.step(&json!({"key":"ArrowRight"})).unwrap();
+    assert_eq!(click_d1_and_apply(&mut h), "d1");
+}
+
+#[test]
+fn clicking_another_dimension_lets_typing_continue_after_its_name() {
+    let mut h = editing_d2("2 * ");
+    h.step(&json!({"click":{"dimension":"d1"}})).unwrap();
+    h.frames(2);
+    h.step(&json!({"text":" + 1"})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert_eq!(h.app.session.doc.param("d2").unwrap().expr, "2 * d1 + 1");
+    crate::dim_view::cancel();
+}
+
+#[test]
+fn clicking_another_dimension_inserts_its_name_at_the_cursor() {
+    let mut h = editing_d2("( ) / 2");
+    h.step(&json!({"key":"Home"})).unwrap();
+    h.step(&json!({"key":"ArrowRight"})).unwrap();
+    h.step(&json!({"key":"ArrowRight"})).unwrap();
+    assert_eq!(click_d1_and_apply(&mut h), "( d1) / 2");
+}
+
+#[test]
+fn clicking_another_dimension_replaces_the_selected_text() {
+    let mut h = editing_d2("5 + 7");
+    h.step(&json!({"key":"ArrowLeft","shift":true})).unwrap();
+    assert_eq!(click_d1_and_apply(&mut h), "5 + d1");
+}
+
+#[test]
+fn double_clicking_another_dimension_inserts_its_name_once() {
+    let mut h = editing_d2("3 * ");
+    // Synthetic input feeds one pointer event per frame, so this is a click and, a frame
+    // later, a second click that egui reads as a double-click.
+    h.step(&json!({"click":{"dimension":"d1"},"double":true})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert_eq!(h.app.session.doc.param("d2").unwrap().expr, "3 * d1");
     crate::dim_view::cancel();
 }
 
