@@ -24,6 +24,8 @@ const AXES: [&str; 7] = ["+z", "-z", "+x", "-x", "+y", "-y", "custom"];
 const ANCHORS: [&str; 3] = ["min", "center", "max"];
 /// What the work origin is on.
 const ORIGINS: [&str; 3] = ["stock box", "part box", "world point"];
+/// The simulation's detail: a name and how many columns along the stock's longer side.
+const SIM_DETAIL: [(&str, u32); 3] = [("coarse", 150), ("normal", 300), ("fine", 700)];
 /// Most toolpath segments drawn.
 const MAX_SEGMENTS: usize = 400_000;
 
@@ -331,6 +333,10 @@ pub struct CamUi {
     pub show_stock: bool,
     /// Counts changes of `stock` (the viewport redraws when it moves on).
     stock_stamp: u64,
+    /// How finely the simulation looks at the stock: index into [`SIM_DETAIL`].
+    pub sim_detail: usize,
+    /// The setup last simulated (simulated again when the detail changes).
+    simulated: Option<u64>,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
     /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
@@ -363,6 +369,8 @@ impl Default for CamUi {
             stock: None,
             show_stock: true,
             stock_stamp: 0,
+            sim_detail: 1,
+            simulated: None,
             cache: None,
             heights: None,
             selection_heights: None,
@@ -924,7 +932,9 @@ pub fn simulate(app: &mut SolveApp) {
 /// Runs `cam.simulate` on a setup and keeps what it found for the window.
 pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
     app.manufacture.stock_stamp += 1;
-    match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true })) {
+    app.manufacture.simulated = Some(setup);
+    let columns = SIM_DETAIL.get(app.manufacture.sim_detail).map_or(300, |d| d.1);
+    match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true, "columns": columns })) {
         Ok(v) => {
             let number = |k: &str| v[k].as_f64();
             let mut found = vec![format!("Removed {:.2} cm³", number("removed_volume").unwrap_or(0.0) / 1000.0)];
@@ -1101,6 +1111,7 @@ fn help(label: &str) -> Option<&'static str> {
         "Faces" => "Picked faces of the part: they give the outline and the heights.",
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
+        "Simulation detail" => "How finely the simulation looks at the stock. Fine shows the cut closer to the toolpaths and takes longer.",
         "From selection" => {
             "Click an edge, a point or a face of the model (the bottom circle of a hole, say), then take its height for Top or Bottom here."
         }
@@ -1862,6 +1873,21 @@ fn manufacture_window(
                 ui.checkbox(&mut cam.show_setups, "Stock and origin");
                 if cam.stock.is_some() {
                     ui.checkbox(&mut cam.show_stock, "Simulated stock");
+                    // Finer shows the cut stock closer to the toolpaths, and takes longer.
+                    let before = cam.sim_detail;
+                    let detail = SIM_DETAIL.map(|d| d.0);
+                    explained(ui.label("Detail"), "Simulation detail", None);
+                    egui::ComboBox::from_id_salt("sc_cam_sim_detail")
+                        .selected_text(detail.get(cam.sim_detail).copied().unwrap_or_default())
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for (i, d) in detail.iter().enumerate() {
+                                ui.selectable_value(&mut cam.sim_detail, i, *d);
+                            }
+                        });
+                    if cam.sim_detail != before {
+                        asked.simulate = cam.simulated;
+                    }
                 }
             });
             ui.add_space(4.0);

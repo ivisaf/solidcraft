@@ -102,7 +102,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_simulate").noundo().params(
         "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
-         width in mm (default: the stock's longer side / 300) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
+         width in mm (default: the stock's longer side / 300) — or columns?: how many along the stock's longer side (10 to 2000) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
          against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {frame, origin, cell, nx, ny, floor, z: [nx × ny heights], \
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
     ),
@@ -863,6 +863,17 @@ fn round_wall(body: &solidcraft_doc::ModelBody, index: usize) -> Option<solidcra
 /// The bodies seen from above in a setup, over `lo`–`hi` in its work coordinates; `floor` where
 /// there is nothing. `None` without bodies, or when the bodies are too detailed to look at.
 fn part_field(s: &Session, at: &Resolved, lo: Vec2, hi: Vec2, floor: f64) -> Option<cam::HeightField> {
+    let triangles = part_triangles(s, at);
+    if triangles.is_empty() || !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let size = (hi.x - lo.x).max(hi.y - lo.y);
+    let cell = (size / 300.0).max(0.05);
+    cam::HeightField::of_triangles(lo, hi, cell, floor, &triangles, true).ok()
+}
+
+/// The bodies' triangles in a setup's work coordinates.
+fn part_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
     let state = s.model.state();
     let mut triangles = Vec::new();
     for body in &state.bodies {
@@ -874,12 +885,7 @@ fn part_field(s: &Session, at: &Resolved, lo: Vec2, hi: Vec2, floor: f64) -> Opt
             }
         }
     }
-    if triangles.is_empty() || !lo.is_finite() || !hi.is_finite() {
-        return None;
-    }
-    let size = (hi.x - lo.x).max(hi.y - lo.y);
-    let cell = (size / 300.0).max(0.05);
-    cam::HeightField::of_triangles(lo, hi, cell, floor, &triangles).ok()
+    triangles
 }
 
 /// What an operation cuts, as far as the heights it finds by itself go.
@@ -904,6 +910,17 @@ impl OpShape {
 
 /// The top and bottom an operation takes from its geometry (see [`build`]); `None` where it has none.
 fn auto_heights(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
+    let (top, bottom) = auto_heights_of_part(at, g, shape, source);
+    // Picked faces and walls give the part's heights; while the stock still stands above them,
+    // cutting starts at its top (not down in the material, at a rapid).
+    let stock_top = at.stock.map(|(_, hi)| hi.z);
+    match (source, top, stock_top) {
+        (CamGeometry::Faces { .. }, Some(t), Some(s)) => (Some(t.max(s)), bottom),
+        _ => (top, bottom),
+    }
+}
+
+fn auto_heights_of_part(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
     let picked = matches!(source, CamGeometry::Faces { .. });
     let on_sketch = matches!(source, CamGeometry::Sketch { .. });
     let stock_top = at.stock.map(|(_, hi)| hi.z);
@@ -937,7 +954,9 @@ fn auto_heights(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometr
 /// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
 /// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
 /// the face, and likewise down to a sketch's plane (from the stock's top when that is higher);
-/// for drilling, the top (the face) and the bottom (the bottom of its body). Retract
+/// for drilling, the top (the face) and the bottom (the bottom of its body); a picked round wall,
+/// its top and its foot. Where the stock stands higher than a picked face's top, cutting starts
+/// at the stock's top. Retract
 /// and clearance are 2 mm and 10 mm above the top (clearance above the whole body and the
 /// stock). Facing without a sketch or faces covers the stock, from its top to the part's.
 pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
@@ -1583,9 +1602,6 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "setup": setup.id, "operations": out }))
 }
 
-/// Most ray tests when the bodies are sampled for the comparison.
-const MAX_PART_WORK: u64 = 400_000_000;
-
 fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.simulate";
     let setup = setup(s, p, cmd)?;
@@ -1602,9 +1618,13 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         }
         None => at.stock.ok_or_else(|| bad(cmd, "there is no body to take the stock from; give `stock`"))?,
     };
-    let cell = match p.get("cell") {
-        Some(_) => num(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| bad(cmd, "`cell` must be above 0"))?,
-        None => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
+    let cell = match (p.get("cell"), p.get("columns")) {
+        (Some(_), _) => num(p, "cell").filter(|c| *c > 0.0).ok_or_else(|| bad(cmd, "`cell` must be above 0"))?,
+        (None, Some(_)) => {
+            let n = num(p, "columns").filter(|n| (10.0..=2000.0).contains(n)).ok_or_else(|| bad(cmd, "`columns` must be 10 to 2000"))?;
+            ((max.x - min.x).max(max.y - min.y) / n).max(0.02)
+        }
+        (None, None) => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
     };
     let mut stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
     let mut ops = Vec::new();
@@ -1632,31 +1652,24 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut deviation: Option<Vec<f64>> = None;
     if triangles == 0 {
         warnings.push("there is no body to compare the result with".into());
-    } else if triangles.saturating_mul((stock.nx * stock.ny) as u64) > MAX_PART_WORK {
-        warnings.push("the bodies are too detailed to compare at this cell size; use a larger `cell`".into());
     } else {
-        let mut part = stock.clone();
-        let above = max.z + 1.0;
-        for j in 0..part.ny {
-            for i in 0..part.nx {
-                let c = part.centre(i, j);
-                let from = at.frame.world(Vec3::new(c.x, c.y, above));
-                let top = meshes.iter().filter_map(|m| m.raycast(from, -at.frame.z)).map(|(t, _)| above - t).fold(part.floor, f64::max);
-                if let Some(z) = part.z.get_mut(j * part.nx + i) {
-                    *z = top;
+        // Each column's centre seen from above, on the stock's own columns.
+        let seen = cam::HeightField::of_triangles(Vec2::new(min.x, min.y), Vec2::new(max.x, max.y), cell, min.z, &part_triangles(s, &at), false);
+        match seen {
+            Ok(part) => {
+                let c = cam::compare(&stock, &part).map_err(cam_error)?;
+                // A column's width of error is expected at walls; less than that is not reported.
+                if c.max_gouge > 1e-3 {
+                    warnings.push(format!("the program cuts up to {:.3} mm into the part, over {:.1} mm²", c.max_gouge, c.gouge_area));
                 }
+                out["max_gouge"] = json!(c.max_gouge);
+                out["gouge_area"] = json!(c.gouge_area);
+                out["max_leftover"] = json!(c.max_leftover);
+                out["leftover_volume"] = json!(c.leftover_volume);
+                deviation = Some(cam::deviations(&stock, &part).map_err(cam_error)?);
             }
+            Err(_) => warnings.push("the bodies are too detailed to compare at this cell size; use a larger `cell`".into()),
         }
-        let c = cam::compare(&stock, &part).map_err(cam_error)?;
-        // A column's width of error is expected at walls; less than that is not reported.
-        if c.max_gouge > 1e-3 {
-            warnings.push(format!("the program cuts up to {:.3} mm into the part, over {:.1} mm²", c.max_gouge, c.gouge_area));
-        }
-        out["max_gouge"] = json!(c.max_gouge);
-        out["gouge_area"] = json!(c.gouge_area);
-        out["max_leftover"] = json!(c.max_leftover);
-        out["leftover_volume"] = json!(c.leftover_volume);
-        deviation = Some(cam::deviations(&stock, &part).map_err(cam_error)?);
     }
     if bool_(p, "field").unwrap_or(false) {
         // Columns in work coordinates, with the frame that puts them in the world; `deviation`

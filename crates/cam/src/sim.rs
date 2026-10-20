@@ -74,10 +74,11 @@ impl HeightField {
     }
 
     /// The top of `triangles` seen from above, on columns `cell` wide over `min`–`max`; `floor`
-    /// where none is. A column takes the highest triangle over its centre, and the corners and
-    /// edges of every triangle mark the columns they pass through, so that walls seen edge-on
-    /// are not lost between centres.
-    pub fn of_triangles(min: Vec2, max: Vec2, cell: f64, floor: f64, triangles: &[[Vec3; 3]]) -> Result<HeightField> {
+    /// where none is. A column takes the highest triangle over its centre; with `edges`, the
+    /// corners and edges of every triangle also mark the columns they pass through, so that walls
+    /// seen edge-on are not lost between centres (what to keep a tool out of, rather than what
+    /// a column's centre sees).
+    pub fn of_triangles(min: Vec2, max: Vec2, cell: f64, floor: f64, triangles: &[[Vec3; 3]], edges: bool) -> Result<HeightField> {
         let mut f = HeightField::block(min.extend(floor), max.extend(floor + 1.0), cell)?;
         f.z.iter_mut().for_each(|z| *z = floor);
         if !(triangles.len() as f64 * 64.0 <= MAX_WORK as f64) {
@@ -112,7 +113,7 @@ impl HeightField {
                 }
             }
             // Along each edge, at half a column: the columns it passes through.
-            for (p, q) in [(a, b), (b, c), (c, a)] {
+            for (p, q) in [(a, b), (b, c), (c, a)].into_iter().filter(|_| edges) {
                 let n = ((Vec2::new(p.x, p.y).dist(Vec2::new(q.x, q.y)) / (cell * 0.5)).ceil()).clamp(1.0, 1.0e5) as usize;
                 for k in 0..=n {
                     let t = k as f64 / n as f64;

@@ -1000,3 +1000,18 @@ fn facing_below_the_part_s_top_goes_round_it_and_cuts_into_it_are_reported() {
     let warning = ops[1]["warning"].as_str().unwrap();
     assert!(warning.starts_with("cuts up to 10.") && warning.ends_with("mm into the part"), "{warning}");
 }
+
+#[test]
+fn a_picked_face_under_standing_stock_is_cut_from_the_stock_s_top() {
+    // Facing the plate's picked top round the boss: the stock stands 13 mm above it.
+    let mut s = plate_with_boss();
+    run(&mut s, "cam.op.face", json!({"tool": 1, "faces": [{"point": [5, 5, 0]}], "stepover": 3, "stepdown": 3}));
+    let (top, bottom) = crate::cam_heights(&s, "cam.op.face", &json!({"faces": [{"point": [5, 5, 0]}]})).unwrap();
+    assert_eq!((top.map(|t| (t * 1e3).round() / 1e3), bottom.map(|b| (b * 1e3).round() / 1e3)), (Some(13.0), Some(0.0)));
+    // In passes from the stock's top, never at a rapid into it, and not into the boss.
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    let op = &sim["operations"][0];
+    assert_eq!(op["rapid_collisions"], 0, "{sim}");
+    assert!(op["max_engagement"].as_f64().unwrap() <= 3.0 + 1e-6, "{sim}");
+    assert_eq!(sim["max_gouge"], 0.0);
+}

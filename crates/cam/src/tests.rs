@@ -290,7 +290,7 @@ fn plate_with_boss(cell: f64) -> HeightField {
         };
         tris.push([p(30.0, 20.0, 12.0), at(k), at(k + 1)]);
     }
-    HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), cell, -1.0, &tris).unwrap()
+    HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), cell, -1.0, &tris, true).unwrap()
 }
 
 #[test]
