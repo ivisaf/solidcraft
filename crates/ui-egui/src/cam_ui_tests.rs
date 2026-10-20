@@ -601,6 +601,12 @@ fn browser_lists_setups_and_operations_with_their_menus() {
     assert!(!rows(&h).iter().any(|r| r == "Manufacture"), "the folder goes with the last setup");
 }
 
+/// Whether the form's OK button is on (`None`: there is none).
+fn ok_enabled(h: &Harness) -> Option<bool> {
+    let tree = h.output.accesskit_update.as_ref()?;
+    tree.nodes.iter().find(|(_, n)| n.label() == Some("OK")).map(|(_, n)| !n.is_disabled())
+}
+
 #[test]
 fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
     let mut h = lab();
@@ -618,11 +624,8 @@ fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
     h.app.start("cam.op.pocket");
     h.frames(3);
     assert!(h.widget("Still needed: Bottom (marked red; point at a row for more)").is_some());
-    // OK is off: pressing it adds nothing.
-    h.step(&json!({"widget": "OK"})).unwrap();
-    h.frames(2);
-    assert!(h.app.session.doc.manufacture.setups[0].operations.is_empty());
-    assert!(h.app.manufacture.form.is_some());
+    // OK is off.
+    assert_eq!(ok_enabled(&h), Some(false));
 
     // A contour on the same sketch goes through the part: nothing is missing.
     h.app.start("cam.op.contour");
@@ -636,7 +639,8 @@ fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
     }
     h.frames(3);
     assert!(h.widget("Still needed: Bottom (marked red; point at a row for more)").is_none());
-    h.step(&json!({"widget": "OK"})).unwrap();
+    assert_eq!(ok_enabled(&h), Some(true));
+    apply(&mut h.app);
     h.frames(2);
     assert_eq!(h.app.session.doc.manufacture.setups[0].operations.len(), 1);
     assert!(h.app.manufacture.form.is_none());
@@ -646,7 +650,7 @@ fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
 fn missing_rows_follow_the_form() {
     let tools = vec![("1".to_string(), "T1  D6 flat".to_string())];
     let data = vec![("1".to_string(), ToolData { diameter: 6.0, flutes: 2, ..ToolData::default() })];
-    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None, picked: None };
+    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None, picked: None, cut_heights: None };
     let fields = |form: &Form, lists: &Choices| missing(form, lists).into_iter().map(|n| n.field).collect::<Vec<_>>();
     // No sketch to cut, and a tool without speed or feed of its own.
     let mut h = sketched();
@@ -663,7 +667,7 @@ fn missing_rows_follow_the_form() {
     op.chip_load = "0.03".into();
     op.flutes = 2;
     op.sketch = "Pocket".into();
-    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())), picked: None };
+    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())), picked: None, cut_heights: None };
     let need = missing(&Form::Op(op), &failing);
     assert_eq!(need, vec![Need { field: "", why: "no closed profile".into() }]);
     assert_eq!(need_text(&need), "no closed profile");
@@ -906,4 +910,35 @@ fn panels_are_dragged_wider_and_keep_their_width() {
     h.frames(3);
     assert_eq!(h.app.preferences.cam_panel_width, 0.0);
     assert!(h.app.manufacture.panel.unwrap().width() <= crate::frame::DIALOG_WIDE_MAX_W + 1.0);
+}
+
+#[test]
+fn the_form_knows_every_height_it_cuts_at() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.pocket");
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        (op.bottom, op.stepdown) = ("-3 mm".into(), "1 mm".into());
+    }
+    h.frames(2);
+    let seen = |h: &Harness| match &h.app.manufacture.preview {
+        Some((_, _, Ok(p))) => p.heights.clone().unwrap(),
+        other => panic!("no preview: {other:?}"),
+    };
+    // Automatic: retract 2 over the top (the sketch's plane), clearance 10 over it; three passes.
+    let auto = seen(&h);
+    assert_eq!((auto.clearance, auto.retract, auto.top, auto.bottom), (10.0, 2.0, 0.0, -3.0));
+    assert_eq!(auto.levels, vec![-1.0, -2.0, -3.0]);
+    assert!(h.widget("A picture of the heights shows once nothing is missing").is_none(), "the picture is drawn");
+    // Typed in, they are what it cuts at, and what an edit opens with.
+    if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+        (op.clearance, op.retract) = ("15 mm".into(), "5 mm".into());
+    }
+    h.frames(2);
+    assert_eq!((seen(&h).clearance, seen(&h).retract), (15.0, 5.0));
+    apply(&mut h.app);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Op(f)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][0]) else { panic!("no form") };
+    assert_eq!((f.clearance.as_str(), f.retract.as_str()), ("15 mm", "5 mm"));
 }

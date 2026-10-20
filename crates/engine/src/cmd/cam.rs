@@ -98,7 +98,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it; warning: how deep it cuts into the part, when it does"),
     CommandSpec::new("cam.toolpath", "Show Toolpaths", toolpath).at("MANUFACTURE", "ACTIONS").icon("cam_contour").noundo().params(
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
-         rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]",
+         rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]; heights?: bool, also each one's heights: {clearance, retract, top, bottom, levels: [depth passes]} in the setup's Z",
     ),
     CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_simulate").noundo().params(
         "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
@@ -1017,36 +1017,12 @@ fn auto_heights_of_part(at: &Resolved, g: &Geometry, shape: OpShape, source: &Ca
     }
 }
 
-/// The toolpath of `op` in its setup's work coordinates, from the model as it is now.
-///
-/// Heights the operation leaves out follow its geometry. A sketch gives the top (its plane).
-/// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
-/// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
-/// the face, and likewise down to a sketch's plane (from the stock's top when that is higher);
-/// for drilling, the top (the face) and the bottom (the bottom of its body); a picked round wall,
-/// its top and its foot. Where the stock stands higher than a picked face's top, cutting starts
-/// at the stock's top. Retract
-/// and clearance are 2 mm and 10 mm above the top (clearance above the whole body and the
-/// stock). Facing without a sketch or faces covers the stock, from its top to the part's.
-pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
-    let at = resolve(s, setup).map_err(|e| EngineError::Other(format!("setup `{}`: {e}", setup.name)))?;
-    build_in(s, &at, op)
-}
-
-/// [`build`] in a setup already worked out.
-fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
+/// What `op` cuts with in its setup: the heights it gives or finds (see [`build`]), its feeds and stepdown.
+fn op_cut(s: &Session, at: &Resolved, op: &CamOperation, g: &Geometry) -> Result<Cut> {
     let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
-    let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
-    let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
-    let g = geometry(s, at, &op.geometry).map_err(fail)?;
-    let picked = matches!(op.geometry, CamGeometry::Faces { .. });
-    // Only a contour can use the outline of a face on the far side.
-    if g.facing_away && !matches!(op.kind, CamOperationKind::Contour { .. }) {
-        return Err(fail("a picked face points away from the tool; machine it in a setup whose axis faces it".into()));
-    }
     let stock_top = at.stock.map(|(_, hi)| hi.z);
-    let (auto_top, auto_bottom) = auto_heights(at, &g, OpShape::of(&op.kind), &op.geometry);
+    let (auto_top, auto_bottom) = auto_heights(at, g, OpShape::of(&op.kind), &op.geometry);
     let height = |what: &str, given: &Option<Expr>, auto: Option<f64>| match given {
         Some(e) => len(what, e),
         None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
@@ -1075,7 +1051,38 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         top,
         bottom,
     };
-    let cut = Cut { heights, feeds: Feeds { cut: op.cut_feed, plunge: op.plunge_feed }, stepdown: len("stepdown", &op.stepdown)? };
+    Ok(Cut { heights, feeds: Feeds { cut: op.cut_feed, plunge: op.plunge_feed }, stepdown: len("stepdown", &op.stepdown)? })
+}
+
+/// The toolpath of `op` in its setup's work coordinates, from the model as it is now.
+///
+/// Heights the operation leaves out follow its geometry. A sketch gives the top (its plane).
+/// Picked faces give: for a pocket, the bottom (the face: the pocket's floor) and the top (the
+/// top of its body); for a contour, top and bottom of the body; for facing, a single pass at
+/// the face, and likewise down to a sketch's plane (from the stock's top when that is higher);
+/// for drilling, the top (the face) and the bottom (the bottom of its body); a picked round wall,
+/// its top and its foot. Where the stock stands higher than a picked face's top, cutting starts
+/// at the stock's top. Retract
+/// and clearance are 2 mm and 10 mm above the top (clearance above the whole body and the
+/// stock). Facing without a sketch or faces covers the stock, from its top to the part's.
+pub(crate) fn build(s: &Session, setup: &Setup, op: &CamOperation) -> Result<Toolpath> {
+    let at = resolve(s, setup).map_err(|e| EngineError::Other(format!("setup `{}`: {e}", setup.name)))?;
+    build_in(s, &at, op)
+}
+
+/// [`build`] in a setup already worked out.
+fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
+    let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
+    let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
+    let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
+    let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
+    let g = geometry(s, at, &op.geometry).map_err(fail)?;
+    let picked = matches!(op.geometry, CamGeometry::Faces { .. });
+    // Only a contour can use the outline of a face on the far side.
+    if g.facing_away && !matches!(op.kind, CamOperationKind::Contour { .. }) {
+        return Err(fail("a picked face points away from the tool; machine it in a setup whose axis faces it".into()));
+    }
+    let cut = op_cut(s, at, op, &g)?;
     let regions = &g.regions;
     let path = match &op.kind {
         CamOperationKind::Face { stepover, inside, margin } => {
@@ -1214,9 +1221,18 @@ pub fn cam_preview(s: &Session, cmd: &str, p: &Value) -> Result<CamPreview> {
     }
     let mut copy = s.scratch();
     let made = copy.execute(cmd, p)?;
-    let ask = json!({ "setup": made["setup"], "op": made["operation"] });
+    let ask = json!({ "setup": made["setup"], "op": made["operation"], "heights": true });
     let path = copy.execute("cam.toolpath", &ask)?;
-    let points = path["operations"].get(0).and_then(|o| o["points"].as_array()).cloned().unwrap_or_default();
+    let op = path["operations"].get(0).cloned().unwrap_or_default();
+    let points = op["points"].as_array().cloned().unwrap_or_default();
+    let h = &op["heights"];
+    let heights = match (h["clearance"].as_f64(), h["retract"].as_f64(), h["top"].as_f64(), h["bottom"].as_f64()) {
+        (Some(clearance), Some(retract), Some(top), Some(bottom)) => {
+            let levels = h["levels"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+            Some(PreviewHeights { clearance, retract, top, bottom, levels })
+        }
+        _ => None,
+    };
     let points = points
         .iter()
         .filter_map(|q| Some((Vec3::new(q.get(0)?.as_f64()?, q.get(1)?.as_f64()?, q.get(2)?.as_f64()?), q.get(3)?.as_bool()?)))
@@ -1231,7 +1247,17 @@ pub fn cam_preview(s: &Session, cmd: &str, p: &Value) -> Result<CamPreview> {
         .flat_map(|x| x["operations"].as_array().cloned().unwrap_or_default())
         .find(|o| o["id"] == made["operation"])
         .and_then(|o| o["warning"].as_str().map(str::to_string));
-    Ok(CamPreview { points, warning: gouge })
+    Ok(CamPreview { points, warning: gouge, heights })
+}
+
+/// The heights a previewed operation cuts at, in its setup's Z, and its depth passes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewHeights {
+    pub clearance: f64,
+    pub retract: f64,
+    pub top: f64,
+    pub bottom: f64,
+    pub levels: Vec<f64>,
 }
 
 /// What [`cam_preview`] finds: the toolpath's points in world coordinates, each with whether the
@@ -1240,6 +1266,7 @@ pub fn cam_preview(s: &Session, cmd: &str, p: &Value) -> Result<CamPreview> {
 pub struct CamPreview {
     pub points: Vec<(Vec3, bool)>,
     pub warning: Option<String>,
+    pub heights: Option<PreviewHeights>,
 }
 
 /// How high the selection reaches in a setup: the lowest and highest point of the selected
@@ -1685,6 +1712,14 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
         v["name"] = json!(op.name);
         v["kind"] = json!(op.kind.label());
         v["tool"] = json!(op.tool);
+        // The heights it cuts at, in the setup's Z: for a form's picture of them.
+        if bool_(p, "heights").unwrap_or(false) {
+            let g = geometry(s, &at, &op.geometry).map_err(|e| bad(cmd, e))?;
+            let c = op_cut(s, &at, op, &g)?;
+            let h = c.heights;
+            v["heights"] =
+                json!({"clearance": h.clearance, "retract": h.retract, "top": h.top, "bottom": h.bottom, "levels": c.levels().map_err(cam_error)?});
+        }
         if with_points {
             let points = path.points(TOLERANCE);
             if points.len() > MAX_POINTS {

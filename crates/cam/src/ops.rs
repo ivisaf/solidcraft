@@ -86,7 +86,7 @@ impl Cut {
     }
 
     /// Depth passes from the top down to the bottom, evenly spaced and at most a stepdown apart.
-    fn levels(&self) -> Result<Vec<f64>> {
+    pub fn levels(&self) -> Result<Vec<f64>> {
         let (top, bottom) = (self.heights.top, self.heights.bottom);
         let n = ((top - bottom) / self.stepdown - 1e-9).ceil().max(1.0);
         if !(n <= MAX_LEVELS as f64) {

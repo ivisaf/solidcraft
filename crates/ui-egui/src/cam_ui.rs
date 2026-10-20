@@ -167,6 +167,9 @@ pub struct OpForm {
     pub plunge_feed: String,
     pub top: String,
     pub bottom: String,
+    /// Where the tool travels between cuts, and where its rapid approach stops (empty: automatic).
+    pub clearance: String,
+    pub retract: String,
     pub stepdown: String,
     pub stepover: String,
     pub side: usize,
@@ -500,6 +503,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             feed: String::new(),
             plunge_feed: String::new(),
             top: String::new(),
+            clearance: String::new(),
+            retract: String::new(),
             stepdown: String::new(),
             stepover: if kind == OpKind::Face { "5 mm".into() } else { String::new() },
             side: 0,
@@ -666,12 +671,13 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                             _ => optional(&mut p, "sketch", &f.sketch),
                         }
                     }
-                    optional(&mut p, "top", &f.top);
-                    optional(&mut p, "bottom", &f.bottom);
+                    for (k, text) in [("top", &f.top), ("bottom", &f.bottom), ("clearance", &f.clearance), ("retract", &f.retract)] {
+                        optional(&mut p, k, text);
+                    }
                 }
                 // An edit: an emptied height goes back to automatic; geometry is sent only when it changed.
                 Some(e) => {
-                    for (k, text) in [("top", &f.top), ("bottom", &f.bottom)] {
+                    for (k, text) in [("top", &f.top), ("bottom", &f.bottom), ("clearance", &f.clearance), ("retract", &f.retract)] {
                         p.insert(k.into(), if text.trim().is_empty() { Value::Null } else { json!(text.trim()) });
                     }
                     if f.kind == OpKind::Drill && f.peck.trim().is_empty() {
@@ -842,6 +848,8 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         plunge_feed: number(&op["plunge_feed"]),
         top: text(op, "top"),
         bottom: text(op, "bottom"),
+        clearance: text(op, "clearance"),
+        retract: text(op, "retract"),
         stepdown: text(op, "stepdown"),
         stepover: text(inputs, "stepover"),
         side: SIDES.iter().position(|s| Some(*s) == inputs["side"].as_str()).unwrap_or(0),
@@ -1235,6 +1243,8 @@ fn help(label: &str) -> Option<&'static str> {
         "Sketch" => "The sketch whose closed profiles are cut.",
         "Faces" => "Picked faces of the part: they give the outline and the heights.",
         "Tool" => "The tool that cuts. Its speed and feeds fill the rows below.",
+        "Clearance" => "Where the tool travels between cuts, clear of the part and its clamps. Empty: 10 mm over the top, the part and the stock.",
+        "Retract" => "Where the tool's fast approach stops and it feeds down into the material. Empty: 2 mm over the top.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
         "Panel fade" => {
@@ -1298,11 +1308,14 @@ fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
 
 /// [`field`] for a height, with a button beside it that takes `picked`: the selection's height
 /// (its highest point for a top, its lowest for a bottom; `None` with nothing selected).
-fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) {
+/// `true` while the row is pointed at or typed in (the heights picture lights its line).
+fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) -> bool {
     let need = needed(need, label);
+    let mut lit = false;
     row_label(ui, label, need);
     ui.horizontal(|ui| {
         let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
+        lit |= r.hovered() || r.has_focus();
         mark(ui, &r, need);
         let r = explained(r, label, need);
         crate::params_dialog::complete(ui, &r, value);
@@ -1318,11 +1331,89 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
         let b = b
             .on_hover_text(tip)
             .on_disabled_hover_text("Click an edge, a point or a face of the model first (the bottom circle of a hole, say); this takes its height.");
+        lit |= b.hovered();
         if let (true, Some(z)) = (b.clicked(), picked) {
             *value = mm(z);
         }
     });
     ui.end_row();
+    lit
+}
+
+/// [`field`], also saying whether its row is pointed at or typed in.
+fn field_seen(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> (bool, bool) {
+    let need = needed(need, label);
+    row_label(ui, label, need);
+    let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
+    mark(ui, &r, need);
+    let lit = r.hovered() || r.has_focus();
+    let r = explained(r, label, need);
+    let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
+    ui.end_row();
+    (lit, changed)
+}
+
+/// Which line of the heights picture a form row stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeightLine {
+    Clearance,
+    Retract,
+    Top,
+    Bottom,
+    Passes,
+}
+
+/// The heights of an operation as a side view: the material with the cut in it, its depth
+/// passes, the tool above it, and a line at each height with its value. `lit` is drawn stronger.
+fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit: Option<HeightLine>) {
+    let t = Tokens::get();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(PICTURE_W, 230.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    // Z from a little below the bottom to a little above the clearance, onto the picture's height.
+    let depth = (h.top - h.bottom).max(1e-3);
+    let (lo, hi) = (h.bottom - depth * 0.35, h.clearance.max(h.retract).max(h.top) + depth * 0.1);
+    let span = (hi - lo).max(1e-3);
+    let y = |z: f64| rect.bottom() - 6.0 - ((z - lo) / span) as f32 * (rect.height() - 12.0);
+    // The material: a block from the top down past the bottom, with the cut taken out of its left half.
+    let (block_l, block_r, cut_r) = (rect.left() + 4.0, rect.left() + 70.0, rect.left() + 36.0);
+    let (top_y, bottom_y, floor_y) = (y(h.top), y(h.bottom), rect.bottom() - 2.0);
+    let material = t.text_dim.gamma_multiply(0.35);
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(cut_r, top_y), egui::pos2(block_r, floor_y)), 0.0, material);
+    painter.rect_filled(egui::Rect::from_min_max(egui::pos2(block_l, bottom_y), egui::pos2(cut_r, floor_y)), 0.0, material);
+    // The depth passes: where each one cuts, in the cut.
+    let passes = lit == Some(HeightLine::Passes);
+    for z in &h.levels {
+        let stroke = Stroke::new(if passes { 1.6 } else { 1.0 }, t.accent.gamma_multiply(if passes { 1.0 } else { 0.55 }));
+        painter.add(egui::Shape::dashed_line(&[egui::pos2(block_l, y(*z)), egui::pos2(cut_r, y(*z))], stroke, 4.0, 3.0));
+    }
+    // The tool, waiting at the retract height over the cut.
+    let tool_x = (block_l + cut_r) * 0.5;
+    let tool = egui::Rect::from_min_max(egui::pos2(tool_x - 5.0, y(h.retract) - 22.0), egui::pos2(tool_x + 5.0, y(h.retract)));
+    painter.rect_filled(tool, 2.0, t.text_dim);
+    // A line at each height across the picture, with its name and value on the right; labels are
+    // kept apart where heights lie close together.
+    let lines = [
+        (HeightLine::Clearance, "Clearance", h.clearance, t.text_dim),
+        (HeightLine::Retract, "Retract", h.retract, t.warning),
+        (HeightLine::Top, "Top", h.top, t.accent),
+        (HeightLine::Bottom, "Bottom", h.bottom, t.accent),
+    ];
+    let mut label_y = f32::NEG_INFINITY;
+    let mut labels: Vec<(f32, String, egui::Color32, bool)> = Vec::new();
+    for (line, name, z, colour) in lines.iter().rev() {
+        let on = lit == Some(*line);
+        let ly = y(*z);
+        let stroke = Stroke::new(if on { 2.0 } else { 1.0 }, if on { t.text } else { *colour });
+        painter.add(egui::Shape::dashed_line(&[egui::pos2(rect.left(), ly), egui::pos2(block_r + 4.0, ly)], stroke, 5.0, 3.0));
+        // Bottom first, upwards: each label at least a line above the last.
+        let place = if label_y.is_finite() { ly.min(label_y - 13.0) } else { ly };
+        label_y = place;
+        labels.push((place, format!("{name} {}", shown(*z, 2)), if on { t.text } else { *colour }, on));
+    }
+    for (ly, text, colour, on) in labels {
+        let font = egui::FontId::proportional(if on { 12.0 } else { 11.0 });
+        painter.text(egui::pos2(block_r + 8.0, ly), egui::Align2::LEFT_CENTER, text, font, colour);
+    }
 }
 
 /// A labelled text box in a form's grid; `true` when its text changed this frame.
@@ -1416,6 +1507,8 @@ struct Choices {
     heights: Option<Heights>,
     /// How high the selection reaches in the open operation form's setup: lowest and highest point.
     picked: Option<(f64, f64)>,
+    /// The heights the open operation form's preview cuts at.
+    cut_heights: Option<solidcraft_engine::PreviewHeights>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -1455,12 +1548,54 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             },
         ));
     }
-    Choices { sketches, tools, data, heights: None, picked: None }
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None }
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
     // A form's labels stay on one line each.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    // An operation form's heights, as a picture beside the rows (or under them in a narrow panel).
+    let mut picture: Option<(Option<solidcraft_engine::PreviewHeights>, Option<HeightLine>)> = None;
+    let below = ui
+        .horizontal_top(|ui| {
+            form_grid(ui, form, selected, choices, need, &mut picture);
+            let Some((seen, lit)) = &picture else { return false };
+            if ui.available_width() < PICTURE_W + 12.0 {
+                return true;
+            }
+            ui.add_space(12.0);
+            ui.vertical(|ui| heights_or_note(ui, seen.as_ref(), *lit));
+            false
+        })
+        .inner;
+    if below && let Some((seen, lit)) = &picture {
+        heights_or_note(ui, seen.as_ref(), *lit);
+    }
+}
+
+/// The heights picture, or what it waits for.
+fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHeights>, lit: Option<HeightLine>) {
+    match seen {
+        Some(h) => heights_picture(ui, h, lit),
+        None => {
+            ui.set_max_width(PICTURE_W);
+            ui.add(egui::Label::new(RichText::new("A picture of the heights shows once nothing is missing").color(Tokens::get().text_dim)).wrap());
+        }
+    }
+}
+
+/// The heights picture's width (points).
+const PICTURE_W: f32 = 170.0;
+
+/// The form's rows; an operation form leaves its heights in `picture` for beside them.
+fn form_grid(
+    ui: &mut egui::Ui,
+    form: &mut Form,
+    selected: &[(String, Vec3)],
+    choices: &Choices,
+    need: &[Need],
+    picture: &mut Option<(Option<solidcraft_engine::PreviewHeights>, Option<HeightLine>)>,
+) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
         Form::Tool(f) => {
             if f.editing {
@@ -1559,11 +1694,29 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             let given = lists_heights(choices);
             // Beside each, a button that takes the height from what is selected in the model.
             let (low, high) = (choices.picked.map(|p| p.0), choices.picked.map(|p| p.1));
-            height_field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high);
-            height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low);
-            if f.kind != OpKind::Drill {
-                field(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter");
+            // The heights the preview cuts at fill the automatic ones in.
+            let seen = choices.cut_heights.as_ref();
+            // Known from the preview: the value; else how it is found.
+            let automatic = |z: Option<f64>, what: &str| z.map_or_else(|| what.to_string(), |z| format!("{} mm (automatic)", shown(z, 3)));
+            let mut lit = None;
+            if height_field(ui, need, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high) {
+                lit = Some(HeightLine::Clearance);
             }
+            if height_field(ui, need, "Retract", &mut f.retract, &automatic(seen.map(|h| h.retract), "2 mm over the top"), high) {
+                lit = Some(HeightLine::Retract);
+            }
+            if height_field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high) {
+                lit = Some(HeightLine::Top);
+            }
+            if height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low) {
+                lit = Some(HeightLine::Bottom);
+            }
+            // Drilling has no stepdown (its peck depth is further down).
+            if f.kind != OpKind::Drill && field_seen(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter").0 {
+                lit = Some(HeightLine::Passes);
+            }
+            // The picture of these heights goes beside the form.
+            *picture = Some((seen.cloned(), lit));
             match f.kind {
                 OpKind::Face => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or half its diameter");
@@ -2315,6 +2468,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     lists.heights = form_heights(app);
     lists.picked = picked_heights(app);
     update_preview(app, &lists);
+    lists.cut_heights = match &app.manufacture.preview {
+        Some((_, _, Ok(p))) => p.heights.clone(),
+        _ => None,
+    };
     // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
     let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());
