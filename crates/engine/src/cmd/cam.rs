@@ -4,7 +4,8 @@
 
 use serde_json::{Value, json};
 use solidcraft_cam::{
-    self as cam, BoreParams, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath,
+    self as cam, BoreParams, ChamferParams, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind,
+    Toolpath,
 };
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
@@ -92,11 +93,12 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); inner profiles are islands")),
+    CommandSpec::new("cam.op.chamfer", "Chamfer", op_chamfer).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("width?: expr across the top (default 1 mm); tip_offset?: expr, how much deeper than the chamfer the tool's point goes (default 0.5 mm); side?: outside|inside (default outside: the profiles are the part); climb?: bool (default true); ramp_angle?: angle expr (default 3 deg); chamfers the top edges of the profiles or picked faces in one pass with a V-bit or a drill, at the tool's angle; the depth comes from the width (bottom is not used)")),
     CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, pitch, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, pitch, width, tip_offset, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -1114,6 +1116,7 @@ fn part_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
 enum OpShape {
     Face,
     Contour,
+    Chamfer,
     Pocket,
     Drill,
 }
@@ -1123,6 +1126,7 @@ impl OpShape {
         match kind {
             CamOperationKind::Face { .. } => OpShape::Face,
             CamOperationKind::Contour { .. } => OpShape::Contour,
+            CamOperationKind::Chamfer { .. } => OpShape::Chamfer,
             CamOperationKind::Pocket { .. } => OpShape::Pocket,
             // Holes, as drilled: their heights are the same.
             CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } => OpShape::Drill,
@@ -1133,6 +1137,10 @@ impl OpShape {
 /// The top and bottom an operation takes from its geometry (see [`build`]); `None` where it has none.
 fn auto_heights(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
     let (top, bottom) = auto_heights_of_part(at, g, shape, source);
+    // A chamfer is on the picked face's own edge, wherever the stock is.
+    if matches!(shape, OpShape::Chamfer) {
+        return (top, bottom);
+    }
     // Picked faces and walls give the part's heights; while the stock still stands above them,
     // cutting starts at its top (not down in the material, at a rapid).
     let stock_top = at.stock.map(|(_, hi)| hi.z);
@@ -1143,6 +1151,15 @@ fn auto_heights(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometr
 }
 
 fn auto_heights_of_part(at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
+    // A chamfer is on the top edge of what it is given: a picked face's (a picked hole wall's
+    // top), or where a contour of the sketch starts. Its depth comes from its width.
+    if matches!(shape, OpShape::Chamfer) {
+        let top = match source {
+            CamGeometry::Faces { .. } => Some(g.walls.map_or(g.z, |(_, hi)| hi)),
+            _ => auto_heights_of_part(at, g, OpShape::Contour, source).0,
+        };
+        return (top, top);
+    }
     let picked = matches!(source, CamGeometry::Faces { .. });
     let on_sketch = matches!(source, CamGeometry::Sketch { .. });
     let stock_top = at.stock.map(|(_, hi)| hi.z);
@@ -1239,11 +1256,11 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     // facing and contours beside a line assume a tool as wide all the way down.
     if tool.kind == ToolKind::VBit {
         match &op.kind {
-            CamOperationKind::Contour { side: Side::On, .. } | CamOperationKind::Drill { .. } => {}
+            CamOperationKind::Contour { side: Side::On, .. } | CamOperationKind::Drill { .. } | CamOperationKind::Chamfer { .. } => {}
             CamOperationKind::Contour { .. } => {
                 return Err(fail("a V-bit engraves on the line: set the side to `on`".into()));
             }
-            _ => return Err(fail("a V-bit engraves along a line (2D Contour, side `on`) or spots holes (Drill)".into())),
+            _ => return Err(fail("a V-bit engraves along a line (2D Contour, side `on`), chamfers edges (Chamfer) or spots holes (Drill)".into())),
         }
     }
     let g = geometry(s, at, &op.geometry).map_err(fail)?;
@@ -1309,6 +1326,25 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 finish: finish.as_ref().map(|e| len("finish", e)).transpose()?.unwrap_or(0.0),
             };
             cam::pocket(regions, tool, &params, &cut)
+        }
+        CamOperationKind::Chamfer { side, climb, width, tip_offset, ramp_angle } => {
+            let params = ChamferParams {
+                side: *side,
+                climb: *climb,
+                width: len("width", width)?,
+                tip_offset: len("tip_offset", tip_offset)?,
+                tolerance: TOLERANCE,
+                ramp_angle: angle(ramp_angle)?,
+            };
+            // Round a picked face means round the part's outline, as a contour.
+            let outer: Vec<Region2>;
+            let regions = if picked && *side == Side::Outside {
+                outer = regions.iter().map(|r| Region2 { outer: r.outer.clone(), holes: Vec::new() }).collect();
+                &outer
+            } else {
+                regions
+            };
+            cam::chamfer(regions, tool, &params, &cut)
         }
         CamOperationKind::Bore { climb, stock_to_leave, pitch } => {
             let params = BoreParams { pitch: len("pitch", pitch)?, climb: *climb, stock_to_leave: len("stock_to_leave", stock_to_leave)? };
@@ -1396,6 +1432,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
     let shape = match cmd {
         "cam.op.face" => OpShape::Face,
         "cam.op.contour" => OpShape::Contour,
+        "cam.op.chamfer" => OpShape::Chamfer,
         "cam.op.pocket" => OpShape::Pocket,
         "cam.op.drill" | "cam.op.bore" => OpShape::Drill,
         _ => return Err(bad(cmd, "not an operation")),
@@ -1731,6 +1768,22 @@ fn op_drill(s: &mut Session, p: &Value) -> Result<Value> {
     add_op(s, p, cmd, "Drill", |_| CamOperationKind::Drill { peck, dwell })
 }
 
+fn op_chamfer(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.chamfer";
+    let side = side_param(p, cmd)?;
+    if side == Side::On {
+        return Err(bad(cmd, "`side` must be outside or inside: a chamfer is beside an edge"));
+    }
+    let kind = CamOperationKind::Chamfer {
+        side,
+        climb: bool_(p, "climb").unwrap_or(true),
+        width: expr(p, "width").unwrap_or_else(|| mm(1.0)),
+        tip_offset: expr(p, "tip_offset").unwrap_or_else(|| mm(0.5)),
+        ramp_angle: ramp_angle(p),
+    };
+    add_op(s, p, cmd, "Chamfer", |_| kind)
+}
+
 fn op_bore(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.bore";
     let (pitch, climb, leave) = (expr(p, "pitch"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p));
@@ -1824,7 +1877,22 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let unknown = |k: &str| bad(cmd, format!("a {} operation has no `{k}`", op.kind.label()));
     let mut kind = op.kind.clone();
-    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "tabs", "finish", "pitch", "peck", "dwell", "limit", "margin"] {
+    for k in [
+        "stepover",
+        "side",
+        "climb",
+        "stock_to_leave",
+        "ramp_angle",
+        "tabs",
+        "finish",
+        "pitch",
+        "width",
+        "tip_offset",
+        "peck",
+        "dwell",
+        "limit",
+        "margin",
+    ] {
         if !has(k) {
             continue;
         }
@@ -1838,18 +1906,28 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
             }
             (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
             (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
-            (CamOperationKind::Contour { climb, .. } | CamOperationKind::Pocket { climb, .. } | CamOperationKind::Bore { climb, .. }, "climb") => {
-                *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?
-            }
+            (CamOperationKind::Chamfer { width, .. }, "width") => *width = checked(k, Kind::Length)?,
+            (CamOperationKind::Chamfer { tip_offset, .. }, "tip_offset") => *tip_offset = checked(k, Kind::Length)?,
+            (CamOperationKind::Chamfer { side, .. }, "side") => *side = side_param(p, cmd)?,
+            (
+                CamOperationKind::Contour { climb, .. }
+                | CamOperationKind::Pocket { climb, .. }
+                | CamOperationKind::Bore { climb, .. }
+                | CamOperationKind::Chamfer { climb, .. },
+                "climb",
+            ) => *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?,
             (
                 CamOperationKind::Contour { stock_to_leave, .. }
                 | CamOperationKind::Pocket { stock_to_leave, .. }
                 | CamOperationKind::Bore { stock_to_leave, .. },
                 "stock_to_leave",
             ) => *stock_to_leave = checked(k, Kind::Length)?,
-            (CamOperationKind::Contour { ramp_angle, .. } | CamOperationKind::Pocket { ramp_angle, .. }, "ramp_angle") => {
-                *ramp_angle = checked(k, Kind::Angle)?
-            }
+            (
+                CamOperationKind::Contour { ramp_angle, .. }
+                | CamOperationKind::Pocket { ramp_angle, .. }
+                | CamOperationKind::Chamfer { ramp_angle, .. },
+                "ramp_angle",
+            ) => *ramp_angle = checked(k, Kind::Angle)?,
             (CamOperationKind::Contour { tabs, .. }, "tabs") => *tabs = tabs_param(s, p, cmd)?,
             (CamOperationKind::Contour { finish, .. } | CamOperationKind::Pocket { finish, .. }, "finish") => *finish = finish_param(s, p, cmd)?,
             (CamOperationKind::Drill { peck, .. }, "peck") => *peck = optional(k)?,
@@ -1939,7 +2017,8 @@ fn list_now(s: &Session) -> Value {
                                 (Some(part), Some(tool)) => cam::gouge(&path, tool, part),
                                 _ => 0.0,
                             };
-                            if depth > GOUGE_REPORTED {
+                            // A chamfer cuts the part's edge on purpose: the model has no chamfer to compare with.
+                            if depth > GOUGE_REPORTED && !matches!(op.kind, CamOperationKind::Chamfer { .. }) {
                                 v["warning"] = json!(format!("cuts up to {depth:.2} mm into the part"));
                             }
                         }
@@ -2089,10 +2168,17 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let mut ops = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut removed = 0.0;
+    // Chamfers cut the part's edges on purpose, and the model has none: the stock without them
+    // is what is checked against the part.
+    let is_chamfer = |op: &CamOperation| matches!(op.kind, CamOperationKind::Chamfer { .. });
+    let mut plain = setup.operations.iter().any(is_chamfer).then(|| stock.clone());
     for op in &setup.operations {
         let path = build_in(s, &at, op)?;
         let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         let report = cam::simulate(&mut stock, &path, tool).map_err(cam_error)?;
+        if let Some(plain) = plain.as_mut().filter(|_| !is_chamfer(op)) {
+            cam::simulate(plain, &path, tool).map_err(cam_error)?;
+        }
         removed += report.removed_volume;
         let mut own = Vec::new();
         if report.rapid_collisions > 0 {
@@ -2117,15 +2203,30 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         match seen {
             Ok(part) => {
                 let c = cam::compare(&stock, &part).map_err(cam_error)?;
+                let checked = match &plain {
+                    Some(plain) => cam::compare(plain, &part).map_err(cam_error)?,
+                    None => c,
+                };
                 // A column's width of error is expected at walls; less than that is not reported.
-                if c.max_gouge > 1e-3 {
-                    warnings.push(format!("the program cuts up to {:.3} mm into the part, over {:.1} mm²", c.max_gouge, c.gouge_area));
+                if checked.max_gouge > 1e-3 {
+                    warnings.push(format!("the program cuts up to {:.3} mm into the part, over {:.1} mm²", checked.max_gouge, checked.gouge_area));
                 }
-                out["max_gouge"] = json!(c.max_gouge);
-                out["gouge_area"] = json!(c.gouge_area);
+                out["max_gouge"] = json!(checked.max_gouge);
+                out["gouge_area"] = json!(checked.gouge_area);
                 out["max_leftover"] = json!(c.max_leftover);
                 out["leftover_volume"] = json!(c.leftover_volume);
-                deviation = Some(cam::deviations(&stock, &part).map_err(cam_error)?);
+                let mut dev = cam::deviations(&stock, &part).map_err(cam_error)?;
+                // Where only a chamfer went below the part, it is the chamfer, not a fault.
+                if let Some(plain) = &plain {
+                    let without = cam::deviations(plain, &part).map_err(cam_error)?;
+                    for (((d, cut), uncut), w) in dev.iter_mut().zip(&stock.z).zip(&plain.z).zip(&without) {
+                        if *d < 0.0 && *cut < *uncut - 1e-9 {
+                            *d = w.min(0.0);
+                        }
+                    }
+                    out["notes"] = json!(["Chamfers are left out of the check against the part: the model has none"]);
+                }
+                deviation = Some(dev);
             }
             Err(_) => warnings.push("the bodies are too detailed to compare at this cell size; use a larger `cell`".into()),
         }

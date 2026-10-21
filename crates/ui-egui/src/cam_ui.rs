@@ -62,6 +62,7 @@ pub enum OpKind {
     Face,
     Contour,
     Pocket,
+    Chamfer,
     Bore,
     Drill,
 }
@@ -72,6 +73,7 @@ impl OpKind {
             OpKind::Face => "cam.op.face",
             OpKind::Contour => "cam.op.contour",
             OpKind::Pocket => "cam.op.pocket",
+            OpKind::Chamfer => "cam.op.chamfer",
             OpKind::Bore => "cam.op.bore",
             OpKind::Drill => "cam.op.drill",
         }
@@ -81,6 +83,7 @@ impl OpKind {
             OpKind::Face => "FACE",
             OpKind::Contour => "2D CONTOUR",
             OpKind::Pocket => "2D POCKET",
+            OpKind::Chamfer => "CHAMFER",
             OpKind::Bore => "BORE",
             OpKind::Drill => "DRILL",
         }
@@ -274,6 +277,9 @@ pub struct OpForm {
     pub finish: String,
     /// How far a bore's helix goes down in one turn.
     pub pitch: String,
+    /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
+    pub width: String,
+    pub tip_offset: String,
     pub peck: String,
     pub dwell: String,
     pub coolant: bool,
@@ -673,6 +679,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             tab_height: String::new(),
             finish: String::new(),
             pitch: String::new(),
+            width: String::new(),
+            tip_offset: String::new(),
             peck: String::new(),
             dwell: String::new(),
             coolant: false,
@@ -723,6 +731,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
         "cam.op.pocket" => Some(op(OpKind::Pocket)),
+        "cam.op.chamfer" => Some(op(OpKind::Chamfer)),
         "cam.op.bore" => Some(op(OpKind::Bore)),
         "cam.op.drill" => Some(op(OpKind::Drill)),
         _ => None,
@@ -927,6 +936,11 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
+                OpKind::Chamfer => {
+                    optional(&mut p, "width", &f.width);
+                    optional(&mut p, "tip_offset", &f.tip_offset);
+                    optional(&mut p, "ramp_angle", &f.ramp_angle);
+                }
                 OpKind::Bore => {
                     optional(&mut p, "pitch", &f.pitch);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
@@ -938,7 +952,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("faces".into(), json!(faces));
             }
             // A number of passes instead of the stepdown; on an edit an emptied one goes back to the stepdown.
-            if !matches!(f.kind, OpKind::Drill | OpKind::Bore) {
+            if !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer) {
                 match f.passes.trim().parse::<u64>() {
                     Ok(n) => {
                         p.insert("passes".into(), json!(n));
@@ -995,7 +1009,11 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             if f.kind == OpKind::Contour {
                 p.insert("side".into(), json!(SIDES.get(f.side).copied().unwrap_or("outside")));
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore) {
+            // A chamfer is outside or inside an edge, never on it.
+            if f.kind == OpKind::Chamfer {
+                p.insert("side".into(), json!(if f.side == 1 { "inside" } else { "outside" }));
+            }
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer) {
                 p.insert("climb".into(), json!(f.climb));
             }
             p.insert("coolant".into(), json!(f.coolant));
@@ -1096,6 +1114,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         "face" => OpKind::Face,
         "contour" => OpKind::Contour,
         "pocket" => OpKind::Pocket,
+        "chamfer" => OpKind::Chamfer,
         "bore" => OpKind::Bore,
         "drill" => OpKind::Drill,
         _ => return None,
@@ -1148,6 +1167,8 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         tab_height: text(&inputs["tabs"], "height"),
         finish: text(inputs, "finish"),
         pitch: text(inputs, "pitch"),
+        width: text(inputs, "width"),
+        tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
         dwell: inputs["dwell"].as_f64().filter(|d| *d > 0.0).map(|d| d.to_string()).unwrap_or_default(),
         coolant: op["coolant"].as_bool().unwrap_or(false),
@@ -1349,6 +1370,7 @@ pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
                 found.push(if gouge > 1e-3 { format!("Cuts up to {gouge:.3} mm into the part") } else { "Does not cut into the part".into() });
                 found.push(format!("Leaves up to {left:.2} mm on the part ({:.2} cm³)", volume / 1000.0));
             }
+            found.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
             let warnings = v["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
             app.manufacture.simulation = Some((found, warnings));
             app.manufacture.stock = StockField::from_json(&v["field"]);
@@ -1825,6 +1847,8 @@ fn help(label: &str) -> Option<&'static str> {
         "Retract" => "Where the tool's fast approach stops and it feeds down into the material. Empty: 2 mm over the top.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
+        "Chamfer width" => "How wide the chamfer is across the top. Its angle is the tool's; its depth follows from the two.",
+        "Tip offset" => "How much deeper than the chamfer the tool's point goes, so that the sharp tip does not do the cutting and wear.",
         "Depth per turn" => "How far the helix goes down in one turn round the hole. Smaller: gentler on the tool, longer to cut.",
         "Rapid rate" => "How fast your machine's rapids move (mm/min): the played program's times follow it. Kept for the next start.",
         "Panel fade" => {
@@ -2638,7 +2662,8 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if height_field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high) {
                 lit = Some(HeightLine::Top);
             }
-            if height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low) {
+            // A chamfer's depth comes from its width.
+            if f.kind != OpKind::Chamfer && height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low) {
                 lit = Some(HeightLine::Bottom);
             }
             // Drilling has no stepdown (its peck depth is further down).
@@ -2646,7 +2671,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             let unused =
                 (!f.passes.trim().is_empty()).then_some("Not used: the passes divide the depth evenly. Empty Passes to cut by the stepdown.");
             // A bore goes down on its helix (its depth per turn is further down).
-            let levels = !matches!(f.kind, OpKind::Drill | OpKind::Bore);
+            let levels = !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer);
             if levels && field_unless(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter", unused).0 {
                 lit = Some(HeightLine::Passes);
             }
@@ -2691,6 +2716,12 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                     field(ui, need, "Finish allowance", &mut f.finish, "none");
                 }
+                OpKind::Chamfer => {
+                    f.side = f.side.min(1);
+                    choice(ui, need, "sc_cam_chamfer_side", "Side", &mut f.side, &["outside", "inside"]);
+                    field(ui, need, "Chamfer width", &mut f.width, "1 mm");
+                    field(ui, need, "Tip offset", &mut f.tip_offset, "0.5 mm");
+                }
                 OpKind::Bore => {
                     field(ui, need, "Depth per turn", &mut f.pitch, "the tool's stepdown, or a quarter of its diameter");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
@@ -2700,10 +2731,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Dwell (s)", &mut f.dwell, "0");
                 }
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Chamfer) {
                 field(ui, need, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore) {
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer) {
                 row_label(ui, "Direction", None);
                 crate::ui_kit::checkbox(ui, "Climb", &mut f.climb);
                 ui.end_row();
@@ -3046,11 +3077,17 @@ struct Asked {
 }
 
 /// Why Simulate and Post Process are off on a setup without operations.
-const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket, Bore or Drill)";
+const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket, Chamfer, Bore or Drill)";
 
 /// The operations the toolbar offers, by their command and label.
-const OPERATIONS: [(&str, &str); 5] =
-    [("cam.op.face", "Face"), ("cam.op.contour", "2D Contour"), ("cam.op.pocket", "2D Pocket"), ("cam.op.bore", "Bore"), ("cam.op.drill", "Drill")];
+const OPERATIONS: [(&str, &str); 6] = [
+    ("cam.op.face", "Face"),
+    ("cam.op.contour", "2D Contour"),
+    ("cam.op.pocket", "2D Pocket"),
+    ("cam.op.chamfer", "Chamfer"),
+    ("cam.op.bore", "Bore"),
+    ("cam.op.drill", "Drill"),
+];
 
 /// How far along the way to a program the job is: a setup, an operation, a simulation, a
 /// program written (until the design changes). Each step is a button that does it; the line
@@ -3088,7 +3125,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
             let tip = [
                 "The raw block and the work zero. Click to make one, or to change it.",
-                "Face, 2D Contour, 2D Pocket, Bore or Drill: click to choose one.",
+                "Face, 2D Contour, 2D Pocket, Chamfer, Bore or Drill: click to choose one.",
                 "Cut the raw block with every operation and see what is left, or cut into the part.",
                 "Write the setup's program for the machine.",
             ];
@@ -3695,6 +3732,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             // A bore is a hole too: it shares the drill's icon.
             let icon = match text(op, "kind").as_str() {
                 "bore" => "cam_drill".to_string(),
+                "chamfer" => "cam_contour".to_string(),
                 kind => format!("cam_{kind}"),
             };
             let r = draw_row(

@@ -164,6 +164,78 @@ pub struct DrillParams {
     pub dwell: f64,
 }
 
+/// How a top edge is chamfered with a pointed tool (a V-bit, a drill): the chamfer's angle is the tool's.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChamferParams {
+    /// Outside: the regions' edges round a part; inside: the edges of openings. `On` is not a chamfer.
+    pub side: Side,
+    pub climb: bool,
+    /// How wide the chamfer is, across the top (mm).
+    pub width: f64,
+    /// How much deeper than the chamfer the tool's point goes, so that it does not cut with its very tip (mm).
+    pub tip_offset: f64,
+    /// Chord error allowed on spline boundaries (mm).
+    pub tolerance: f64,
+    /// Steepest descent along the edge into the cut (radians); 0 plunges straight down.
+    pub ramp_angle: f64,
+}
+
+/// Chamfers the top edges of `regions` (at the cut's top) with a V-bit or a drill in one pass
+/// along each loop: its cone cuts the chamfer from `width` in from the edge on the top down to
+/// the wall, its point `tip_offset` lower.
+pub fn chamfer(regions: &[Region2], tool: &Tool, params: &ChamferParams, cut: &Cut) -> Result<Toolpath> {
+    tool.validate()?;
+    cut.heights.validate()?;
+    cut.feeds.validate()?;
+    check_ramp(params.ramp_angle)?;
+    if !matches!(tool.kind, crate::tool::ToolKind::VBit | crate::tool::ToolKind::Drill) {
+        return invalid("a chamfer is cut with a pointed tool: a V-bit or a drill");
+    }
+    if params.side == Side::On {
+        return invalid("a chamfer is on the outside or the inside of an edge");
+    }
+    if !(params.width > 0.0 && params.width <= MAX_COORD) {
+        return invalid("the chamfer's width must be above 0");
+    }
+    if !(params.tip_offset >= 0.0 && params.tip_offset <= MAX_COORD) {
+        return invalid("the tip offset must be 0 or more");
+    }
+    let slope = (tool.point_angle() * 0.5).to_radians().tan();
+    // The chamfer's depth, the point's depth, and how far the axis stays off the wall.
+    let depth = params.width / slope;
+    let point = cut.heights.top - depth - params.tip_offset;
+    let off = tool.tip() * 0.5 + params.tip_offset * slope;
+    if off + params.width > tool.radius() + 1e-9 {
+        return invalid(format!(
+            "the {} mm tool is too narrow for a {} mm chamfer with a {} mm tip offset",
+            tool.diameter, params.width, params.tip_offset
+        ));
+    }
+    let shape = Shape::from_regions(regions, params.tolerance)?;
+    let loops = match params.side {
+        Side::Inside => shape.offset(off)?,
+        _ => shape.offset(-off)?,
+    };
+    if loops.is_empty() {
+        return invalid("the tool does not fit the profile");
+    }
+    let heights = Heights { bottom: point.min(cut.heights.top), ..cut.heights };
+    let cut = Cut { heights, ..*cut };
+    let natural_is_climb = params.side != Side::Outside;
+    let mut b = Builder::new(&cut);
+    for lp in &loops {
+        let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
+        let Some(first) = lp.first() else { continue };
+        b.travel_to(first.start())?;
+        b.plunge_to(heights.top)?;
+        b.ramp_loop(&lp, point, params.ramp_angle)?;
+        b.cut_loop(&lp, point)?;
+        b.cut_to(first.start(), point)?;
+        b.retract()?;
+    }
+    b.finish()
+}
+
 /// How a hole larger than the tool is milled on a helix.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoreParams {

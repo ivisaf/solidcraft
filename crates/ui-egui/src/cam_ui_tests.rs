@@ -487,7 +487,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 11, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 12, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1163,4 +1163,29 @@ fn a_bore_form_mills_round_holes_on_a_helix() {
     assert_eq!((again.kind, again.pitch.as_str(), again.climb), (OpKind::Bore, "1.5 mm", false));
     h.frames(2);
     assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Bore1"));
+}
+
+#[test]
+fn a_chamfer_form_takes_its_depth_from_its_width() {
+    let mut h = sketched();
+    h.app.run("cam.tool.define", json!({"number": 1, "kind": "vbit", "diameter": 10, "tip_angle": 90, "spindle_rpm": 18000, "feed": 900})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.chamfer");
+    h.frames(2);
+    // No bottom, stepdown or passes: the width, the tip offset, outside or inside.
+    assert!(h.widget("CHAMFER").is_some() && h.widget("Chamfer width").is_some() && h.widget("Tip offset").is_some());
+    assert!(h.widget("Bottom").is_none() && h.widget("Stepdown").is_none() && h.widget("Passes").is_none());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.tool, f.width, f.side) = ("1".into(), "0.8 mm".into(), 1);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert!(matches!(
+        &op.kind,
+        solidcraft_engine::doc::manufacture::CamOperationKind::Chamfer { width, side: solidcraft_engine::cam::Side::Inside, .. } if width == "0.8 mm"
+    ));
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+    assert_eq!((again.kind, again.width.as_str(), again.side), (OpKind::Chamfer, "0.8 mm", 1));
 }

@@ -185,6 +185,16 @@ pub enum CamOperationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<Expr>,
     },
+    /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
+    /// deeper than the chamfer (length expressions).
+    Chamfer {
+        side: Side,
+        climb: bool,
+        width: Expr,
+        tip_offset: Expr,
+        #[serde(default = "default_ramp")]
+        ramp_angle: Expr,
+    },
     /// Mills round holes larger than the tool on a helix, `pitch` (a length expression) down a turn.
     Bore { climb: bool, stock_to_leave: Expr, pitch: Expr },
     /// Drills at the centre of each profile.
@@ -215,6 +225,7 @@ impl CamOperationKind {
             CamOperationKind::Face { .. } => "face",
             CamOperationKind::Contour { .. } => "contour",
             CamOperationKind::Pocket { .. } => "pocket",
+            CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",
         }

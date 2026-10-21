@@ -445,6 +445,40 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
 }
 
 #[test]
+fn chamfer_cuts_the_top_edge_with_the_tool_s_cone() {
+    // A 90° V-bit 10 mm across: a 1 mm chamfer is 1 mm deep, its point 0.5 mm lower and 0.5 mm off the wall.
+    let vbit = |angle: f64| Tool { tip_angle: Some(angle), ..Tool::new(1, ToolKind::VBit, 10.0, 5.0) };
+    let c = cut(0.0, -10.0, 2.0);
+    let params = ChamferParams { side: Side::Outside, climb: true, width: 1.0, tip_offset: 0.5, tolerance: 0.01, ramp_angle: 0.0 };
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let path = chamfer(&regions, &vbit(90.0), &params, &c).unwrap();
+    let pts = cutting_points(&path, -1.4);
+    assert!(!pts.is_empty());
+    for p in &pts {
+        close(p.z, -1.5, 1e-9);
+        close((p.x.clamp(0.0, 40.0) - p.x).hypot(p.y.clamp(0.0, 30.0) - p.y), 0.5, 1e-6);
+    }
+    // The stock: the wall cut back to 1 mm down, halfway across 0.5 mm down, untouched beyond 1 mm in.
+    let mut stock = HeightField::block(Vec3::new(-5.0, -5.0, -10.0), Vec3::new(45.0, 35.0, 0.0), 0.05).unwrap();
+    simulate(&mut stock, &path, &vbit(90.0)).unwrap();
+    close(stock.at(v(0.025, 15.0)), -0.975, 0.03);
+    close(stock.at(v(0.525, 15.0)), -0.475, 0.03);
+    close(stock.at(v(1.2, 15.0)), 0.0, 1e-9);
+    // A 60° bit makes the same width deeper; the inside of an opening is chamfered inside it.
+    let steep = chamfer(&regions, &vbit(60.0), &params, &c).unwrap();
+    assert!(steep.stats().lowest_z.unwrap() < -1.5 - 0.5);
+    let inside = chamfer(&regions, &vbit(90.0), &ChamferParams { side: Side::Inside, ..params }, &c).unwrap();
+    assert!(cutting_points(&inside, -1.4).iter().all(|p| p.x > 0.0 && p.x < 40.0 && p.y > 0.0 && p.y < 30.0));
+    // Too wide for the tool, a flat tool, on the line, a bad width: refused.
+    assert!(chamfer(&regions, &vbit(90.0), &ChamferParams { width: 5.0, ..params }, &c).is_err());
+    assert!(chamfer(&regions, &tool(6.0), &params, &c).is_err());
+    assert!(chamfer(&regions, &vbit(90.0), &ChamferParams { side: Side::On, ..params }, &c).is_err());
+    for width in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(chamfer(&regions, &vbit(90.0), &ChamferParams { width, ..params }, &c).is_err());
+    }
+}
+
+#[test]
 fn bore_mills_a_hole_on_a_helix_and_a_last_turn_at_the_bottom() {
     // A 20 mm hole with a 6 mm tool: its axis goes round 7 mm from the centre, 2 mm down a turn.
     let c = cut(0.0, -5.0, 2.0);

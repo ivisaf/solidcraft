@@ -1145,6 +1145,62 @@ fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes
 }
 
 #[test]
+fn chamfer_cuts_the_top_edge_at_the_v_bit_s_angle() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "vbit", "diameter": 10, "tip_angle": 90, "spindle_rpm": 18000, "feed": 900}));
+    run(&mut s, "cam.setup.create", json!({}));
+    // 1 mm wide at 90°: 1 mm deep, the point 0.5 mm lower; no bottom asked for.
+    let op = run(&mut s, "cam.op.chamfer", json!({"sketch": "Plate", "tool": 1}));
+    close(op["lowest_z"].as_f64().unwrap(), -1.5, 1e-9);
+    let listed = run(&mut s, "cam.list", json!({}));
+    let first = &listed["setups"][0]["operations"][0];
+    assert_eq!(
+        (first["kind"].as_str(), first["inputs"]["width"].as_str(), first["inputs"]["tip_offset"].as_str()),
+        (Some("chamfer"), Some("1 mm"), Some("0.5 mm"))
+    );
+    // What it takes off: a 1 × 1 mm triangle round the 200 mm edge, within the simulation's columns.
+    let sim = run(&mut s, "cam.simulate", json!({"cell": 0.1, "field": true}));
+    let removed = sim["removed_volume"].as_f64().unwrap();
+    assert!((removed / 100.0 - 1.0).abs() < 0.05, "{removed}");
+    // The model has no chamfer: it is no fault, neither in the listing nor in the simulation.
+    assert!(sim["max_gouge"].as_f64().unwrap() < 1e-3 && sim["warnings"] == json!([]), "{}", sim["warnings"]);
+    assert!(sim["field"]["deviation"].as_array().unwrap().iter().all(|d| d.as_f64().unwrap() >= 0.0));
+    assert_eq!(sim["notes"][0], "Chamfers are left out of the check against the part: the model has none");
+    assert!(run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0].get("warning").is_none());
+    // A pocket that does cut into the part is still found, chamfer or not.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Slot"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [20, 10], "p1": [40, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 4, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    let slot = run(&mut s, "cam.op.pocket", json!({"sketch": "Slot", "tool": 4, "bottom": -2}));
+    let sim = run(&mut s, "cam.simulate", json!({"cell": 0.2}));
+    assert!(sim["max_gouge"].as_f64().unwrap() > 1.9, "{sim}");
+    run(&mut s, "cam.op.remove", json!({"op": slot["operation"]}));
+    // Wider is deeper; on the line, too wide, or with a flat tool, refused.
+    let wider = run(&mut s, "cam.op.edit", json!({"op": op["operation"], "width": "2 mm"}));
+    close(wider["lowest_z"].as_f64().unwrap(), -2.5, 1e-9);
+    assert!(s.execute("cam.op.chamfer", &json!({"sketch": "Plate", "tool": 1, "side": "on"})).is_err());
+    assert!(s.execute("cam.op.chamfer", &json!({"sketch": "Plate", "tool": 1, "width": "6 mm"})).is_err());
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    assert!(s.execute("cam.op.chamfer", &json!({"sketch": "Plate", "tool": 2})).is_err());
+    // On a picked face below the stock's top, the chamfer is on that face's edge, not at the stock's top.
+    run(&mut s, "cam.setup.create", json!({"name": "Raised", "stock": {"top": 5}, "origin": {"of": "stock", "z": "max"}}));
+    let picked = run(&mut s, "cam.op.chamfer", json!({"setup": "Raised", "faces": [{"point": [30, 20, 0]}], "tool": 1}));
+    close(picked["lowest_z"].as_f64().unwrap(), -6.5, 1e-9);
+    // On a plate with a boss, the plate's picked top is chamfered at its own height, not the boss's top.
+    let mut s = plate_with_boss();
+    run(&mut s, "cam.tool.define", json!({"number": 5, "kind": "vbit", "diameter": 10, "tip_angle": 90, "spindle_rpm": 18000, "feed": 900}));
+    let plate = run(&mut s, "cam.op.chamfer", json!({"faces": [{"point": [5, 5, 0]}], "tool": 5}));
+    close(plate["lowest_z"].as_f64().unwrap(), -1.5, 1e-9);
+    let boss = run(&mut s, "cam.op.chamfer", json!({"faces": [{"point": [30, 20, 12]}], "tool": 5}));
+    close(boss["lowest_z"].as_f64().unwrap(), 10.5, 1e-9);
+}
+
+#[test]
 fn bore_mills_round_holes_wider_than_its_tool_through_the_part() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
