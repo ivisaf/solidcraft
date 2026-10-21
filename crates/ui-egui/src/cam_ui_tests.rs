@@ -1029,3 +1029,41 @@ fn a_tool_s_data_in_a_material_fills_the_operations_of_a_setup_of_it() {
     apply(&mut h.app);
     assert_eq!(h.app.session.doc.manufacture.setups[0].material, None);
 }
+
+#[test]
+fn a_contour_form_sets_tabs_a_finishing_pass_and_its_passes() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.contour");
+    h.frames(2);
+    // Tabs are asked for with a tick; their rows follow it.
+    assert!(h.widget("Hold the part").is_some() && h.widget("Finish allowance").is_some() && h.widget("Passes").is_some());
+    assert!(h.widget("Tab count").is_none());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.bottom, f.passes, f.finish, f.tabs, f.tab_height) = ("-6".into(), "3".into(), "0.5 mm".into(), true, "2 mm".into());
+    h.frames(2);
+    assert!(h.widget("Tab count").is_some() && h.widget("Tab width").is_some());
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert_eq!(op.passes, Some(3));
+    let solidcraft_engine::doc::manufacture::CamOperationKind::Contour { tabs: Some(tabs), finish, .. } = &op.kind else { panic!("no tabs") };
+    assert_eq!((tabs.count, tabs.width.as_str(), tabs.height.as_str(), finish.as_deref()), (4, "6 mm", "2 mm", Some("0.5 mm")));
+    // Edited, the form shows them; emptied and unticked, they are gone again.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(mut f)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+    assert_eq!((f.passes.as_str(), f.tabs, f.tab_count.as_str(), f.tab_height.as_str(), f.finish.as_str()), ("3", true, "4", "2 mm", "0.5 mm"));
+    (f.passes, f.finish, f.tabs) = (String::new(), String::new(), false);
+    h.app.manufacture.form = Some(Form::Op(f));
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = &h.app.session.doc.manufacture.setups[0].operations[0];
+    assert!(op.passes.is_none());
+    assert!(matches!(&op.kind, solidcraft_engine::doc::manufacture::CamOperationKind::Contour { tabs: None, finish: None, .. }));
+    // A number of passes that is not one says so.
+    let Some(Form::Op(mut f)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+    f.passes = "two".into();
+    assert!(command(&Form::Op(f)).is_err());
+}

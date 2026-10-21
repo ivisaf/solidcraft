@@ -260,6 +260,15 @@ pub struct OpForm {
     pub climb: bool,
     pub stock_to_leave: String,
     pub ramp_angle: String,
+    /// How many depth passes instead of the stepdown (empty: by the stepdown).
+    pub passes: String,
+    /// A contour's tabs: whether it has any, how many on each loop, how wide and how high.
+    pub tabs: bool,
+    pub tab_count: String,
+    pub tab_width: String,
+    pub tab_height: String,
+    /// What the depth passes leave on the walls for one finishing pass (empty: none).
+    pub finish: String,
     pub peck: String,
     pub dwell: String,
     pub coolant: bool,
@@ -598,6 +607,12 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             climb: true,
             stock_to_leave: String::new(),
             ramp_angle: String::new(),
+            passes: String::new(),
+            tabs: false,
+            tab_count: String::new(),
+            tab_width: String::new(),
+            tab_height: String::new(),
+            finish: String::new(),
             peck: String::new(),
             dwell: String::new(),
             coolant: false,
@@ -857,6 +872,40 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 let faces: Vec<Value> = f.faces.iter().map(|(body, at)| json!({"body": body, "point": [at.x, at.y, at.z]})).collect();
                 p.insert("faces".into(), json!(faces));
             }
+            // A number of passes instead of the stepdown; on an edit an emptied one goes back to the stepdown.
+            if f.kind != OpKind::Drill {
+                match f.passes.trim().parse::<u64>() {
+                    Ok(n) => {
+                        p.insert("passes".into(), json!(n));
+                    }
+                    Err(_) if !f.passes.trim().is_empty() => return Err("The number of passes must be a whole number".into()),
+                    Err(_) if f.editing.is_some() => {
+                        p.insert("passes".into(), Value::Null);
+                    }
+                    Err(_) => {}
+                }
+            }
+            if f.kind == OpKind::Contour {
+                if f.tabs {
+                    let mut tabs = serde_json::Map::new();
+                    if !f.tab_count.trim().is_empty() {
+                        let n = f.tab_count.trim().parse::<u64>().map_err(|_| "The number of tabs must be a whole number".to_string())?;
+                        tabs.insert("count".into(), json!(n));
+                    }
+                    optional(&mut tabs, "width", &f.tab_width);
+                    optional(&mut tabs, "height", &f.tab_height);
+                    p.insert("tabs".into(), Value::Object(tabs));
+                } else if f.editing.is_some() {
+                    p.insert("tabs".into(), Value::Null);
+                }
+            }
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
+                if !f.finish.trim().is_empty() {
+                    p.insert("finish".into(), json!(f.finish.trim()));
+                } else if f.editing.is_some() {
+                    p.insert("finish".into(), Value::Null);
+                }
+            }
             p.insert("tool".into(), json!(number("The tool", &f.tool)? as u64));
             // A chip load without a feed gives the feed, at this operation's speed and its tool's flutes.
             let mut from_chip = String::new();
@@ -1026,6 +1075,12 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         climb: inputs["climb"].as_bool().unwrap_or(true),
         stock_to_leave: text(inputs, "stock_to_leave"),
         ramp_angle: text(inputs, "ramp_angle"),
+        passes: op["passes"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+        tabs: inputs["tabs"].is_object(),
+        tab_count: inputs["tabs"]["count"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+        tab_width: text(&inputs["tabs"], "width"),
+        tab_height: text(&inputs["tabs"], "height"),
+        finish: text(inputs, "finish"),
         peck: text(inputs, "peck"),
         dwell: inputs["dwell"].as_f64().filter(|d| *d > 0.0).map(|d| d.to_string()).unwrap_or_default(),
         coolant: op["coolant"].as_bool().unwrap_or(false),
@@ -1409,6 +1464,14 @@ fn help(label: &str) -> Option<&'static str> {
         "Feed" => "How fast the tool moves sideways while cutting. Empty: the tool's own feed.",
         "Plunge feed" => "How fast the tool moves down into the material.",
         "Stepdown" => "How deep the tool goes per pass. Deep cuts are made in several passes.",
+        "Passes" => "How many depth passes, instead of a stepdown: the depth is divided evenly. Empty: by the stepdown.",
+        "Finish allowance" => {
+            "What the depth passes leave on the walls; one more pass at the full depth then takes it off, for a clean wall. Empty: none."
+        }
+        "Tabs" => "Small bridges left standing at the bottom, so that a part cut out of a sheet stays in place. Cut them free by hand afterwards.",
+        "Tab count" => "How many tabs on each outline, spaced evenly along it.",
+        "Tab width" => "How long each tab is along the part's edge.",
+        "Tab height" => "How high each tab stands over the bottom of the cut.",
         "Stepover" => "How far apart the side-by-side passes are. Smaller is cleaner but slower.",
         "Name" => "Your own name for it. Empty: one is made up.",
         "Tool axis" => "The direction the tool comes from. +z: from above.",
@@ -2239,6 +2302,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if f.kind != OpKind::Drill && field_seen(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter").0 {
                 lit = Some(HeightLine::Passes);
             }
+            // Or how many passes: the depth is then divided evenly.
+            if f.kind != OpKind::Drill && field_seen(ui, need, "Passes", &mut f.passes, "by the stepdown").0 {
+                lit = Some(HeightLine::Passes);
+            }
             let last_row = ui.cursor().top() - ui.spacing().item_spacing.y;
             // The picture of these heights goes beside the form.
             *picture = Some(Picture { seen: seen.cloned(), lit, rows: (first_row, last_row) });
@@ -2257,10 +2324,24 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 OpKind::Contour => {
                     choice(ui, need, "sc_cam_side", "Side", &mut f.side, &SIDES);
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    // On the line there is no wall to finish.
+                    if SIDES.get(f.side) != Some(&"on") {
+                        field(ui, need, "Finish allowance", &mut f.finish, "none");
+                    }
+                    row_label(ui, "Tabs", None);
+                    let r = crate::ui_kit::checkbox(ui, "Hold the part", &mut f.tabs);
+                    explained(r, "Tabs", None);
+                    ui.end_row();
+                    if f.tabs {
+                        field(ui, need, "Tab count", &mut f.tab_count, "4 on each loop");
+                        field(ui, need, "Tab width", &mut f.tab_width, "6 mm");
+                        field(ui, need, "Tab height", &mut f.tab_height, "2 mm");
+                    }
                 }
                 OpKind::Pocket => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    field(ui, need, "Finish allowance", &mut f.finish, "none");
                 }
                 OpKind::Drill => {
                     field(ui, need, "Peck depth", &mut f.peck, "one pass");

@@ -26,6 +26,8 @@ const MAX_HOLES: usize = 100_000;
 const MAX_RAMP_LAPS: f64 = 2000.0;
 /// Largest coordinate or height (mm).
 const MAX_COORD: f64 = 1.0e6;
+/// Most tabs on one loop of a contour.
+pub const MAX_TABS: u32 = 100;
 
 /// The Z levels of an operation (work coordinates, mm).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -121,6 +123,21 @@ pub struct ContourParams {
     pub tolerance: f64,
     /// Steepest descent into each depth pass, along the profile (radians); 0 plunges straight down.
     pub ramp_angle: f64,
+    /// Tabs left standing on each loop, holding a part that is cut out.
+    pub tabs: Option<Tabs>,
+    /// Material the depth passes leave on the wall besides `stock_to_leave` (mm), taken off by
+    /// one more pass round each loop at the full depth; 0: none.
+    pub finish: f64,
+}
+
+/// Tabs that hold a part being cut out: `count` on each loop, spaced evenly along it, each
+/// `width` long along the part's edge and `height` high over the bottom (mm). Where a depth
+/// pass is below a tab's top the tool goes up over it and down again after it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Tabs {
+    pub count: u32,
+    pub width: f64,
+    pub height: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -134,6 +151,9 @@ pub struct PocketParams {
     pub tolerance: f64,
     /// Steepest descent into uncut material, along the first pass (radians); 0 plunges straight down.
     pub ramp_angle: f64,
+    /// Material the depth passes leave on the walls besides `stock_to_leave` (mm), taken off by
+    /// one more pass along the walls at the full depth; 0: none.
+    pub finish: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -256,6 +276,48 @@ impl Builder {
         }
     }
 
+    /// Cuts along `segs` (pieces, each saying whether it runs over a tab) going evenly from
+    /// depth `z0` to `z1`, never below `tab_z` over a tab: up onto a tab where the tool is
+    /// below its top, and down again after it.
+    fn cut_segments(&mut self, segs: &[(Piece, bool)], z0: f64, z1: f64, tab_z: f64) -> Result<()> {
+        let total: f64 = segs.iter().map(|(p, _)| p.length()).sum();
+        let at = |done: f64| if total > 1e-12 { z0 + (z1 - z0) * (done / total).min(1.0) } else { z1 };
+        let mut done = 0.0;
+        for (piece, tab) in segs {
+            let za = at(done);
+            done += piece.length();
+            let zb = at(done);
+            let (za, zb) = if *tab { (za.max(tab_z), zb.max(tab_z)) } else { (za, zb) };
+            if let Some(q) = self.pos {
+                if q.z < za - 1e-9 {
+                    self.push(Move::Feed { to: Vec3::new(q.x, q.y, za), feed: self.feeds.cut })?;
+                } else if q.z > za + 1e-9 {
+                    self.push(Move::Feed { to: Vec3::new(q.x, q.y, za), feed: self.feeds.plunge })?;
+                }
+            }
+            self.cut_piece(piece, za, zb)?;
+        }
+        Ok(())
+    }
+
+    /// [`Builder::ramp_loop`] and a whole lap at `z` along a loop split at its tabs, staying over them.
+    fn tabbed_lap(&mut self, segs: &[(Piece, bool)], z: f64, angle: f64, tab_z: f64) -> Result<()> {
+        let Some(from) = self.pos.map(|p| p.z) else { return Err(CamError::Unsafe("a ramp before the first positioning move".into())) };
+        let drop = from - z;
+        let length: f64 = segs.iter().map(|(p, _)| p.length()).sum();
+        let laps = if drop > 1e-9 { (drop / angle.tan() / length - 1e-9).ceil().max(1.0) } else { 0.0 };
+        if drop > 1e-9 && (!(angle > 0.0) || !(length > 1e-3) || !(laps <= MAX_RAMP_LAPS)) {
+            // Straight down where the loop starts (never on a tab).
+            self.plunge_to(z)?;
+        } else {
+            for k in 0..laps as usize {
+                let (za, zb) = (from - drop * k as f64 / laps, from - drop * (k + 1) as f64 / laps);
+                self.cut_segments(segs, za, zb, tab_z)?;
+            }
+        }
+        self.cut_segments(segs, z, z, tab_z)
+    }
+
     fn retract(&mut self) -> Result<()> {
         match self.pos {
             Some(q) if q.z < self.h.clearance => self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.clearance) }),
@@ -281,6 +343,45 @@ fn check_ramp(angle: f64) -> Result<()> {
 
 fn check_leave(leave: f64) -> Result<()> {
     if leave.is_finite() && (0.0..=MAX_COORD).contains(&leave) { Ok(()) } else { invalid("the stock to leave must be 0 or more") }
+}
+
+fn check_finish(finish: f64) -> Result<()> {
+    if finish.is_finite() && (0.0..=MAX_COORD).contains(&finish) { Ok(()) } else { invalid("the finishing allowance must be 0 or more") }
+}
+
+/// Where the tabs are along a loop `length` long, as stretches of the tool's path (from, to):
+/// each a tab's width and the tool's diameter long, spaced evenly and none at the loop's
+/// start. None on a loop too short to carry them.
+fn tab_spans(length: f64, tabs: &Tabs, diameter: f64) -> Vec<(f64, f64)> {
+    let span = tabs.width + diameter;
+    let n = tabs.count as f64;
+    if n * span > 0.8 * length {
+        return Vec::new();
+    }
+    (0..tabs.count).map(|k| length * (k as f64 + 0.5) / n).map(|c| (c - span * 0.5, c + span * 0.5)).collect()
+}
+
+/// A loop split where its tabs start and end; each piece says whether it runs over a tab.
+fn tab_segments(lp: &[Piece], spans: &[(f64, f64)]) -> Vec<(Piece, bool)> {
+    let mut out = Vec::new();
+    let mut s0 = 0.0;
+    for piece in lp {
+        let len = piece.length();
+        let s1 = s0 + len;
+        // Where along this piece (0..1) a tab starts or ends.
+        let mut cuts: Vec<f64> =
+            spans.iter().flat_map(|(a, b)| [*a, *b]).filter(|s| *s > s0 + 1e-9 && *s < s1 - 1e-9).map(|s| (s - s0) / len).collect();
+        cuts.sort_by(f64::total_cmp);
+        let mut t0 = 0.0;
+        for t1 in cuts.into_iter().chain([1.0]) {
+            let mid = s0 + len * (t0 + t1) * 0.5;
+            let on_tab = spans.iter().any(|(a, b)| mid > *a && mid < *b);
+            out.push((if t0 == 0.0 && t1 == 1.0 { *piece } else { piece.sub(t0, t1) }, on_tab));
+            t0 = t1;
+        }
+        s0 = s1;
+    }
+    out
 }
 
 /// The loop turned to start at its corner nearest to `p`.
@@ -451,31 +552,62 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     tool.validate()?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
+    check_finish(params.finish)?;
     check_ramp(params.ramp_angle)?;
+    if params.side == Side::On && params.finish > 0.0 {
+        return invalid("a contour on the line has no finishing pass: it leaves nothing on a wall");
+    }
+    let depth = cut.heights.top - cut.heights.bottom;
+    if let Some(t) = &params.tabs {
+        if !(1..=MAX_TABS).contains(&t.count) {
+            return invalid(format!("a contour has 1 to {MAX_TABS} tabs on each loop"));
+        }
+        if !(t.width > 0.0 && t.width <= MAX_COORD) {
+            return invalid("the tabs' width must be above 0");
+        }
+        if !(t.height > 0.0 && t.height < depth) {
+            return invalid("the tabs must be above 0 high and lower than the depth cut");
+        }
+    }
     let shape = Shape::from_regions(regions, params.tolerance)?;
-    let away = tool.radius() + params.stock_to_leave;
-    let loops = match params.side {
-        Side::Outside => shape.offset(-away)?,
-        Side::Inside => shape.offset(away)?,
-        Side::On => shape.loops().to_vec(),
+    let loops_at = |leave: f64| -> Result<Vec<Vec<Piece>>> {
+        let away = tool.radius() + leave;
+        Ok(match params.side {
+            Side::Outside => shape.offset(-away)?,
+            Side::Inside => shape.offset(away)?,
+            Side::On => shape.loops().to_vec(),
+        })
     };
+    // The depth passes leave the finishing allowance; one pass more at full depth takes it off.
+    let loops = loops_at(params.stock_to_leave + params.finish)?;
     if loops.is_empty() {
         return invalid("the tool does not fit the profile");
     }
+    let finish = if params.finish > 0.0 { loops_at(params.stock_to_leave)? } else { Vec::new() };
     // Loops come with the regions on their left. Around a part that puts the wall on the left
     // (conventional), inside an opening on the right (climb).
     let natural_is_climb = params.side != Side::Outside;
     let levels = cut.levels()?;
+    let tab_z = params.tabs.map_or(f64::NEG_INFINITY, |t| cut.heights.bottom + t.height);
     let mut b = Builder::new(cut);
-    for lp in &loops {
+    let passes = loops.iter().map(|lp| (lp, levels.as_slice())).chain(finish.iter().map(|lp| (lp, std::slice::from_ref(&cut.heights.bottom))));
+    for (lp, levels) in passes {
         let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
         let Some(first) = lp.first() else { continue };
+        let segs = match &params.tabs {
+            Some(t) => tab_segments(&lp, &tab_spans(lp.iter().map(Piece::length).sum(), t, tool.diameter)),
+            None => Vec::new(),
+        };
         b.travel_to(first.start())?;
         // Down to the last pass (through what it cut), then into the material along the loop.
         b.plunge_to(cut.heights.top)?;
-        for &z in &levels {
-            b.ramp_loop(&lp, z, params.ramp_angle)?;
-            b.cut_loop(&lp, z)?;
+        for &z in levels {
+            if z < tab_z - 1e-9 && segs.iter().any(|(_, tab)| *tab) {
+                b.tabbed_lap(&segs, z, params.ramp_angle, tab_z)?;
+            } else {
+                b.ramp_loop(&lp, z, params.ramp_angle)?;
+                b.cut_loop(&lp, z)?;
+            }
             b.cut_to(first.start(), z)?;
         }
         b.retract()?;
@@ -488,13 +620,15 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     tool.validate()?;
     cut.validate()?;
     check_leave(params.stock_to_leave)?;
+    check_finish(params.finish)?;
     check_ramp(params.ramp_angle)?;
     let r = tool.radius();
     if !(params.stepover > 0.0) || !(params.stepover <= tool.diameter) {
         return invalid("the stepover must be above 0 and at most the tool diameter");
     }
     let shape = Shape::from_regions(regions, params.tolerance)?;
-    let wall = r + params.stock_to_leave;
+    // The depth passes leave the finishing allowance on the walls; a last pass along them takes it off.
+    let wall = r + params.stock_to_leave + params.finish;
     let mut rings: Vec<Vec<Vec<Piece>>> = Vec::new();
     loop {
         let ring = shape.offset(wall + params.stepover * rings.len() as f64)?;
@@ -565,6 +699,19 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
         }
         cleared = z;
         b.retract()?;
+    }
+    if params.finish > 0.0 {
+        let z = cut.heights.bottom;
+        for lp in shape.offset(r + params.stock_to_leave)? {
+            let lp = if params.climb { lp } else { reversed(&lp) };
+            let Some(first) = lp.first() else { continue };
+            // Down where the depth passes cleared, all but the allowance itself.
+            b.travel_to(first.start())?;
+            b.plunge_to(z)?;
+            b.cut_loop(&lp, z)?;
+            b.cut_to(first.start(), z)?;
+            b.retract()?;
+        }
     }
     b.finish()
 }

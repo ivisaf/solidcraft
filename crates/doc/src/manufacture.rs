@@ -119,6 +119,9 @@ pub struct CamOperation {
     pub bottom: Option<Expr>,
     /// Depth per pass, as a length expression.
     pub stepdown: Expr,
+    /// How many depth passes, instead of the stepdown (each then the depth over this).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passes: Option<u32>,
     /// Where to cut.
     pub geometry: CamGeometry,
     pub kind: CamOperationKind,
@@ -166,6 +169,12 @@ pub enum CamOperationKind {
         /// Steepest descent into each depth pass (an angle expression; 0 plunges).
         #[serde(default = "default_ramp")]
         ramp_angle: Expr,
+        /// Tabs left standing to hold a part being cut out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tabs: Option<TabsDef>,
+        /// Allowance the depth passes leave on the wall for one finishing pass at full depth (a length expression).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<Expr>,
     },
     Pocket {
         stepover: Expr,
@@ -173,6 +182,8 @@ pub enum CamOperationKind {
         stock_to_leave: Expr,
         #[serde(default = "default_ramp")]
         ramp_angle: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<Expr>,
     },
     /// Drills at the centre of each profile.
     Drill {
@@ -181,6 +192,15 @@ pub enum CamOperationKind {
         #[serde(default)]
         dwell: f64,
     },
+}
+
+/// A contour's tabs: how many on each loop, how long along the part's edge and how high over
+/// the bottom (length expressions).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TabsDef {
+    pub count: u32,
+    pub width: Expr,
+    pub height: Expr,
 }
 
 fn default_ramp() -> Expr {

@@ -1099,6 +1099,52 @@ fn an_rp23cnc_tool_library_is_imported_with_its_materials_and_cutting_data() {
 }
 
 #[test]
+fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes() {
+    let mut s = pocket_job(0.0, json!({}));
+    let base = json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -6, "stepdown": 1, "ramp_angle": 0});
+    let with = |extra: Value| {
+        let mut p = base.clone();
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p
+    };
+    // Three passes instead of a 1 mm stepdown; four tabs 2 mm high with the defaults' width.
+    let op = run(&mut s, "cam.op.contour", with(json!({"passes": 3, "tabs": {"height": "2 mm"}})));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let first = &listed["setups"][0]["operations"][0];
+    assert_eq!((first["passes"].clone(), first["inputs"]["tabs"].clone()), (json!(3), json!({"count": 4, "width": "6 mm", "height": "2 mm"})));
+    let path = run(&mut s, "cam.toolpath", json!({"op": op["operation"], "heights": true}));
+    assert_eq!(path["operations"][0]["heights"]["levels"], json!([-2.0, -4.0, -6.0]));
+    // Below the tabs' top (−4) the last pass lifts over each of them: the cut is longer by 4 × 2 × 2 mm.
+    let plain = run(&mut s, "cam.op.contour", with(json!({"passes": 3})));
+    close(op["cut_length"].as_f64().unwrap() - plain["cut_length"].as_f64().unwrap(), 16.0, 1e-6);
+    // A finishing allowance adds one lap at full depth; edited away, and passes back to the stepdown.
+    let finished = run(&mut s, "cam.op.edit", json!({"op": plain["operation"], "finish": "0.5 mm"}));
+    assert!(finished["cut_length"].as_f64().unwrap() > plain["cut_length"].as_f64().unwrap() + 140.0);
+    run(&mut s, "cam.op.edit", json!({"op": plain["operation"], "finish": null, "passes": null, "tabs": {"count": 2}}));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let second = &listed["setups"][0]["operations"][1];
+    assert!(second.get("passes").is_none() && second["inputs"].get("finish").is_none());
+    assert_eq!(second["inputs"]["tabs"]["count"], 2);
+    let pocket = run(&mut s, "cam.op.pocket", with(json!({"finish": "0.3 mm", "stepover": 2.5})));
+    assert!(pocket["cut_length"].as_f64().unwrap() > 0.0);
+    // Saved and opened again, all of it is kept.
+    let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(reopened.manufacture, s.doc.manufacture);
+    // What makes no sense is refused, naming its input.
+    for (cmd, bad) in [
+        ("cam.op.contour", with(json!({"passes": 0}))),
+        ("cam.op.contour", with(json!({"tabs": {"count": 0}}))),
+        ("cam.op.contour", with(json!({"tabs": {"height": "6 mm"}}))),
+        ("cam.op.contour", with(json!({"tabs": 3}))),
+        ("cam.op.contour", with(json!({"side": "on", "finish": "1 mm"}))),
+        ("cam.op.pocket", with(json!({"finish": "-1 mm"}))),
+    ] {
+        assert!(s.execute(cmd, &bad).is_err(), "{cmd} {bad}");
+    }
+    assert!(s.execute("cam.op.edit", &json!({"op": op["operation"], "finish": "x"})).is_err());
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));
