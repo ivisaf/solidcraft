@@ -251,53 +251,183 @@ fn profile(tool: &Tool, d: f64) -> f64 {
 /// Runs `path` with `tool` through the stock.
 pub fn simulate(field: &mut HeightField, path: &Toolpath, tool: &Tool) -> Result<CutReport> {
     tool.validate()?;
-    let r = tool.radius();
     let mut report = CutReport::default();
     let mut work = 0u64;
     let mut from: Option<Vec3> = None;
     // Arcs as chords well inside a column.
     for (to, cutting) in path.points((field.cell * 0.1).max(1e-4)) {
         let Some(a) = from.replace(to) else { continue };
-        if !a.is_finite() || !to.is_finite() {
-            return Err(CamError::Unsafe("a coordinate is not a finite number".into()));
-        }
-        let (a2, b2) = (Vec2::new(a.x, a.y), Vec2::new(to.x, to.y));
-        let lo = Vec2::new(a2.x.min(b2.x) - r, a2.y.min(b2.y) - r);
-        let hi = Vec2::new(a2.x.max(b2.x) + r, a2.y.max(b2.y) + r);
-        let (is, js) = field.range(lo, hi);
-        work += (is.len() as u64) * (js.len() as u64);
-        if work > MAX_WORK {
-            return Err(CamError::TooLarge("the simulation is too long; use a larger cell".into()));
-        }
-        let d = b2 - a2;
-        let len2 = d.len2();
-        let mut collided = false;
-        for j in js {
-            for i in is.clone() {
-                let c = field.centre(i, j);
-                let t = if len2 > 0.0 { ((c - a2).dot(d) / len2).clamp(0.0, 1.0) } else { 0.0 };
-                let off = c.dist(a2 + d * t);
-                if off > r {
-                    continue;
-                }
-                // Straight down or up, the lowest point of the move is what cuts.
-                let tip = if len2 > 0.0 { a.z + (to.z - a.z) * t } else { a.z.min(to.z) };
-                let z = (tip + profile(tool, off)).max(field.floor);
-                let Some(h) = field.z.get_mut(j * field.nx + i) else { continue };
-                if z < *h - 1e-9 {
-                    if cutting {
-                        report.max_engagement = report.max_engagement.max(*h - z);
-                        report.removed_volume += (*h - z) * field.cell * field.cell;
-                        *h = z;
-                    } else {
-                        collided = true;
-                    }
+        sweep(field, a, to, cutting, tool, &mut report, &mut work)?;
+    }
+    Ok(report)
+}
+
+/// The tool moved from `a` to `b` through the stock: at feed it cuts; at rapid running into
+/// material counts as a collision and leaves the stock as it was. `work` counts column updates.
+fn sweep(field: &mut HeightField, a: Vec3, to: Vec3, cutting: bool, tool: &Tool, report: &mut CutReport, work: &mut u64) -> Result<()> {
+    if !a.is_finite() || !to.is_finite() {
+        return Err(CamError::Unsafe("a coordinate is not a finite number".into()));
+    }
+    let r = tool.radius();
+    let (a2, b2) = (Vec2::new(a.x, a.y), Vec2::new(to.x, to.y));
+    let lo = Vec2::new(a2.x.min(b2.x) - r, a2.y.min(b2.y) - r);
+    let hi = Vec2::new(a2.x.max(b2.x) + r, a2.y.max(b2.y) + r);
+    let (is, js) = field.range(lo, hi);
+    *work += (is.len() as u64) * (js.len() as u64);
+    if *work > MAX_WORK {
+        return Err(CamError::TooLarge("the simulation is too long; use a larger cell".into()));
+    }
+    let d = b2 - a2;
+    let len2 = d.len2();
+    let mut collided = false;
+    for j in js {
+        for i in is.clone() {
+            let c = field.centre(i, j);
+            let t = if len2 > 0.0 { ((c - a2).dot(d) / len2).clamp(0.0, 1.0) } else { 0.0 };
+            let off = c.dist(a2 + d * t);
+            if off > r {
+                continue;
+            }
+            // Straight down or up, the lowest point of the move is what cuts.
+            let tip = if len2 > 0.0 { a.z + (to.z - a.z) * t } else { a.z.min(to.z) };
+            let z = (tip + profile(tool, off)).max(field.floor);
+            let Some(h) = field.z.get_mut(j * field.nx + i) else { continue };
+            if z < *h - 1e-9 {
+                if cutting {
+                    report.max_engagement = report.max_engagement.max(*h - z);
+                    report.removed_volume += (*h - z) * field.cell * field.cell;
+                    *h = z;
+                } else {
+                    collided = true;
                 }
             }
         }
-        report.rapid_collisions += usize::from(collided);
     }
-    Ok(report)
+    report.rapid_collisions += usize::from(collided);
+    Ok(())
+}
+
+/// The rate rapids move at in a [`Playback`] unless told otherwise (mm/min): a typical hobby
+/// router's; machines differ.
+pub const DEFAULT_RAPID_RATE: f64 = 5000.0;
+/// Most steps of a playback.
+const MAX_STEPS: usize = 20_000_000;
+
+/// One straight step of a [`Playback`]: from `from` to `to`, at feed or rapid, starting
+/// `start` minutes into the program and taking `minutes`; `op` is its toolpath's index. A
+/// dwell is a step that stays where it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Step {
+    pub from: Vec3,
+    pub to: Vec3,
+    /// The feed (mm/min); `None` at rapid.
+    pub feed: Option<f64>,
+    pub dwell: bool,
+    pub start: f64,
+    pub minutes: f64,
+    pub op: usize,
+}
+
+/// Toolpaths run one after the other in time, to show the tool moving and the stock being cut
+/// as far as the program has got. Arcs are straight steps well inside a column `cell` wide.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Playback {
+    pub steps: Vec<Step>,
+    /// How long the whole program takes (minutes).
+    pub minutes: f64,
+    /// The rate rapids move at (mm/min).
+    pub rapid_rate: f64,
+}
+
+fn check_rapid(rate: f64) -> Result<()> {
+    if rate > 0.0 && rate <= 1.0e6 { Ok(()) } else { invalid("the rapid rate must be above 0 and at most 1000000 mm/min") }
+}
+
+impl Playback {
+    /// `paths` one after the other, rapids at `rapid_rate` (mm/min).
+    pub fn new(paths: &[&Toolpath], cell: f64, rapid_rate: f64) -> Result<Playback> {
+        check_rapid(rapid_rate)?;
+        let mut out = Playback { rapid_rate, ..Playback::default() };
+        let mut at: Option<Vec3> = None;
+        // Each step starts where the program has got to.
+        let push = |out: &mut Playback, step: Step| {
+            if out.steps.len() >= MAX_STEPS {
+                return Err(CamError::TooLarge(format!("the program has more than {MAX_STEPS} steps to show")));
+            }
+            out.steps.push(Step { start: out.minutes, ..step });
+            out.minutes += step.minutes;
+            Ok(())
+        };
+        for (op, path) in paths.iter().enumerate() {
+            for (to, feed, dwell) in path.timed_points((cell * 0.1).max(1e-4)) {
+                if !to.is_finite() {
+                    return Err(CamError::Unsafe("a coordinate is not a finite number".into()));
+                }
+                if let Some(from) = at.replace(to) {
+                    let rate = feed.filter(|f| *f > 0.0).unwrap_or(rapid_rate);
+                    push(&mut out, Step { from, to, feed, dwell: false, start: 0.0, minutes: from.dist(to) / rate, op })?;
+                }
+                if dwell > 0.0 {
+                    push(&mut out, Step { from: to, to, feed, dwell: true, start: 0.0, minutes: dwell, op })?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rapids at `rate` from now on: every step's time is worked out again. → where `t` minutes
+    /// into the program was, in the new times.
+    pub fn retime(&mut self, rate: f64, t: f64) -> Result<f64> {
+        check_rapid(rate)?;
+        let (k, f) = match self.step_at(t).and_then(|k| Some((k, self.steps.get(k)?))) {
+            Some((k, s)) => (k, if s.minutes > 0.0 { ((t - s.start) / s.minutes).clamp(0.0, 1.0) } else { 1.0 }),
+            None => (0, 0.0),
+        };
+        let mut start = 0.0;
+        for s in &mut self.steps {
+            if s.feed.is_none() && !s.dwell {
+                s.minutes = s.from.dist(s.to) / rate;
+            }
+            s.start = start;
+            start += s.minutes;
+        }
+        (self.minutes, self.rapid_rate) = (start, rate);
+        Ok(self.steps.get(k).map_or(0.0, |s| s.start + s.minutes * f))
+    }
+
+    /// The step under way `t` minutes into the program (the last one after the end).
+    pub fn step_at(&self, t: f64) -> Option<usize> {
+        if self.steps.is_empty() {
+            return None;
+        }
+        let k = self.steps.partition_point(|s| s.start + s.minutes <= t);
+        Some(k.min(self.steps.len() - 1))
+    }
+
+    /// Where the tool is `t` minutes into the program, and the step it is on.
+    pub fn at(&self, t: f64) -> Option<(Vec3, &Step)> {
+        let step = self.steps.get(self.step_at(t)?)?;
+        let f = if step.minutes > 0.0 { ((t - step.start) / step.minutes).clamp(0.0, 1.0) } else { 1.0 };
+        Some((step.from + (step.to - step.from) * f, step))
+    }
+
+    /// Cuts the stock as the program goes from `t0` to `t1` minutes (`t1` after `t0`); `tools`
+    /// holds each toolpath's tool.
+    pub fn cut(&self, field: &mut HeightField, tools: &[Tool], t0: f64, t1: f64) -> Result<CutReport> {
+        tools.iter().try_for_each(Tool::validate)?;
+        let mut report = CutReport::default();
+        let mut work = 0u64;
+        let (Some(first), Some(last)) = (self.step_at(t0), self.step_at(t1)) else { return Ok(report) };
+        for step in self.steps.get(first..=last).into_iter().flatten() {
+            let tool = tools.get(step.op).ok_or_else(|| CamError::Invalid("a toolpath without its tool".into()))?;
+            let along = |t: f64| {
+                let f = if step.minutes > 0.0 { ((t - step.start) / step.minutes).clamp(0.0, 1.0) } else { 1.0 };
+                step.from + (step.to - step.from) * f
+            };
+            sweep(field, along(t0), along(t1), step.feed.is_some(), tool, &mut report, &mut work)?;
+        }
+        Ok(report)
+    }
 }
 
 /// The stock after cutting against the part.

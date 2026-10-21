@@ -823,6 +823,61 @@ fn simulation_removes_what_the_tool_sweeps() {
 }
 
 #[test]
+fn a_playback_cuts_the_stock_as_far_as_the_program_has_got() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let c = cut(0.0, -5.0, 2.5);
+    let params = PocketParams { stepover: 2.5, climb: true, stock_to_leave: 0.0, tolerance: 0.01, ramp_angle: 0.0, finish: 0.0 };
+    let path = pocket(&regions, &tool(6.0), &params, &c).unwrap();
+    let block = HeightField::block(Vec3::new(-5.0, -5.0, -10.0), Vec3::new(45.0, 35.0, 0.0), 0.5).unwrap();
+    let mut whole = block.clone();
+    simulate(&mut whole, &path, &tool(6.0)).unwrap();
+    let mut play = Playback::new(&[&path], block.cell, DEFAULT_RAPID_RATE).unwrap();
+    // As long as its feeds and, at a typical router's rapid rate, its rapids take.
+    let stats = path.stats();
+    close(play.minutes, stats.cut_minutes + stats.rapid_length / DEFAULT_RAPID_RATE, 1e-9);
+    // Rapids at another rate: the times are worked out again, the tool staying where it was.
+    let (t, (was, _)) = (play.minutes * 0.3, play.at(play.minutes * 0.3).unwrap());
+    let now = play.retime(10_000.0, t).unwrap();
+    close(play.minutes, stats.cut_minutes + stats.rapid_length / 10_000.0, 1e-9);
+    assert!(play.at(now).unwrap().0.dist(was) < 1e-9);
+    assert!(play.retime(0.0, now).is_err() && play.retime(f64::NAN, now).is_err());
+    play.retime(DEFAULT_RAPID_RATE, now).unwrap();
+    // Cut in many small pieces it leaves what the whole run leaves.
+    let mut pieces = block.clone();
+    let n = 37;
+    for k in 0..n {
+        let (t0, t1) = (play.minutes * k as f64 / n as f64, play.minutes * (k + 1) as f64 / n as f64);
+        play.cut(&mut pieces, &[tool(6.0)], t0, t1).unwrap();
+    }
+    assert!(pieces.z.iter().zip(&whole.z).all(|(a, b)| (a - b).abs() < 1e-9));
+    // Halfway the tool is on the path, and less has been cut than in the end.
+    let mut half = block.clone();
+    let removed = play.cut(&mut half, &[tool(6.0)], 0.0, play.minutes * 0.5).unwrap().removed_volume;
+    let (at, step) = play.at(play.minutes * 0.5).unwrap();
+    assert!(step.start <= play.minutes * 0.5 && play.minutes * 0.5 <= step.start + step.minutes && step.op == 0);
+    close(at.dist(step.from) + at.dist(step.to), step.from.dist(step.to), 1e-9);
+    assert!(removed > 0.0 && half.volume() > whole.volume() + 1.0);
+    // Before the start the tool is where the path begins; past the end, where it ends.
+    assert_eq!(play.at(-1.0).map(|(p, _)| p), play.steps.first().map(|s| s.from));
+    assert_eq!(play.at(play.minutes + 1.0).map(|(p, _)| p), play.steps.last().map(|s| s.to));
+    // Hostile times and a missing tool are no panic.
+    for t in [f64::NAN, f64::INFINITY, -f64::INFINITY] {
+        let _ = play.at(t);
+        let _ = play.cut(&mut half.clone(), &[tool(6.0)], 0.0, t);
+    }
+    assert!(play.cut(&mut half, &[], 0.0, play.minutes).is_err());
+    assert!(Playback::new(&[], 0.5, DEFAULT_RAPID_RATE).unwrap().at(0.0).is_none());
+    assert!(Playback::new(&[&path], 0.5, -1.0).is_err());
+    // A drill's dwell is time at the bottom of the hole.
+    let drilled = drill(&[v(10.0, 10.0)], &tool(6.0), &DrillParams { peck: None, dwell: 3.0 }, &c).unwrap();
+    let play = Playback::new(&[&drilled], 0.5, DEFAULT_RAPID_RATE).unwrap();
+    let stats = drilled.stats();
+    close(play.minutes, stats.cut_minutes + stats.rapid_length / DEFAULT_RAPID_RATE, 1e-9);
+    let dwell = play.steps.iter().find(|s| s.dwell).expect("a dwell");
+    assert!(dwell.from == dwell.to && (dwell.minutes - 0.05).abs() < 1e-12 && (dwell.to.z + 5.0).abs() < 1e-9);
+}
+
+#[test]
 fn simulation_knows_tool_shapes_and_rapids_through_material() {
     let block = || HeightField::block(Vec3::new(-10.0, -10.0, -20.0), Vec3::new(10.0, 10.0, 0.0), 0.1).unwrap();
     let down =

@@ -308,6 +308,20 @@ impl StockField {
         })
     }
 
+    /// A height field in work coordinates with the work frame that puts it in the world; no deviations.
+    fn of(frame: [Vec3; 4], field: &solidcraft_engine::cam::HeightField) -> StockField {
+        StockField {
+            frame,
+            origin: [field.origin.x, field.origin.y],
+            cell: field.cell,
+            nx: field.nx,
+            ny: field.ny,
+            floor: field.floor,
+            z: field.z.clone(),
+            deviation: Vec::new(),
+        }
+    }
+
     /// A point in work coordinates, in the world.
     fn world(&self, q: Vec3) -> Vec3 {
         let [o, x, y, z] = self.frame;
@@ -422,6 +436,8 @@ pub struct SetupView {
 }
 
 pub struct CamUi {
+    /// The program being shown running, when it is.
+    pub play: Option<Box<Play>>,
     pub open: bool,
     /// The Tool Library window.
     pub tools_open: bool,
@@ -464,6 +480,8 @@ pub struct CamUi {
     pub sim_detail: usize,
     pub path_width: usize,
     pub path_colour: usize,
+    /// How fast the machine's rapids move (mm/min), for playing a program; kept with the preferences.
+    pub rapid_rate: f64,
     /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
     pub look: PanelLook,
     pub tools_look: PanelLook,
@@ -491,9 +509,45 @@ pub struct CamUi {
     selection_heights: Option<(u64, Value, Option<(f64, f64)>)>,
 }
 
+/// A setup's program shown running: the tool moving along the toolpaths and the stock cut as
+/// far as it has got.
+pub struct Play {
+    data: solidcraft_engine::CamPlayback,
+    /// The stock cut as far as `t`.
+    field: solidcraft_engine::cam::HeightField,
+    /// Minutes into the program, and where the controls asked to go.
+    pub t: f64,
+    seek: Option<f64>,
+    pub playing: bool,
+    /// Index into [`PLAY_SPEEDS`].
+    pub speed: usize,
+    /// When the drawn stock was last brought up to date (seconds of the app's clock).
+    drawn_at: f64,
+    /// How many times a rapid has run into material so far, and the last time: where (world) and when.
+    pub collisions: usize,
+    flash: Option<(Vec3, f64)>,
+    /// The simulation's own stock (with its deviations from the part), shown again at the end.
+    finished: Option<StockField>,
+}
+
+/// How much faster than the machine a program plays: a name and the factor.
+const PLAY_SPEEDS: [(&str, f64); 4] = [("1×", 1.0), ("5×", 5.0), ("20×", 20.0), ("100×", 100.0)];
+/// How often the drawn stock follows a playing program (per second).
+const PLAY_REDRAWS: f64 = 15.0;
+/// How long a rapid into material stays marked (seconds).
+const FLASH_SECONDS: f64 = 1.5;
+
+/// Minutes as the clock shows them: m:ss.
+fn clock(minutes: f64) -> String {
+    let s = (minutes.max(0.0) * 60.0).round() as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
 impl Default for CamUi {
     fn default() -> Self {
         CamUi {
+            rapid_rate: solidcraft_engine::cam::DEFAULT_RAPID_RATE,
+            play: None,
             open: false,
             tools_open: false,
             folded: false,
@@ -1270,6 +1324,7 @@ pub fn simulate(app: &mut SolveApp) {
 
 /// Runs `cam.simulate` on a setup and keeps what it found for the window.
 pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
+    app.manufacture.play = None;
     app.manufacture.stock_stamp += 1;
     app.manufacture.simulated = Some(setup);
     let columns = SIM_DETAIL.get(app.manufacture.sim_detail).map_or(300, |d| d.1);
@@ -1291,6 +1346,188 @@ pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
             app.manufacture.stock = None;
             app.manufacture.error = Some(e.to_string());
         }
+    }
+}
+
+/// Starts playing a setup's program from its beginning, on the simulation's columns.
+pub fn start_play(app: &mut SolveApp, setup: u64) {
+    let columns = SIM_DETAIL.get(app.manufacture.sim_detail).map_or(300, |d| d.1);
+    let rapid_rate = app.manufacture.rapid_rate;
+    match solidcraft_engine::cam_playback(&app.session, &json!({ "setup": setup, "columns": columns, "rapid_rate": rapid_rate })) {
+        Ok(data) => {
+            let speed = app.manufacture.play.as_ref().map_or(1, |p| p.speed);
+            let finished = app.manufacture.play.take().map_or_else(|| app.manufacture.stock.clone(), |p| p.finished);
+            let field = data.stock.clone();
+            app.manufacture.play = Some(Box::new(Play {
+                data,
+                field,
+                t: 0.0,
+                seek: Some(0.0),
+                playing: true,
+                speed,
+                drawn_at: f64::NEG_INFINITY,
+                collisions: 0,
+                flash: None,
+                finished,
+            }));
+            app.manufacture.show_stock = true;
+            app.manufacture.error = None;
+        }
+        Err(e) => app.manufacture.error = Some(e.to_string()),
+    }
+}
+
+/// Moves a playing program on by the time since the last frame (or to where the controls asked
+/// to go), cutting the stock as it goes; the drawn stock follows a few times a second.
+fn tick(app: &mut SolveApp, ctx: &egui::Context) {
+    let (now, dt) = ctx.input(|i| (i.time, f64::from(i.stable_dt).clamp(0.0, 0.1)));
+    let Some(play) = app.manufacture.play.as_mut() else { return };
+    let total = play.data.playback.minutes;
+    let seek = play.seek.take();
+    let to = match seek {
+        Some(t) if t.is_finite() => t.clamp(0.0, total),
+        Some(_) => return,
+        None if play.playing => (play.t + dt / 60.0 * PLAY_SPEEDS.get(play.speed).map_or(1.0, |s| s.1)).min(total),
+        None => {
+            if play.flash.is_some_and(|(_, when)| now - when < FLASH_SECONDS) {
+                ctx.request_repaint();
+            }
+            return;
+        }
+    };
+    // Back in time: from the uncut block again.
+    if to < play.t {
+        play.field = play.data.stock.clone();
+        (play.t, play.collisions) = (0.0, 0);
+    }
+    let mut failed = None;
+    match play.data.playback.cut(&mut play.field, &play.data.tools, play.t, to) {
+        Ok(report) if report.rapid_collisions > 0 => {
+            play.collisions += report.rapid_collisions;
+            if let Some((at, _)) = play.data.playback.at(to) {
+                let [o, x, y, z] = play.data.frame;
+                play.flash = Some((o + x * at.x + y * at.y + z * at.z, now));
+            }
+        }
+        Ok(_) => {}
+        Err(e) => failed = Some(e.to_string()),
+    }
+    play.t = to;
+    let end = to >= total;
+    if end || failed.is_some() {
+        play.playing = false;
+    }
+    let redraw = end || seek.is_some() || now - play.drawn_at >= 1.0 / PLAY_REDRAWS;
+    let stock = if end && play.finished.is_some() { play.finished.clone() } else { Some(StockField::of(play.data.frame, &play.field)) };
+    if redraw {
+        play.drawn_at = now;
+    }
+    if play.playing || play.flash.is_some_and(|(_, when)| now - when < FLASH_SECONDS) {
+        ctx.request_repaint();
+    }
+    if redraw {
+        app.manufacture.stock = stock;
+        app.manufacture.stock_stamp += 1;
+    }
+    if let Some(e) = failed {
+        app.manufacture.error = Some(e);
+    }
+}
+
+/// Under a simulation: play its program, and while it plays the controls, where it is and what it does.
+fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
+    let t = Tokens::get();
+    let Some(setup) = cam.simulated else { return };
+    ui.add_space(4.0);
+    let Some(play) = cam.play.as_mut() else {
+        if button(ui, "Play the program", Button::Normal).on_hover_text("Show the tool moving along the toolpaths and cutting the stock").clicked() {
+            asked.play = Some(setup);
+        }
+        return;
+    };
+    let total = play.data.playback.minutes;
+    let steps = &play.data.playback.steps;
+    let k = play.data.playback.step_at(play.t).unwrap_or(0);
+    let mut stop = false;
+    ui.horizontal_wrapped(|ui| {
+        if button(ui, "|<", Button::Small).on_hover_text("To the start").clicked() {
+            play.seek = Some(0.0);
+        }
+        if button(ui, "<", Button::Small).on_hover_text("Back one move").clicked() {
+            let back = match steps.get(k) {
+                Some(s) if play.t > s.start + 1e-9 => s.start,
+                _ => k.checked_sub(1).and_then(|k| steps.get(k)).map_or(0.0, |s| s.start),
+            };
+            (play.seek, play.playing) = (Some(back), false);
+        }
+        let label = if play.playing {
+            "Pause"
+        } else if play.t >= total {
+            "Again"
+        } else {
+            "Play"
+        };
+        if button(ui, label, Button::Small).clicked() {
+            if play.t >= total {
+                (play.seek, play.playing) = (Some(0.0), true);
+            } else {
+                play.playing = !play.playing;
+            }
+        }
+        if button(ui, ">", Button::Small).on_hover_text("On one move").clicked() {
+            let on = steps.get(k).map_or(total, |s| s.start + s.minutes);
+            (play.seek, play.playing) = (Some(on), false);
+        }
+        if button(ui, ">|", Button::Small).on_hover_text("To the end").clicked() {
+            (play.seek, play.playing) = (Some(total), false);
+        }
+        let speeds = PLAY_SPEEDS.map(|s| s.0);
+        small_choice(ui, "sc_cam_play_speed", "Speed", "Playback speed", &mut play.speed, &speeds);
+        if button(ui, "Stop", Button::Small).on_hover_text("Stop playing and show the simulation's result").clicked() {
+            stop = true;
+        }
+    });
+    // The machine's own rapid rate: the times follow it, the tool stays where it is.
+    ui.horizontal(|ui| {
+        explained(ui.label("Rapids"), "Rapid rate", None);
+        let mut rate = cam.rapid_rate;
+        let r = ui_kit::number_field(ui, &mut rate, 100.0..=100_000.0, 50.0, " mm/min");
+        if r.changed() && rate != cam.rapid_rate {
+            match play.data.playback.retime(rate, play.t) {
+                Ok(t) => {
+                    cam.rapid_rate = rate;
+                    play.t = t;
+                }
+                Err(e) => cam.error = Some(e.to_string()),
+            }
+        }
+    });
+    let mut at = play.t;
+    let r = ui.scope(|ui| {
+        ui.set_max_width(ui.available_width().min(420.0));
+        ui_kit::slider(ui, &mut at, 0.0..=total.max(1e-9), ui_kit::Slider { format: clock, ..Default::default() })
+    });
+    if r.inner.changed() {
+        (play.seek, play.playing) = (Some(at), false);
+    }
+    if let Some((p, step)) = play.data.playback.at(play.t) {
+        let op = play.data.ops.get(step.op).map_or("", String::as_str);
+        let tool = play.data.tools.get(step.op).map_or(0, |t| t.number);
+        let feed = match step.feed {
+            _ if step.dwell => format!("dwell {} s", shown(step.minutes * 60.0, 1)),
+            Some(f) => format!("feed {} mm/min", shown(f, 0)),
+            None => "rapid".to_string(),
+        };
+        let mm = |v: f64| shown((v * 1e3).round() / 1e3 + 0.0, 3);
+        ui.label(RichText::new(format!("{op}  T{tool}   X {}  Y {}  Z {}   {feed}", mm(p.x), mm(p.y), mm(p.z))).color(t.text));
+        ui.label(RichText::new(format!("{} of {}", clock(play.t), clock(total))).color(t.text_dim));
+    }
+    if play.collisions > 0 {
+        ui.label(RichText::new(format!("{} rapid move(s) ran into material: marked red where it happened", play.collisions)).color(t.error));
+    }
+    if stop && let Some(play) = cam.play.take() {
+        cam.stock = play.finished;
+        cam.stock_stamp += 1;
     }
 }
 
@@ -1322,6 +1559,7 @@ fn refresh(app: &mut SolveApp) {
         }
     }
     // A simulation of the design as it was says nothing about it now.
+    app.manufacture.play = None;
     app.manufacture.simulation = None;
     app.manufacture.stock = None;
     app.manufacture.stock_stamp += 1;
@@ -1431,6 +1669,90 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             painter.line_segment([from, to], stroke);
         }
     }
+    // A playing program: its tool where it is, and where a rapid last ran into material.
+    if let Some(play) = app.manufacture.play.as_ref().filter(|_| app.manufacture.open) {
+        if let Some((at, step)) = play.data.playback.at(play.t)
+            && let Some(tool) = play.data.tools.get(step.op)
+        {
+            draw_tool(painter, proj, play.data.frame, at, tool);
+        }
+        let now = painter.ctx().input(|i| i.time);
+        if let Some((at, when)) = play.flash.filter(|(_, when)| now - when < FLASH_SECONDS)
+            && let Some(p) = proj.to_screen(at)
+        {
+            let fade = (1.0 - (now - when) / FLASH_SECONDS) as f32;
+            painter.circle(p, 14.0, t.error.gamma_multiply(0.35 * fade), Stroke::new(2.0, t.error.gamma_multiply(fade)));
+        }
+    }
+}
+
+/// The tool at `tip` (work coordinates in `frame`): its cutting part and its shank, each drawn
+/// as the outline of its rings round the setup's Z.
+fn draw_tool(painter: &egui::Painter, proj: &Proj, frame: [Vec3; 4], tip: Vec3, tool: &solidcraft_engine::cam::Tool) {
+    use solidcraft_engine::cam::ToolKind;
+    let t = Tokens::get();
+    let [o, x, y, z] = frame;
+    let r = tool.radius();
+    let flute = tool.flute_length;
+    let length = tool.length.unwrap_or(flute + 2.0 * tool.diameter).max(flute);
+    let shank = tool.shank_diameter.unwrap_or(tool.diameter) * 0.5;
+    // Rings as (height over the tip, radius).
+    let cutting: Vec<(f64, f64)> = match tool.kind {
+        ToolKind::FlatEndmill => vec![(0.0, r), (flute, r)],
+        ToolKind::BallEndmill => {
+            (0..=6).map(|k| f64::from(k) / 6.0 * std::f64::consts::FRAC_PI_2).map(|a| (r - r * a.cos(), r * a.sin())).chain([(flute, r)]).collect()
+        }
+        ToolKind::Drill | ToolKind::VBit => {
+            let point = tool.tip() * 0.5;
+            let cone = ((r - point) / (tool.point_angle() * 0.5).to_radians().tan()).min(flute);
+            vec![(0.0, point), (cone, r), (flute, r)]
+        }
+    };
+    let outline = |rings: &[(f64, f64)]| -> Vec<egui::Pos2> {
+        let mut pts = Vec::new();
+        for &(h, radius) in rings {
+            for k in 0..24 {
+                let a = f64::from(k) / 24.0 * std::f64::consts::TAU;
+                let q = Vec3::new(tip.x + radius * a.cos(), tip.y + radius * a.sin(), tip.z + h);
+                if let Some(p) = proj.to_screen(o + x * q.x + y * q.y + z * q.z) {
+                    pts.push(p);
+                }
+            }
+        }
+        convex_hull(pts)
+    };
+    let shank_pts = outline(&[(flute, shank), (length, shank)]);
+    if shank_pts.len() >= 3 {
+        painter.add(egui::Shape::convex_polygon(shank_pts, t.text_dim.gamma_multiply(0.8), Stroke::new(1.0, t.text)));
+    }
+    let cut_pts = outline(&cutting);
+    if cut_pts.len() >= 3 {
+        painter.add(egui::Shape::convex_polygon(cut_pts, t.accent.gamma_multiply(0.85), Stroke::new(1.0, t.text)));
+    }
+}
+
+/// The convex hull of points on the screen, anticlockwise.
+fn convex_hull(mut pts: Vec<egui::Pos2>) -> Vec<egui::Pos2> {
+    pts.retain(|p| p.x.is_finite() && p.y.is_finite());
+    pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+    pts.dedup();
+    if pts.len() < 3 {
+        return pts;
+    }
+    let cross = |o: egui::Pos2, a: egui::Pos2, b: egui::Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let mut hull: Vec<egui::Pos2> = Vec::with_capacity(pts.len() * 2);
+    for pass in [false, true] {
+        let start = hull.len();
+        let ordered: Box<dyn Iterator<Item = &egui::Pos2>> = if pass { Box::new(pts.iter().rev()) } else { Box::new(pts.iter()) };
+        for &p in ordered {
+            while hull.len() >= start + 2 && hull.get(hull.len() - 2).zip(hull.last()).is_some_and(|(a, b)| cross(*a, *b, p) <= 0.0) {
+                hull.pop();
+            }
+            hull.push(p);
+        }
+        hull.pop();
+    }
+    hull
 }
 
 /// A value a form still needs before OK can run its command: the row it belongs to (empty: the
@@ -1490,6 +1812,7 @@ fn help(label: &str) -> Option<&'static str> {
         "Retract" => "Where the tool's fast approach stops and it feeds down into the material. Empty: 2 mm over the top.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
+        "Rapid rate" => "How fast your machine's rapids move (mm/min): the played program's times follow it. Kept for the next start.",
         "Panel fade" => {
             "How see-through these panels' background gets while the pointer is in the 3D view; over a panel, or typing in it, it is solid again. Kept for the next start."
         }
@@ -2692,6 +3015,8 @@ struct Asked {
     edit_op: Option<(Value, Value)>,
     apply: bool,
     simulate: Option<u64>,
+    /// A setup whose simulated program to play.
+    play: Option<u64>,
     /// Write a program: the setup, one operation of it or all (`None`), and the setup's post.
     post: Option<(u64, Option<(u64, String)>, String)>,
     import: bool,
@@ -3083,6 +3408,7 @@ fn manufacture_window(
                 for line in warnings {
                     ui.label(RichText::new(line).color(t.warning));
                 }
+                play_controls(ui, cam, asked);
             }
             if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
                 asked.apply |= form_block(ui, cam, selected, lists);
@@ -3102,6 +3428,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     if !app.manufacture.open && !app.manufacture.tools_open {
         return;
     }
+    tick(app, ctx);
     if app.manufacture.open && (app.manufacture.show_paths || app.manufacture.show_setups) {
         refresh(app);
     }
@@ -3133,6 +3460,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         (prefs.cam_sim_detail, prefs.cam_path_width, prefs.cam_path_colour);
     (app.manufacture.look.width, app.manufacture.tools_look.width) = (prefs.cam_panel_width, prefs.cam_tools_width);
     (app.manufacture.look.fade, app.manufacture.tools_look.fade) = (prefs.cam_panel_fade, prefs.cam_panel_fade);
+    app.manufacture.rapid_rate = f64::from(prefs.cam_rapid_rate);
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
         manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
@@ -3148,6 +3476,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         (cam.sim_detail, cam.path_width, cam.path_colour);
     (app.preferences.cam_panel_width, app.preferences.cam_tools_width, app.preferences.cam_panel_fade) =
         (cam.look.width, cam.tools_look.width, cam.look.fade);
+    app.preferences.cam_rapid_rate = cam.rapid_rate as f32;
     app.manufacture = cam;
     answer(app, asked);
 }
@@ -3216,6 +3545,9 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
     }
     if let Some(setup) = asked.simulate {
         simulate_setup(app, setup);
+    }
+    if let Some(setup) = asked.play {
+        start_play(app, setup);
     }
     // File pickers answer later; the command runs when a file is chosen.
     if asked.import {

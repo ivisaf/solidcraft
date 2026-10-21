@@ -1067,3 +1067,72 @@ fn a_contour_form_sets_tabs_a_finishing_pass_and_its_passes() {
     f.passes = "two".into();
     assert!(command(&Form::Op(f)).is_err());
 }
+
+#[test]
+fn a_simulated_program_plays_with_the_tool_cutting_the_stock() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
+    h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
+    fill(&mut h, "cam.op.contour", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        op.side = 1;
+    });
+    h.frames(2);
+    h.app.start("cam.simulate");
+    h.frames(2);
+    let simulated = h.app.manufacture.stock.clone().expect("the simulated stock");
+    // Under the simulation: play it; it starts from the uncut block, the tool drawn where it is,
+    // rapids at the machine's rate from the preferences.
+    h.app.preferences.cam_rapid_rate = 8000.0;
+    h.frames(1);
+    h.step(&json!({"widget": "Play the program"})).unwrap();
+    h.frames(2);
+    let play = h.app.manufacture.play.as_ref().expect("playing");
+    assert!(play.playing && play.t < play.data.playback.minutes);
+    assert_eq!(play.data.playback.rapid_rate, 8000.0);
+    assert!(h.widget("Rapids").is_some());
+    assert!(h.widget("Pause").is_some() && h.widget("Contour1  T1   X 0  Y 0  Z 0   rapid").is_none(), "where the tool is, as it goes");
+    // Halfway, less is cut than in the end; at the end, the simulation's stock is back.
+    let total = play.data.playback.minutes;
+    let volume = |f: &StockField| f.z.iter().sum::<f64>();
+    if let Some(play) = h.app.manufacture.play.as_mut() {
+        play.seek = Some(total * 0.5);
+        play.playing = false;
+    }
+    h.frames(2);
+    let half = h.app.manufacture.stock.clone().expect("the stock so far");
+    assert!(half.deviation.is_empty() && volume(&half) > volume(&simulated) + 1.0);
+    if let Some(play) = h.app.manufacture.play.as_mut() {
+        play.seek = Some(total);
+    }
+    h.frames(2);
+    assert_eq!(h.app.manufacture.stock.as_ref().map(|f| &f.z), Some(&simulated.z));
+    assert!(h.widget("Again").is_some(), "played to the end");
+    // Back to the start: the block is whole again; Stop shows the simulation's result.
+    if let Some(play) = h.app.manufacture.play.as_mut() {
+        play.seek = Some(0.0);
+    }
+    h.frames(2);
+    assert!(h.app.manufacture.stock.as_ref().is_some_and(|f| f.z.iter().all(|z| (z - f.z[0]).abs() < 1e-9) && volume(f) > volume(&half)));
+    h.step(&json!({"widget": "Stop"})).unwrap();
+    h.frames(2);
+    assert!(h.app.manufacture.play.is_none() && h.app.manufacture.stock.as_ref() == Some(&simulated));
+    // A change to the design stops it with the simulation.
+    h.app.manufacture.play = None;
+    h.step(&json!({"widget": "Play the program"})).unwrap();
+    h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "outside"})).unwrap();
+    h.frames(2);
+    assert!(h.app.manufacture.play.is_none());
+}
+
+#[test]
+fn a_hull_goes_round_its_points() {
+    let p = egui::pos2;
+    let hull = convex_hull(vec![p(0.0, 0.0), p(2.0, 0.0), p(1.0, 1.0), p(2.0, 2.0), p(0.0, 2.0), p(1.0, 1.0), p(f32::NAN, 1.0)]);
+    assert_eq!(hull.len(), 4);
+    assert!(hull.contains(&p(2.0, 2.0)) && !hull.contains(&p(1.0, 1.0)));
+    assert!(convex_hull(vec![p(0.0, 0.0), p(1.0, 1.0)]).len() == 2 && convex_hull(Vec::new()).is_empty());
+}

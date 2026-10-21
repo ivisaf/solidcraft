@@ -96,13 +96,19 @@ impl Toolpath {
     /// The path as points for display and checking: `(point, cutting)` where `cutting` says
     /// whether the tool reached the point at feed. Arcs are followed within `tol`.
     pub fn points(&self, tol: f64) -> Vec<(Vec3, bool)> {
+        self.timed_points(tol).into_iter().map(|(p, feed, _)| (p, feed.is_some())).collect()
+    }
+
+    /// [`Toolpath::points`] with the feed (mm/min) the tool reached each point at (`None` at
+    /// rapid) and how long it then dwells there (minutes).
+    pub fn timed_points(&self, tol: f64) -> Vec<(Vec3, Option<f64>, f64)> {
         let mut out = Vec::new();
         let mut pos: Option<Vec3> = None;
         for m in &self.moves {
             match *m {
-                Move::Rapid { to } => out.push((to, false)),
-                Move::Feed { to, .. } => out.push((to, true)),
-                Move::Arc { to, center, ccw, .. } => {
+                Move::Rapid { to } => out.push((to, None, 0.0)),
+                Move::Feed { to, feed } => out.push((to, Some(feed), 0.0)),
+                Move::Arc { to, center, ccw, feed } => {
                     if let Some(p) = pos {
                         let start = Vec2::new(p.x, p.y) - center;
                         let (r, sweep) = (start.len(), arc_sweep(p, to, center, ccw));
@@ -112,12 +118,16 @@ impl Toolpath {
                         for i in 1..n {
                             let t = i as f64 / n as f64;
                             let q = center + Vec2::from_angle(start.angle() + sweep * t) * r;
-                            out.push((q.extend(p.z + (to.z - p.z) * t), true));
+                            out.push((q.extend(p.z + (to.z - p.z) * t), Some(feed), 0.0));
                         }
                     }
-                    out.push((to, true));
+                    out.push((to, Some(feed), 0.0));
                 }
-                Move::Dwell { .. } => {}
+                Move::Dwell { seconds } => {
+                    if let Some(last) = out.last_mut() {
+                        last.2 += seconds.max(0.0) / 60.0;
+                    }
+                }
             }
             if let Some(to) = m.target() {
                 pos = Some(to);

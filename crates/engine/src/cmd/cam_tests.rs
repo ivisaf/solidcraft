@@ -1145,6 +1145,31 @@ fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes
 }
 
 #[test]
+fn a_setup_s_program_plays_back_to_what_its_simulation_leaves() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    run(&mut s, "cam.op.pocket", pocket_op());
+    run(&mut s, "cam.op.contour", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "side": "inside"}));
+    let play = crate::cam_playback(&s, &json!({"columns": 80})).unwrap();
+    assert_eq!((play.ops.as_slice(), play.tools.len()), (["Pocket1".to_string(), "Contour1".to_string()].as_slice(), 2));
+    assert!(play.playback.steps.iter().any(|st| st.op == 1));
+    let mut stock = play.stock.clone();
+    play.playback.cut(&mut stock, &play.tools, 0.0, play.playback.minutes).unwrap();
+    let simulated = run(&mut s, "cam.simulate", json!({"columns": 80, "field": true}));
+    let z: Vec<f64> = simulated["field"]["z"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert_eq!(z.len(), stock.z.len());
+    assert!(z.iter().zip(&stock.z).all(|(a, b)| (a - b).abs() < 1e-9));
+    // Faster rapids, a shorter program; a rate that is no rate is refused.
+    let fast = crate::cam_playback(&s, &json!({"columns": 80, "rapid_rate": 20000})).unwrap();
+    assert!(fast.playback.minutes < play.playback.minutes && fast.playback.rapid_rate == 20000.0);
+    assert!(crate::cam_playback(&s, &json!({"rapid_rate": 0})).is_err() && crate::cam_playback(&s, &json!({"rapid_rate": "x"})).is_err());
+    // Nothing to play without operations, or without a setup.
+    run(&mut s, "cam.setup.create", json!({"name": "Empty"}));
+    assert!(crate::cam_playback(&s, &json!({"setup": "Empty"})).is_err());
+    assert!(crate::cam_playback(&Session::default(), &json!({})).is_err());
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

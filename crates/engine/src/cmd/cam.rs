@@ -1976,15 +1976,9 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "setup": setup.id, "operations": out }))
 }
 
-fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "cam.simulate";
-    let setup = setup(s, p, cmd)?;
-    if setup.operations.is_empty() {
-        return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
-    }
-    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
-    let state = s.model.state();
-    let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
+/// The raw block a simulation starts from, on its columns: `stock` ({min, max}) or the setup's,
+/// `cell` wide or `columns` across its longer side (default 300); and its corners.
+fn sim_block(p: &Value, cmd: &str, at: &Resolved) -> Result<(cam::HeightField, Box3)> {
     let (min, max) = match p.get("stock") {
         Some(v) => {
             let corner = |k: &str| v.get(k).and_then(vec3).ok_or_else(|| bad(cmd, "`stock` must be {min: [x, y, z], max: [x, y, z]}"));
@@ -2000,7 +1994,61 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
     };
-    let mut stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
+    let stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
+    Ok((stock, (min, max)))
+}
+
+/// A setup's program to show running: what [`cam_playback`] gives.
+pub struct CamPlayback {
+    pub setup: u64,
+    /// The setup's work frame in the world: origin, X, Y, Z. Everything else is in work coordinates.
+    pub frame: [Vec3; 4],
+    /// The raw block, uncut.
+    pub stock: cam::HeightField,
+    /// The operations' moves one after the other in time.
+    pub playback: cam::Playback,
+    /// Each operation's name and tool, by the playback's toolpath index.
+    pub ops: Vec<String>,
+    pub tools: Vec<Tool>,
+}
+
+/// A setup's program to show running (`p`: setup?, stock?, cell?, columns? as `cam.simulate`;
+/// rapid_rate?: mm/min, default [`cam::DEFAULT_RAPID_RATE`]): the raw block and every
+/// operation's moves in time, to cut it as far as the program has got.
+pub fn cam_playback(s: &Session, p: &Value) -> Result<CamPlayback> {
+    let cmd = "cam.simulate";
+    let setup = setup(s, p, cmd)?;
+    if setup.operations.is_empty() {
+        return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
+    }
+    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
+    let (stock, _) = sim_block(p, cmd, &at)?;
+    let (mut paths, mut ops, mut tools) = (Vec::new(), Vec::new(), Vec::new());
+    for op in &setup.operations {
+        paths.push(build_in(s, &at, op)?);
+        tools.push(s.doc.manufacture.tool(op.tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?);
+        ops.push(op.name.clone());
+    }
+    let rapid = match p.get("rapid_rate") {
+        Some(_) => num(p, "rapid_rate").ok_or_else(|| bad(cmd, "`rapid_rate` must be a number (mm/min)"))?,
+        None => cam::DEFAULT_RAPID_RATE,
+    };
+    let playback = cam::Playback::new(&paths.iter().collect::<Vec<_>>(), stock.cell, rapid).map_err(|e| bad(cmd, e.to_string()))?;
+    let f = &at.frame;
+    Ok(CamPlayback { setup: setup.id, frame: [f.o, f.x, f.y, f.z], stock, playback, ops, tools })
+}
+
+fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.simulate";
+    let setup = setup(s, p, cmd)?;
+    if setup.operations.is_empty() {
+        return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
+    }
+    let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
+    let state = s.model.state();
+    let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
+    let (mut stock, (min, max)) = sim_block(p, cmd, &at)?;
+    let cell = stock.cell;
     let mut ops = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut removed = 0.0;
