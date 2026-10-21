@@ -2813,10 +2813,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         Some((_, _, Ok(p))) => p.heights.clone(),
         _ => None,
     };
-    // Docked like the app's command dialogs: flush to the viewport's right edge, under the view
+    // Docked like the app's command dialogs: at the right edge of their area, under the view
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
-    let vp = app.viewport.rect.unwrap_or_else(|| ctx.content_rect());
-    let top = (vp.top() + crate::viewport::AXIS_VIEW_CLEARANCE).min((vp.bottom() - 360.0).max(vp.top()));
+    let vp = crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect()));
+    let top = crate::shell::panel_top(app, vp, vp.bottom(), crate::frame::Side::Right);
     let right = app.viewport.dialog_rect.filter(|_| app.dialog.is_some()).map_or(vp.right(), |r| r.left() - 6.0);
     let max_height = vp.bottom() - top - 8.0;
     let mut asked = Asked::default();
