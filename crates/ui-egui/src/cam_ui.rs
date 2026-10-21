@@ -5,6 +5,7 @@
 //! command the toolbar started, and Post Process. Toolpaths come from `cam.toolpath` and are
 //! redrawn when the design changes.
 
+use crate::ui_kit::{self, Button, button};
 use egui::{RichText, Stroke};
 use serde_json::{Value, json};
 use solidcraft_engine::geom::Vec3;
@@ -45,7 +46,9 @@ fn path_colour(index: usize) -> egui::Color32 {
 fn small_choice(ui: &mut egui::Ui, id: &str, label: &str, help_label: &str, index: &mut usize, options: &[&str]) -> bool {
     let before = *index;
     explained(ui.label(label), help_label, None);
-    crate::ui_kit::dropdown(ui, id, index, options);
+    // Only as wide as its longest option: the kit's drop-down otherwise fills the row.
+    let width = ui_kit::ContentWidth::dropdown(ui, options) + ui_kit::ContentWidth::label(ui, " ");
+    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| crate::ui_kit::dropdown(ui, id, index, options));
     *index != before
 }
 
@@ -1342,6 +1345,32 @@ fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
     }
 }
 
+/// A form's text box, 140 pt wide; `invalid` draws it in the error colour (its value is still needed).
+fn text_box(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, invalid: bool) -> egui::Response {
+    ui.scope(|ui| {
+        ui.set_max_width(140.0);
+        crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, hint, invalid)
+    })
+    .inner
+}
+
+/// `add` with its buttons filled with `fill` and outlined with `stroke` (where set).
+fn tinted<R>(ui: &mut egui::Ui, fill: Option<egui::Color32>, stroke: Option<Stroke>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        for v in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+            if let Some(fill) = fill {
+                v.weak_bg_fill = fill;
+            }
+            if let Some(stroke) = stroke {
+                v.bg_stroke = stroke;
+            }
+        }
+        add(ui)
+    })
+    .inner
+}
+
 /// [`field`] for a height, with a button beside it that takes `picked`: the selection's height
 /// (its highest point for a top, its lowest for a bottom; `None` with nothing selected).
 /// `true` while the row is pointed at or typed in (the heights picture lights its line).
@@ -1350,16 +1379,19 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
     let mut lit = false;
     row_label(ui, label, need);
     ui.horizontal(|ui| {
-        let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
+        let r = text_box(ui, label, value, hint, need.is_some());
         lit |= r.hovered() || r.has_focus();
-        mark(ui, &r, need);
         let r = explained(r, label, need);
         crate::params_dialog::complete(ui, &r, value);
         let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
-        let b = ui.add_enabled(picked.is_some(), egui::Button::new("").min_size(egui::vec2(24.0, 20.0)));
-        crate::icons::paint_icon(ui.painter(), b.rect.shrink(2.0), "select", if picked.is_some() { 1.0 } else { 0.35 });
         let name = format!("{label} from the selection");
-        b.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, picked.is_some(), &name));
+        let side = crate::ui_kit::row_height();
+        let b = ui
+            .add_enabled_ui(picked.is_some(), |ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+                crate::ui_kit::icon_button_at(ui, rect, "select", &name)
+            })
+            .inner;
         let tip = match picked {
             Some(z) => format!("Take the height from the selection: {}", mm(z)),
             None => String::new(),
@@ -1380,8 +1412,7 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
 fn field_seen(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> (bool, bool) {
     let need = needed(need, label);
     row_label(ui, label, need);
-    let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
-    mark(ui, &r, need);
+    let r = text_box(ui, label, value, hint, need.is_some());
     let lit = r.hovered() || r.has_focus();
     let r = explained(r, label, need);
     let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
@@ -1456,8 +1487,7 @@ fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit
 fn field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> bool {
     let need = needed(need, label);
     row_label(ui, label, need);
-    let r = ui.add(egui::TextEdit::singleline(value).hint_text(hint).desired_width(140.0));
-    mark(ui, &r, need);
+    let r = text_box(ui, label, value, hint, need.is_some());
     let r = explained(r, label, need);
     let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
     ui.end_row();
@@ -1789,18 +1819,7 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need]) {
     let t = Tokens::get();
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     // Where it is: three steps, each a button back to it.
-    ui.horizontal(|ui| {
-        for (k, name) in ["1  Kind", "2  Shape", "3  Cutting data"].iter().enumerate() {
-            if k > 0 {
-                ui.label(RichText::new("→").color(t.text_dim));
-            }
-            let caption = RichText::new(*name);
-            let b = if f.step == k { egui::Button::new(caption.strong()).stroke(Stroke::new(1.5, t.accent)) } else { egui::Button::new(caption) };
-            if ui.add(b).clicked() {
-                f.step = k;
-            }
-        }
-    });
+    crate::ui_kit::segmented(ui, &mut f.step, &["1  Kind", "2  Shape", "3  Cutting data"], crate::ui_kit::Segments::default());
     ui.add_space(6.0);
     match f.step {
         0 => {
@@ -1884,10 +1903,10 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need]) {
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(f.step > 0, egui::Button::new("< Back")).clicked() {
+        if button(ui, "< Back", ui_kit::Button::Enabled(f.step > 0)).clicked() {
             f.step -= 1;
         }
-        if ui.add_enabled(f.step < 2, egui::Button::new("Next >")).clicked() {
+        if button(ui, "Next >", ui_kit::Button::Enabled(f.step < 2)).clicked() {
             f.step += 1;
         }
     });
@@ -1947,7 +1966,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 row_label(ui, "Faces", None);
                 ui.horizontal(|ui| {
                     ui.label(format!("{} picked", f.faces.len()));
-                    if ui.small_button("Use a sketch").clicked() {
+                    if button(ui, "Use a sketch", Button::Small).clicked() {
                         f.faces.clear();
                     }
                 });
@@ -1955,7 +1974,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             if !selected.is_empty() && selected != f.faces.as_slice() {
                 ui.label("");
-                if ui.small_button(format!("Cut the {} selected face(s)", selected.len())).clicked() {
+                if button(ui, format!("Cut the {} selected face(s)", selected.len()), Button::Small).clicked() {
                     f.faces = selected.to_vec();
                 }
                 ui.end_row();
@@ -2156,8 +2175,8 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
         // OK stays off until nothing is missing; what is missing is said under it.
         let wanted = need_text(&need);
         ui.horizontal(|ui| {
-            ok = ui.add_enabled(need.is_empty(), egui::Button::new("OK")).on_disabled_hover_text(&wanted).clicked();
-            cancel = ui.button("Cancel").clicked();
+            ok = button(ui, "OK", ui_kit::Button::Enabled(need.is_empty())).on_disabled_hover_text(&wanted).clicked();
+            cancel = button(ui, "Cancel", Button::Normal).clicked();
         });
         if !need.is_empty() {
             ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
@@ -2260,7 +2279,9 @@ fn docked_panel(
     let width = ctx.memory(|m| m.area_rect(egui::Id::new(id))).map_or(crate::frame::DIALOG_MIN_W, |r| r.width());
     let vp = dock.viewport;
     let p = dock.anchor + *offset;
-    let x = if vp.left() + width <= vp.right() { p.x.clamp(vp.left() + width, vp.right()) } else { dock.anchor.x };
+    // The kit's panels keep `space_8` off the viewport's right edge.
+    let right = vp.right() - t.space_8;
+    let x = if vp.left() + width <= right { p.x.clamp(vp.left() + width, right) } else { dock.anchor.x };
     let y = if vp.top() <= vp.bottom() - 40.0 { p.y.clamp(vp.top(), vp.bottom() - 40.0) } else { dock.anchor.y };
     let anchor = egui::pos2(x, y);
     let max_height = dock.max_height - (anchor.y - dock.anchor.y);
@@ -2276,10 +2297,7 @@ fn docked_panel(
         let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
         drag_header(ui, id, band, offset, anchor - dock.anchor);
         ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(RichText::new(if *folded { "+" } else { "−" }).size(t.font_heading)).frame(false))
-                .on_hover_text(if *folded { "Expand" } else { "Collapse" })
-                .clicked()
+            if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, if *folded { "Expand" } else { "Collapse" }, true, false).clicked()
             {
                 *folded = !*folded;
             }
@@ -2288,9 +2306,7 @@ fn docked_panel(
                 .on_hover_text("Drag to move, double-click to dock again");
             let width = ui.spacing().interact_size.x;
             right_aligned(ui, total, width, |ui| {
-                let close =
-                    egui::Button::new(RichText::new("×").size(t.font_heading).color(t.text_dim)).frame(false).min_size(egui::vec2(width, 0.0));
-                if ui.add(close).on_hover_text("Close").clicked() {
+                if crate::ui_kit::compact_button(ui, "×", "Close", true, false).clicked() {
                     keep = false;
                 }
             });
@@ -2416,10 +2432,10 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             // Each step needs the ones before it.
             let open = done.iter().take(k).all(|d| *d);
             let caption = RichText::new(format!("{}  {name}", k + 1));
-            let button = match (is_done, is_next) {
-                (true, _) => egui::Button::new(caption.color(t.text)).fill(t.accent_soft),
-                (_, true) => egui::Button::new(caption.strong().color(t.text)).stroke(Stroke::new(1.5, t.accent)),
-                _ => egui::Button::new(caption.color(t.text_dim)),
+            let (caption, fill, stroke) = match (is_done, is_next) {
+                (true, _) => (caption.color(t.text), Some(t.accent_soft), None),
+                (_, true) => (caption.strong().color(t.text), None, Some(Stroke::new(1.5, t.accent))),
+                _ => (caption.color(t.text_dim), None, None),
             };
             let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
             let tip = [
@@ -2429,14 +2445,15 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
                 "Write the setup's program for the machine.",
             ];
             let r = ui
-                .add_enabled(open, button)
+                .add_enabled_ui(open, |ui| tinted(ui, fill, stroke, |ui| button(ui, caption, Button::Normal)))
+                .inner
                 .on_hover_text(tip.get(k).copied().unwrap_or_default())
                 .on_disabled_hover_text(why.get(k).copied().unwrap_or_default());
             if k == 1 {
                 // The operations to choose from, under the step.
                 egui::Popup::menu(&r).show(|ui| {
                     for (cmd, label) in OPERATIONS {
-                        if ui.button(label).clicked() {
+                        if button(ui, label, Button::Normal).clicked() {
                             asked.start = Some(cmd);
                         }
                     }
@@ -2565,7 +2582,7 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             ui.add_space(6.0);
             // What can be done: always New Tool and the library file; with a tool picked, to that tool.
             ui.horizontal_wrapped(|ui| {
-                if ui.button("New Tool").clicked() {
+                if button(ui, "New Tool", Button::Normal).clicked() {
                     asked.new_tool = true;
                 }
                 if let Some((in_library, number)) = cam.selected_tool
@@ -2573,18 +2590,20 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                 {
                     ui.separator();
                     ui.label(RichText::new(format!("T{number}")).strong());
-                    if ui.button("Edit").clicked() {
+                    if button(ui, "Edit", Button::Normal).clicked() {
                         asked.form = tool_form(tool, in_library);
                     }
-                    if ui.button("Remove").clicked() {
+                    if button(ui, "Remove", Button::Normal).clicked() {
                         let id = if in_library { "cam.library.remove" } else { "cam.tool.remove" };
                         asked.run.push((id, json!({ "number": number })));
                     }
-                    if !in_library && ui.button("Add to library").clicked() {
+                    if !in_library && button(ui, "Add to library", Button::Normal).clicked() {
                         asked.run.push(("cam.library.add", json!({ "number": number })));
                     }
                     if tool["design"].as_str() == Some("differs")
-                        && ui.button("Update this design").on_hover_text("Replace this design's older copy of the tool with the library's").clicked()
+                        && button(ui, "Update this design", Button::Normal)
+                            .on_hover_text("Replace this design's older copy of the tool with the library's")
+                            .clicked()
                     {
                         asked.run.push(("cam.tool.update", json!({ "number": number })));
                     }
@@ -2592,11 +2611,10 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                     ui.label(RichText::new("Pick a tool to change or remove it").color(t.text_dim));
                 }
                 ui.separator();
-                asked.import = ui
-                    .button("Import…")
+                asked.import = button(ui, "Import…", Button::Normal)
                     .on_hover_text("Add the tools of a library file to this machine's library: SolidCraft's own, or an RP23CNC toollibrary.json")
                     .clicked();
-                asked.export = ui.button("Export…").on_hover_text("Write this machine's library to a file").clicked();
+                asked.export = button(ui, "Export…", Button::Normal).on_hover_text("Write this machine's library to a file").clicked();
             });
             for (k, line) in cam.import_notes.iter().enumerate() {
                 let colour = if k == 0 { t.text_dim } else { t.warning };
@@ -2633,7 +2651,7 @@ fn manufacture_window(
                 ui.label(RichText::new(e).color(t.error));
             }
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Tool Library…").clicked() {
+                if button(ui, "Tool Library…", Button::Normal).clicked() {
                     cam.tools_open = true;
                 }
                 crate::ui_kit::checkbox(ui, "Toolpaths", &mut cam.show_paths);
@@ -2666,19 +2684,20 @@ fn manufacture_window(
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(text(setup, "name")).strong());
                         ui.label(RichText::new(format!("post: {}", text(setup, "post"))).color(t.text_dim));
-                        if ui.small_button("Edit").clicked() {
+                        if button(ui, "Edit", Button::Small).clicked() {
                             asked.form = setup_form(setup);
                         }
                         let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
                         if ui
-                            .add_enabled(has_ops, egui::Button::new("Simulate").small())
+                            .add_enabled_ui(has_ops, |ui| button(ui, "Simulate", Button::Small))
+                            .inner
                             .on_hover_text("Cut the raw block with every operation and show what is left")
                             .on_disabled_hover_text(NO_OPS)
                             .clicked()
                         {
                             asked.simulate = Some(id);
                         }
-                        if ui.small_button("Remove").clicked() {
+                        if button(ui, "Remove", Button::Small).clicked() {
                             asked.run.push(("cam.setup.remove", json!({ "setup": id })));
                         }
                     });
@@ -2700,15 +2719,16 @@ fn manufacture_window(
                                 }
                             }
                             for (label, by) in [("Up", -1), ("Down", 1)] {
-                                if ui.small_button(label).clicked() {
+                                if button(ui, label, Button::Small).clicked() {
                                     asked.run.push(("cam.op.move", json!({ "setup": id, "op": op["id"], "by": by })));
                                 }
                             }
-                            if ui.small_button("Edit").clicked() {
+                            if button(ui, "Edit", Button::Small).clicked() {
                                 asked.edit_op = Some((setup.clone(), op.clone()));
                             }
                             if ui
-                                .add_enabled(op.get("error").is_none(), egui::Button::new("Post").small())
+                                .add_enabled_ui(op.get("error").is_none(), |ui| button(ui, "Post", Button::Small))
+                                .inner
                                 .on_hover_text("Write this operation alone as G-code")
                                 .on_disabled_hover_text("This operation cannot be cut: fix what it says first (Edit)")
                                 .clicked()
@@ -2716,7 +2736,7 @@ fn manufacture_window(
                             {
                                 asked.post = Some((id, Some((op_id, text(op, "name"))), text(setup, "post")));
                             }
-                            if ui.small_button("Remove").clicked() {
+                            if button(ui, "Remove", Button::Small).clicked() {
                                 asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
                             }
                         });
@@ -2734,9 +2754,15 @@ fn manufacture_window(
                     ui.add_space(6.0);
                     let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
                     let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(t.font_heading).color(t.text);
-                    let button = egui::Button::new(label).fill(t.accent_soft).min_size(egui::vec2(ui.available_width(), 32.0));
-                    if ui
-                        .add_enabled(has_ops, button)
+                    let post = ui.add_enabled_ui(has_ops, |ui| {
+                        ui.vertical_centered_justified(|ui| {
+                            ui.spacing_mut().button_padding.y = t.space_8;
+                            tinted(ui, Some(t.accent_soft), None, |ui| button(ui, label, Button::Normal))
+                        })
+                        .inner
+                    });
+                    if post
+                        .inner
                         .on_hover_text("Write every operation of this setup, in order, as one G-code program")
                         .on_disabled_hover_text(NO_OPS)
                         .clicked()
@@ -2810,7 +2836,9 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     if cam.tools_open {
         // Beside where the Manufacture panel docks, wherever it was dragged to.
-        let beside = if cam.open { right - cam.panel.map_or(DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
+        // The kit's panels keep `space_8` off the viewport's right edge.
+        let docked = right.min(vp.right() - Tokens::get().space_8);
+        let beside = if cam.open { docked - cam.panel.map_or(DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
         tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
     }
     (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =
