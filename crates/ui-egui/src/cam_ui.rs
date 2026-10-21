@@ -1614,9 +1614,15 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
 
 /// [`field`], also saying whether its row is pointed at or typed in.
 fn field_seen(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> (bool, bool) {
+    field_unless(ui, need, label, value, hint, None)
+}
+
+/// [`field_seen`], greyed out with `unused` saying why while it is `Some`.
+fn field_unless(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, unused: Option<&str>) -> (bool, bool) {
     let need = needed(need, label);
     row_label(ui, label, need);
-    let r = text_box(ui, label, value, hint, need.is_some());
+    let r = ui.add_enabled_ui(unused.is_none(), |ui| text_box(ui, label, value, hint, need.is_some())).inner;
+    let r = r.on_disabled_hover_text(unused.unwrap_or_default());
     let lit = r.hovered() || r.has_focus();
     let r = explained(r, label, need);
     let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
@@ -2299,7 +2305,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 lit = Some(HeightLine::Bottom);
             }
             // Drilling has no stepdown (its peck depth is further down).
-            if f.kind != OpKind::Drill && field_seen(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter").0 {
+            // Not used while a number of passes divides the depth.
+            let unused =
+                (!f.passes.trim().is_empty()).then_some("Not used: the passes divide the depth evenly. Empty Passes to cut by the stepdown.");
+            if f.kind != OpKind::Drill && field_unless(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter", unused).0 {
                 lit = Some(HeightLine::Passes);
             }
             // Or how many passes: the depth is then divided evenly.
