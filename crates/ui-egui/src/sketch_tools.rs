@@ -595,7 +595,7 @@ pub fn hint(id: &str) -> Option<String> {
             "sketch.edit_text" => "Edit Text: click a letter interior or outline",
             "sketch.blend_curve" => "Blend curve: click the ends of two curves",
             "sketch.constraint.curvature" => "Curvature: click two curves that share an end",
-            "sketch.circle.two_tangent" => "2-tangent circle: click two curves (the circle goes near the second click)",
+            "sketch.circle.two_tangent" => "2-tangent circle: click two curves (the circle goes between the two clicks)",
             "sketch.circle.three_tangent" => "3-tangent circle: click three curves",
             "sketch.constrainer" => "Constrain: click one or two entities; right-click to apply",
             "sketch.constraint.polygon" => "Polygon: click the lines of a closed chain; right-click to apply",
@@ -1007,7 +1007,9 @@ fn run_entities(app: &mut SolveApp, t: &Tool) {
         "sketch.constraint.curvature" => json!({"a": k[0], "b": k[1]}),
         "sketch.circle.two_tangent" => {
             let r = round_nice(curve_len(app, &k[0]).min(curve_len(app, &k[1])) * 0.1);
-            let near = t.pts.last().map(|p| xy(p.0)).unwrap_or(json!([0, 0]));
+            // Between the two clicks: each lies on its curve, so the circle in the corner they
+            // span is the one nearest their midpoint (#3141).
+            let near = xy(t.pts.iter().fold(Vec2::ZERO, |a, p| a + p.0) / t.pts.len().max(1) as f64);
             json!({"curves": k, "radius": r, "near": near})
         }
         "sketch.circle.three_tangent" => {

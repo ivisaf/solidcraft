@@ -609,6 +609,9 @@ const ELEMENTS: &[Element] = &[
             primary_button(ui, "Create");
         });
     }),
+    element!("wide_primary_button", |ui, _| {
+        wide_primary_button(ui, "Finish Sketch");
+    }),
     element!("button", "dialog:row:Gallery", Some("dialog:button:Gallery:Add"), |ui, _| {
         row(ui, "Gallery", |ui| {
             button(ui, "Add", Button::Normal);

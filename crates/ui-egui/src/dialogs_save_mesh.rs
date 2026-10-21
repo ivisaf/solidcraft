@@ -1,7 +1,7 @@
 //! The Save as mesh dialog (`file.save_mesh`): which bodies, the mesh format, and optionally a
 //! slicer to open the saved file in.
 //!
-//! Every place that saves a mesh opens this dialog: File › Save as mesh, the Mesh tab, and the
+//! Every place that saves a mesh opens this dialog: File › Export STL / Export 3MF, the Mesh tab, and the
 //! Save As Mesh item of the body menus. The slicer list holds the programs the user added (kept
 //! between runs, newest first), then the slicers found on this machine, then "Custom…", which asks
 //! for a program and adds it at the top; "Custom…" itself is never the selection. Pressing Delete
@@ -37,6 +37,14 @@ pub struct SaveMesh {
     slicer: String,
     /// The slicer list has not been read for this opening yet.
     stale: bool,
+}
+
+impl SaveMesh {
+    /// The chosen format, as `file.save_mesh` names it (`stl`, `3mf`, `3mf-tagged`).
+    #[cfg(test)]
+    pub(crate) fn format_name(&self) -> &'static str {
+        FORMATS.get(self.format).map_or("stl", |f| f.1)
+    }
 }
 
 /// One line of the slicer list.
@@ -85,6 +93,17 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
     let format = FORMATS.iter().position(|f| f.1 == p.save_mesh_format).unwrap_or(0);
     let kind = Kind::SaveMesh(SaveMesh { format, send: p.save_mesh_send, slicer: p.save_mesh_slicer.clone(), stale: true });
     Some((kind, vec![SelInput::new("Bodies", BODIES, true)]))
+}
+
+/// Open the dialog with `format` (`stl`, `3mf` or `3mf-tagged`) chosen, whatever was used last:
+/// File › Export STL… and Export 3MF…. The user can still change it in the dialog.
+pub fn start_with_format(app: &mut SolveApp, format: &str) {
+    app.start("file.save_mesh");
+    if let Some(index) = FORMATS.iter().position(|f| f.1 == format)
+        && let Some(Kind::SaveMesh(k)) = app.dialog.as_mut().map(|d| &mut d.kind)
+    {
+        k.format = index;
+    }
 }
 
 /// A popup with the slicer list is open (Delete belongs to it, not to the design's selection).

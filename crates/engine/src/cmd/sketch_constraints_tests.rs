@@ -374,6 +374,66 @@ fn symmetry_moves_a_free_line_between_two_fixed_lines() {
     }
 }
 
+/// A 20 x 10 rectangle (sides l1..l4; left = l4 and right = l2 run in opposite directions) and a
+/// free vertical line at x = -20 as the symmetry line (#2940, #2961).
+fn rectangle_and_axis(dimension_left: bool) -> (Session, Vec<String>) {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-12, 0], "p1": [8, 10]}));
+    let sides = ids(&r["curves"]);
+    run(&mut s, "sketch.line", json!({"points": [[-20, -5], [-20, 15]], "construction": true, "ids": ["axis"]}));
+    if dimension_left {
+        run(&mut s, "sketch.dimension", json!({"entities": [sides[3].clone()], "value": 10}));
+    }
+    (s, sides)
+}
+
+/// Both sides keep their 10 mm height and their ends mirror in x about `axis_x`.
+fn assert_sides_mirror_with_height(s: &Session, left: &str, right: &str, axis_x: f64) {
+    let sk = sketch(s);
+    let at = |r: String| sk.point(sk.resolve_point(&r).unwrap()).unwrap();
+    for side in [left, right] {
+        let (a, b) = (at(format!("{side}.start")), at(format!("{side}.end")));
+        assert!((a.y - b.y).abs() > 9.999 && (a.y - b.y).abs() < 10.001, "{side} height {:?} {:?}", a, b);
+        assert!((a.x - b.x).abs() < 1e-7, "{side} not vertical: {:?} {:?}", a, b);
+    }
+    let (l, r) = (at(format!("{left}.start")), at(format!("{right}.start")));
+    assert!((l.x + r.x - 2.0 * axis_x).abs() < 1e-6, "sides not mirrored: {l:?} {r:?}");
+}
+
+#[test]
+fn symmetry_of_rectangle_sides_keeps_their_height() {
+    // #2940: the opposite sides of a rectangle run in opposite directions, so pairing their ends
+    // by index forced both heights to 0.
+    let (mut s, sides) = rectangle_and_axis(false);
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": sides[3], "b": sides[1], "line": "axis"}));
+    assert_sides_mirror_with_height(&s, &sides[3], &sides[1], -20.0);
+}
+
+#[test]
+fn symmetry_of_a_dimensioned_rectangle_side_is_accepted() {
+    // #2961: with a length on a side, the same symmetry was refused as "neither entity can move".
+    let (mut s, sides) = rectangle_and_axis(true);
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": sides[3], "b": sides[1], "line": "axis"}));
+    assert_sides_mirror_with_height(&s, &sides[3], &sides[1], -20.0);
+}
+
+#[test]
+fn symmetry_of_rectangle_sides_with_swapped_arguments() {
+    let (mut s, sides) = rectangle_and_axis(true);
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": sides[1], "b": sides[3], "line": "axis"}));
+    assert_sides_mirror_with_height(&s, &sides[3], &sides[1], -20.0);
+}
+
+#[test]
+fn symmetry_of_rectangle_sides_about_the_y_axis() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-12, 0], "p1": [8, 10]}));
+    let sides = ids(&r["curves"]);
+    run(&mut s, "sketch.dimension", json!({"entities": [sides[3].clone()], "value": 10}));
+    run(&mut s, "sketch.constraint.symmetry", json!({"a": sides[3], "b": sides[1], "line": "y"}));
+    assert_sides_mirror_with_height(&s, &sides[3], &sides[1], 0.0);
+}
+
 #[test]
 fn midpoint_alignment_persists_undoes_and_survives_endpoint_edits() {
     use solidcraft_sketch::ConstraintKind;

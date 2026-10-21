@@ -136,6 +136,11 @@ mod web {
                 self.app.open_path(&path);
                 self.files.panel.set(false);
             }
+            // Recent designs whose file is gone are dropped from the list.
+            for path in self.files.gone.borrow_mut().drain(..) {
+                self.app.home.recent.retain(|r| *r != path);
+                self.app.home.opened_at.remove(&path);
+            }
             for (text, error) in self.files.messages.borrow_mut().drain(..) {
                 self.app.set_status(text, error);
             }
@@ -203,7 +208,9 @@ mod web {
             let mut entries = self.files.entries.borrow().clone();
             entries.sort_by(|a, b| b.modified.total_cmp(&a.modified));
             let recent = &mut self.app.home.recent;
-            recent.retain(|p| vfs::exists(p));
+            let known = self.files.disk_known.borrow().clone();
+            // A design on the computer's disk stays listed while its file is remembered.
+            recent.retain(|p| vfs::exists(p) || disk::parse(p).is_some_and(|(id, _)| known.contains(id)));
             for e in entries.iter().filter(|e| solidcraft_engine::io::is_design_path(&e.name)) {
                 let p = format!("{}{}", files::OPFS, e.name);
                 if !recent.contains(&p) {
@@ -211,6 +218,10 @@ mod web {
                 }
             }
             recent.truncate(solidcraft_ui_egui::home::MAX_RECENT);
+            // Remembered files that no recent design or autosave names are forgotten in time.
+            let recovered = self.files.recovery.borrow().as_ref().and_then(|(_, p)| p.clone());
+            let keep = recent.iter().chain(recovered.as_ref()).filter_map(|p| disk::parse(p)).map(|(id, _)| id.to_string()).collect();
+            disk::prune(keep);
         }
 
         /// The stored designs: open, insert, rename, delete, download; open from the computer.
@@ -563,6 +574,7 @@ mod web {
                         let files = Rc::new(Files::default());
                         files::start(&files);
                         let (panel, opener, saver, shown) = (files.clone(), files.clone(), files.clone(), files.clone());
+                        let (restorable, restorer) = (files.clone(), files.clone());
                         let services = Services {
                             // Open shows the browser's open dialog for a design where it has one
                             // (the file keeps its handle, so Save writes back to it); otherwise,
@@ -587,6 +599,12 @@ mod web {
                                     SaveTarget::Download => Box::pin(std::future::ready(Some(format!("{}{name}", files::DOWNLOADS)))),
                                 }
                             })),
+                            // A recent design on the disk, from an earlier session, opens by asking
+                            // the browser for its remembered file.
+                            can_restore: Some(Box::new(move |path: &str| {
+                                disk::parse(path).is_some_and(|(id, _)| restorable.disk_known.borrow().contains(id))
+                            })),
+                            restore_file: Some(Box::new(move |path: &str| disk::restore(&restorer, path))),
                             download_design: Some(Box::new(files::download)),
                             browser_files: Some(Box::new(move || shown.panel.set(true))),
                             install_app: Some(crate::install::service(&cc.egui_ctx)),

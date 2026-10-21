@@ -212,6 +212,27 @@ fn favorites_comments_and_completion() {
     assert!(c["suggestions"].as_array().unwrap().iter().any(|x| x["text"] == "atan2("), "{c}");
 }
 
+/// #2757: a parameter is suggested for a word anywhere in its name, not only at its start;
+/// names that start with the word come first. Functions still match from the start.
+#[test]
+fn completion_matches_parameters_anywhere_in_their_name() {
+    let mut s = Session::default();
+    for (name, e) in [("cab_side_thickness", "18 mm"), ("side", "40 mm"), ("door_width", "300 mm")] {
+        run(&mut s, "parameters.add", json!({"name": name, "expression": e}));
+    }
+    let texts = |c: &Value| -> Vec<String> {
+        c["suggestions"].as_array().unwrap().iter().filter(|x| x["kind"] == "parameter").map(|x| x["text"].as_str().unwrap().to_string()).collect()
+    };
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "2 * side"}));
+    assert_eq!(texts(&c), ["side", "cab_side_thickness"], "the name starting with it first: {c}");
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "THICK"}));
+    assert_eq!(texts(&c), ["cab_side_thickness"], "any case: {c}");
+    assert!(texts(&run(&mut s, "parameters.complete", json!({"prefix": "xyz"}))).is_empty());
+    // Functions keep matching from the start: `in` is not `sin(`.
+    let c = run(&mut s, "parameters.complete", json!({"prefix": "in"}));
+    assert!(!c["suggestions"].as_array().unwrap().iter().any(|x| x["text"] == "sin("), "{c}");
+}
+
 #[test]
 fn csv_and_json_round_trip() {
     let mut s = Session::default();

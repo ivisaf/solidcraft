@@ -57,6 +57,10 @@ pub struct Files {
     pub incoming: RefCell<Vec<(String, Vec<u8>, Intent)>>,
     /// Designs opened from the computer's disk: their paths in the engine's files.
     pub opened: RefCell<Vec<String>>,
+    /// The ids of the files remembered from earlier sessions (see `disk::restore`).
+    pub disk_known: RefCell<std::collections::HashSet<String>>,
+    /// Recent designs whose file is gone: to drop from the recent list.
+    pub gone: RefCell<Vec<String>>,
     /// Disk designs whose last write failed: they are not saved.
     pub unsaved: RefCell<Vec<String>>,
     /// Messages for the status line (errors and confirmations).
@@ -90,7 +94,7 @@ impl Files {
     }
 
     /// Run a frame (the app sleeps until something happens).
-    fn wake(&self) {
+    pub fn wake(&self) {
         if let Some(c) = self.ctx.borrow().as_ref() {
             c.request_repaint();
         }
@@ -267,6 +271,10 @@ pub fn start(files: &Rc<Files>) {
     }
     let files = files.clone();
     spawn_local(async move {
+        match disk::known_ids().await {
+            Ok(ids) => files.disk_known.borrow_mut().extend(ids),
+            Err(e) => log::info!("no remembered files: {e}"),
+        }
         match read_all().await {
             Ok(all) => {
                 if local_only() {

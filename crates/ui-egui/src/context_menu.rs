@@ -312,8 +312,8 @@ pub fn component_bodies(app: &SolveApp, id: u64) -> Vec<String> {
 /// The eight radial commands, clockwise from the top.
 pub fn radial_items(app: &SolveApp) -> Vec<Item> {
     let repeat = match &app.last_command {
-        Some((_, label)) => act("ui.repeat", &format!("Repeat {label}"), "redo"),
-        None => act("ui.repeat", "Repeat", "redo").on(false),
+        Some((_, label)) => act("ui.repeat", &format!("Repeat {label}"), "redo").key(crate::keymap::REPEAT_KEY),
+        None => act("ui.repeat", "Repeat", "redo").key(crate::keymap::REPEAT_KEY).on(false),
     };
     let delete = act("ui.delete", "Delete", "delete").key("Del").on(!app.session.selection.is_empty());
     if app.session.active_sketch.is_some() {
@@ -470,7 +470,7 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
     let has = |f: fn(&Sel) -> bool| sel.iter().any(f);
     let mut v = Vec::new();
     if let Some((_, label)) = &app.last_command {
-        v.push(act("ui.repeat", &format!("Repeat {label}"), "redo"));
+        v.push(act("ui.repeat", &format!("Repeat {label}"), "redo").key(crate::keymap::REPEAT_KEY));
         v.push(Item::sep());
     }
     // Everything under the cursor, for what lies beneath something else.
@@ -981,9 +981,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             }
         }
         "ui.repeat" => {
-            if let Some((id, _)) = app.last_command.clone() {
-                app.start(&id);
-            }
+            app.repeat_last();
         }
         "ui.selectOther" => {
             crate::select_other::open(app, at);
@@ -1111,7 +1109,7 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
             app.tree.hidden_section = None;
             drop(app.run("inspect.section", json!({"clear": true})));
         }
-        "ui.editSection" => app.start("inspect.section"),
+        "ui.editSection" => crate::dialogs::edit_section(app),
         "ui.sectionVisible" => crate::browser::set_section_shown(app, p.get("visible").and_then(Value::as_bool).unwrap_or(true)),
         "ui.fit" => app.animate_view("fit"),
         "ui.home" => app.animate_view("home"),

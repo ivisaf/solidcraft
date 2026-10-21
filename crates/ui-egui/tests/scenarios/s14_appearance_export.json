@@ -95,7 +95,7 @@
   "click": {"handle": "appbar:file"}
  },
  {
-  "widget": "Save as mesh\u2026"
+  "widget": "Export STL\u2026"
  },
  {
   "expect": {

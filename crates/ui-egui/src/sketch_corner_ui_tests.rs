@@ -649,3 +649,33 @@ fn trim_hover_shows_the_piece_a_click_takes_away() {
     h.step(&json!({"move":{"world":[15,0,0]}})).unwrap();
     assert!(trim_hover_piece(&h.app, sid, &line).is_none(), "only Trim shows a piece");
 }
+
+/// #3141: the 2-tangent circle tool, clicked on two sides of a rectangle drawn away from the
+/// origin, puts its circle in the corner between the clicks without moving the rectangle, and
+/// fixed sides no longer make it fail.
+#[test]
+fn two_tangent_circle_clicked_on_two_sides_fits_the_corner_and_moves_nothing() {
+    for fixed in [false, true] {
+        let mut h = crate::scenario::Harness::new();
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let r = h.app.run("sketch.rectangle.two_point", json!({"p0":[-800,0],"p1":[-300,500]})).unwrap();
+        if fixed {
+            h.app.run("sketch.constraint.fix", json!({"entities": r["curves"]})).unwrap();
+        }
+        h.step(&json!({"call":"ui.view","params":{"view":"fit"}})).unwrap();
+        h.settle();
+        let sid = h.app.session.active_sketch.unwrap();
+        let points =
+            |h: &crate::scenario::Harness| h.app.session.model.state().sketch(sid).unwrap().sketch.points.iter().map(|p| p.pos).collect::<Vec<_>>();
+        let before = points(&h);
+        h.step(&json!({"start":"sketch.circle.two_tangent"})).unwrap();
+        h.step(&json!({"click":{"world":[-550,0,0]}})).unwrap();
+        h.step(&json!({"click":{"world":[-800,250,0]}})).unwrap();
+        let sk = h.app.session.model.state().sketch(sid).unwrap().sketch.clone();
+        let circle = sk.curves.iter().position(|c| matches!(c.kind, CurveKind::Circle { .. }));
+        let circle = circle.unwrap_or_else(|| panic!("fixed {fixed}: no circle: {:?}", h.app.status));
+        assert!(sk.center(circle).unwrap().dist(Vec2::new(-750.0, 50.0)) < 1e-6, "fixed {fixed}: {:?}", sk.center(circle));
+        let after = points(&h);
+        assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle moved: {after:?}");
+    }
+}

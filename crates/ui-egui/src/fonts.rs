@@ -97,7 +97,7 @@ fn install(ctx: &egui::Context, fonts: FontDefinitions) {
 }
 
 /// Install only the bundled definitions (also used by the offscreen scenario shell).
-pub(crate) fn setup_bundled_fonts(ctx: &egui::Context) {
+pub fn setup_bundled_fonts(ctx: &egui::Context) {
     install(ctx, base_font_definitions());
 }
 
@@ -164,7 +164,7 @@ pub fn with_symbol_fallback(mut fonts: egui::FontDefinitions) -> egui::FontDefin
 
 /// UI languages whose text needs the CJK font. The web app's bundled font covers Japanese only;
 /// add Chinese or Korean here together with a font that covers them.
-pub const CJK_LANGUAGES: &[&str] = &["ja", "zh", "ko"];
+pub const CJK_LANGUAGES: &[&str] = &["ja", "zh", "zh-TW", "ko"];
 
 /// Whether the UI language needs a CJK font (the web app fetches one only then).
 pub fn needs_cjk_font(language: &str) -> bool {
@@ -648,7 +648,7 @@ fn find_system_cjk_font() -> Option<Vec<u8>> {
 /// Thai comes last whatever the language: no other face draws it.
 pub fn fallback_order(language: &str) -> [&'static str; 4] {
     match language {
-        "zh" => [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK],
+        "zh" | "zh-TW" => [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK],
         "ko" => [HANGUL_FALLBACK, CJK_FALLBACK, CHINESE_FALLBACK, THAI_FALLBACK],
         _ => [CJK_FALLBACK, CHINESE_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK],
     }
@@ -659,10 +659,75 @@ pub fn fallback_order(language: &str) -> [&'static str; 4] {
 /// when one is chosen (see [`ui_font`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
-    let cjk = find_system_cjk_font();
-    let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
-    let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
-    let thai = THAI_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+    install_fonts(ctx, language, ui_font, Some(system_fallbacks()));
+}
+
+/// The system fallback faces, searched for once and kept: reading them takes long on a system
+/// with large CJK fonts, so the app starts that search on a thread and draws its first frame
+/// with the bundled faces (see [`load_system_fonts_in_background`]).
+#[cfg(not(target_arch = "wasm32"))]
+struct SystemFonts {
+    cjk: Option<Vec<u8>>,
+    chinese: Option<Vec<u8>>,
+    hangul: Option<Vec<u8>>,
+    thai: Option<Vec<u8>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static SYSTEM_FONTS: std::sync::OnceLock<SystemFonts> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn system_fallbacks() -> &'static SystemFonts {
+    SYSTEM_FONTS.get_or_init(|| {
+        let cjk = find_system_cjk_font();
+        let chinese = find_system_chinese_font().filter(|bytes| cjk.as_ref() != Some(bytes));
+        let hangul = HANGUL_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+        let thai = THAI_FONT_CANDIDATES.iter().find_map(|path| try_read_font(std::path::Path::new(path)));
+        SystemFonts { cjk, chinese, hangul, thai }
+    })
+}
+
+/// Whether the system fallback faces have been searched for.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn system_fonts_ready() -> bool {
+    SYSTEM_FONTS.get().is_some()
+}
+
+/// Search for the system fallback faces on a thread and repaint when they are found.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_system_fonts_in_background(ctx: &egui::Context) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    if SYSTEM_FONTS.get().is_some() {
+        return;
+    }
+    let mut first = false;
+    STARTED.call_once(|| first = true);
+    if !first {
+        return;
+    }
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new().name("system-fonts".into()).spawn(move || {
+        system_fallbacks();
+        ctx.request_repaint();
+    });
+    // Without a thread the first frame waits for them, as it always did.
+    if spawned.is_err() {
+        system_fallbacks();
+    }
+}
+
+/// [`setup_fonts_for`] with the system fallbacks that are there already, never waiting for the search.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn setup_fonts_without_waiting(ctx: &egui::Context, language: &str, ui_font: &str) {
+    install_fonts(ctx, language, ui_font, SYSTEM_FONTS.get());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn install_fonts(ctx: &egui::Context, language: &str, ui_font: &str, system: Option<&SystemFonts>) {
+    let (cjk, chinese, hangul, thai) = match system {
+        Some(f) => (f.cjk.clone(), f.chinese.clone(), f.hangul.clone(), f.thai.clone()),
+        None => (None, None, None, None),
+    };
     let mut fonts = base_font_definitions();
     if let Some(font) = self::ui_font(ui_font) {
         fonts = with_ui_font(fonts, font);
@@ -770,6 +835,19 @@ fn find_chinese_font_in(dirs: &[std::path::PathBuf]) -> Option<Vec<u8>> {
 /// Web installs the bundled faces synchronously; Japanese is fetched by the shell on demand.
 /// Preserve that downloaded face when preferences change later in the session.
 #[cfg(target_arch = "wasm32")]
+pub fn load_system_fonts_in_background(_ctx: &egui::Context) {}
+
+#[cfg(target_arch = "wasm32")]
+pub fn system_fonts_ready() -> bool {
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn setup_fonts_without_waiting(ctx: &egui::Context, language: &str, ui_font: &str) {
+    setup_fonts_for(ctx, language, ui_font);
+}
+
+#[cfg(target_arch = "wasm32")]
 pub fn setup_fonts_for(ctx: &egui::Context, language: &str, ui_font: &str) {
     let previous = ctx.data(|d| d.get_temp::<FontDefinitions>(installed_fonts_id()));
     let mut fonts = web_font_definitions(ui_font, previous);
@@ -811,6 +889,22 @@ pub(crate) fn test_context() -> egui::Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The system faces are searched for on a thread; installing fonts before they are found does
+    /// not wait for the search and still gives the bundled faces.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn system_fonts_load_in_the_background_and_installing_does_not_wait() {
+        let ctx = egui::Context::default();
+        setup_fonts_without_waiting(&ctx, "en", "");
+        assert!(ctx.data(|d| d.get_temp::<FontDefinitions>(installed_fonts_id())).is_some());
+        load_system_fonts_in_background(&ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !system_fonts_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(system_fonts_ready());
+    }
 
     /// Whether a face of the Proportional family has `c`. Checked in the font data:
     /// `Fonts::has_glyph` misses a glyph in the face that also gives the replacement glyph.
@@ -991,6 +1085,7 @@ mod tests {
     #[test]
     fn a_chinese_ui_puts_the_chinese_face_before_the_japanese_one() {
         assert_eq!(fallback_order("zh"), [CHINESE_FALLBACK, CJK_FALLBACK, HANGUL_FALLBACK, THAI_FALLBACK]);
+        assert_eq!(fallback_order("zh-TW"), fallback_order("zh"));
         assert_eq!(fallback_order("ko"), [HANGUL_FALLBACK, CJK_FALLBACK, CHINESE_FALLBACK, THAI_FALLBACK]);
         for lang in ["en", "ja", "de"] {
             assert_eq!(

@@ -438,6 +438,51 @@ fn new_creation_tools() {
     assert!(a.iter().any(|x| close(*x, pi * 5.0 * 2.0 + pi)), "{a:?}");
 }
 
+/// #3141: a 2-tangent circle asked for near a point on one of its curves (where a click on that
+/// curve puts it) is solved from the touching circle nearest that point: it lands in the corner,
+/// the rectangle stays as drawn, and fixed sides no longer make it fail.
+#[test]
+fn two_tangent_circle_from_a_click_on_a_curve_leaves_the_curves_as_drawn() {
+    let side = |s: &Session, sides: &[String], on: fn(Vec2) -> bool| -> String {
+        let sk = sketch(s);
+        sides
+            .iter()
+            .find(|c| {
+                let i = sk.curve_index(c).unwrap();
+                matches!(sk.shape(i), Some(solidcraft_sketch::Shape::Line { a, b }) if on(a) && on(b))
+            })
+            .unwrap()
+            .clone()
+    };
+    let points = |s: &Session| sketch(s).points.iter().map(|p| p.pos).collect::<Vec<_>>();
+    for fixed in [false, true] {
+        let mut s = new_sketch();
+        let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [-800, 0], "p1": [-300, 500]}));
+        let sides = ids(&r["curves"]);
+        if fixed {
+            run(&mut s, "sketch.constraint.fix", json!({"entities": sides}));
+        }
+        let before = points(&s);
+        let bottom = side(&s, &sides, |p| p.y.abs() < 1e-9);
+        let left = side(&s, &sides, |p| (p.x + 800.0).abs() < 1e-9);
+        // Midway between a click on the bottom side and one on the left side.
+        let r = run(&mut s, "sketch.circle.two_tangent", json!({"curves": [bottom, left], "radius": 50, "near": [-675, 125]}));
+        let c = ids(&r["curves"])[0].clone();
+        let sk = sketch(&s);
+        let ci = sk.curve_index(&c).unwrap();
+        assert!(sk.center(ci).unwrap().dist(Vec2::new(-750.0, 50.0)) < 1e-6, "fixed {fixed}: {:?}", sk.center(ci));
+        assert!(close(sk.radius(ci).unwrap(), 50.0));
+        let after = points(&s);
+        assert!(before.iter().zip(&after).all(|(a, b)| a.dist(*b) < 1e-9), "fixed {fixed}: the rectangle did not move: {after:?}");
+        // Asked for right on the left side: still a touching circle next to it.
+        let r = run(&mut s, "sketch.circle.two_tangent", json!({"curves": [bottom, left], "radius": 20, "near": [-800, 30]}));
+        let c = ids(&r["curves"])[0].clone();
+        let sk = sketch(&s);
+        let o = sk.center(sk.curve_index(&c).unwrap()).unwrap();
+        assert!(close(o.y, 20.0) && close((o.x + 800.0).abs(), 20.0), "fixed {fixed}: {o:?}");
+    }
+}
+
 #[test]
 fn ellipse_splines_conic() {
     let pi = std::f64::consts::PI;

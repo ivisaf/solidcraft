@@ -1864,8 +1864,11 @@ fn c_symmetry(s: &mut Session, p: &Value) -> Result<Value> {
                 let cb = sk.curve_index(rb).ok_or_else(|| bad(cmd, format!("unknown entity `{rb}`")))?;
                 match (sk.curves.get(ca).map(|c| c.kind.clone()), sk.curves.get(cb).map(|c| c.kind.clone())) {
                     (Some(CurveKind::Line { a: a0, b: a1 }), Some(CurveKind::Line { a: b0, b: b1 })) => {
-                        out.push(add_c(sk, ConstraintKind::Symmetric { p: a0, q: b0, l })?);
-                        out.push(add_c(sk, ConstraintKind::Symmetric { p: a1, q: b1, l })?);
+                        // Opposite sides of a rectangle run in opposite directions: pair each end
+                        // with the end of the other line nearest its mirror image (#2961, #2940).
+                        let (p0, p1) = if mirror_pairing_is_crossed(sk, l, [a0, a1], [b0, b1]) { (b1, b0) } else { (b0, b1) };
+                        out.push(add_c(sk, ConstraintKind::Symmetric { p: a0, q: p0, l })?);
+                        out.push(add_c(sk, ConstraintKind::Symmetric { p: a1, q: p1, l })?);
                     }
                     (Some(_), Some(_)) => {
                         let pa = round_center(sk, ca).ok_or_else(|| bad(cmd, "symmetry needs two lines or two circles/arcs"))?;
@@ -1884,6 +1887,25 @@ fn c_symmetry(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(out)
     })?;
     Ok(json!({"constraints": ids, "sketch": info}))
+}
+
+/// True when the ends of line `a` mirror (about the line `l`) closer onto the ends of `b` crossed
+/// (`a0` with `b1`, `a1` with `b0`) than in order. A degenerate symmetry line keeps the order.
+fn mirror_pairing_is_crossed(sk: &Sketch, l: usize, a: [usize; 2], b: [usize; 2]) -> bool {
+    let Some((o, e)) = line_pts(sk, l) else { return false };
+    let d = e - o;
+    let len2 = d.x * d.x + d.y * d.y;
+    if len2 < 1e-18 {
+        return false;
+    }
+    let pt = |i: usize| sk.point(i).unwrap_or_default();
+    let near = |i: usize, j: usize| {
+        let v = pt(i) - o;
+        let t = (v.x * d.x + v.y * d.y) / len2;
+        let foot = o + d * t;
+        (foot * 2.0 - pt(i)).dist(pt(j))
+    };
+    near(a[0], b[1]) + near(a[1], b[0]) < near(a[0], b[0]) + near(a[1], b[1])
 }
 
 /// Symmetry about point `c`: two points, two circles/arcs (their centres, and equal radii) or two
@@ -2513,9 +2535,11 @@ fn move_point(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.move_point";
     let to = req_vec2(cmd, p, "to")?;
     let id = target_sketch(s, p, cmd)?;
+    let state = s.model.result(id).map(|r| r.state.clone());
+    let last = state.as_ref().and_then(|state| state.sketch(id));
     let (_, rep) = edit_solved(s, id, false, Analysis::Freedom, |sk, _| {
         let q = point_ref(sk, p.get("point"), cmd, "point")?;
-        Ok(((), drag_entity(sk, Ent::Point(q), &[], to, to, false).1.solve_again()))
+        Ok(((), drag_entity(sk, Ent::Point(q), &[], to, to, false, last).1.solve_again()))
     })?;
     Ok(json!({"sketch": rep.as_ref().map(report_json)}))
 }
@@ -2538,7 +2562,8 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
     };
     let id = target_sketch(s, p, cmd)?;
     // The sketch's report as last evaluated: a live frame keeps its degrees of freedom.
-    let last = s.model.result(id).and_then(|r| r.state.sketch(id)).map(|ss| ss.report.clone());
+    let state = s.model.result(id).map(|r| r.state.clone());
+    let last = state.as_ref().and_then(|state| state.sketch(id));
     let analysis = if live { Analysis::Full } else { Analysis::Freedom };
     let (d, rep) = edit_solved(s, id, false, analysis, |sk, doc| {
         let r = p.get("entity").and_then(Value::as_str).ok_or_else(|| bad(cmd, "`entity` must be a sketch point or curve"))?;
@@ -2565,7 +2590,7 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
         }
         // The held solves work on the dimensions' current values (a solved step applies them).
         doc.apply_dimension_values(&doc.param_values().0, sk)?;
-        let (d, left) = drag_entity(sk, e, &with, from, to, live);
+        let (d, left) = drag_entity(sk, e, &with, from, to, live, last);
         // A live frame's held solve is its only one; otherwise the sketch's own solve reports
         // its degrees of freedom.
         Ok((d, if live && last.is_some() { left } else { left.solve_again() }))
@@ -2574,7 +2599,7 @@ fn drag_frame(s: &mut Session, p: &Value, live: bool) -> Result<(Value, Option<c
     // average displacement of their moving points, as before.
     let sk = s.doc.sketch(id)?;
     let at = d.at(sk, from);
-    let rep = rep.or_else(|| last.map(|last| SolveReport { status: solidcraft_sketch::SolveStatus::Solved, failing: Vec::new(), ..last }));
+    let rep = rep.or_else(|| last.map(|ss| SolveReport { status: solidcraft_sketch::SolveStatus::Solved, failing: Vec::new(), ..ss.report.clone() }));
     let out = json!({"sketch": rep.as_ref().map(report_json), "reached": d.reached, "at": [at.x, at.y], "retry": d.retry});
     Ok((out, rep.filter(|_| live).map(|report| crate::LiveEdit { sketch: id, report })))
 }

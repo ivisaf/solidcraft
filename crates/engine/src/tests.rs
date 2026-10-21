@@ -1785,6 +1785,23 @@ fn checkpoint_restores_with_a_full_undo_history() {
     assert!(s.execute("edit.restore_checkpoint", &json!({"checkpoint": id})).is_err());
 }
 
+/// Regression (#3242): `file.new` replaced the session and its checkpoints with it, so a
+/// batch that failed after `file.new` could not go back to the design it began in.
+#[test]
+fn a_checkpoint_survives_file_new() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 1.0, "width": 1.0, "height": 1.0}));
+    let id = run(&mut s, "edit.checkpoint", json!({}))["checkpoint"].as_u64().unwrap();
+    run(&mut s, "file.new", json!({"name": "Replacement"}));
+    run(&mut s, "solid.box", json!({"length": 2.0, "width": 2.0, "height": 2.0}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(8.0));
+    run(&mut s, "edit.restore_checkpoint", json!({"checkpoint": id}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(1.0));
+    // The undo history is the restored design's own: one step back is the empty design.
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(run(&mut s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64(), Some(0.0));
+}
+
 #[test]
 fn components_occurrences_and_world_placement() {
     let mut s = Session::default();
@@ -3013,6 +3030,40 @@ fn shell_directions_and_tangent_chain() {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
     assert!(s.execute("solid.shell", &json!({"faces": [[20, 15, 20]], "thickness": 2, "direction": "sideways"})).is_err());
+}
+
+/// #209: selecting a tangent chain must explain why no shell can remain.
+#[test]
+fn shell_tangent_chain_that_opens_every_face_explains_how_to_keep_walls() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 60}));
+    run(
+        &mut s,
+        "solid.fillet",
+        json!({
+            "edges": [[0,0,30], [40,0,30], [40,30,30], [0,30,30],
+                      [20,0,60], [20,30,60], [0,15,60], [40,15,60],
+                      [20,0,0], [20,30,0], [0,15,0], [40,15,0]],
+            "radius": 1.5
+        }),
+    );
+    let before = s.doc.to_json();
+    for direction in ["inside", "outside", "both"] {
+        let error = s
+            .execute(
+                "solid.shell",
+                &json!({
+                    "faces": [[20,0,30]], "thickness": 2, "tangent_chain": true, "direction": direction
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Tangent Chain") && error.contains("every face") && error.contains("turn off"), "{direction}: {error}");
+        assert_eq!(s.doc.to_json(), before, "a refused shell must preserve the design");
+    }
+    run(&mut s, "solid.shell", json!({"faces": [[20,0,30]], "thickness": 2, "tangent_chain": false}));
+    assert!((volume(&mut s) - 15_305.28).abs() < 0.1);
+    assert_eq!(s.model.state().bodies.len(), 1);
 }
 
 /// Hole To Object (a face it meets, or a point) and holes at every point of a sketch.

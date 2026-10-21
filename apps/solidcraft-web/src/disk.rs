@@ -59,6 +59,34 @@ pub fn make_id(ms: u64, random: u64) -> String {
     format!("{ms:x}-{random:x}")
 }
 
+/// How long a remembered file may go unused, and unreferenced by the recent designs and the
+/// autosave, before the browser's copy of its handle is dropped.
+pub const HANDLE_MAX_AGE_MS: f64 = 90.0 * 24.0 * 3600.0 * 1000.0;
+
+/// What to do with the remembered handles.
+#[derive(Debug, Default, PartialEq)]
+pub struct PrunePlan {
+    /// Handles to forget.
+    pub delete: Vec<String>,
+    /// Handles seen unused for the first time: start their clock.
+    pub stamp: Vec<String>,
+}
+
+/// Decide which of the remembered handles `ids` (id, when it was last stamped) to forget: those
+/// that no recent design or autosave (`keep`) names and that have gone unused for `max_age`. One
+/// never stamped starts its clock now, so a file another tab has just saved is never dropped.
+pub fn plan_prune(ids: &[(String, Option<f64>)], keep: &std::collections::HashSet<String>, now: f64, max_age: f64) -> PrunePlan {
+    let mut plan = PrunePlan::default();
+    for (id, stamped) in ids.iter().filter(|(id, _)| !keep.contains(id)) {
+        match stamped {
+            None => plan.stamp.push(id.clone()),
+            Some(at) if now - at > max_age => plan.delete.push(id.clone()),
+            Some(_) => {}
+        }
+    }
+    plan
+}
+
 /// Where a design saved with Save As goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaveTarget {
@@ -112,7 +140,7 @@ mod web {
     use wasm_bindgen_futures::{JsFuture, spawn_local};
     use web_sys::{FileSystemFileHandle, IdbDatabase, IdbObjectStore, IdbOpenDbRequest, IdbRequest, IdbTransactionMode};
 
-    use super::{is_abort, make_id, opens_design, parse, path, save_type};
+    use super::{HANDLE_MAX_AGE_MS, is_abort, make_id, opens_design, parse, path, plan_prune, save_type};
     use crate::files::{Files, err, read_handle};
 
     const DB: &str = "solidcraft-disk-handles";
@@ -397,10 +425,106 @@ mod web {
         db.transaction_with_str_and_mode(STORE, mode).map_err(err)?.object_store(STORE).map_err(err)
     }
 
+    /// Key of the time a handle was last used (the handle's own key is its id).
+    fn stamp_key(id: &str) -> String {
+        format!("at:{id}")
+    }
+
     async fn remember(id: &str, handle: &FileSystemFileHandle) -> Result<(), String> {
         let db = open_db().await?;
-        let req = store(&db, IdbTransactionMode::Readwrite)?.put_with_key(handle, &id.into()).map_err(err)?;
-        result(&req).await.map(|_| ())
+        let store = store(&db, IdbTransactionMode::Readwrite)?;
+        result(&store.put_with_key(handle, &id.into()).map_err(err)?).await?;
+        result(&store.put_with_key(&js_sys::Date::now().into(), &stamp_key(id).into()).map_err(err)?).await.map(|_| ())
+    }
+
+    /// Note that the file was used now.
+    async fn touch(id: &str) {
+        let Ok(db) = open_db().await else { return };
+        if let Ok(store) = store(&db, IdbTransactionMode::Readwrite)
+            && let Ok(req) = store.put_with_key(&js_sys::Date::now().into(), &stamp_key(id).into())
+        {
+            let _ = result(&req).await;
+        }
+    }
+
+    /// The ids of every remembered file.
+    pub async fn known_ids() -> Result<Vec<String>, String> {
+        let db = open_db().await?;
+        let req = store(&db, IdbTransactionMode::Readonly)?.get_all_keys().map_err(err)?;
+        let keys: Array = result(&req).await?.dyn_into().map_err(|_| "no keys".to_string())?;
+        Ok(keys.iter().filter_map(|k| k.as_string()).filter(|k| !k.starts_with("at:")).collect())
+    }
+
+    async fn forget(ids: &[String]) -> Result<(), String> {
+        let db = open_db().await?;
+        let store = store(&db, IdbTransactionMode::Readwrite)?;
+        for id in ids {
+            result(&store.delete(&id.as_str().into()).map_err(err)?).await?;
+            result(&store.delete(&stamp_key(id).into()).map_err(err)?).await?;
+            HANDLES.with(|h| h.borrow_mut().remove(id));
+        }
+        Ok(())
+    }
+
+    /// Forget the remembered files nothing refers to any more (`keep`: the ids the recent designs
+    /// and the autosave name), once they have gone unused for a long while.
+    pub fn prune(keep: std::collections::HashSet<String>) {
+        spawn_local(async move {
+            let r = async {
+                // A transaction ends when the page awaits anything but its own requests, so each
+                // step opens its own.
+                let known = known_ids().await?;
+                let db = open_db().await?;
+                let reading = store(&db, IdbTransactionMode::Readonly)?;
+                let mut ids = Vec::new();
+                for id in known {
+                    let at = result(&reading.get(&stamp_key(&id).into()).map_err(err)?).await?.as_f64();
+                    ids.push((id, at));
+                }
+                let plan = plan_prune(&ids, &keep, js_sys::Date::now(), HANDLE_MAX_AGE_MS);
+                for id in &plan.stamp {
+                    touch(id).await;
+                }
+                forget(&plan.delete).await
+            };
+            if let Err(e) = r.await {
+                log::warn!("remembered files weren't tidied: {e}");
+            }
+        });
+    }
+
+    /// Open a design remembered from an earlier session (a recent one, after a reload): ask once
+    /// for access to the file (call in the click), read it into the engine's files and queue it
+    /// to open. A file that is gone is forgotten and dropped from the recent designs.
+    pub fn restore(files: &Rc<Files>, path: &str) {
+        let Some((id, name)) = parse(path) else { return };
+        let (files, path, id, name) = (files.clone(), path.to_string(), id.to_string(), name.to_string());
+        spawn_local(async move {
+            let r = async {
+                let handle = handle_for(&id).await?;
+                ensure_readwrite(&handle).await?;
+                read_handle(&handle).await
+            };
+            match r.await {
+                Ok(bytes) => {
+                    vfs::insert(&path, bytes);
+                    files.opened.borrow_mut().push(path);
+                    files.wake();
+                    touch(&id).await;
+                }
+                Err(e) => {
+                    let gone = e.contains("NotFoundError") || e.contains("could not be found") || e.contains("no longer remembers");
+                    if gone {
+                        let _ = forget(std::slice::from_ref(&id)).await;
+                        files.disk_known.borrow_mut().remove(&id);
+                        files.gone.borrow_mut().push(path);
+                        files.say(format!("{name} isn't where it was saved any more"), true);
+                    } else {
+                        files.say(format!("{name}: {e}"), true);
+                    }
+                }
+            }
+        });
     }
 
     async fn recall(id: &str) -> Result<Option<JsValue>, String> {
@@ -453,6 +577,22 @@ mod tests {
         assert_eq!(route("/disk/18f-2a/Bracket.solidcraft"), WriteTo::Disk);
         assert_eq!(route("/downloads/part.step"), WriteTo::Download);
         assert_eq!(route("/upload/part.step"), WriteTo::Memory);
+    }
+
+    #[test]
+    fn only_unreferenced_handles_unused_for_long_are_forgotten() {
+        let keep: std::collections::HashSet<String> = ["recent".to_string()].into();
+        let day = 24.0 * 3600.0 * 1000.0;
+        let now = 1000.0 * day;
+        let ids = vec![
+            ("recent".to_string(), Some(now - 200.0 * day)),
+            ("old".to_string(), Some(now - 100.0 * day)),
+            ("fresh".to_string(), Some(now - 5.0 * day)),
+            ("unstamped".to_string(), None),
+        ];
+        let plan = plan_prune(&ids, &keep, now, HANDLE_MAX_AGE_MS);
+        assert_eq!(plan, PrunePlan { delete: vec!["old".to_string()], stamp: vec!["unstamped".to_string()] });
+        assert_eq!(plan_prune(&[], &keep, now, HANDLE_MAX_AGE_MS), PrunePlan::default());
     }
 
     #[test]

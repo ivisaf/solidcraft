@@ -279,6 +279,17 @@ pub(crate) fn primary_button(ui: &mut Ui, label: &str) -> Response {
     response
 }
 
+/// Accent action across the full width of its container, for the bottom of a panel. Tokens:
+/// `form_primary, on_accent, form_button_height, font_label`.
+pub(crate) fn wide_primary_button(ui: &mut Ui, label: &str) -> Response {
+    let t = Tokens::get();
+    let text = RichText::new(crate::i18n::tr_label(label)).size(t.font_label).color(t.on_accent);
+    let size = vec2(ui.available_width(), t.form_button_height);
+    let response = ui.add(egui::Button::new(crate::fonts::RichTextExt::bold_face(text)).fill(t.form_primary).min_size(size));
+    pointer_on_hover(ui, &response);
+    response
+}
+
 #[cfg(test)]
 #[path = "actions_tests.rs"]
 mod tests;

@@ -30,6 +30,11 @@ Changes:
   With no direction to go by, the edge goes where both of its ends are in one wire.
 - `transversal/divide_face/mod.rs`: a face piece whose wire is not simple makes the operation
   give up (`Face::try_new`) instead of panicking.
+- `transversal/divide_face/mod.rs`: a loop whose polygon in the face's parameters has no area
+  (a small hole's rim divided at the tolerance of a much larger operand: one chord per half
+  circle) is divided again, finer, before its area's sign tells a hole from a face piece. The
+  sign of a zero area was random: the hole became a face of its own, inside out, and the face it
+  was cut in stayed whole.
 - `lib.rs`: `tr!` reports where an operation gives up when `SHAPEOPS_TRACE` is set; compiler
   warnings no longer fail the build.
 - Face and edge history (`transversal/history.rs`, new): `and_with_history` / `or_with_history`

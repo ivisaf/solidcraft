@@ -12,7 +12,7 @@ use solidcraft_engine::view::{GridPlane, colors, grid_plane, grid_step, sketch_l
 use std::hash::{Hash, Hasher};
 
 use crate::gpu::{Frame, GpuScene, GpuTarget, SceneSlot, ViewportCallback};
-use crate::navigation::{CameraInput, NavCaps, OrbitSnap, orbit_drag};
+use crate::navigation::{CameraInput, NavCaps, orbit_drag};
 use crate::selection::{BoxSel, origin_quads, origin_size, ray_quad};
 use crate::theme::Tokens;
 use crate::{SolveApp, icons};
@@ -45,6 +45,8 @@ pub enum NavMode {
 
 #[derive(Default)]
 pub struct ViewportState {
+    /// The arrow turning the view that is still down (`navigation::step_key_hold`).
+    pub(crate) key_hold: Option<crate::navigation::KeyHold>,
     /// A two-point drawing tool's first point was placed by a press (here) that became a drag:
     /// the release places the second (#1630), unless it lands within [`DRAW_DRAG_MIN`] of the
     /// press. Such a drag was a click that moved on the way (#2448): the release places the
@@ -130,8 +132,6 @@ pub struct ViewportState {
     pub axis_drag: Option<Pos2>,
     /// Unsnapped camera while Shift-orbit previews a standard or diagonal view.
     pub orbit_free: Option<Camera>,
-    /// Spring toward the chosen orientation, including after the drag ends.
-    pub(crate) orbit_snap: Option<OrbitSnap>,
     pub build_ms: f64,
     /// Adaptive supersampling (#1288): the view drawn last (its view-projection and pixels) and
     /// since when it has held still (app time, s).
@@ -1176,6 +1176,7 @@ pub(crate) fn pick_cached(app: &mut SolveApp, proj: &Proj, pos: Pos2) -> Vec<Hit
     app.dialog.as_ref().and_then(|d| d.active_input()).map(|i| i.accept).hash(&mut h);
     app.session.visibility.hidden_bodies.hash(&mut h);
     app.session.visibility.hidden_occurrences.hash(&mut h);
+    origin_point_shown(app).hash(&mut h);
     app.perspective_view().hash(&mut h);
     (proj.rect.width().to_bits(), proj.rect.height().to_bits()).hash(&mut h);
     crate::sketch_display::projection_key(proj, app.viewport.pixels_per_point()).hash(&mut h);
@@ -1414,6 +1415,16 @@ fn pick_hits(app: &SolveApp, proj: &Proj, pos: Pos2, other_sketch_points: bool, 
             if dd < 6.0 && beste.wants(dd) && visible(ray_segment_closest(o, d, *p0, *p1)) {
                 beste.offer(dd, Hit::Edge { body: b.name.clone(), index: ei, mid: polyline_mid(e) });
             }
+        }
+    }
+    // The origin point, for an input that takes it: a vertex of no body, drawn over everything.
+    if app.dialog.as_ref().and_then(|d| d.active_input()).is_some_and(|i| i.accept & crate::selection::ORIGIN != 0)
+        && origin_point_shown(app)
+        && let Some(sp) = proj.to_screen(Vec3::ZERO)
+    {
+        let dd = sp.distance(pos);
+        if dd < 7.0 && bestv.wants(dd) {
+            bestv.offer(dd, Hit::Vertex { body: String::new(), point: Vec3::ZERO });
         }
     }
     hits.extend(bestv.hits());
@@ -2418,9 +2429,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
         || (primary_nav.is_some() && primary_down)
         || mode.is_some()
         || app.viewport.axis_drag.is_some()
-        || app.viewport.spin
-        || app.viewport.orbit_snap.is_some()
-        || app.cam_anim.is_some();
+        || app.viewport.spin;
     let hits = hover.filter(|_| inside && app.viewport.boxsel.is_none() && !navigating).map(|p| pick_cached(app, &proj, p)).unwrap_or_default();
     // The Fillet and Chamfer window resolves its own corners: the nearest sketch point to a
     // corner drawn from the origin is the fixed origin, which ends no two curves.
@@ -2979,6 +2988,7 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
     crate::select_other::show(app, ui.ctx());
     axis_view(app, ui, rect);
     nav_bar(app, ui, rect);
+    agent_chip(app, ui, rect);
     transient_messages(app, ui, rect);
 }
 
@@ -2999,6 +3009,38 @@ fn paint_box_selection(painter: &egui::Painter, bx: BoxSel, sketch: bool) {
         }
     } else {
         painter.rect_stroke(bx.rect, 0.0, Stroke::new(1.2, col), egui::StrokeKind::Inside);
+    }
+}
+
+/// An agent's command computing off the window thread (#1989): which one, in the agent cursor's
+/// colour, and a button that stops waiting for it.
+fn agent_chip(app: &mut SolveApp, ui: &egui::Ui, rect: Rect) {
+    let t = Tokens::get();
+    let painter = ui.painter().clone();
+    if let Some((since, label)) = app.agent_computing().map(|(since, label)| (since, label.to_string())) {
+        let seconds = ((crate::now_ms() - since) / 1000.0).floor().max(0.0);
+        let computing = crate::i18n::format("dialog.computing", &[("seconds", &format!("{seconds:.0}"))]);
+        let above = if app.computing_since().is_some() { 106.0 } else { 76.0 };
+        let pos = pos2(rect.left() + 12.0, rect.bottom() - above);
+        let galley = painter.layout_no_wrap(format!("{label} · {computing}"), FontId::proportional(t.font_label), t.text);
+        let stop = painter.layout_no_wrap(crate::i18n::tr("ui.agent_chat_stop").to_string(), FontId::proportional(t.font_label), t.text);
+        let r = Rect::from_min_size(pos, vec2(galley.size().x + stop.size().x + 54.0, galley.size().y.max(stop.size().y) + 8.0));
+        painter.rect_filled(r, 4.0, t.overlay);
+        painter.rect_stroke(r, 4.0, Stroke::new(1.0, crate::icons::pointer::agent()), egui::StrokeKind::Inside);
+        egui::Spinner::new()
+            .color(crate::icons::pointer::agent())
+            .size(t.space_12)
+            .paint_at(ui, Rect::from_center_size(pos2(r.left() + 13.0, r.center().y), vec2(12.0, 12.0)));
+        painter.galley(pos + vec2(26.0, 4.0), galley.clone(), t.text);
+        let button = Rect::from_min_size(pos2(pos.x + galley.size().x + 34.0, r.top() + 2.0), vec2(stop.size().x + 12.0, r.height() - 4.0));
+        let clicked = ui.interact(button, egui::Id::new("sc_agent_stop"), Sense::click());
+        painter.rect_filled(button, 3.0, if clicked.hovered() { t.hover } else { t.overlay });
+        painter.galley(button.min + vec2(6.0, 2.0), stop, t.text);
+        crate::scenario::publish_handle("agent:stop", button.center());
+        if clicked.clicked() {
+            app.stop_agent_command();
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
 
@@ -3368,11 +3410,15 @@ fn box_select(app: &mut SolveApp, proj: &Proj, bx: BoxSel, add: bool) {
     let _ = app.run("select.set", json!({"items": items, "add": add}));
 }
 
+/// Whether the origin point is drawn (the Origin shown and its point not hidden).
+fn origin_point_shown(app: &SolveApp) -> bool {
+    app.origin_visible() && !app.session.visibility.hidden_origin.iter().any(|h| h == "O")
+}
+
 /// Screen-space dots: the origin point, and hovered or selected body vertices.
 fn points_2d(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let t = Tokens::get();
-    if app.origin_visible()
-        && !app.session.visibility.hidden_origin.iter().any(|h| h == "O")
+    if origin_point_shown(app)
         && let Some(o) = proj.to_screen(Vec3::ZERO)
     {
         painter.circle(o, 4.5, t.origin_point, Stroke::new(1.0, Color32::from_gray(110)));
@@ -3706,14 +3752,7 @@ fn signed_axis_view(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect) {
             if frame.z.abs() > 0.5 {
                 to.yaw = nearest_quarter_turn(app.cam.yaw);
             }
-            if app.preferences.look_at_anim {
-                app.cancel_view_animation();
-                app.viewport.orbit_free = None;
-                app.viewport.orbit_snap = Some(OrbitSnap { target: to, yaw_velocity: 0.0, pitch_velocity: 0.0, pivot: None });
-                ui.ctx().request_repaint();
-            } else {
-                app.animate_to(to);
-            }
+            app.animate_to(to);
         }
     }
     let home = Rect::from_center_size(pos2(c.x - 37.0, c.y - 37.0), vec2(18.0, 18.0));
@@ -5230,14 +5269,6 @@ mod tests {
         app.viewport.spin = false;
         hover_frame(&mut app, &ctx, vec![]);
         assert!(app.viewport.hover.is_some());
-        app.cam_anim = Some(solidcraft_engine::render::CameraAnim::new(app.cam, app.cam, 0.0));
-        for _ in 0..3 {
-            hover_frame(&mut app, &ctx, vec![]);
-            assert!(app.viewport.hover.is_none());
-        }
-        app.cam_anim = None;
-        hover_frame(&mut app, &ctx, vec![]);
-        assert!(app.viewport.hover.is_some());
     }
 
     /// After a close-up refines a body (#1320), the model draws it from the refined plan (on the
@@ -6210,17 +6241,13 @@ mod tests {
         let before = h.app.cam;
         for _ in 0..100 {
             orbit_drag(&mut h.app, rect, 2.0, 0.0, None, true, false);
-            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
-        }
-        for _ in 0..120 {
-            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
         }
         assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_2).abs() < 1e-6);
         assert_eq!(h.app.cam.target, before.target);
         assert_eq!(h.app.cam.distance, before.distance);
         orbit_drag(&mut h.app, rect, 0.0, 0.0, None, false, false);
-        h.settle();
         assert!((h.app.cam.yaw - 1.6).abs() < 1e-6);
+        h.frames(2);
         assert!(h.app.viewport.orbit_free.is_none());
     }
 
@@ -6241,49 +6268,33 @@ mod tests {
     }
 
     #[test]
-    fn camera_resets_cancel_pending_axis_motion() {
+    fn camera_resets_drop_the_unsnapped_orbit() {
         for reset in 0..3 {
             let mut h = crate::scenario::Harness::new();
             h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
             let rect = h.app.viewport.rect.unwrap();
             orbit_drag(&mut h.app, rect, 120.0, 40.0, None, true, false);
-            assert!(h.app.viewport.orbit_snap.is_some());
+            assert!(h.app.viewport.orbit_free.is_some());
             match reset {
                 0 => h.app.fit_view(),
                 1 => h.app.set_up_axis(solidcraft_engine::render::UpAxis::Y),
                 _ => crate::documents::new_design(&mut h.app),
             }
-            let before = h.app.cam;
-            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
-            assert_eq!(h.app.cam.yaw, before.yaw);
-            assert_eq!(h.app.cam.pitch, before.pitch);
-            assert_eq!(h.app.cam.target, before.target);
-            assert!(h.app.viewport.orbit_snap.is_none());
             assert!(h.app.viewport.orbit_free.is_none());
         }
     }
 
     #[test]
-    fn axis_snap_spring_eases_in_and_settles_at_each_frame_rate() {
-        for fps in [30, 60, 120] {
-            let mut h = crate::scenario::Harness::new();
-            h.call("ui.view", json!({"view":"front"}));
-            let rect = h.app.viewport.rect.unwrap();
-            orbit_drag(&mut h.app, rect, 120.0, 0.0, None, true, false);
-            assert_eq!(h.app.cam.yaw, 0.0, "choosing a diagonal must not jump the camera");
-            step_orbit_snap(&mut h.app, rect, 1.0 / f64::from(fps));
-            assert!(h.app.cam.yaw > 0.0 && h.app.cam.yaw < std::f64::consts::FRAC_PI_4 * 0.25);
-            for _ in 0..fps * 2 {
-                step_orbit_snap(&mut h.app, rect, 1.0 / f64::from(fps));
-                assert!(h.app.cam.yaw <= std::f64::consts::FRAC_PI_4 + 0.03, "elastic finish stays small");
-            }
-            assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_4).abs() < 1e-6);
-            assert!(h.app.viewport.orbit_snap.is_none());
-        }
+    fn axis_snap_is_applied_at_once() {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.view", json!({"view":"front"}));
+        let rect = h.app.viewport.rect.unwrap();
+        orbit_drag(&mut h.app, rect, 120.0, 0.0, None, true, false);
+        assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_4).abs() < 1e-6, "the snapped view shows in the same frame");
     }
 
-    /// The origin pivot holds through a Shift drag that snaps to an axis: the spring eases the
-    /// view round without letting the origin slide on screen.
+    /// The origin pivot holds through a Shift drag that snaps to an axis: the snapped
+    /// view turns without letting the origin slide on screen.
     #[test]
     fn snapping_keeps_the_origin_still() {
         let mut h = crate::scenario::Harness::new();
@@ -6293,15 +6304,9 @@ mod tests {
         let rect = h.app.viewport.rect.unwrap();
         let at = rect.center() + vec2(50.0, -20.0);
         orbit_drag(&mut h.app, rect, 0.0, 0.0, Some(at), true, true);
-        assert_eq!(
-            h.app.viewport.orbit_snap.as_ref().and_then(|s| s.pivot).map(|(p, _)| p),
-            Some(Vec3::ZERO),
-            "the origin is the pivot while snapping"
-        );
         let before = projection(&h.app, rect).to_screen(Vec3::ZERO).unwrap();
         for _ in 0..30 {
             orbit_drag(&mut h.app, rect, 4.0, 2.0, Some(at), true, true);
-            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
             let after = projection(&h.app, rect).to_screen(Vec3::ZERO).unwrap();
             assert!(after.distance(before) < 2.0, "{before:?} -> {after:?}");
         }
@@ -6399,7 +6404,6 @@ mod tests {
         let before = projection(&h.app, rect).to_screen(pivot).unwrap();
         for _ in 0..20 {
             orbit_drag(&mut h.app, rect, 4.0, 2.0, Some(at), true, true);
-            step_orbit_snap(&mut h.app, rect, 1.0 / 60.0);
             let after = projection(&h.app, rect).to_screen(pivot).unwrap();
             assert!(after.distance(before) < 2.0);
         }
@@ -6409,7 +6413,6 @@ mod tests {
         let before = h.app.cam;
         h.call("ui.drag", json!({"x0":800,"y0":500,"x1":1020,"y1":500,"button":"middle","shift":true,"steps":40}));
         assert!((h.app.cam.yaw - 1.76).abs() < 1e-6, "before={before:?}, after={:?}", h.app.cam);
-        assert!(h.app.viewport.orbit_snap.is_none());
         h.call("ui.view", json!({"view":"front"}));
         h.call("ui.drag", json!({"x0":800,"y0":500,"x1":850,"y1":520,"button":"middle"}));
         assert_eq!(h.app.cam.yaw, before.yaw);
@@ -6431,7 +6434,6 @@ mod tests {
             assert!((h.app.cam.pitch - expected.pitch).abs() < 1e-6, "{preset}: {:?}", h.app.cam);
             assert_eq!(h.app.cam.target, before.target);
             assert_eq!(h.app.cam.distance, before.distance);
-            assert!(h.app.viewport.orbit_snap.is_none());
             h.call("ui.view", json!({"view":"front"}));
             h.call("ui.drag", json!({"x0":800,"y0":500,"x1":1020,"y1":500,"button":"right","shift":true,"steps":40}));
             assert!((h.app.cam.yaw - std::f64::consts::FRAC_PI_2).abs() < 1e-6, "{preset}: {:?}", h.app.cam);

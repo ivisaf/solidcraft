@@ -11,8 +11,12 @@ use solidcraft_engine::command_specs;
 use crate::SolveApp;
 use crate::ui_kit;
 
+/// Repeats the last tool or dialog started (`SolveApp::repeat_last`, #3045).
+pub const REPEAT_KEY: &str = "Shift+R";
+
 /// Keys the application handles before any command shortcut.
 pub const RESERVED: &[&str] = &[
+    REPEAT_KEY,
     "Escape",
     "S",
     "V",
@@ -112,11 +116,11 @@ pub fn command_for(app: &SolveApp, key: &str) -> Option<&'static str> {
 /// starts in the new sketch.
 pub fn press(app: &mut SolveApp, key: &str) {
     if let Some(id) = command_for(app, key) {
-        app.start(id);
+        app.start(app.preferences.sketch_variants.resolve(id));
     } else if let Some(id) = sketch_tool_for(app, key) {
         app.start("sketch.create");
         if let Some(d) = app.dialog.as_mut().filter(|d| matches!(d.kind, crate::dialogs::Kind::Sketch)) {
-            d.then_start = Some(id);
+            d.then_start = Some(app.preferences.sketch_variants.resolve(id));
         }
     }
 }
@@ -378,6 +382,33 @@ mod tests {
         reset(&mut b, None);
         assert_eq!(effective(&b, "solid.move").as_deref(), Some("M"));
         assert_eq!(key_name(egui::Key::K, egui::Modifiers { ctrl: true, shift: true, ..Default::default() }), "Ctrl+Shift+K");
+    }
+
+    /// #3045: Shift+R starts the last tool again (here a sketch's Line after Escape put it
+    /// down), R alone is still the rectangle; the menus show the key on Repeat, and no command
+    /// can take it.
+    #[test]
+    fn shift_r_repeats_the_last_tool() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.frames(2);
+        h.step(&json!({"start": "sketch.line"})).unwrap();
+        h.step(&json!({"key": "Escape"})).unwrap();
+        h.frames(1);
+        assert!(h.app.tool.is_none());
+        h.step(&json!({"key": "R", "shift": true})).unwrap();
+        h.frames(1);
+        assert_eq!(h.app.tool.as_ref().map(|t| t.cmd.to_string()).as_deref(), Some("sketch.line"), "Shift+R starts Line again");
+        h.step(&json!({"key": "Escape"})).unwrap();
+        h.step(&json!({"key": "R"})).unwrap();
+        h.frames(1);
+        let rectangle = h.app.tool.as_ref().map(|t| t.cmd.to_string()).unwrap_or_default();
+        assert!(rectangle.starts_with("sketch.rectangle"), "R alone: {rectangle}");
+        let repeat = crate::context_menu::radial_items(&h.app).into_iter().find(|i| i.id == "ui.repeat").unwrap();
+        assert_eq!(repeat.shortcut, REPEAT_KEY);
+        let mut a = app();
+        assert!(bind(&mut a, "solid.extrude", REPEAT_KEY, true).is_err(), "Shift+R is the app's");
     }
 }
 

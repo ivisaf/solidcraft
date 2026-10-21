@@ -91,6 +91,8 @@ pub struct TreeState {
     /// A Section Analysis hidden with its eye in the Analysis folder: its plane (origin,
     /// normal), so the eye can bring it back (#822).
     pub hidden_section: Option<(solidcraft_engine::geom::Vec3, solidcraft_engine::geom::Vec3)>,
+    /// What the Section Analysis dialog's OK last made, for Edit to start from.
+    pub section_dialog: Option<crate::dialogs::SectionDraft>,
     /// The Analysis folder hidden with its own eye, and the Section Analysis hidden with its
     /// own: the section shows only while neither is, and each eye keeps its state.
     pub analysis_hidden: bool,
@@ -428,9 +430,19 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
         if row.selected { crate::theme::TabAccent::current(ui.ctx()).ink } else { row.color.unwrap_or(if row.dim { t.text_dim } else { t.text }) };
     let label_display = if row.name { crate::i18n::tr_name(row.label) } else { crate::i18n::tr_dyn(row.label) };
     let font = if row.selected { crate::fonts::semibold(t.font_label) } else { FontId::proportional(t.font_label) };
-    let galley = ui.painter().layout_no_wrap(label_display, font, col);
+    // The label stops before the badges and the card's edge; a longer name ends in an ellipsis
+    // and its full text is in the tooltip.
+    let badges_width = row.badges.len() as f32 * 15.0;
+    let room = (r.right() - 4.0 - badges_width - x).max(0.0);
+    let mut job = egui::text::LayoutJob::simple(label_display.to_string(), font, col, room);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('\u{2026}');
+    let galley = ui.painter().layout_job(job);
     let lw = galley.size().x;
-    ui.painter().galley(pos2(x, cy - galley.size().y / 2.0), galley, col);
+    let elided = galley.elided;
+    crate::scenario::publish_rect(&format!("row_label:{}", row.label), Rect::from_min_size(pos2(x, cy - galley.size().y / 2.0), galley.size()));
+    ui.painter().with_clip_rect(ui.painter().clip_rect().intersect(r)).galley(pos2(x, cy - galley.size().y / 2.0), galley, col);
     let mut bx = (x + lw + 6.0).min(r.right() - 16.0);
     for b in row.badges {
         let br = Rect::from_center_size(pos2(bx + 6.0, cy), vec2(12.0, 12.0));
@@ -446,6 +458,7 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     };
     let resp = match tip {
         Some(t) => resp.on_hover_text(t),
+        None if elided => resp.on_hover_text(label_display.to_string()),
         None => resp,
     };
     out.on_control = press_on != 0;
@@ -1238,7 +1251,7 @@ fn origin_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &Actio
         let sel = match icon {
             "plane" => Some(Sel::Plane { name: k.into() }),
             "axis" => Some(Sel::Axis { name: k.into() }),
-            _ => None,
+            _ => Some(Sel::Vertex { body: String::new(), point: solidcraft_engine::geom::Vec3::ZERO }),
         };
         let (selected, mark) = lit_row(lit(&thing));
         let r = draw_row(
@@ -1391,7 +1404,7 @@ fn analysis_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize, acts: &mut
         set_section_shown(app, !section_shown);
     }
     if r.double {
-        app.start("inspect.section");
+        crate::dialogs::edit_section(app);
     }
     if let Some(p) = r.secondary {
         acts.menu = Some((p, Target::Section));
@@ -1558,6 +1571,8 @@ fn pick_from_browser(app: &mut SolveApp, x: Sel) {
     let hit = match &x {
         Sel::Plane { name } => crate::viewport::Hit::Plane { name: name.clone(), point: solidcraft_engine::geom::Vec3::ZERO },
         Sel::Axis { name } => crate::viewport::Hit::Axis { name: name.clone() },
+        // The origin point goes only into a dialog input that takes it.
+        Sel::Vertex { body, point } if body.is_empty() && app.dialog.is_some() => crate::viewport::Hit::Vertex { body: String::new(), point: *point },
         _ => return,
     };
     if let Some(mut d) = app.dialog.take() {

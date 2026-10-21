@@ -504,11 +504,42 @@ impl Mesh {
         if self.smooth_seam(e, cos) {
             return chain;
         }
+        // The edges by the grid cell of each end, so each step looks only at the edges that end
+        // near it (#3745: scanning every edge for every edge of a long helical chain held a hover
+        // for seconds). Cells are twice the join tolerance: two ends within it share a cell or
+        // touch neighbouring ones.
+        let cell = tol * 2.0;
+        let key = |p: Vec3| [(p.x / cell).floor() as i64, (p.y / cell).floor() as i64, (p.z / cell).floor() as i64];
+        let mut at_end: std::collections::HashMap<[i64; 3], Vec<usize>> = std::collections::HashMap::new();
+        for (i, p) in self.edges.iter().enumerate() {
+            for q in [p.first(), p.last()].into_iter().flatten().filter(|q| q.is_finite()) {
+                let slot = at_end.entry(key(*q)).or_default();
+                if slot.last() != Some(&i) {
+                    slot.push(i);
+                }
+            }
+        }
+        let mut in_chain: std::collections::HashSet<usize> = chain.iter().copied().collect();
         let mut todo = vec![e];
         while let Some(cur) = todo.pop() {
             let Some(ce) = ends(cur) else { continue };
-            for (i, _) in self.edges.iter().enumerate() {
-                if chain.contains(&i) || !self.edge_pickable(i) || self.smooth_seam(i, cos) {
+            // The edges with an end near one of `cur`'s, in edge order (as a scan of every edge
+            // meets them).
+            let mut near: Vec<usize> = Vec::new();
+            for (p, _) in &ce {
+                let [x, y, z] = key(*p);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            near.extend(at_end.get(&[x + dx, y + dy, z + dz]).into_iter().flatten());
+                        }
+                    }
+                }
+            }
+            near.sort_unstable();
+            near.dedup();
+            for i in near {
+                if in_chain.contains(&i) || !self.edge_pickable(i) || self.smooth_seam(i, cos) {
                     continue;
                 }
                 let Some(ne) = ends(i) else { continue };
@@ -516,6 +547,7 @@ impl Mesh {
                 let smooth = ce.iter().any(|(p, d)| ne.iter().any(|(q, dn)| p.dist(*q) < tol && d.dot(-*dn) > cos));
                 if smooth && chain.len() < 10_000 {
                     chain.push(i);
+                    in_chain.insert(i);
                     todo.push(i);
                 }
             }

@@ -125,7 +125,33 @@ impl Path {
 ///
 /// `live`: one frame of an interactive drag, whose held solves and cursor correction share
 /// one frame's work budget ([`Budget::frame`]); otherwise each has a solve's own.
-pub(super) fn drag_entity(sk: &mut Sketch, e: Ent, with: &[Ent], from: Vec2, to: Vec2, live: bool) -> (Dragged, Left) {
+///
+/// `solved`: the sketch as last evaluated. When it is unchanged and solved, a grabbed entity it
+/// determined is not dragged.
+pub(super) fn drag_entity(
+    sk: &mut Sketch,
+    e: Ent,
+    with: &[Ent],
+    from: Vec2,
+    to: Vec2,
+    live: bool,
+    solved: Option<&solidcraft_doc::SolvedSketch>,
+) -> (Dragged, Left) {
+    // An unchanged, solved entity with no freedom cannot follow a drag. Holding it at a
+    // different position only makes its constraints conflict, and a large pattern would spend
+    // minutes trying dense solves before returning to the same geometry (#2006).
+    if solved.is_some_and(|ss| {
+        ss.report.ok()
+            && ss.sketch == *sk
+            && match e {
+                Ent::Point(q) => ss.report.point_determined.get(q),
+                Ent::Curve(c) => ss.report.curve_determined.get(c),
+            }
+            .copied()
+            .unwrap_or(false)
+    }) {
+        return (Dragged::default(), Left::Solved);
+    }
     let Some((path, hold, n, short)) = prepare(sk, e, with, from, to) else {
         return (Dragged::default(), Left::Unsolved);
     };

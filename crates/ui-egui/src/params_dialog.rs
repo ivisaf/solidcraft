@@ -634,11 +634,12 @@ pub(crate) fn suggestions_for(ctx: &egui::Context, word: &str, explicit: bool) -
         return Vec::new();
     }
     let w = word.to_ascii_lowercase();
-    all.iter()
-        .filter(|s| s.text.to_ascii_lowercase().starts_with(&w) && (explicit || s.text.trim_end_matches('(') != word))
-        .take(8)
-        .cloned()
-        .collect()
+    let offered = |s: &&Suggestion| explicit || s.text.trim_end_matches('(') != word;
+    let starts = |s: &&Suggestion| s.text.to_ascii_lowercase().starts_with(&w);
+    // A parameter is also offered for a word anywhere in its name (`side` finds
+    // `cab_side_thickness`, #2757), after the names that start with it.
+    let within = |s: &&Suggestion| s.kind == "parameter" && !starts(s) && s.text.to_ascii_lowercase().contains(&w);
+    all.iter().filter(|s| starts(s) && offered(s)).chain(all.iter().filter(|s| within(s) && offered(s))).take(8).cloned().collect()
 }
 
 /// Offer keyboard and pointer completions under a focused expression box.
@@ -670,6 +671,22 @@ mod tests {
         assert!(r.iter().any(|x| x.name == "width" && x.source == "user"));
         assert!(check(&mut app, "width / 2", "mm").is_ok());
         assert!(check(&mut app, "width + 1 deg", "mm").is_err());
+    }
+
+    /// #2757: typing part of a parameter's name offers it, not only its start; names that start
+    /// with the word come first, and functions still match from the start.
+    #[test]
+    fn a_parameter_is_offered_for_any_part_of_its_name() {
+        let ctx = egui::Context::default();
+        let mut app = SolveApp::new(solidcraft_engine::Session::default(), Default::default());
+        for (name, e) in [("cab_side_thickness", "18 mm"), ("sides", "4")] {
+            let _ = app.run("parameters.add", json!({"name": name, "expression": e}));
+        }
+        publish(&mut app, &ctx);
+        let texts = |w: &str| suggestions(&ctx, w).into_iter().map(|s| s.text).collect::<Vec<_>>();
+        assert_eq!(texts("side"), ["sides", "cab_side_thickness"]);
+        assert_eq!(texts("Thick"), ["cab_side_thickness"]);
+        assert!(!texts("in").iter().any(|t| t == "sin("), "functions match from the start");
     }
 
     /// A favourite is listed twice, under Favorites and in its own table; typing into either of its
