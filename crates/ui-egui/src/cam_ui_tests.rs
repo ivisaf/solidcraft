@@ -650,7 +650,7 @@ fn a_form_marks_what_it_still_needs_and_ok_waits_for_it() {
 fn missing_rows_follow_the_form() {
     let tools = vec![("1".to_string(), "T1  D6 flat".to_string())];
     let data = vec![("1".to_string(), ToolData { diameter: 6.0, flutes: 2, ..ToolData::default() })];
-    let lists = Choices { sketches: Vec::new(), tools: tools.clone(), data: data.clone(), heights: None, picked: None, cut_heights: None };
+    let lists = Choices { tools: tools.clone(), data: data.clone(), ..Choices::default() };
     let fields = |form: &Form, lists: &Choices| missing(form, lists).into_iter().map(|n| n.field).collect::<Vec<_>>();
     // No sketch to cut, and a tool without speed or feed of its own.
     let mut h = sketched();
@@ -667,7 +667,7 @@ fn missing_rows_follow_the_form() {
     op.chip_load = "0.03".into();
     op.flutes = 2;
     op.sketch = "Pocket".into();
-    let failing = Choices { sketches: Vec::new(), tools, data, heights: Some(Err("no closed profile".into())), picked: None, cut_heights: None };
+    let failing = Choices { tools, data, heights: Some(Err("no closed profile".into())), ..Choices::default() };
     let need = missing(&Form::Op(op), &failing);
     assert_eq!(need, vec![Need { field: "", why: "no closed profile".into() }]);
     assert_eq!(need_text(&need), "no closed profile");
@@ -975,4 +975,57 @@ fn the_tool_assistant_makes_a_v_bit() {
     );
     let Some(Form::Tool(again)) = tool_form(tool, true) else { panic!("no form") };
     assert_eq!((again.kind, again.tip_angle.as_str(), again.step), (3, "60", 1));
+}
+
+#[test]
+fn a_tool_s_data_in_a_material_fills_the_operations_of_a_setup_of_it() {
+    let mut h = sketched();
+    // A material is added in the Tool Library window.
+    h.app.manufacture.tools_open = true;
+    h.app.manufacture.new_material = "MDF".into();
+    h.frames(2);
+    h.step(&json!({"widget": "Add material"})).unwrap();
+    h.frames(2);
+    assert_eq!(library_listing(&mut h.app, true)["materials"], json!(["MDF"]));
+    // A tool: its own data, and a faster feed in MDF; switching material keeps what each has.
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        (tool.spindle_rpm, tool.feed) = ("12000".into(), "900".into());
+        tool.show_material("MDF");
+        assert!(tool.spindle_rpm.is_empty() && tool.feed.is_empty(), "MDF has no data of its own yet");
+        tool.feed = "1800".into();
+        tool.show_material("");
+        assert_eq!((tool.spindle_rpm.as_str(), tool.feed.as_str()), ("12000", "900"));
+    });
+    let library = library_listing(&mut h.app, true);
+    assert_eq!(library["tools"][0]["cutting"], json!([{"material": "MDF", "feed": 1800.0}]));
+    // Opened again, the tool has its MDF data; its cutting data step offers the material.
+    let Some(Form::Tool(mut again)) = tool_form(&library["tools"][0], true) else { panic!("no form") };
+    again.show_material("mdf");
+    assert_eq!((again.feed.as_str(), again.chip_load.as_str()), ("1800", "0.075"));
+    again.step = 2;
+    h.app.manufacture.form = Some(Form::Tool(again));
+    h.frames(2);
+    assert!(h.widget("Material").is_some() && h.widget("MDF  (has data)").is_some());
+    let Some(Form::Tool(shown)) = &h.app.manufacture.form else { panic!("no tool form") };
+    assert_eq!(shown.material, "MDF", "kept under the spelling it has");
+    h.app.manufacture.form = None;
+    // A setup of MDF: a new operation's form is filled with the tool's data in it.
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.material = "MDF".into();
+    });
+    assert_eq!(h.app.session.doc.manufacture.setups[0].material.as_deref(), Some("MDF"));
+    h.app.start("cam.op.pocket");
+    h.frames(2);
+    let Some(Form::Op(op)) = &h.app.manufacture.form else { panic!("no operation form") };
+    assert_eq!((op.spindle_rpm.as_str(), op.feed.as_str()), ("12000", "1800"));
+    // The setup opens again with its material, and can be set back to none.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut setup)) = setup_form(&listed["setups"][0]) else { panic!("no setup form") };
+    assert_eq!(setup.material, "MDF");
+    setup.material.clear();
+    h.app.manufacture.form = Some(Form::Setup(setup));
+    apply(&mut h.app);
+    assert_eq!(h.app.session.doc.manufacture.setups[0].material, None);
 }

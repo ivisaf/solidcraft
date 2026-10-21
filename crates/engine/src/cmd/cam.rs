@@ -3,7 +3,7 @@
 //! profiles are; toolpaths are never stored, so they follow the design.
 
 use serde_json::{Value, json};
-use solidcraft_cam::{self as cam, ContourParams, Cut, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
+use solidcraft_cam::{self as cam, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup, SetupOrigin, StockDef};
@@ -33,8 +33,8 @@ macro_rules! op_doc {
         concat!(
             $own,
             "; library?: the machine's tool library file (default: this machine's); sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills) or round walls along Z (a hole's or a boss's: their circle, from the wall's top to its foot); tool: number, from this design or the machine's library (the design then keeps a copy); spindle_rpm?, feed?: mm/min, plunge_feed?: mm/min \
-             (defaults: the tool's own; plunge_feed else feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
-             retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default: the tool's own, else half its diameter); coolant?: bool; \
+             (defaults: the tool's data in the setup's material, else its own; plunge_feed else feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
+             retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default: the tool's, else half its diameter); coolant?: bool; \
              setup?: id or name (default: the only setup); name? → operation: id, name, and its toolpath's cut_length, rapid_length, cut_minutes"
         )
     };
@@ -44,14 +44,14 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0); origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
-     rs274) → setup: id, name";
+     rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
             "number: 1–9999; kind: flat|ball|drill|vbit; diameter: expr; tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
-             from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
+             from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it); cutting?: [{material, spindle_rpm?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
     CommandSpec::new("cam.tool.update", "Update Design Tools", tool_update).icon("update")
         .params("number?: one tool (default: every tool) — replaces this design's copy with the machine library's tool of that number where they differ; library? → updated: tool numbers"),
@@ -59,7 +59,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_tool")
         .noundo()
-        .params("library?: file (default: the machine's library) → path, tools (each with design: absent|same|differs, this design's copy against it), only_in_design"),
+        .params("library?: file (default: the machine's library) → path, tools (each with design: absent|same|differs, this design's copy against it), only_in_design, materials: the names stock on this machine is made of"),
     CommandSpec::new("cam.library.define", "Define Library Tool", library_define).icon("library")
         .noundo()
         .params("as cam.tool.define, into the machine's library: tools every design on this machine can use; library?: file"),
@@ -69,6 +69,14 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.library.import", "Import Library", library_import).icon("import")
         .noundo()
         .params("path: a tool library file (ours, or an RP23CNC toollibrary.json: its end mills, ball end mills and drills, with their first preset's cutting data); replace?: bool (default false: tools whose number is taken are skipped); library? → added, replaced, skipped, notes: what was left out"),
+    CommandSpec::new("cam.material.define", "Define Material", material_define)
+        .icon("library")
+        .noundo()
+        .params("name: a material stock on this machine is made of, for setups to choose and tools to have cutting data for; library?"),
+    CommandSpec::new("cam.material.remove", "Remove Material", material_remove)
+        .icon("delete")
+        .noundo()
+        .params("name; library? — the library's tools lose their cutting data for it (designs keep theirs) → removed, tools: the numbers of those that had some"),
     CommandSpec::new("cam.tool.export", "Export Tools", tool_export).icon("export").noundo().params("path: a JSON file to write the tool library to"),
     CommandSpec::new("cam.tool.import", "Import Tools", tool_import).icon("import")
         .params("path: a tool library written by cam.tool.export; replace?: bool (default false: tools whose number is taken are skipped) → added, replaced, skipped: tool numbers"),
@@ -95,7 +103,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "ACTIONS")
         .icon("cam_setup")
         .noundo()
-        .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it; warning: how deep it cuts into the part, when it does"),
+        .params("→ tools and setups with their operations; each operation with its toolpath's lengths and time, or the error that stops it; warning: how deep it cuts into the part, when it does; materials: those the setups and tools name"),
     CommandSpec::new("cam.toolpath", "Show Toolpaths", toolpath).at("MANUFACTURE", "ACTIONS").icon("cam_contour").noundo().params(
         "setup?: id or name; op?: id or name (default every operation); points?: bool (default true) → operations: [{id, name, cut_length, \
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]; heights?: bool, also each one's heights: {clearance, retract, top, bottom, levels: [depth passes]} in the setup's Z",
@@ -228,6 +236,10 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
             None => feed = Some(from_chip),
         }
     }
+    let cutting = match p.get("cutting") {
+        None => was.map(|t| t.cutting.clone()).unwrap_or_default(),
+        Some(v) => cutting_param(v, cmd, flutes, spindle_rpm)?,
+    };
     let tool = Tool {
         number,
         kind,
@@ -252,9 +264,77 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         },
         shank_diameter: data("shank_diameter", was.and_then(|t| t.shank_diameter))?,
         length: data("length", was.and_then(|t| t.length))?,
+        cutting,
     };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
     Ok(tool)
+}
+
+/// `cutting`: a tool's data in particular materials (null: none). A chip load gives the feed
+/// from the material's spindle speed, else the tool's own; a material given nothing is left out.
+fn cutting_param(v: &Value, cmd: &str, flutes: u32, own_rpm: Option<f64>) -> Result<Vec<CuttingData>> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let list = v
+        .as_array()
+        .filter(|l| l.len() <= cam::MAX_MATERIALS)
+        .ok_or_else(|| bad(cmd, format!("`cutting` must be a list of at most {} materials", cam::MAX_MATERIALS)))?;
+    let (mut out, mut seen): (Vec<CuttingData>, Vec<String>) = (Vec::new(), Vec::new());
+    for e in list {
+        let material = cam::material_name(str_(e, "material").unwrap_or("")).map_err(|err| bad(cmd, format!("cutting: {err}")))?;
+        if seen.iter().any(|m| cam::same_material(m, &material)) {
+            return Err(bad(cmd, format!("cutting: {material} twice")));
+        }
+        seen.push(material.clone());
+        let value = |k: &str| match e.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(_) => num(e, k)
+                .filter(|v| *v > 0.0 && *v <= 1.0e6)
+                .map(Some)
+                .ok_or_else(|| bad(cmd, format!("cutting in {material}: `{k}` must be above 0"))),
+        };
+        let mut data = CuttingData {
+            material: material.clone(),
+            spindle_rpm: value("spindle_rpm")?,
+            feed: value("feed")?,
+            plunge_feed: value("plunge_feed")?,
+            stepdown: value("stepdown")?,
+            stepover: value("stepover")?,
+        };
+        if let Some(chip) = value("chip_load")?.filter(|_| data.feed.is_none()) {
+            let rpm = data.spindle_rpm.or(own_rpm).ok_or_else(|| bad(cmd, format!("cutting in {material}: `chip_load` needs a spindle speed")))?;
+            data.feed = Some((rpm * f64::from(flutes) * chip * 1e6).round() / 1e6);
+        }
+        if !data.is_empty() {
+            out.push(data);
+        }
+    }
+    Ok(out)
+}
+
+/// The materials a design names: its setups' and its tools' (in the order met, each once).
+fn design_materials(s: &Session) -> Vec<String> {
+    let m = &s.doc.manufacture;
+    let mut out: Vec<String> = Vec::new();
+    let named = m.setups.iter().filter_map(|x| x.material.clone()).chain(m.tools.iter().flat_map(|t| t.cutting.iter().map(|c| c.material.clone())));
+    for name in named {
+        if !out.iter().any(|o| cam::same_material(o, &name)) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// A setup's `material`: `None` when not given, `Some(None)` for null or "".
+fn material_param(p: &Value, cmd: &str) -> Result<Option<Option<String>>> {
+    match p.get("material") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(m)) if m.trim().is_empty() => Ok(Some(None)),
+        Some(Value::String(m)) => cam::material_name(m).map(|m| Some(Some(m))).map_err(|e| bad(cmd, e.to_string())),
+        Some(_) => Err(bad(cmd, "`material` must be a name")),
+    }
 }
 
 /// A tool for a listing: itself, and its chip load (mm per tooth) when its speed and feed say what it is.
@@ -292,13 +372,15 @@ fn library_path(p: &Value, cmd: &str) -> Result<std::path::PathBuf> {
 /// The machine library's tool `number`, if the library can be read and has it.
 fn library_tool(p: &Value, number: u64) -> Option<Tool> {
     let path = library_path(p, "").ok()?;
-    toollib::load(&path).ok()?.into_iter().find(|t| u64::from(t.number) == number)
+    toollib::load(&path).ok()?.tools.into_iter().find(|t| u64::from(t.number) == number)
 }
 
 fn library_list(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.library.list";
     let path = library_path(p, cmd)?;
-    let tools: Vec<Value> = toollib::load(&path)?
+    let library = toollib::load(&path)?;
+    let tools: Vec<Value> = library
+        .tools
         .iter()
         .map(|tool| {
             let mut v = tool_json(tool);
@@ -313,23 +395,25 @@ fn library_list(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let numbers: Vec<u32> = tools.iter().filter_map(|t| t["number"].as_u64()).map(|n| n as u32).collect();
     let only_in_design: Vec<Value> = s.doc.manufacture.tools.iter().filter(|t| !numbers.contains(&t.number)).map(tool_json).collect();
-    Ok(json!({"path": path, "tools": tools, "only_in_design": only_in_design}))
+    Ok(json!({"path": path, "tools": tools, "only_in_design": only_in_design, "materials": library.materials}))
 }
 
 fn library_define(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.library.define";
     let path = library_path(p, cmd)?;
-    let mut tools = toollib::load(&path)?;
+    let mut library = toollib::load(&path)?;
     let number = p.get("number").and_then(Value::as_u64).unwrap_or(0);
-    let was = tools.iter().find(|t| u64::from(t.number) == number).cloned();
+    let was = library.tools.iter().find(|t| u64::from(t.number) == number).cloned();
     let tool = tool_param(s, p, cmd, was.as_ref())?;
-    if was.is_none() && tools.len() >= toollib::MAX_TOOLS {
+    if was.is_none() && library.tools.len() >= toollib::MAX_TOOLS {
         return Err(bad(cmd, "the tool library is full"));
     }
+    let tools = &mut library.tools;
     tools.retain(|t| t.number != tool.number);
     tools.push(tool.clone());
     tools.sort_by_key(|t| t.number);
-    toollib::save(&path, &tools)?;
+    library.add_tool_materials();
+    toollib::save(&path, &library)?;
     Ok(json!({ "tool": tool_json(&tool), "path": path }))
 }
 
@@ -337,12 +421,12 @@ fn library_remove(_: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.library.remove";
     let path = library_path(p, cmd)?;
     let number = p.get("number").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "`number` is required"))?;
-    let mut tools = toollib::load(&path)?;
-    if !tools.iter().any(|t| u64::from(t.number) == number) {
+    let mut library = toollib::load(&path)?;
+    if !library.tools.iter().any(|t| u64::from(t.number) == number) {
         return Err(bad(cmd, format!("no tool {number} in the library")));
     }
-    tools.retain(|t| u64::from(t.number) != number);
-    toollib::save(&path, &tools)?;
+    library.tools.retain(|t| u64::from(t.number) != number);
+    toollib::save(&path, &library)?;
     Ok(json!({ "removed": number }))
 }
 
@@ -358,14 +442,16 @@ fn library_add(s: &mut Session, p: &Value) -> Result<Value> {
     if chosen.is_empty() {
         return Err(bad(cmd, "the design has no such tool"));
     }
-    let mut tools = toollib::load(&path)?;
+    let mut library = toollib::load(&path)?;
+    let tools = &mut library.tools;
     tools.retain(|t| !chosen.iter().any(|c| c.number == t.number));
     tools.extend(chosen.iter().cloned());
     if tools.len() > toollib::MAX_TOOLS {
         return Err(bad(cmd, "the tool library would be too large"));
     }
     tools.sort_by_key(|t| t.number);
-    toollib::save(&path, &tools)?;
+    library.add_tool_materials();
+    toollib::save(&path, &library)?;
     Ok(json!({ "added": chosen.iter().map(|t| t.number).collect::<Vec<_>>() }))
 }
 
@@ -378,7 +464,7 @@ fn tool_update(s: &mut Session, p: &Value) -> Result<Value> {
     let mut updated = Vec::new();
     let mut tools = s.doc.manufacture.tools.clone();
     for copy in tools.iter_mut().filter(|t| number.is_none_or(|n| u64::from(t.number) == n)) {
-        if let Some(tool) = library.iter().find(|t| t.number == copy.number).filter(|t| *t != copy) {
+        if let Some(tool) = library.tools.iter().find(|t| t.number == copy.number).filter(|t| *t != copy) {
             *copy = tool.clone();
             updated.push(tool.number);
         }
@@ -392,9 +478,8 @@ fn tool_update(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "updated": updated }))
 }
 
-/// Reads a library file a command was pointed at.
-/// The tools of a library file (ours, or another program's we read), and notes on what was left out.
-fn read_library(path: &str, cmd: &str) -> Result<(Vec<Tool>, Vec<String>)> {
+/// A library file a command was pointed at (ours, or another program's we read), and notes on what was left out.
+fn read_library(path: &str, cmd: &str) -> Result<(toollib::Library, Vec<String>)> {
     let bytes = solidcraft_io::vfs::read(path, 16 << 20).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     toollib::parse_any(&bytes).map_err(|e| bad(cmd, format!("{path}: {e}")))
 }
@@ -425,9 +510,9 @@ fn merge_tools(library: &mut Vec<Tool>, incoming: Vec<Tool>, replace: bool, cmd:
 fn tool_export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.tool.export";
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
-    let tools = &s.doc.manufacture.tools;
-    solidcraft_io::vfs::write(path, toollib::text(tools)?.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    Ok(json!({"path": path, "tools": tools.len()}))
+    let library = toollib::Library { tools: s.doc.manufacture.tools.clone(), materials: design_materials(s) };
+    solidcraft_io::vfs::write(path, toollib::text(&library)?.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    Ok(json!({"path": path, "tools": library.tools.len()}))
 }
 
 fn tool_import(s: &mut Session, p: &Value) -> Result<Value> {
@@ -435,7 +520,7 @@ fn tool_import(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
     let (incoming, notes) = read_library(path, cmd)?;
     let mut library = s.doc.manufacture.tools.clone();
-    let mut out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
+    let mut out = merge_tools(&mut library, incoming.tools, bool_(p, "replace").unwrap_or(false), cmd)?;
     s.doc_mut().manufacture.tools = library;
     out["notes"] = json!(notes);
     Ok(out)
@@ -444,9 +529,9 @@ fn tool_import(s: &mut Session, p: &Value) -> Result<Value> {
 fn library_export(_: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.library.export";
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
-    let tools = toollib::load(&library_path(p, cmd)?)?;
-    solidcraft_io::vfs::write(path, toollib::text(&tools)?.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    Ok(json!({"path": path, "tools": tools.len()}))
+    let library = toollib::load(&library_path(p, cmd)?)?;
+    solidcraft_io::vfs::write(path, toollib::text(&library)?.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    Ok(json!({"path": path, "tools": library.tools.len()}))
 }
 
 fn library_import(_: &mut Session, p: &Value) -> Result<Value> {
@@ -455,10 +540,47 @@ fn library_import(_: &mut Session, p: &Value) -> Result<Value> {
     let (incoming, notes) = read_library(path, cmd)?;
     let file = library_path(p, cmd)?;
     let mut library = toollib::load(&file)?;
-    let mut out = merge_tools(&mut library, incoming, bool_(p, "replace").unwrap_or(false), cmd)?;
+    let mut out = merge_tools(&mut library.tools, incoming.tools, bool_(p, "replace").unwrap_or(false), cmd)?;
+    for name in &incoming.materials {
+        library.add_material(name);
+    }
+    library.add_tool_materials();
     toollib::save(&file, &library)?;
     out["notes"] = json!(notes);
+    out["materials"] = json!(incoming.materials);
     Ok(out)
+}
+
+fn material_define(_: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.material.define";
+    let name = cam::material_name(str_(p, "name").unwrap_or("")).map_err(|e| bad(cmd, e.to_string()))?;
+    let path = library_path(p, cmd)?;
+    let mut library = toollib::load(&path)?;
+    if !library.add_material(&name) {
+        return Err(bad(cmd, format!("the tool library has {} materials already", cam::MAX_MATERIALS)));
+    }
+    toollib::save(&path, &library)?;
+    Ok(json!({ "material": name, "materials": library.materials }))
+}
+
+fn material_remove(_: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.material.remove";
+    let name = str_(p, "name").ok_or_else(|| bad(cmd, "`name` is required"))?;
+    let path = library_path(p, cmd)?;
+    let mut library = toollib::load(&path)?;
+    if !library.materials.iter().any(|m| cam::same_material(m, name)) {
+        return Err(bad(cmd, format!("no material `{}` in the library", name.trim())));
+    }
+    library.materials.retain(|m| !cam::same_material(m, name));
+    let mut tools = Vec::new();
+    for tool in &mut library.tools {
+        if tool.cutting_in(name).is_some() {
+            tool.cutting.retain(|c| !cam::same_material(&c.material, name));
+            tools.push(tool.number);
+        }
+    }
+    toollib::save(&path, &library)?;
+    Ok(json!({ "removed": name.trim(), "tools": tools }))
 }
 
 fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -500,7 +622,8 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let post = str_(p, "post").unwrap_or("rs274");
     let post = Post::builtin(post).ok_or_else(|| bad(cmd, format!("unknown post `{post}` (known: {})", Post::BUILTIN.join(", "))))?.name;
-    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, post, operations: Vec::new() };
+    let material = material_param(p, cmd)?.flatten();
+    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, operations: Vec::new() };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -508,7 +631,7 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "setup": id, "name": name }))
 }
 
-/// Changes what is given of a setup: name, post, tool axis, origin, stock.
+/// Changes what is given of a setup: name, post, tool axis, origin, stock, material.
 fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.setup.edit";
     let i = setup_index(s, p, cmd)?;
@@ -531,6 +654,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = p.get("stock") {
         setup.stock = stock_param(s, v, &setup.stock, cmd)?;
+    }
+    if let Some(material) = material_param(p, cmd)? {
+        setup.material = material;
     }
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     let (id, name) = (setup.id, setup.name.clone());
@@ -1357,12 +1483,19 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     // The design's own copy of the tool, else the machine library's, which the design then keeps a copy of.
     let own = s.doc.manufacture.tools.iter().find(|t| u64::from(t.number) == number).cloned();
     let from_library = own.is_none();
-    let tool = own.or_else(|| library_tool(p, number)).ok_or_else(|| bad(cmd, format!("no tool {number} (define it in the tool library first)")))?;
+    let stored =
+        own.or_else(|| library_tool(p, number)).ok_or_else(|| bad(cmd, format!("no tool {number} (define it in the tool library first)")))?;
+    // Its cutting data in the stock's material, where it has some.
+    let tool = stored.in_material(setup.material.as_deref());
     let positive = |k: &str| num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6);
-    // Speed and feeds left out are the tool's own.
+    let none = match &setup.material {
+        Some(m) => format!("none for {m} and none of its own"),
+        None => "none of its own".to_string(),
+    };
+    // Speed and feeds left out are the tool's.
     let given = |k: &str, what: &str, tools: Option<f64>| match p.get(k) {
         Some(_) => positive(k).ok_or_else(|| bad(cmd, format!("`{k}` must be above 0{what}"))),
-        None => tools.ok_or_else(|| bad(cmd, format!("`{k}` is required: tool {} has none of its own", tool.number))),
+        None => tools.ok_or_else(|| bad(cmd, format!("`{k}` is required: tool {} has {none}", tool.number))),
     };
     let spindle_rpm = given("spindle_rpm", "", tool.spindle_rpm)?;
     let cut_feed = given("feed", " (mm/min)", tool.feed)?;
@@ -1402,7 +1535,7 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     // An operation that cannot be cut is not added.
     if from_library {
         let tools = &mut s.doc_mut().manufacture.tools;
-        tools.push(tool.clone());
+        tools.push(stored.clone());
         tools.sort_by_key(|t| t.number);
     }
     let path = match build(s, &setup, &op) {
@@ -1710,7 +1843,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "post": setup.post, "operations": ops});
+                "material": setup.material, "post": setup.post, "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -1724,7 +1857,7 @@ fn list_now(s: &Session) -> Value {
             v
         })
         .collect();
-    json!({ "tools": m.tools.iter().map(tool_json).collect::<Vec<_>>(), "setups": setups, "posts": Post::BUILTIN })
+    json!({ "tools": m.tools.iter().map(tool_json).collect::<Vec<_>>(), "setups": setups, "posts": Post::BUILTIN, "materials": design_materials(s) })
 }
 
 fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {

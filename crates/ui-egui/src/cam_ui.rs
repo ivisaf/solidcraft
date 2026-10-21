@@ -120,6 +120,79 @@ pub struct ToolForm {
     pub length: String,
     /// The assistant's step: 0 the kind, 1 the shape, 2 the cutting data.
     pub step: usize,
+    /// The material whose cutting data the rows show ("": the tool's own, for every other material).
+    pub material: String,
+    /// The cutting data the rows do not show: other materials', and the tool's own ("") while
+    /// they show a material's.
+    pub others: Vec<(String, CutText)>,
+}
+
+/// A tool's cutting data as a form shows it: for one material, or the tool's own.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CutText {
+    pub spindle_rpm: String,
+    pub feed: String,
+    pub plunge_feed: String,
+    pub stepdown: String,
+    pub stepover: String,
+    pub chip_load: String,
+}
+
+impl CutText {
+    /// Whether nothing is typed in it.
+    fn is_empty_text(&self) -> bool {
+        [&self.spindle_rpm, &self.feed, &self.plunge_feed, &self.stepdown, &self.stepover, &self.chip_load].iter().all(|v| v.trim().is_empty())
+    }
+}
+
+impl ToolForm {
+    /// The cutting data the rows show.
+    fn shown(&self) -> CutText {
+        CutText {
+            spindle_rpm: self.spindle_rpm.clone(),
+            feed: self.feed.clone(),
+            plunge_feed: self.plunge_feed.clone(),
+            stepdown: self.stepdown.clone(),
+            stepover: self.stepover.clone(),
+            chip_load: self.chip_load.clone(),
+        }
+    }
+    /// The cutting data kept for `material` ("": the tool's own).
+    fn kept(&self, material: &str) -> CutText {
+        if same_material(&self.material, material) {
+            return self.shown();
+        }
+        self.others.iter().find(|(m, _)| same_material(m, material)).map(|(_, c)| c.clone()).unwrap_or_default()
+    }
+    /// Shows `material`'s cutting data in the rows ("": the tool's own), keeping what they showed.
+    pub fn show_material(&mut self, material: &str) {
+        if same_material(&self.material, material) {
+            return;
+        }
+        let was = (std::mem::take(&mut self.material), self.shown());
+        self.others.retain(|(m, _)| !same_material(m, &was.0));
+        self.others.push(was);
+        // Kept under the spelling it already has.
+        let (name, c) =
+            self.others.iter().find(|(m, _)| same_material(m, material)).cloned().unwrap_or_else(|| (material.to_string(), CutText::default()));
+        self.others.retain(|(m, _)| !same_material(m, material));
+        (self.spindle_rpm, self.feed, self.plunge_feed) = (c.spindle_rpm, c.feed, c.plunge_feed);
+        (self.stepdown, self.stepover, self.chip_load) = (c.stepdown, c.stepover, c.chip_load);
+        self.material = name;
+    }
+    /// Every material's cutting data, as typed (the tool's own left out).
+    fn by_material(&self) -> Vec<(String, CutText)> {
+        let mut out: Vec<(String, CutText)> = self.others.iter().filter(|(m, _)| !m.is_empty()).cloned().collect();
+        if !self.material.is_empty() {
+            out.push((self.material.clone(), self.shown()));
+        }
+        out
+    }
+}
+
+/// Whether two material names are the same material (case and surrounding spaces aside).
+fn same_material(a: &str, b: &str) -> bool {
+    solidcraft_engine::cam::same_material(a, b)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,6 +211,8 @@ pub struct SetupForm {
     pub top: String,
     pub bottom: String,
     pub post: usize,
+    /// What the stock is made of ("": not said).
+    pub material: String,
 }
 
 /// The operation a form edits, and the geometry it had when the form opened.
@@ -358,6 +433,8 @@ pub struct CamUi {
     pub selected_tool: Option<(bool, u64)>,
     /// The tool library file to use instead of the machine's own (tests).
     pub library: Option<String>,
+    /// A material's name as typed in the Tool Library window, to add to the library.
+    pub new_material: String,
     /// The machine library as last listed, and how many frames ago.
     listing: Option<(u32, Value)>,
     /// Whether setups' stock boxes and work origins are drawn.
@@ -419,6 +496,7 @@ impl Default for CamUi {
             pinned_paths: false,
             browser_listing: None,
             selected_tool: None,
+            new_material: String::new(),
             library: None,
             listing: None,
             show_setups: true,
@@ -549,6 +627,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 shank_diameter: String::new(),
                 length: String::new(),
                 step: 0,
+                material: String::new(),
+                others: Vec::new(),
             })))
         }
         "cam.setup.create" => Some(Form::Setup(Box::new(SetupForm {
@@ -563,6 +643,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             top: String::new(),
             bottom: String::new(),
             post: 0,
+            material: String::new(),
         }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
@@ -612,12 +693,13 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("flutes".into(), json!(number("The number of flutes", &f.flutes)? as u64));
             }
             // An emptied value is cleared on a tool being edited.
+            let own = f.kept("");
             for (k, what, text) in [
-                ("spindle_rpm", "The spindle speed", &f.spindle_rpm),
-                ("feed", "The feed", &f.feed),
-                ("plunge_feed", "The plunge feed", &f.plunge_feed),
-                ("stepdown", "The stepdown", &f.stepdown),
-                ("stepover", "The stepover", &f.stepover),
+                ("spindle_rpm", "The spindle speed", &own.spindle_rpm),
+                ("feed", "The feed", &own.feed),
+                ("plunge_feed", "The plunge feed", &own.plunge_feed),
+                ("stepdown", "The stepdown", &own.stepdown),
+                ("stepover", "The stepover", &own.stepover),
             ] {
                 if !text.trim().is_empty() {
                     p.insert(k.into(), json!(number(what, text)?));
@@ -640,9 +722,35 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 }
             }
             // A chip load without a feed: the engine works the feed out.
-            if f.feed.trim().is_empty() && !f.chip_load.trim().is_empty() {
+            if own.feed.trim().is_empty() && !own.chip_load.trim().is_empty() {
                 p.insert("feed".into(), Value::Null);
-                p.insert("chip_load".into(), json!(number("The chip load", &f.chip_load)?));
+                p.insert("chip_load".into(), json!(number("The chip load", &own.chip_load)?));
+            }
+            // The data in particular materials; a material with nothing typed is left out.
+            let mut cutting = Vec::new();
+            for (material, c) in f.by_material() {
+                let mut e = serde_json::Map::new();
+                for (k, what, text) in [
+                    ("spindle_rpm", "The spindle speed", &c.spindle_rpm),
+                    ("feed", "The feed", &c.feed),
+                    ("plunge_feed", "The plunge feed", &c.plunge_feed),
+                    ("stepdown", "The stepdown", &c.stepdown),
+                    ("stepover", "The stepover", &c.stepover),
+                ] {
+                    if !text.trim().is_empty() {
+                        e.insert(k.into(), json!(number(&format!("{what} in {material}"), text)?));
+                    }
+                }
+                if c.feed.trim().is_empty() && !c.chip_load.trim().is_empty() {
+                    e.insert("chip_load".into(), json!(number(&format!("The chip load in {material}"), &c.chip_load)?));
+                }
+                if !e.is_empty() {
+                    e.insert("material".into(), json!(material));
+                    cutting.push(Value::Object(e));
+                }
+            }
+            if !cutting.is_empty() || f.editing {
+                p.insert("cutting".into(), json!(cutting));
             }
             Ok((if f.library { "cam.library.define" } else { "cam.tool.define" }, Value::Object(p)))
         }
@@ -675,6 +783,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("stock".into(), Value::Object(stock));
             }
             p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(f.post).copied().unwrap_or("rs274")));
+            p.insert("material".into(), if f.material.trim().is_empty() { Value::Null } else { json!(f.material.trim()) });
             match f.editing {
                 Some(id) => {
                     p.insert("setup".into(), json!(id));
@@ -811,6 +920,31 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         length: number("length"),
         // A tool that exists opens on its shape.
         step: 1,
+        material: String::new(),
+        others: tool["cutting"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| {
+                let value = |k: &str| c[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
+                // The chip load its feed makes at its speed (else the tool's own).
+                let rpm = c["spindle_rpm"].as_f64().or(tool["spindle_rpm"].as_f64());
+                let flutes = tool["flutes"].as_f64().filter(|z| *z >= 1.0);
+                let chip_load = match (c["feed"].as_f64(), rpm, flutes) {
+                    (Some(feed), Some(rpm), Some(z)) if rpm > 0.0 => shown(feed / (rpm * z), 4),
+                    _ => String::new(),
+                };
+                let cut = CutText {
+                    spindle_rpm: value("spindle_rpm"),
+                    feed: value("feed"),
+                    plunge_feed: value("plunge_feed"),
+                    stepdown: value("stepdown"),
+                    stepover: value("stepover"),
+                    chip_load,
+                };
+                Some((c["material"].as_str()?.to_string(), cut))
+            })
+            .collect(),
     })))
 }
 
@@ -838,6 +972,7 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
         top: offset("top"),
         bottom: offset("bottom"),
         post: solidcraft_engine::cam::Post::BUILTIN.iter().position(|p| Some(*p) == setup["post"].as_str()).unwrap_or(0),
+        material: text(setup, "material"),
     })))
 }
 
@@ -903,6 +1038,9 @@ pub fn imported(app: &mut SolveApp, result: Result<Value, String>) {
         Ok(v) => {
             let count = |k: &str| v[k].as_array().map_or(0, Vec::len);
             let mut lines = vec![format!("Imported {} tool(s)", count("added") + count("replaced"))];
+            if count("materials") > 0 {
+                lines[0].push_str(&format!(" and {} material(s)", count("materials")));
+            }
             if count("skipped") > 0 {
                 let numbers: Vec<String> = v["skipped"].as_array().into_iter().flatten().map(|n| format!("T{n}")).collect();
                 lines.push(format!("Skipped {}: the library has these numbers already", numbers.join(", ")));
@@ -1278,6 +1416,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
+        "Material" => {
+            "What the stock is made of. A setup's material picks each tool's cutting data for it (a tool without any cuts with its own); in a tool, the rows below are for the material chosen here."
+        }
         "Boundary" => "The area to face: the raw block, the part's outline, or a sketch's outline.",
         "Sketch" => "The sketch whose closed profiles are cut.",
         "Faces" => "Picked faces of the part: they give the outline and the heights.",
@@ -1578,6 +1719,10 @@ struct Choices {
     picked: Option<(f64, f64)>,
     /// The heights the open operation form's preview cuts at.
     cut_heights: Option<solidcraft_engine::PreviewHeights>,
+    /// The materials stock is made of: the machine library's, then those only this design names.
+    materials: Vec<String>,
+    /// The material of the setup an operation form adds to (its tools' data is for it).
+    material: Option<String>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -1593,6 +1738,26 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
         .map(|f| (f.name.clone(), f.name.clone()))
         .collect();
     let (mut tools, mut data) = (Vec::new(), Vec::new());
+    let mut materials: Vec<String> = Vec::new();
+    for m in
+        library["materials"].as_array().into_iter().flatten().chain(listed["materials"].as_array().into_iter().flatten()).filter_map(Value::as_str)
+    {
+        if !materials.iter().any(|n| same_material(n, m)) {
+            materials.push(m.to_string());
+        }
+    }
+    // The operation form's setup: the one it edits in, else the only one.
+    let setups = listed["setups"].as_array().cloned().unwrap_or_default();
+    let editing = match &app.manufacture.form {
+        Some(Form::Op(f)) => f.editing.as_ref().map(|e| e.setup),
+        _ => None,
+    };
+    let setup = match editing {
+        Some(id) => setups.iter().find(|x| x["id"].as_u64() == Some(id)),
+        None if setups.len() == 1 => setups.first(),
+        None => None,
+    };
+    let material = setup.and_then(|x| x["material"].as_str()).map(str::to_string);
     // The design's own copy of a tool is the one its operations cut with.
     for t in listed["tools"].as_array().into_iter().flatten().chain(library["tools"].as_array().into_iter().flatten()) {
         let (Some(n), Some(diameter)) = (t["number"].as_u64(), t["diameter"].as_f64()) else { continue };
@@ -1603,7 +1768,11 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
         let name = text(t, "description");
         let what = if name.is_empty() { text(t, "kind").replace('_', " ") } else { name };
         tools.push((n.clone(), format!("T{n}  D{diameter} {what}")));
-        let value = |k: &str| t[k].as_f64();
+        // Its data in the setup's material, where it has some, else its own.
+        let cut = material
+            .as_deref()
+            .and_then(|m| t["cutting"].as_array().into_iter().flatten().find(|c| c["material"].as_str().is_some_and(|n| same_material(n, m))));
+        let value = |k: &str| cut.and_then(|c| c[k].as_f64()).or(t[k].as_f64());
         data.push((
             n,
             ToolData {
@@ -1617,14 +1786,14 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             },
         ));
     }
-    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None }
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material }
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
     // A form's labels stay on one line each.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     if let Form::Tool(f) = form {
-        tool_assistant(ui, f, need);
+        tool_assistant(ui, f, need, &choices.materials);
         return;
     }
     // An operation form's heights, as a picture beside the rows (or under them in a narrow panel).
@@ -1815,7 +1984,7 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
 }
 
 /// The tool assistant: the kind (tiles), the shape (with its dimensioned picture), the cutting data.
-fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need]) {
+fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials: &[String]) {
     let t = Tokens::get();
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     // Where it is: three steps, each a button back to it.
@@ -1888,17 +2057,51 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need]) {
             });
         }
         _ => {
+            // Which material's data the rows show: the library's materials, and any the tool has data for.
+            let mut options: Vec<(String, String)> = vec![(String::new(), "Every material".into())];
+            for m in materials.iter().map(String::as_str).chain(f.others.iter().map(|(m, _)| m.as_str())).chain([f.material.as_str()]) {
+                if !m.is_empty() && !options.iter().any(|(n, _)| same_material(n, m)) {
+                    let has = !f.kept(m).is_empty_text();
+                    options.push((m.to_string(), if has { format!("{m}  (has data)") } else { m.to_string() }));
+                }
+            }
+            if options.len() > 1 {
+                options[0].1 = "Any other material".into();
+            }
+            let own = f.kept("");
+            let in_material = !f.material.is_empty();
+            // In a material, an empty row is the tool's own value: its hint says what that is.
+            let hint = |own: &str, usual: &'static str| -> String {
+                match (in_material, own.trim()) {
+                    (false, _) => usual.to_string(),
+                    (true, "") => "the tool's: none".to_string(),
+                    (true, v) => format!("the tool's: {v}"),
+                }
+            };
             egui::Grid::new("sc_cam_tool_cutting").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                let mut chosen = f.material.clone();
+                pick(ui, need, "sc_cam_tool_material", "Material", &mut chosen, &options);
+                f.show_material(&chosen);
                 // Speed, flutes, chip load and feed belong together: feed = speed × flutes × chip load.
-                let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "none");
-                let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
-                let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "speed × flutes × chip load");
+                let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, &hint(&own.spindle_rpm, "none"));
+                let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, &hint(&own.chip_load, "feed ÷ (speed × flutes)"));
+                let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, &hint(&own.feed, "speed × flutes × chip load"));
                 let flutes = parsed(&f.flutes);
-                link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
-                field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "feed / 3");
-                field(ui, need, "Stepdown (mm)", &mut f.stepdown, "half the diameter");
-                field(ui, need, "Stepover (mm)", &mut f.stepover, "by operation");
+                // A material without a speed of its own cuts at the tool's.
+                let rpm = if f.spindle_rpm.trim().is_empty() { own.spindle_rpm.clone() } else { f.spindle_rpm.clone() };
+                link_chip_load(&rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
+                field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, &hint(&own.plunge_feed, "feed / 3"));
+                field(ui, need, "Stepdown (mm)", &mut f.stepdown, &hint(&own.stepdown, "half the diameter"));
+                field(ui, need, "Stepover (mm)", &mut f.stepover, &hint(&own.stepover, "by operation"));
             });
+            let note = if in_material {
+                "Rows left empty take the tool's own value. A setup whose stock is of this material cuts with these."
+            } else if options.len() > 1 {
+                "The tool's own data: for setups of any material it has no data of its own for, and for setups without a material."
+            } else {
+                "Materials are added in the Tool Library; a tool can then have data for each."
+            };
+            ui.add(egui::Label::new(RichText::new(note).color(Tokens::get().text_dim)).wrap());
         }
     }
     ui.add_space(4.0);
@@ -1951,6 +2154,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 choice(ui, need, "sc_cam_setup_z", "Origin Z", z, &["bottom", "middle", "top"]);
             }
             choice(ui, need, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
+            let mut materials: Vec<(String, String)> = vec![(String::new(), "not said".into())];
+            materials.extend(choices.materials.iter().map(|m| (m.clone(), m.clone())));
+            pick(ui, need, "sc_cam_setup_material", "Material", &mut f.material, &materials);
         }
         Form::Op(f) => {
             field(ui, need, "Name", &mut f.name, "automatic");
@@ -1983,9 +2189,14 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             pick(ui, need, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);
             // Another tool brings its own speed, feeds, stepdown and stepover; all stay editable here.
             prefill(f, choices);
-            let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, "the tool's");
+            // Filled from the tool's data in the setup's material, when the setup says one.
+            let tools = match &choices.material {
+                Some(m) => format!("the tool's for {m}"),
+                None => "the tool's".to_string(),
+            };
+            let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, &tools);
             let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
-            let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, "the tool's");
+            let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, &tools);
             let flutes = Some(f64::from(f.flutes));
             link_chip_load(&f.spindle_rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
             field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, "the tool's, or feed / 3");
@@ -2623,6 +2834,8 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             if matches!(cam.form, Some(Form::Tool(_))) {
                 asked.apply |= form_block(ui, cam, &[], lists);
             }
+            ui.add_space(6.0);
+            materials_block(ui, cam, library, asked);
         }
     });
     cam.tools_folded = folded;
@@ -2847,6 +3060,47 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         (cam.look.width, cam.tools_look.width, cam.look.fade);
     app.manufacture = cam;
     answer(app, asked);
+}
+
+/// The machine library's materials: each with a button to remove it, and a box to add one.
+fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mut Asked) {
+    let t = Tokens::get();
+    let materials: Vec<&str> = library["materials"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Materials").strong());
+            ui.label(RichText::new("what stock is made of: a tool can have cutting data for each").color(t.text_dim));
+        });
+        ui.add_space(4.0);
+        if materials.is_empty() {
+            ui.label(RichText::new("None yet. Add one, then give tools their data for it (Edit, Cutting data).").color(t.text_dim));
+        }
+        ui.horizontal_wrapped(|ui| {
+            for m in &materials {
+                ui.label(*m);
+                if ui_kit::compact_button(ui, "×", &format!("Remove {m}"), true, false)
+                    .on_hover_text("Tools in the library lose their data for it; designs keep theirs")
+                    .clicked()
+                {
+                    asked.run.push(("cam.material.remove", json!({ "name": m })));
+                }
+                ui.add_space(6.0);
+            }
+        });
+        ui.horizontal(|ui| {
+            let (enter, _) = ui
+                .scope(|ui| {
+                    ui.set_max_width(180.0);
+                    ui_kit::text_field(ui, &mut cam.new_material, "Plywood, MDF, Aluminium…")
+                })
+                .inner;
+            let named = !cam.new_material.trim().is_empty();
+            if (button(ui, "Add material", ui_kit::Button::Enabled(named)).clicked() || enter) && named {
+                asked.run.push(("cam.material.define", json!({ "name": cam.new_material.trim() })));
+                cam.new_material.clear();
+            }
+        });
+    });
 }
 
 /// Does what a panel, the browser or a menu asked for.

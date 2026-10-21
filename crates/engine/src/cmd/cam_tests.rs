@@ -1057,7 +1057,7 @@ fn a_contour_round_a_picked_boss_top_stops_at_the_floor_it_stands_on() {
 }
 
 #[test]
-fn an_rp23cnc_tool_library_is_imported_with_its_cutting_data() {
+fn an_rp23cnc_tool_library_is_imported_with_its_materials_and_cutting_data() {
     let mut s = Session::default();
     let library = library_file("rp23cnc");
     let file = std::env::temp_dir().join(format!("solidcraft-rp23cnc-{}.json", std::process::id()));
@@ -1067,24 +1067,116 @@ fn an_rp23cnc_tool_library_is_imported_with_its_cutting_data() {
             {"Number": 2, "Name": "3 mm flat end mill", "Type": "EndMill", "DiameterMm": 3, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
             {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1, "VeeAngleDeg": 60, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null}
         ],
-        "Materials": [{"Name": "Plywood", "Notes": null}],
-        "Presets": [{"Name": "6 mm in plywood", "ToolNumber": 1, "Material": null, "FeedMmMin": 1200, "PlungeMmMin": 400, "SpindleRpm": 18000, "DepthOfCutMm": 3, "StepoverPercent": 40, "Notes": null}]
+        "Materials": [{"Name": "Plywood", "Notes": null}, {"Name": "Aluminium", "Notes": null}],
+        "Presets": [
+            {"Name": "6 mm in plywood", "ToolNumber": 1, "Material": null, "FeedMmMin": 1200, "PlungeMmMin": 400, "SpindleRpm": 18000, "DepthOfCutMm": 3, "StepoverPercent": 40, "Notes": null},
+            {"Name": "6 mm in aluminium", "ToolNumber": 1, "Material": "Aluminium", "FeedMmMin": 500, "PlungeMmMin": 100, "SpindleRpm": 20000, "DepthOfCutMm": 0.5, "StepoverPercent": 25, "Notes": null},
+            {"Name": "6 mm again", "ToolNumber": 1, "Material": null, "FeedMmMin": 900, "Notes": null},
+            {"Name": "3 mm in MDF", "ToolNumber": 2, "Material": "MDF", "FeedMmMin": 800, "Notes": null}
+        ]
     });
     std::fs::write(&file, rp.to_string()).unwrap();
     let out = run(&mut s, "cam.library.import", json!({"library": library, "path": file}));
     let _ = std::fs::remove_file(&file);
     assert_eq!(out["added"], json!([1, 2, 3]));
-    assert_eq!(out["notes"], json!([]));
-    // The preset is tool 1's cutting data; its stepover, 40% of 6 mm.
-    let tools = crate::toollib::load(std::path::Path::new(&library)).unwrap();
+    assert_eq!(out["notes"], json!(["preset `6 mm again` of tool 1 (6 mm flat end mill): its own data is `6 mm in plywood`'s"]));
+    // The preset without a material is tool 1's own cutting data; its stepover, 40% of 6 mm.
+    let read = crate::toollib::load(std::path::Path::new(&library)).unwrap();
+    let tools = &read.tools;
     let t1 = &tools[0];
     assert_eq!((t1.description.as_str(), t1.diameter, t1.flutes, t1.flute_length), ("6 mm flat end mill", 6.0, 2, 18.0));
     assert_eq!((t1.spindle_rpm, t1.feed, t1.plunge_feed, t1.stepdown), (Some(18000.0), Some(1200.0), Some(400.0), Some(3.0)));
     assert!((t1.stepover.unwrap() - 2.4).abs() < 1e-9);
-    assert_eq!((tools[1].diameter, tools[1].feed), (3.0, None));
+    // A preset for a material is the tool's data in it; a material only a preset names joins the list.
+    let alu = t1.cutting_in("aluminium").unwrap();
+    assert_eq!((alu.spindle_rpm, alu.feed, alu.plunge_feed, alu.stepdown), (Some(20000.0), Some(500.0), Some(100.0), Some(0.5)));
+    assert!((alu.stepover.unwrap() - 1.5).abs() < 1e-9);
+    assert_eq!(read.materials, ["Plywood", "Aluminium", "MDF"]);
+    assert_eq!((tools[1].diameter, tools[1].feed, tools[1].cutting_in("MDF").and_then(|c| c.feed)), (3.0, None, Some(800.0)));
     // The V-bit with its point.
     assert_eq!((tools[2].kind, tools[2].tip_angle, tools[2].tip_diameter), (solidcraft_cam::ToolKind::VBit, Some(60.0), None));
     let _ = std::fs::remove_file(&library);
+}
+
+#[test]
+fn operations_take_the_cutting_data_for_their_setups_material() {
+    let lib = library_file("materials");
+    let mut s = pocket_job(0.0, json!({"material": "MDF"}));
+    // Tool 1 cuts MDF faster than anything else; in aluminium it has only a feed of its own.
+    let cutting = json!([
+        {"material": "mdf", "spindle_rpm": 18000, "chip_load": 0.05, "stepdown": 4},
+        {"material": "Aluminium", "feed": 300},
+        {"material": "Brass"}
+    ]);
+    let tool =
+        run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 900, "cutting": cutting}));
+    // The feed in MDF is worked out from its chip load at its own speed; a material given nothing is left out.
+    assert_eq!(
+        tool["tool"]["cutting"],
+        json!([{"material": "mdf", "spindle_rpm": 18000.0, "feed": 1800.0, "stepdown": 4.0}, {"material": "Aluminium", "feed": 300.0}])
+    );
+    let op = |s: &mut Session, setup: &str| {
+        run(s, "cam.op.pocket", json!({"setup": setup, "sketch": "Pocket", "tool": 1, "bottom": -5}));
+        let listed = run(s, "cam.list", json!({}));
+        let setup = listed["setups"].as_array().unwrap().iter().find(|x| x["name"] == setup).unwrap().clone();
+        let op = setup["operations"][0].clone();
+        (op["spindle_rpm"].as_f64(), op["cut_feed"].as_f64(), op["stepdown"].clone())
+    };
+    assert_eq!(op(&mut s, "Setup1"), (Some(18000.0), Some(1800.0), json!("4 mm")));
+    // In aluminium the speed is the tool's own; with no material, all of it is.
+    run(&mut s, "cam.setup.create", json!({"name": "Alu", "material": "Aluminium"}));
+    assert_eq!(op(&mut s, "Alu"), (Some(12000.0), Some(300.0), json!("3 mm")));
+    run(&mut s, "cam.setup.create", json!({"name": "Plain"}));
+    assert_eq!(op(&mut s, "Plain"), (Some(12000.0), Some(900.0), json!("3 mm")));
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["materials"], json!(["MDF", "Aluminium"]));
+    assert_eq!(listed["setups"][1]["material"], "Aluminium");
+
+    // A tool with no feed of its own and none in the setup's material says which is missing.
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 2, "kind": "flat", "diameter": 3, "spindle_rpm": 15000, "cutting": [{"material": "MDF", "feed": 700}]}),
+    );
+    let e = s.execute("cam.op.pocket", &json!({"setup": "Alu", "sketch": "Pocket", "tool": 2, "bottom": -5})).unwrap_err().to_string();
+    assert!(e.contains("`feed` is required: tool 2 has none for Aluminium and none of its own"), "{e}");
+    // A setup's material is changed and cleared; a design saved and opened again keeps it.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Plain", "material": "Pine"}));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Alu", "material": null}));
+    let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(reopened.manufacture, s.doc.manufacture);
+    let materials: Vec<_> = reopened.manufacture.setups.iter().map(|x| x.material.clone()).collect();
+    assert_eq!(materials, [Some("MDF".to_string()), None, Some("Pine".to_string())]);
+    for bad in [json!({"setup": "Plain", "material": 3}), json!({"setup": "Plain", "material": "x".repeat(65)})] {
+        assert!(s.execute("cam.setup.edit", &bad).is_err(), "{bad}");
+    }
+    assert!(
+        s.execute(
+            "cam.tool.define",
+            &json!({"number": 3, "kind": "flat", "diameter": 3, "cutting": [{"material": "MDF"}, {"material": "mdf", "feed": 1}]})
+        )
+        .is_err()
+    );
+    assert!(
+        s.execute("cam.tool.define", &json!({"number": 3, "kind": "flat", "diameter": 3, "cutting": [{"material": "MDF", "feed": -1}]})).is_err()
+    );
+
+    // The machine's library names materials: those defined, and those its tools have data for.
+    run(&mut s, "cam.material.define", json!({"library": lib, "name": "Plywood"}));
+    run(&mut s, "cam.material.define", json!({"library": lib, "name": " plywood "}));
+    run(&mut s, "cam.library.add", json!({"library": lib, "number": 1}));
+    let listed = run(&mut s, "cam.library.list", json!({"library": lib}));
+    assert_eq!(listed["materials"], json!(["Plywood", "mdf", "Aluminium"]));
+    // Removing one takes it from the library's tools too; the design keeps its copy.
+    let removed = run(&mut s, "cam.material.remove", json!({"library": lib, "name": "MDF"}));
+    assert_eq!(removed["tools"], json!([1]));
+    let listed = run(&mut s, "cam.library.list", json!({"library": lib}));
+    assert_eq!(listed["materials"], json!(["Plywood", "Aluminium"]));
+    assert_eq!(listed["tools"][0]["design"], "differs");
+    assert!(s.doc.manufacture.tool(1).and_then(|t| t.cutting_in("MDF")).is_some());
+    assert!(s.execute("cam.material.remove", &json!({"library": lib, "name": "MDF"})).is_err());
+    assert!(s.execute("cam.material.define", &json!({"library": lib, "name": "  "})).is_err());
+    let _ = std::fs::remove_file(&lib);
 }
 
 #[test]

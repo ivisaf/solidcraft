@@ -8,6 +8,10 @@ use crate::{Result, invalid};
 pub const MAX_TOOL_NUMBER: u32 = 9999;
 /// Largest tool diameter (mm).
 pub const MAX_TOOL_DIAMETER: f64 = 1000.0;
+/// Most materials a tool has cutting data for (and a tool library names).
+pub const MAX_MATERIALS: usize = 100;
+/// Longest material name (characters).
+pub const MAX_MATERIAL_NAME: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +71,47 @@ pub struct Tool {
     pub shank_diameter: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<f64>,
+    /// Cutting data for particular materials; the data above is for every other one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cutting: Vec<CuttingData>,
+}
+
+/// A tool's cutting data in one material: what it says replaces the tool's own data when the
+/// setup's stock is of that material; what it leaves out stays the tool's own.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CuttingData {
+    pub material: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spindle_rpm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plunge_feed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepdown: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepover: Option<f64>,
+}
+
+impl CuttingData {
+    /// Whether it says nothing beyond its material.
+    pub fn is_empty(&self) -> bool {
+        [self.spindle_rpm, self.feed, self.plunge_feed, self.stepdown, self.stepover].iter().all(Option::is_none)
+    }
+}
+
+/// Whether two material names name the same material (case and surrounding spaces aside).
+pub fn same_material(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// A material name as given, checked: not empty, at most [`MAX_MATERIAL_NAME`] characters, no control characters.
+pub fn material_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > MAX_MATERIAL_NAME || name.chars().any(char::is_control) {
+        return invalid(format!("a material name has 1 to {MAX_MATERIAL_NAME} characters"));
+    }
+    Ok(name.to_string())
 }
 
 fn two() -> u32 {
@@ -91,7 +136,24 @@ impl Tool {
             tip_diameter: None,
             shank_diameter: None,
             length: None,
+            cutting: Vec::new(),
         }
+    }
+    /// The tool's cutting data in `material`, if it has any of its own for it.
+    pub fn cutting_in(&self, material: &str) -> Option<&CuttingData> {
+        self.cutting.iter().find(|c| same_material(&c.material, material))
+    }
+    /// The tool as it cuts `material`: its data for that material where it has some, else its own.
+    pub fn in_material(&self, material: Option<&str>) -> Tool {
+        let mut tool = self.clone();
+        if let Some(c) = material.and_then(|m| self.cutting_in(m)) {
+            tool.spindle_rpm = c.spindle_rpm.or(tool.spindle_rpm);
+            tool.feed = c.feed.or(tool.feed);
+            tool.plunge_feed = c.plunge_feed.or(tool.plunge_feed);
+            tool.stepdown = c.stepdown.or(tool.stepdown);
+            tool.stepover = c.stepover.or(tool.stepover);
+        }
+        tool
     }
     /// The point's included angle (degrees): 180 for a flat or ball end.
     pub fn point_angle(&self) -> f64 {
@@ -138,6 +200,18 @@ impl Tool {
         }
         if self.length.is_some_and(|l| !(l >= self.flute_length && l <= 10.0 * MAX_TOOL_DIAMETER)) {
             return invalid("a tool's length must be at least its flute length");
+        }
+        if self.cutting.len() > MAX_MATERIALS {
+            return invalid(format!("a tool has cutting data for at most {MAX_MATERIALS} materials"));
+        }
+        for (i, c) in self.cutting.iter().enumerate() {
+            material_name(&c.material)?;
+            if self.cutting.iter().take(i).any(|d| same_material(&d.material, &c.material)) {
+                return invalid(format!("the tool has cutting data for `{}` twice", c.material.trim()));
+            }
+            if [c.spindle_rpm, c.feed, c.plunge_feed, c.stepdown, c.stepover].iter().flatten().any(|v| !(*v > 0.0) || !(*v <= 1.0e6)) {
+                return invalid(format!("the spindle speed, feeds, stepdown and stepover in `{}` must be above 0", c.material.trim()));
+            }
         }
         Ok(())
     }

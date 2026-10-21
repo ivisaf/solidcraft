@@ -38,6 +38,9 @@ pub struct Setup {
     pub origin: SetupOrigin,
     #[serde(default)]
     pub stock: StockDef,
+    /// What the stock is made of: operations take their tool's cutting data for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<String>,
     /// The built-in post processor programs are written with.
     pub post: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

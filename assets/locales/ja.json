@@ -452,6 +452,8 @@
   "cmd.cam_library_list": "工具ライブラリ",
   "cmd.cam_library_remove": "ライブラリ工具を削除",
   "cmd.cam_list": "製造",
+  "cmd.cam_material_define": "材料を定義",
+  "cmd.cam_material_remove": "材料を削除",
   "cmd.cam_op_contour": "2D 輪郭",
   "cmd.cam_op_drill": "穴あけ",
   "cmd.cam_op_edit": "加工を編集",
