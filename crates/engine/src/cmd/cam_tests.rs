@@ -1145,6 +1145,34 @@ fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes
 }
 
 #[test]
+fn a_pocket_machines_the_rest_a_larger_tool_left() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 10000, "feed": 800}));
+    let big = run(&mut s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 2, "bottom": -4, "stepdown": 2, "stepover": 5}));
+    let rest = run(
+        &mut s,
+        "cam.op.pocket",
+        json!({"sketch": "Pocket", "tool": 1, "bottom": -4, "stepdown": 2, "spindle_rpm": 15000, "feed": 600, "rest_from": 2}),
+    );
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["setups"][0]["operations"][1]["inputs"]["rest_from"], 2);
+    // Only the corners: far less than the whole pocket with the same tool.
+    let whole = run(&mut s, "cam.op.edit", json!({"op": rest["operation"], "rest_from": null}));
+    assert!(rest["cut_length"].as_f64().unwrap() < whole["cut_length"].as_f64().unwrap() * 0.5);
+    run(&mut s, "cam.op.edit", json!({"op": rest["operation"], "rest_from": 2}));
+    // The larger tool stays while the rest is machined after it; no such tool, or a smaller one: refused.
+    run(&mut s, "cam.op.remove", json!({"op": big["operation"]}));
+    let e = s.execute("cam.tool.remove", &json!({"number": 2})).unwrap_err().to_string();
+    assert!(e.contains("machines the rest of tool 2"), "{e}");
+    assert!(
+        s.execute("cam.op.pocket", &json!({"sketch": "Pocket", "tool": 1, "bottom": -4, "spindle_rpm": 15000, "feed": 600, "rest_from": 9})).is_err()
+    );
+    assert!(s.execute("cam.op.pocket", &json!({"sketch": "Pocket", "tool": 2, "bottom": -4, "rest_from": 1})).is_err());
+    let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(reopened.manufacture, s.doc.manufacture);
+}
+
+#[test]
 fn chamfer_cuts_the_top_edge_at_the_v_bit_s_angle() {
     let mut s = Session::default();
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));

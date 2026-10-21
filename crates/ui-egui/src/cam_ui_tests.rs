@@ -1189,3 +1189,33 @@ fn a_chamfer_form_takes_its_depth_from_its_width() {
     let Some(Form::Op(again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
     assert_eq!((again.kind, again.width.as_str(), again.side), (OpKind::Chamfer, "0.8 mm", 1));
 }
+
+#[test]
+fn a_pocket_form_machines_the_rest_of_a_larger_tool() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    h.app.run("cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 10000, "feed": 800})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 2, "bottom": -4, "stepover": 5})).unwrap();
+    h.app.start("cam.op.pocket");
+    h.frames(2);
+    assert!(h.widget("Rest of tool").is_some() && h.widget("none: the whole pocket").is_some());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.tool, f.bottom, f.rest_from) = ("1".into(), "-4".into(), "2".into());
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[1].clone();
+    assert!(matches!(&op.kind, solidcraft_engine::doc::manufacture::CamOperationKind::Pocket { rest_from: Some(2), .. }));
+    // Opened again it keeps the larger tool; emptied, the whole pocket is cut again.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(mut again)) = edit_form(&h.app, &setup, &setup["operations"][1]) else { panic!("no form") };
+    assert_eq!(again.rest_from, "2");
+    again.rest_from.clear();
+    h.app.manufacture.form = Some(Form::Op(again));
+    apply(&mut h.app);
+    assert!(matches!(
+        &h.app.session.doc.manufacture.setups[0].operations[1].kind,
+        solidcraft_engine::doc::manufacture::CamOperationKind::Pocket { rest_from: None, .. }
+    ));
+}

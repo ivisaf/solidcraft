@@ -277,6 +277,8 @@ pub struct OpForm {
     pub finish: String,
     /// How far a bore's helix goes down in one turn.
     pub pitch: String,
+    /// A pocket's rest machining: the larger tool (its number) that cleared it before (empty: the whole pocket).
+    pub rest_from: String,
     /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
     pub width: String,
     pub tip_offset: String,
@@ -679,6 +681,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             tab_height: String::new(),
             finish: String::new(),
             pitch: String::new(),
+            rest_from: String::new(),
             width: String::new(),
             tip_offset: String::new(),
             peck: String::new(),
@@ -932,6 +935,16 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
                 OpKind::Pocket => {
+                    // An emptied rest tool on an edit means the whole pocket again.
+                    match f.rest_from.trim().parse::<u64>() {
+                        Ok(n) => {
+                            p.insert("rest_from".into(), json!(n));
+                        }
+                        Err(_) if f.editing.is_some() => {
+                            p.insert("rest_from".into(), Value::Null);
+                        }
+                        Err(_) => {}
+                    }
                     optional(&mut p, "stepover", &f.stepover);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
@@ -1167,6 +1180,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         tab_height: text(&inputs["tabs"], "height"),
         finish: text(inputs, "finish"),
         pitch: text(inputs, "pitch"),
+        rest_from: inputs["rest_from"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
         width: text(inputs, "width"),
         tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
@@ -1847,6 +1861,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Retract" => "Where the tool's fast approach stops and it feeds down into the material. Empty: 2 mm over the top.",
         "Top" => "Where cutting starts, in the setup's Z (zero at the work zero).",
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
+        "Rest of tool" => {
+            "Rest machining: a larger tool cleared this pocket before; this one only cuts what it could not reach, in the corners and narrow places."
+        }
         "Chamfer width" => "How wide the chamfer is across the top. Its angle is the tool's; its depth follows from the two.",
         "Tip offset" => "How much deeper than the chamfer the tool's point goes, so that the sharp tip does not do the cutting and wear.",
         "Depth per turn" => "How far the helix goes down in one turn round the hole. Smaller: gentler on the tool, longer to cut.",
@@ -2715,6 +2732,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                     field(ui, need, "Finish allowance", &mut f.finish, "none");
+                    // Rest machining: what a larger tool left, in the corners and narrow places.
+                    let mut options: Vec<(String, String)> = vec![(String::new(), "none: the whole pocket".into())];
+                    options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
+                    pick(ui, need, "sc_cam_rest_from", "Rest of tool", &mut f.rest_from, &options);
                 }
                 OpKind::Chamfer => {
                     f.side = f.side.min(1);

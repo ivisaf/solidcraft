@@ -184,6 +184,9 @@ pub enum CamOperationKind {
         ramp_angle: Expr,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<Expr>,
+        /// Rest machining: the larger tool (its number) that cleared the pocket before; only what it left is cut.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_from: Option<u32>,
     },
     /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
     /// deeper than the chamfer (length expressions).

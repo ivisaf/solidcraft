@@ -92,13 +92,13 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).icon("delete").params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
-    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); inner profiles are islands")),
+    CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
     CommandSpec::new("cam.op.chamfer", "Chamfer", op_chamfer).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("width?: expr across the top (default 1 mm); tip_offset?: expr, how much deeper than the chamfer the tool's point goes (default 0.5 mm); side?: outside|inside (default outside: the profiles are the part); climb?: bool (default true); ramp_angle?: angle expr (default 3 deg); chamfers the top edges of the profiles or picked faces in one pass with a V-bit or a drill, at the tool's angle; the depth comes from the width (bottom is not used)")),
     CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, pitch, width, tip_offset, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, pitch, width, tip_offset, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -597,6 +597,10 @@ fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(op) = m.setups.iter().flat_map(|x| &x.operations).find(|o| u64::from(o.tool) == number) {
         return Err(bad(cmd, format!("tool {number} is used by operation `{}`", op.name)));
+    }
+    let rest_of = |o: &&CamOperation| matches!(o.kind, CamOperationKind::Pocket { rest_from: Some(n), .. } if u64::from(n) == number);
+    if let Some(op) = m.setups.iter().flat_map(|x| &x.operations).find(rest_of) {
+        return Err(bad(cmd, format!("operation `{}` machines the rest of tool {number}", op.name)));
     }
     s.doc_mut().manufacture.tools.retain(|t| u64::from(t.number) != number);
     Ok(json!({ "removed": number }))
@@ -1316,7 +1320,14 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::contour(regions, tool, &params, &cut)
         }
-        CamOperationKind::Pocket { stepover, climb, stock_to_leave, ramp_angle, finish } => {
+        CamOperationKind::Pocket { stepover, climb, stock_to_leave, ramp_angle, finish, rest_from } => {
+            // Rest machining after a larger tool: its diameter.
+            let rest_diameter = match rest_from {
+                Some(n) => {
+                    Some(s.doc.manufacture.tool(*n).map(|t| t.diameter).ok_or_else(|| fail(format!("there is no tool {n} to machine the rest of")))?)
+                }
+                None => None,
+            };
             let params = PocketParams {
                 stepover: len("stepover", stepover)?,
                 climb: *climb,
@@ -1324,6 +1335,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 tolerance: TOLERANCE,
                 ramp_angle: angle(ramp_angle)?,
                 finish: finish.as_ref().map(|e| len("finish", e)).transpose()?.unwrap_or(0.0),
+                rest_diameter,
             };
             cam::pocket(regions, tool, &params, &cut)
         }
@@ -1674,6 +1686,18 @@ fn tabs_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<TabsDef>> {
     Ok(Some(TabsDef { count, width, height }))
 }
 
+/// `rest_from`: the larger tool (a number of this design's) whose pocket this one machines the
+/// rest of (null or left out: the whole pocket).
+fn rest_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<u32>> {
+    match p.get("rest_from") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let n = v.as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| bad(cmd, "`rest_from` must be a tool number"))?;
+            s.doc.manufacture.tool(n).map(|_| Some(n)).ok_or_else(|| bad(cmd, format!("`rest_from`: the design has no tool {n}")))
+        }
+    }
+}
+
 /// `finish`: the finishing allowance (null or left out: none).
 fn finish_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<Expr>> {
     match expr(p, "finish") {
@@ -1749,12 +1773,14 @@ fn op_pocket(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.pocket";
     let (stepover, climb, leave, ramp) = (expr(p, "stepover"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p), ramp_angle(p));
     let finish = finish_param(s, p, cmd)?;
+    let rest_from = rest_param(s, p, cmd)?;
     add_op(s, p, cmd, "Pocket", |tool| CamOperationKind::Pocket {
         stepover: stepover.unwrap_or_else(|| mm(tool.stepover.unwrap_or(tool.diameter * 0.4))),
         climb,
         stock_to_leave: leave,
         ramp_angle: ramp,
         finish,
+        rest_from,
     })
 }
 
@@ -1885,6 +1911,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "ramp_angle",
         "tabs",
         "finish",
+        "rest_from",
         "pitch",
         "width",
         "tip_offset",
@@ -1905,6 +1932,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 *margin = if p.get(k).is_some_and(Value::is_null) { None } else { Some(margin_param(s, p, cmd)?) }
             }
             (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
+            (CamOperationKind::Pocket { rest_from, .. }, "rest_from") => *rest_from = rest_param(s, p, cmd)?,
             (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { width, .. }, "width") => *width = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { tip_offset, .. }, "tip_offset") => *tip_offset = checked(k, Kind::Length)?,

@@ -154,6 +154,9 @@ pub struct PocketParams {
     /// Material the depth passes leave on the walls besides `stock_to_leave` (mm), taken off by
     /// one more pass along the walls at the full depth; 0: none.
     pub finish: f64,
+    /// Rest machining: only what a larger tool this wide (mm) could not reach (corners, narrow
+    /// places) is cut, the larger tool having cleared the rest to the same depth and walls.
+    pub rest_diameter: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -726,6 +729,9 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     if rings.is_empty() {
         return invalid("the tool does not fit the pocket");
     }
+    if let Some(big) = params.rest_diameter {
+        return rest(&shape, &rings, tool, params, cut, big);
+    }
     // Rings more than a radius apart leave material wherever the next ring in does not run
     // within a radius: the middle of a part of the pocket it no longer fits in, a passage that
     // narrows. A ring a radius further in clears it; it is cut where some stretch of it is out
@@ -795,6 +801,165 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
             b.cut_to(first.start(), z)?;
             b.retract()?;
         }
+    }
+    b.finish()
+}
+
+/// Most cells of the grid rest machining finds the material left on.
+const MAX_REST_CELLS: usize = 2_000_000;
+
+/// [`pocket`]'s rings, cut only where they come within reach of what a tool `big` wide left:
+/// the pocket's points that no position of the larger tool (as far from the walls as this
+/// pocket's) came within its radius of. The stretches of the rings near such material are cut
+/// on each depth pass; the tool goes up and over between them.
+fn rest(shape: &Shape, rings: &[Vec<Vec<Piece>>], tool: &Tool, params: &PocketParams, cut: &Cut, big: f64) -> Result<Toolpath> {
+    let (r, leave) = (tool.radius(), params.stock_to_leave + params.finish);
+    if !(big > tool.diameter + 1e-9) || !(big <= MAX_COORD) {
+        return invalid("rest machining follows a larger tool: its diameter must be above this tool's");
+    }
+    let big_r = big * 0.5;
+    // The pocket on a grid a quarter of this tool's radius fine.
+    let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for (a, b) in shape.loops().iter().flatten().map(Piece::bounds) {
+        (lo, hi) = (Vec2::new(lo.x.min(a.x), lo.y.min(a.y)), Vec2::new(hi.x.max(b.x), hi.y.max(b.y)));
+    }
+    let cell = (r * 0.25).max(0.01);
+    if !lo.is_finite() || !hi.is_finite() || !(((hi.x - lo.x) / cell + 1.0) * ((hi.y - lo.y) / cell + 1.0) <= MAX_REST_CELLS as f64) {
+        return Err(CamError::TooLarge("the pocket is too large for rest machining with so small a tool".into()));
+    }
+    let flat = |z: f64| HeightField::block(lo.extend(z - 1.0), hi.extend(z), cell);
+    let (mut centres, mut inside) = (flat(0.0)?, flat(0.0)?);
+    for j in 0..centres.ny {
+        for i in 0..centres.nx {
+            let q = centres.centre(i, j);
+            let d = shape.dist(q);
+            let k = j * centres.nx + i;
+            let is_in = shape.inside(q, d.max(1e-6));
+            // Where the larger tool's axis could be, and where the pocket's material is (not what stays on the walls).
+            if let Some(z) = centres.z.get_mut(k) {
+                *z = if is_in && d >= big_r + leave - 1e-9 { 1.0 } else { 0.0 };
+            }
+            if let Some(z) = inside.z.get_mut(k) {
+                *z = if is_in && d > leave + cell * 0.5 { 1.0 } else { 0.0 };
+            }
+        }
+    }
+    // A column more: the grid's own rounding is no material left (a sliver thinner than a column is not cut again).
+    let reached = centres.dilated(big_r + cell)?;
+    let mut left = inside.clone();
+    for (z, reach) in left.z.iter_mut().zip(&reached.z) {
+        if *reach > 0.5 {
+            *z = 0.0;
+        }
+    }
+    if left.z.iter().all(|z| *z < 0.5) {
+        return invalid(format!("the {big} mm tool leaves nothing for this tool: it reached the whole pocket"));
+    }
+    // Where this tool's axis touches what was left (a column more, so that no corner is missed).
+    let near = left.dilated(r + cell)?;
+    let touches = |p: Vec2| near.at(p) > 0.5;
+    // Each ring's stretches near what was left, joined while they follow on; a ring near it all
+    // the way round is one whole loop (ramped into: nothing of it was cleared).
+    let mut stretches: Vec<Vec<Piece>> = Vec::new();
+    let mut whole: Vec<Vec<Piece>> = Vec::new();
+    for lp in rings.iter().rev().flatten() {
+        let lp = if params.climb { lp.clone() } else { reversed(lp) };
+        // Started where it is clear of what was left, so that no stretch begins in it.
+        let clear = lp.iter().enumerate().find_map(|(i, piece)| {
+            let n = ((piece.length() / (cell * 0.5)).ceil() as usize).clamp(1, 100_000);
+            (0..n).map(|k| k as f64 / n as f64).find(|t| !touches(piece.point_at(*t))).map(|t| (i, t))
+        });
+        let Some((i, t)) = clear else {
+            whole.push(lp);
+            continue;
+        };
+        let mut turned: Vec<Piece> = Vec::with_capacity(lp.len() + 1);
+        if let Some(piece) = lp.get(i) {
+            turned.push(if t > 0.0 { piece.sub(t, 1.0) } else { *piece });
+        }
+        turned.extend(lp.iter().cycle().skip(i + 1).take(lp.len().saturating_sub(1)).copied());
+        if let Some(piece) = lp.get(i).filter(|_| t > 0.0) {
+            turned.push(piece.sub(0.0, t));
+        }
+        let lp = turned;
+        let mut open: Vec<Piece> = Vec::new();
+        for piece in &lp {
+            let n = ((piece.length() / (cell * 0.5)).ceil() as usize).clamp(1, 100_000);
+            let mut from: Option<usize> = None;
+            for k in 0..=n {
+                let on = touches(piece.point_at(k as f64 / n as f64));
+                match (on, from) {
+                    (true, None) => from = Some(k),
+                    (false, Some(f)) => {
+                        open.push(piece.sub(f as f64 / n as f64, k as f64 / n as f64));
+                        stretches.push(std::mem::take(&mut open));
+                        from = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(f) = from {
+                open.push(if f == 0 { *piece } else { piece.sub(f as f64 / n as f64, 1.0) });
+            }
+        }
+        if !open.is_empty() {
+            stretches.push(open);
+        }
+    }
+    stretches.retain(|s| s.iter().map(Piece::length).sum::<f64>() > 1e-6);
+    // Each one after the one nearest the last's end.
+    let mut ordered: Vec<Vec<Piece>> = Vec::with_capacity(stretches.len());
+    let mut at = stretches.first().and_then(|s| s.first()).map_or(Vec2::ZERO, Piece::start);
+    while !stretches.is_empty() {
+        let next = stretches
+            .iter()
+            .enumerate()
+            .min_by(|a, b| {
+                let d = |s: &Vec<Piece>| s.first().map_or(f64::INFINITY, |p| p.start().dist(at));
+                d(a.1).total_cmp(&d(b.1))
+            })
+            .map_or(0, |(i, _)| i);
+        let s = stretches.swap_remove(next);
+        at = s.last().map_or(at, Piece::end);
+        ordered.push(s);
+    }
+    let stretches = ordered;
+    let mut b = Builder::new(cut);
+    let mut cleared = cut.heights.top;
+    for z in cut.levels()? {
+        for lp in &whole {
+            let Some(first) = lp.first() else { continue };
+            b.retract()?;
+            b.travel_to(first.start())?;
+            b.plunge_to(cleared)?;
+            b.ramp_loop(lp, z, params.ramp_angle)?;
+            b.cut_loop(lp, z)?;
+            b.cut_to(first.start(), z)?;
+        }
+        cleared = z;
+        for stretch in &stretches {
+            let Some(first) = stretch.first() else { continue };
+            // Within the pocket, over at the retract height (the tool kept inside its walls); else by the clearance height.
+            match b.pos {
+                Some(q) if link_is_clear(shape, Vec2::new(q.x, q.y), first.start(), r, r) => {
+                    if q.z < cut.heights.retract {
+                        b.push(Move::Rapid { to: Vec3::new(q.x, q.y, cut.heights.retract) })?;
+                    }
+                    b.push(Move::Rapid { to: first.start().extend(cut.heights.retract) })?;
+                }
+                _ => {
+                    b.retract()?;
+                    b.travel_to(first.start())?;
+                }
+            }
+            // Down where the larger tool cleared: the tool's edge only touches what is left.
+            b.plunge_to(z)?;
+            for piece in stretch {
+                b.cut_to(piece.start(), z)?;
+                b.cut_piece(piece, z, z)?;
+            }
+        }
+        b.retract()?;
     }
     b.finish()
 }
