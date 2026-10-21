@@ -27,7 +27,8 @@ pub use check::verify;
 pub use gcode::{Operation, Program, emit, parse};
 pub use offset::offset_regions;
 pub use ops::{
-    ContourParams, Cut, DrillParams, FaceParams, Feeds, Heights, MAX_TABS, PocketParams, Side, Tabs, contour, drill, face, face_around, pocket,
+    BoreParams, ContourParams, Cut, DrillParams, FaceParams, Feeds, Heights, MAX_TABS, PocketParams, Side, Tabs, bore, contour, drill, face,
+    face_around, pocket,
 };
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, Units};

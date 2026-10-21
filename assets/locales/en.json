@@ -454,6 +454,7 @@
   "cmd.cam_list": "Manufacture",
   "cmd.cam_material_define": "Define Material",
   "cmd.cam_material_remove": "Remove Material",
+  "cmd.cam_op_bore": "Bore",
   "cmd.cam_op_contour": "2D Contour",
   "cmd.cam_op_drill": "Drill",
   "cmd.cam_op_edit": "Edit Operation",

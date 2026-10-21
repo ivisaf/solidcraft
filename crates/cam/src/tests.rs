@@ -445,6 +445,41 @@ fn pocket_with_passes_up_to_a_diameter_apart_still_clears_the_middle() {
 }
 
 #[test]
+fn bore_mills_a_hole_on_a_helix_and_a_last_turn_at_the_bottom() {
+    // A 20 mm hole with a 6 mm tool: its axis goes round 7 mm from the centre, 2 mm down a turn.
+    let c = cut(0.0, -5.0, 2.0);
+    let params = BoreParams { pitch: 2.0, climb: true, stock_to_leave: 0.0 };
+    let path = bore(&[(v(30.0, 20.0), 20.0)], &tool(6.0), &params, &c).unwrap();
+    let pts = cutting_points(&path, 0.0 + 1e-9);
+    assert!(pts.iter().all(|p| (Vec2::new(p.x, p.y).dist(v(30.0, 20.0)) - 7.0).abs() < 1e-6));
+    close(pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min), -5.0, 1e-9);
+    // Three turns down (5 mm), one more at the bottom, and 2 mm from the retract height to the top.
+    let turn = 2.0 * PI * 7.0;
+    close(path.stats().cut_length, 3.0 * turn.hypot(5.0 / 3.0) + turn + 2.0, 1e-6);
+    // Climb inside a hole turns counter-clockwise.
+    assert!(path.moves.iter().all(|m| !matches!(m, Move::Arc { ccw: false, .. })));
+    let conventional = bore(&[(v(30.0, 20.0), 20.0)], &tool(6.0), &BoreParams { climb: false, ..params }, &c).unwrap();
+    assert!(conventional.moves.iter().all(|m| !matches!(m, Move::Arc { ccw: true, .. })));
+    // The stock is cut to the hole's wall, all round.
+    let mut stock = HeightField::block(Vec3::new(10.0, 0.0, -10.0), Vec3::new(50.0, 40.0, 0.0), 0.25).unwrap();
+    simulate(&mut stock, &path, &tool(6.0)).unwrap();
+    for k in 0..16 {
+        let a = k as f64 / 16.0 * 2.0 * PI;
+        let inside = v(30.0, 20.0) + Vec2::from_angle(a) * 9.5;
+        let outside = v(30.0, 20.0) + Vec2::from_angle(a) * 10.5;
+        assert!((stock.at(inside) + 5.0).abs() < 1e-6 && stock.at(outside).abs() < 1e-6, "{a}");
+    }
+    // A small hole close to the tool's size: the axis goes to the middle before it goes up.
+    let small = bore(&[(v(0.0, 0.0), 8.0)], &tool(6.0), &params, &c).unwrap();
+    assert!(cutting_points(&small, 0.0).iter().any(|p| p.x.abs() < 1e-9 && p.y.abs() < 1e-9));
+    // A hole the tool does not fit, no hole, a bad pitch: refused.
+    assert!(bore(&[(v(0.0, 0.0), 6.0)], &tool(6.0), &params, &c).is_err());
+    assert!(bore(&[], &tool(6.0), &params, &c).is_err());
+    assert!(bore(&[(v(0.0, 0.0), 20.0)], &tool(6.0), &BoreParams { pitch: 0.0, ..params }, &c).is_err());
+    assert!(bore(&[(v(0.0, 0.0), f64::NAN)], &tool(6.0), &params, &c).is_err());
+}
+
+#[test]
 fn drill_pecks_and_dwells() {
     let params = DrillParams { peck: Some(4.0), dwell: 0.5 };
     let t = Tool::new(3, ToolKind::Drill, 5.0, 40.0);

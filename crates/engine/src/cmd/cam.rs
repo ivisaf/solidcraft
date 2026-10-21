@@ -3,7 +3,9 @@
 //! profiles are; toolpaths are never stored, so they follow the design.
 
 use serde_json::{Value, json};
-use solidcraft_cam::{self as cam, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath};
+use solidcraft_cam::{
+    self as cam, BoreParams, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind, Toolpath,
+};
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup, SetupOrigin, StockDef, TabsDef};
@@ -90,10 +92,11 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); inner profiles are islands")),
+    CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, pitch, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -1121,7 +1124,8 @@ impl OpShape {
             CamOperationKind::Face { .. } => OpShape::Face,
             CamOperationKind::Contour { .. } => OpShape::Contour,
             CamOperationKind::Pocket { .. } => OpShape::Pocket,
-            CamOperationKind::Drill { .. } => OpShape::Drill,
+            // Holes, as drilled: their heights are the same.
+            CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } => OpShape::Drill,
         }
     }
 }
@@ -1306,6 +1310,25 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::pocket(regions, tool, &params, &cut)
         }
+        CamOperationKind::Bore { climb, stock_to_leave, pitch } => {
+            let params = BoreParams { pitch: len("pitch", pitch)?, climb: *climb, stock_to_leave: len("stock_to_leave", stock_to_leave)? };
+            // Round profiles of a sketch; a picked face's round holes and picked hole walls the tool fits in.
+            let holes: Vec<(Vec2, f64)> = if picked {
+                let walls = g.bores.iter().copied();
+                regions.iter().flat_map(|r| r.holes.iter().filter_map(round_hole)).chain(walls).filter(|(_, r)| 2.0 * r > tool.diameter).collect()
+            } else {
+                let round: Vec<_> = regions.iter().filter_map(|r| round_hole(&r.outer)).collect();
+                if round.len() < regions.len() {
+                    return Err(fail("only round profiles can be bored; use a pocket for the others".into()));
+                }
+                round
+            };
+            if holes.is_empty() {
+                return Err(fail(format!("the picked faces have no round holes wider than the {} mm tool", tool.diameter)));
+            }
+            let holes: Vec<(Vec2, f64)> = holes.into_iter().map(|(c, r)| (c, 2.0 * r)).collect();
+            cam::bore(&holes, tool, &params, &cut)
+        }
         CamOperationKind::Drill { peck, dwell } => {
             let peck = peck.as_ref().map(|e| len("peck", e)).transpose()?;
             // A sketch's profiles are the holes; a picked face's round inner loops are, those a
@@ -1374,7 +1397,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
         "cam.op.face" => OpShape::Face,
         "cam.op.contour" => OpShape::Contour,
         "cam.op.pocket" => OpShape::Pocket,
-        "cam.op.drill" => OpShape::Drill,
+        "cam.op.drill" | "cam.op.bore" => OpShape::Drill,
         _ => return Err(bad(cmd, "not an operation")),
     };
     let setup = setup(s, p, cmd)?;
@@ -1708,6 +1731,16 @@ fn op_drill(s: &mut Session, p: &Value) -> Result<Value> {
     add_op(s, p, cmd, "Drill", |_| CamOperationKind::Drill { peck, dwell })
 }
 
+fn op_bore(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.bore";
+    let (pitch, climb, leave) = (expr(p, "pitch"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p));
+    add_op(s, p, cmd, "Bore", |tool| CamOperationKind::Bore {
+        climb,
+        stock_to_leave: leave,
+        pitch: pitch.unwrap_or_else(|| mm(tool.stepdown.unwrap_or(tool.diameter * 0.25))),
+    })
+}
+
 fn op_position(setup: &Setup, k: &str) -> Option<usize> {
     setup.operations.iter().position(|o| o.id.to_string() == k).or_else(|| setup.operations.iter().position(|o| o.name.eq_ignore_ascii_case(k)))
 }
@@ -1791,7 +1824,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let unknown = |k: &str| bad(cmd, format!("a {} operation has no `{k}`", op.kind.label()));
     let mut kind = op.kind.clone();
-    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "tabs", "finish", "peck", "dwell", "limit", "margin"] {
+    for k in ["stepover", "side", "climb", "stock_to_leave", "ramp_angle", "tabs", "finish", "pitch", "peck", "dwell", "limit", "margin"] {
         if !has(k) {
             continue;
         }
@@ -1804,12 +1837,16 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 *margin = if p.get(k).is_some_and(Value::is_null) { None } else { Some(margin_param(s, p, cmd)?) }
             }
             (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
-            (CamOperationKind::Contour { climb, .. } | CamOperationKind::Pocket { climb, .. }, "climb") => {
+            (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
+            (CamOperationKind::Contour { climb, .. } | CamOperationKind::Pocket { climb, .. } | CamOperationKind::Bore { climb, .. }, "climb") => {
                 *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?
             }
-            (CamOperationKind::Contour { stock_to_leave, .. } | CamOperationKind::Pocket { stock_to_leave, .. }, "stock_to_leave") => {
-                *stock_to_leave = checked(k, Kind::Length)?
-            }
+            (
+                CamOperationKind::Contour { stock_to_leave, .. }
+                | CamOperationKind::Pocket { stock_to_leave, .. }
+                | CamOperationKind::Bore { stock_to_leave, .. },
+                "stock_to_leave",
+            ) => *stock_to_leave = checked(k, Kind::Length)?,
             (CamOperationKind::Contour { ramp_angle, .. } | CamOperationKind::Pocket { ramp_angle, .. }, "ramp_angle") => {
                 *ramp_angle = checked(k, Kind::Angle)?
             }

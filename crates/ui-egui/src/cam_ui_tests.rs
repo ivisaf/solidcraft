@@ -487,7 +487,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 10, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 11, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1135,4 +1135,32 @@ fn a_hull_goes_round_its_points() {
     assert_eq!(hull.len(), 4);
     assert!(hull.contains(&p(2.0, 2.0)) && !hull.contains(&p(1.0, 1.0)));
     assert!(convex_hull(vec![p(0.0, 0.0), p(1.0, 1.0)]).len() == 2 && convex_hull(Vec::new()).is_empty());
+}
+
+#[test]
+fn a_bore_form_mills_round_holes_on_a_helix() {
+    let mut h = lab();
+    h.app.run("sketch.create", json!({"plane": "XY", "name": "Holes"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center": [20, 20], "radius": 8})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.bore");
+    h.frames(2);
+    // Its own rows: no stepdown or passes, a depth per turn and the direction.
+    assert!(h.widget("BORE").is_some() && h.widget("Depth per turn").is_some() && h.widget("Climb").is_some());
+    assert!(h.widget("Stepdown").is_none() && h.widget("Passes").is_none() && h.widget("Ramp angle").is_none());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.bottom, f.pitch, f.climb) = ("-5".into(), "1.5 mm".into(), false);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert!(matches!(&op.kind, solidcraft_engine::doc::manufacture::CamOperationKind::Bore { pitch, climb: false, .. } if pitch == "1.5 mm"));
+    // It opens again as it was, and the browser lists it with the drill's icon.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+    assert_eq!((again.kind, again.pitch.as_str(), again.climb), (OpKind::Bore, "1.5 mm", false));
+    h.frames(2);
+    assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Bore1"));
 }

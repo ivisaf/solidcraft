@@ -185,6 +185,8 @@ pub enum CamOperationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<Expr>,
     },
+    /// Mills round holes larger than the tool on a helix, `pitch` (a length expression) down a turn.
+    Bore { climb: bool, stock_to_leave: Expr, pitch: Expr },
     /// Drills at the centre of each profile.
     Drill {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +215,7 @@ impl CamOperationKind {
             CamOperationKind::Face { .. } => "face",
             CamOperationKind::Contour { .. } => "contour",
             CamOperationKind::Pocket { .. } => "pocket",
+            CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",
         }
     }

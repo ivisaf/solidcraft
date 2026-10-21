@@ -1145,6 +1145,48 @@ fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes
 }
 
 #[test]
+fn bore_mills_round_holes_wider_than_its_tool_through_the_part() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 10, "direction": "negative"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Holes"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 20], "radius": 8}));
+    run(&mut s, "sketch.circle.center", json!({"center": [45, 20], "radius": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "stepdown": 2}));
+    run(&mut s, "cam.setup.create", json!({}));
+    // Through the plate (the sketch is on its top), 2 mm down a turn: the tool's stepdown.
+    let op = run(&mut s, "cam.op.bore", json!({"sketch": "Holes", "tool": 1}));
+    assert_eq!(op["lowest_z"], -10.0);
+    let listed = run(&mut s, "cam.list", json!({}));
+    let first = &listed["setups"][0]["operations"][0];
+    assert_eq!(
+        (first["kind"].as_str(), first["inputs"]["pitch"].as_str(), first["inputs"]["climb"].as_bool()),
+        (Some("bore"), Some("2 mm"), Some(true))
+    );
+    // Both holes are cut: π × (8² + 5²) × 10 mm³, less the 16 mm hole's core (radius 8 − 2 × 3),
+    // which a through hole drops; within the simulation's columns.
+    let sim = run(&mut s, "cam.simulate", json!({"cell": 0.1}));
+    let removed = sim["removed_volume"].as_f64().unwrap();
+    assert!((removed / (std::f64::consts::PI * (89.0 - 4.0) * 10.0) - 1.0).abs() < 0.01, "{removed}");
+    // A finer helix is longer; climb off turns the other way.
+    let fine = run(&mut s, "cam.op.edit", json!({"op": op["operation"], "pitch": "1 mm", "climb": false}));
+    assert!(fine["cut_length"].as_f64().unwrap() > op["cut_length"].as_f64().unwrap());
+    // A profile that is not round, a hole the tool does not fit, a V-bit: refused.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Square"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 5], "p1": [15, 15]}));
+    run(&mut s, "sketch.finish", json!({}));
+    assert!(s.execute("cam.op.bore", &json!({"sketch": "Square", "tool": 1})).is_err());
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 12000, "feed": 600}));
+    assert!(s.execute("cam.op.bore", &json!({"sketch": "Holes", "tool": 2})).is_err());
+    run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "vbit", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    assert!(s.execute("cam.op.bore", &json!({"sketch": "Holes", "tool": 3})).is_err());
+    assert!(s.execute("cam.op.bore", &json!({"sketch": "Holes", "tool": 1, "pitch": "0 mm"})).is_err());
+}
+
+#[test]
 fn a_setup_s_program_plays_back_to_what_its_simulation_leaves() {
     let mut s = pocket_job(0.0, json!({}));
     run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));

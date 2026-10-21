@@ -454,6 +454,7 @@
   "cmd.cam_list": "制造",
   "cmd.cam_material_define": "定义材料",
   "cmd.cam_material_remove": "删除材料",
+  "cmd.cam_op_bore": "螺旋铣孔",
   "cmd.cam_op_contour": "2D 轮廓",
   "cmd.cam_op_drill": "钻孔",
   "cmd.cam_op_edit": "编辑工序",

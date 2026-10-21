@@ -164,6 +164,17 @@ pub struct DrillParams {
     pub dwell: f64,
 }
 
+/// How a hole larger than the tool is milled on a helix.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BoreParams {
+    /// How far the helix goes down in one turn (mm).
+    pub pitch: f64,
+    /// Climb milling (counter-clockwise inside a hole with a clockwise spindle); otherwise conventional.
+    pub climb: bool,
+    /// Material left on the wall (mm).
+    pub stock_to_leave: f64,
+}
+
 /// Collects moves, keeping the tool's position.
 struct Builder {
     moves: Vec<Move>,
@@ -740,6 +751,60 @@ fn link_is_clear(shape: &Shape, a: Vec2, b: Vec2, wall: f64, r: f64) -> bool {
 
 /// Drills at each point from the top to the bottom height, optionally in pecks that lift the
 /// drill to the retract height to clear chips.
+/// Mills round holes (centre, diameter) larger than the tool on a helix down the wall, one turn
+/// for each `pitch` of depth, then a whole turn at the bottom for a clean wall and floor. A hole
+/// more than twice the tool's diameter keeps a core in its middle: a through hole drops it, a
+/// blind one needs a pocket.
+pub fn bore(holes: &[(Vec2, f64)], tool: &Tool, params: &BoreParams, cut: &Cut) -> Result<Toolpath> {
+    tool.validate()?;
+    cut.heights.validate()?;
+    cut.feeds.validate()?;
+    check_leave(params.stock_to_leave)?;
+    if holes.is_empty() {
+        return invalid("there is no hole to bore");
+    }
+    if holes.len() > MAX_HOLES {
+        return Err(CamError::TooLarge(format!("more than {MAX_HOLES} holes")));
+    }
+    if !(params.pitch > 0.0) || !params.pitch.is_finite() {
+        return invalid("the depth per turn must be above 0");
+    }
+    let h = cut.heights;
+    if !(h.top > h.bottom) {
+        return invalid("the hole has no depth");
+    }
+    let turns = ((h.top - h.bottom) / params.pitch - 1e-9).ceil().max(1.0);
+    if !(turns <= MAX_LEVELS as f64) {
+        return Err(CamError::TooLarge(format!("more than {MAX_LEVELS} turns")));
+    }
+    let turns = turns as usize;
+    let mut b = Builder::new(cut);
+    for &(c, d) in holes {
+        check_point(c)?;
+        // Where the tool's axis goes round: the hole's radius less the tool's and what stays on the wall.
+        let r = d * 0.5 - tool.radius() - params.stock_to_leave;
+        if !(r > 1e-3) || !d.is_finite() {
+            return invalid(format!("a {} mm tool cannot bore a hole {} mm across: it needs a larger hole or a drill", tool.diameter, d));
+        }
+        let start = c + Vec2::new(r, 0.0);
+        b.travel_to(start)?;
+        b.plunge_to(h.top)?;
+        // Half turns, so that no arc move comes near a full turn; the last turn stays at the bottom.
+        let half = |k: usize| if k.is_multiple_of(2) { start } else { c - Vec2::new(r, 0.0) };
+        let drop = (h.top - h.bottom) / turns as f64;
+        for k in 1..=2 * (turns + 1) {
+            let z = (h.top - drop * 0.5 * k as f64).max(h.bottom);
+            b.push(Move::Arc { to: half(k).extend(z), center: c, ccw: params.climb, feed: cut.feeds.cut })?;
+        }
+        // Away from the wall before going up, where the middle is cut.
+        if r <= tool.radius() {
+            b.cut_to(c, h.bottom)?;
+        }
+        b.retract()?;
+    }
+    b.finish()
+}
+
 pub fn drill(points: &[Vec2], tool: &Tool, params: &DrillParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
     cut.heights.validate()?;
