@@ -203,6 +203,10 @@ pub enum CamOperationKind {
         /// Rest machining: the larger tool (its number) that cleared the pocket before.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_from: Option<u32>,
+        /// How fast a step lighter than the stepover may go, in percent of the feed (none: 100,
+        /// never faster than the feed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feed_up: Option<f64>,
     },
     /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
     /// deeper than the chamfer (length expressions).

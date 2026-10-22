@@ -93,13 +93,13 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
-    CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); inner profiles are islands")),
+    CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); feed_up?: percent of the feed (100 to 500; null or 100: never faster): a step lighter than the stepover makes thinner chips and goes as much faster, up to this; cuts go as arcs where their steps lie on one; inner profiles are islands")),
     CommandSpec::new("cam.op.chamfer", "Chamfer", op_chamfer).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("width?: expr across the top (default 1 mm); tip_offset?: expr, how much deeper than the chamfer the tool's point goes (default 0.5 mm); side?: outside|inside (default outside: the profiles are the part); climb?: bool (default true); ramp_angle?: angle expr (default 3 deg); chamfers the top edges of the profiles or picked faces in one pass with a V-bit or a drill, at the tool's angle; the depth comes from the width (bottom is not used)")),
     CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, stepover_percent, helix_angle, helix_max, helix_min, pitch, width, tip_offset, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, stepover_percent, helix_angle, helix_max, helix_min, feed_up, pitch, width, tip_offset, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -1363,7 +1363,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::pocket(regions, tool, &params, &cut)
         }
-        CamOperationKind::Adaptive { stepover_percent, climb, stock_to_leave, finish, helix_angle, helix_max, helix_min, rest_from } => {
+        CamOperationKind::Adaptive { stepover_percent, climb, stock_to_leave, finish, helix_angle, helix_max, helix_min, rest_from, feed_up } => {
             let rest_diameter = match rest_from {
                 Some(n) => {
                     Some(s.doc.manufacture.tool(*n).map(|t| t.diameter).ok_or_else(|| fail(format!("there is no tool {n} to machine the rest of")))?)
@@ -1379,6 +1379,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 helix_angle: angle(helix_angle)?,
                 helix_max: helix_max / 100.0,
                 helix_min: helix_min / 100.0,
+                feed_up: feed_up.unwrap_or(100.0) / 100.0,
                 rest_diameter,
             };
             cam::adaptive(regions, tool, &params, &cut)
@@ -1868,8 +1869,15 @@ fn op_adaptive(s: &mut Session, p: &Value) -> Result<Value> {
         helix_max,
         helix_min,
         rest_from: rest_param(s, p, cmd)?,
+        feed_up: feed_up_param(p, cmd)?,
     };
     add_op(s, p, cmd, "Adaptive", |_| kind)
+}
+
+/// How much faster light adaptive steps may go: percent of the feed, none when 100 or left out.
+fn feed_up_param(p: &Value, cmd: &str) -> Result<Option<f64>> {
+    let v = number_in(p, "feed_up", 100.0, 500.0, 100.0, cmd)?;
+    Ok((v > 100.0).then_some(v))
 }
 
 fn op_chamfer(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1994,6 +2002,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "helix_angle",
         "helix_max",
         "helix_min",
+        "feed_up",
         "pitch",
         "width",
         "tip_offset",
@@ -2023,6 +2032,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
             (CamOperationKind::Adaptive { helix_angle, .. }, "helix_angle") => *helix_angle = checked(k, Kind::Angle)?,
             (CamOperationKind::Adaptive { helix_max, .. }, "helix_max") => *helix_max = number_in(p, k, 1.0, 1000.0, *helix_max, cmd)?,
             (CamOperationKind::Adaptive { helix_min, .. }, "helix_min") => *helix_min = number_in(p, k, 1.0, 1000.0, *helix_min, cmd)?,
+            (CamOperationKind::Adaptive { feed_up, .. }, "feed_up") => *feed_up = feed_up_param(p, cmd)?,
             (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { width, .. }, "width") => *width = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { tip_offset, .. }, "tip_offset") => *tip_offset = checked(k, Kind::Length)?,

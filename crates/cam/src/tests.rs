@@ -1164,10 +1164,13 @@ fn adaptive_check(path: &Toolpath, tool_d: f64, lo: Vec2, hi: Vec2, bottom: f64,
     let mut at: Option<Vec3> = None;
     for m in &path.moves {
         let Some(to) = m.target() else { continue };
-        if let (Some(from), Move::Feed { .. }) = (at, m) {
+        if let (Some(from), Move::Feed { .. } | Move::Arc { .. }) = (at, m) {
             let one = Toolpath { moves: vec![Move::Rapid { to: from }, *m] };
             let removed = simulate(&mut field, &one, &t).unwrap().removed_volume;
-            let len = Vec2::new(from.x, from.y).dist(Vec2::new(to.x, to.y));
+            let len = match *m {
+                Move::Arc { center, ccw, .. } => crate::path::arc_sweep(from, to, center, ccw).abs() * Vec2::new(from.x, from.y).dist(center),
+                _ => Vec2::new(from.x, from.y).dist(Vec2::new(to.x, to.y)),
+            };
             if (from.z - bottom).abs() < 1e-9 && (to.z - bottom).abs() < 1e-9 && len > 0.2 {
                 worst = worst.max(removed / -bottom / len);
             }
@@ -1209,6 +1212,7 @@ fn adaptive_params() -> AdaptiveParams {
         helix_max: 1.0,
         helix_min: 0.1,
         rest_diameter: None,
+        feed_up: 1.0,
     }
 }
 
@@ -1272,6 +1276,48 @@ fn adaptive_clears_a_slot_just_wider_than_its_tool() {
     // The steps go down the slot; the lap along the walls takes what they left in the far
     // end's corners, a little over the target there.
     adaptive_case("slot", &[rect(0.0, 0.0, 50.0, 7.0)], adaptive_params(), 1.25);
+    // A cut that starts where the last one ended goes on from there, low: the tool goes up to
+    // the retract height only to enter, not between the many short cuts of a slot.
+    let path = adaptive(&[rect(0.0, 0.0, 30.0, 8.0)], &tool(6.0), &adaptive_params(), &cut(0.0, -4.0, 4.0)).unwrap();
+    let rapids = path.moves.iter().filter(|m| matches!(m, Move::Rapid { .. })).count();
+    assert!(rapids <= 6, "{rapids} rapid moves");
+}
+
+#[test]
+fn adaptive_cuts_go_as_arcs_and_light_steps_feed_faster() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let c = cut(0.0, -4.0, 4.0);
+    // The feeds of the moves along the floor (not those down to it).
+    let feeds = |path: &Toolpath| -> Vec<f64> {
+        let mut z = 0.0;
+        let mut out = Vec::new();
+        for m in &path.moves {
+            if let Move::Feed { to, feed } | Move::Arc { to, feed, .. } = *m
+                && to.z < -3.99
+                && z < -3.99
+            {
+                out.push(feed);
+            }
+            z = m.target().map_or(z, |t| t.z);
+        }
+        out
+    };
+    let plain = adaptive(&regions, &tool(6.0), &adaptive_params(), &c).unwrap();
+    // The steps' points on a circle are one arc move: far fewer moves than steps.
+    let arcs = plain.moves.iter().filter(|m| matches!(m, Move::Arc { to, .. } if to.z < -3.99)).count();
+    assert!(arcs > 50, "{arcs} arcs");
+    // Without a feed allowance every cut goes at the cutting feed.
+    assert!(feeds(&plain).iter().all(|f| (*f - c.feeds.cut).abs() < 1e-9));
+    // With one, the lighter steps go faster, never more than allowed and never slower.
+    let quick = adaptive(&regions, &tool(6.0), &AdaptiveParams { feed_up: 1.5, ..adaptive_params() }, &c).unwrap();
+    let f = feeds(&quick);
+    assert!(f.iter().all(|f| *f >= c.feeds.cut - 1e-9 && *f <= c.feeds.cut * 1.5 + 1e-9), "{f:?}");
+    assert!(f.iter().any(|f| *f > c.feeds.cut * 1.2), "nothing faster");
+    assert!(quick.stats().cut_minutes < plain.stats().cut_minutes);
+    // The same cut, only faster: as long within the arcs' hundredth of a millimetre.
+    close(quick.stats().cut_length, plain.stats().cut_length, plain.stats().cut_length * 1e-3);
+    assert!(adaptive(&regions, &tool(6.0), &AdaptiveParams { feed_up: 0.5, ..adaptive_params() }, &c).is_err());
+    assert!(adaptive(&regions, &tool(6.0), &AdaptiveParams { feed_up: f64::NAN, ..adaptive_params() }, &c).is_err());
 }
 
 #[test]

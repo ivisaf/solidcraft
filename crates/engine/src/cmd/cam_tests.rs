@@ -1162,8 +1162,18 @@ fn adaptive_clears_a_pocket_and_is_edited_and_saved() {
     run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 3, "spindle_rpm": 20000, "feed": 600}));
     let rest = run(&mut s, "cam.op.adaptive", json!({"sketch": "Pocket", "tool": 2, "bottom": -6, "rest_from": 1, "finish": "0.2 mm"}));
     assert!(rest["cut_length"].as_f64().unwrap() < light["cut_length"].as_f64().unwrap() * 0.5);
+    // Light steps may go faster: kept, listed, cleared again; the cut takes less time.
+    let quick = run(&mut s, "cam.op.edit", json!({"op": op["operation"], "feed_up": 150}));
+    assert!(quick["cut_minutes"].as_f64().unwrap() < light["cut_minutes"].as_f64().unwrap());
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["setups"][0]["operations"][0]["inputs"]["feed_up"], json!(150.0));
     let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
     assert_eq!(reopened.manufacture, s.doc.manufacture);
+    run(&mut s, "cam.op.edit", json!({"op": op["operation"], "feed_up": null}));
+    assert!(run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0]["inputs"].get("feed_up").is_none());
+    for bad in [json!(50), json!(600), json!("x")] {
+        assert!(s.execute("cam.op.edit", &json!({"op": op["operation"], "feed_up": bad})).is_err(), "{bad}");
+    }
     assert!(s.execute("cam.tool.remove", &json!({"number": 1})).is_err(), "the rest pass needs tool 1");
     for bad in
         [json!({"stepover_percent": 80}), json!({"stepover_percent": "x"}), json!({"helix_min": 50, "helix_max": 20}), json!({"helix_angle": "x"})]

@@ -62,7 +62,16 @@ pub struct AdaptiveParams {
     /// Rest machining: only what a larger tool this wide (mm) could not reach is cut, the larger
     /// tool having cleared the pocket before to the same depth and walls.
     pub rest_diameter: Option<f64>,
+    /// How much faster than the cutting feed a lighter step may go (1: never): a step that cuts
+    /// narrower than the target makes thinner chips, and its feed goes up until the chips are as
+    /// thick as the target cut's, at most this many times the feed.
+    pub feed_up: f64,
 }
+
+/// Points of a cut that lie within this of a circle are cut as one arc (mm).
+const ARC_FIT: f64 = 0.01;
+/// Feed factors are rounded to this step, so that steps alike share one feed (and one arc).
+const FEED_STEP: f64 = 0.05;
 
 /// How a depth pass enters the material at the start of the plan.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -79,10 +88,15 @@ enum Entry {
 /// along `link` just above the floor, or (empty) over the retract height.
 #[derive(Clone, Debug, PartialEq)]
 struct Run {
+    /// The way through the cleared area to the cut's start (empty: the start is where the tool is).
     link: Vec<Vec2>,
     points: Vec<Vec2>,
+    /// Each step's feed, as a factor of the cutting feed (the first point's is not used).
+    feeds: Vec<f64>,
     /// An entry of its own (a part of the pocket the cleared area does not reach).
     entry: Option<Entry>,
+    /// The first cut without an entry (after a larger tool): the tool comes down to it.
+    down: bool,
 }
 
 /// The pocket on a grid, and what is cleared of it.
@@ -251,6 +265,9 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
     if !(p.helix_min > 0.0 && p.helix_min <= p.helix_max && p.helix_max <= 10.0) {
         return invalid("the entry helix's diameters must be above 0, the smallest no larger than the largest");
     }
+    if !(p.feed_up >= 1.0 && p.feed_up <= 5.0) {
+        return invalid("the feed on light cuts may go up 1 to 5 times, no more");
+    }
     if let Some(big) = p.rest_diameter
         && (!(big > tool.diameter + 1e-9) || !(big <= 1.0e6))
     {
@@ -306,7 +323,7 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
             enter(&mut b, entry, cleared, z, cut, p)?;
         }
         for run in &runs {
-            match (&run.entry, run.link.is_empty()) {
+            match (&run.entry, run.down) {
                 (Some(e), _) => {
                     b.retract()?;
                     enter(&mut b, *e, cleared, z, cut, p)?;
@@ -333,9 +350,7 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
                     }
                 }
             }
-            for &q in &run.points {
-                b.cut_to(q, z)?;
-            }
+            cut_run(&mut b, &grid, &run.points, &run.feeds, z, cut.feeds.cut)?;
         }
         lap(&mut b, &walls, z)?;
         cleared = z;
@@ -498,7 +513,8 @@ fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Re
                 (entry_end(e), Vec::new(), Some(e))
             }
         };
-        let points = cut_from(g, start, ae, s, p.climb, &mut steps)?;
+        let (points, widths) = cut_from(g, start, ae, s, p.climb, &mut steps)?;
+        let feeds = widths.iter().map(|w| feed_factor(*w, ae, tool.diameter, p.feed_up)).collect();
         let moved = points.len() > 1;
         if !moved && entry.is_none() {
             // Nothing could be cut from here: another start, if there is one.
@@ -509,8 +525,8 @@ fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Re
         }
         at = points.last().copied().unwrap_or(start);
         // Without an entry the tool is not down yet at the first cut: it comes down to it.
-        let link = if first.is_none() && runs.is_empty() { Vec::new() } else { link };
-        runs.push(Run { link, points, entry });
+        let down = first.is_none() && runs.is_empty();
+        runs.push(Run { link, points, feeds, entry, down });
     }
     Ok((first, runs))
 }
@@ -630,14 +646,16 @@ fn straighten(g: &Grid, at: Vec2, way: &[Vec2]) -> Vec<Vec2> {
 /// One cut from `start`: steps `s` long (shorter where the full step would take too much), each
 /// in the direction where the tool's cut comes to `ae` wide, the material on the right when
 /// climbing. Ends where nothing more is in reach.
-fn cut_from(g: &mut Grid, start: Vec2, ae: f64, s: f64, climb: bool, steps: &mut usize) -> Result<Vec<Vec2>> {
+fn cut_from(g: &mut Grid, start: Vec2, ae: f64, s: f64, climb: bool, steps: &mut usize) -> Result<(Vec<Vec2>, Vec<f64>)> {
     let into = if climb { -1.0 } else { 1.0 };
     let mut pts = vec![start];
+    // How wide each step cuts (the start's: none).
+    let mut widths = vec![0.0];
     let mut p = start;
     // The first direction: of all round, the one that takes nearest the target with the
     // material on the cutting side; where there is none climbing, the other way round.
     let Some((u0, into)) = [into, -into].into_iter().find_map(|side| first_direction(g, start, ae, s, side).map(|u| (u, side))) else {
-        return Ok(pts);
+        return Ok((pts, widths));
     };
     let mut dirs: VecDeque<Vec2> = VecDeque::from([u0]);
     loop {
@@ -646,9 +664,10 @@ fn cut_from(g: &mut Grid, start: Vec2, ae: f64, s: f64, climb: bool, steps: &mut
         }
         let pred = dirs.iter().fold(Vec2::ZERO, |a, d| a + *d);
         let pred = if pred.len() > 1e-12 { pred * (1.0 / pred.len()) } else { dirs.back().copied().unwrap_or(u0) };
-        let Some((q, u)) = step(g, p, pred, ae, s, into) else { break };
+        let Some((q, u, w)) = step(g, p, pred, ae, s, into) else { break };
         g.sweep(p, q);
         pts.push(q);
+        widths.push(w);
         p = q;
         *steps += 1;
         dirs.push_back(u);
@@ -656,7 +675,103 @@ fn cut_from(g: &mut Grid, start: Vec2, ae: f64, s: f64, climb: bool, steps: &mut
             dirs.pop_front();
         }
     }
-    Ok(pts)
+    Ok((pts, widths))
+}
+
+/// The feed of a step that cuts `w` wide, as a factor of the feed for a cut `ae` wide (tool
+/// `d`): up by as much as the chips get thinner, at most `most` times, never down.
+fn feed_factor(w: f64, ae: f64, d: f64, most: f64) -> f64 {
+    // A chip's thickness against the feed per tooth: 2·√(x(1−x)) for a cut x·d wide, the full
+    // feed from half the diameter on.
+    let chip = |w: f64| {
+        let x = (w / d).clamp(0.0, 0.5);
+        2.0 * (x * (1.0 - x)).sqrt()
+    };
+    let (thin, nominal) = (chip(w), chip(ae));
+    if !(most > 1.0) {
+        return 1.0;
+    }
+    if !(thin > 1e-9) {
+        return most;
+    }
+    let f = (nominal / thin).clamp(1.0, most);
+    ((f / FEED_STEP).floor() * FEED_STEP).max(1.0)
+}
+
+/// Cuts through `points` at `z` from the first (where the tool is), each step at its feed
+/// factor of `feed`; runs of points alike in feed that lie on a circle go as one arc, where the
+/// arc keeps clear of the walls as the steps do.
+fn cut_run(b: &mut Builder, g: &Grid, points: &[Vec2], feeds: &[f64], z: f64, feed: f64) -> Result<()> {
+    let clear = |q: Vec2| g.shape.clear(q, g.reach);
+    let mut i = 0;
+    while i + 1 < points.len() {
+        let f = feeds.get(i + 1).copied().unwrap_or(1.0);
+        // As many points on as fit one arc, at the same feed.
+        let mut best: Option<(usize, Vec2, bool)> = None;
+        let mut j = i + 2;
+        while j < points.len() && feeds.get(j).copied().unwrap_or(1.0) == f {
+            match points.get(i..=j).and_then(|run| arc_through(run, &clear)) {
+                Some((c, ccw)) => best = Some((j, c, ccw)),
+                None => break,
+            }
+            j += 1;
+        }
+        match (best, points.get(i + 1)) {
+            (Some((j, center, ccw)), _) => {
+                let to = points.get(j).copied().unwrap_or_default();
+                b.push(Move::Arc { to: to.extend(z), center, ccw, feed: feed * f })?;
+                i = j;
+            }
+            (None, Some(&q)) => {
+                b.push(Move::Feed { to: q.extend(z), feed: feed * f })?;
+                i += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    Ok(())
+}
+
+/// The circle the points lie on, within [`ARC_FIT`], in order and turning one way through less
+/// than half a turn, its bulge between them `clear` of the walls: its centre and whether it goes
+/// anticlockwise. `None` for a straight run (better a line) or points off any circle.
+fn arc_through(pts: &[Vec2], clear: &impl Fn(Vec2) -> bool) -> Option<(Vec2, bool)> {
+    let (&a, &z) = (pts.first()?, pts.last()?);
+    let m = *pts.get(pts.len() / 2)?;
+    // The circle through the ends and the middle point.
+    let (ab, ac) = (m - a, z - a);
+    let cross = ab.x * ac.y - ab.y * ac.x;
+    if cross.abs() < 1e-12 {
+        return None;
+    }
+    let (b2, c2) = (ab.len2(), ac.len2());
+    let c = a + Vec2::new(ac.y * b2 - ab.y * c2, ab.x * c2 - ac.x * b2) * (0.5 / cross);
+    let r = c.dist(a);
+    // Nearly straight: lines are the plainer program.
+    if !(r.is_finite()) || r > 1000.0 {
+        return None;
+    }
+    let ccw = cross > 0.0;
+    let mut turned = 0.0;
+    for w in pts.windows(2) {
+        let (&p, &q) = (w.first()?, w.get(1)?);
+        if (c.dist(q) - r).abs() > ARC_FIT {
+            return None;
+        }
+        let (u, v) = (p - c, q - c);
+        let t = (u.x * v.y - u.y * v.x).atan2(u.dot(v));
+        // Every step turns the same way, and the chord's middle stays near the circle.
+        if (t > 0.0) != ccw || t.abs() < 1e-12 || (c.dist(p.lerp(q, 0.5)) - r).abs() > ARC_FIT {
+            return None;
+        }
+        // The arc's farthest point from the chord.
+        let mid = (p.lerp(q, 0.5) - c).normalized().map(|n| c + n * r)?;
+        if !clear(mid) {
+            return None;
+        }
+        turned += t.abs();
+    }
+    (turned < PI * 0.9).then_some((c, ccw))
 }
 
 /// The direction to start a cut from `p` in: of 36 round, the one whose step of `s` takes nearest
@@ -687,7 +802,7 @@ fn turned(u: Vec2, a: f64) -> Vec2 {
 /// from away from the material (`into` the other way) towards it until the new area reaches the
 /// target; a position the tool may not take counts as too much. Shorter steps where even the
 /// gentlest turn takes too much; none where nothing near takes enough.
-fn step(g: &Grid, p: Vec2, pred: Vec2, target: f64, s: f64, into: f64) -> Option<(Vec2, Vec2)> {
+fn step(g: &Grid, p: Vec2, pred: Vec2, target: f64, s: f64, into: f64) -> Option<(Vec2, Vec2, f64)> {
     for len in [s, s * 0.5, s * 0.25] {
         let at = |t: f64| {
             let u = turned(pred, t * into);
@@ -716,14 +831,14 @@ fn step(g: &Grid, p: Vec2, pred: Vec2, target: f64, s: f64, into: f64) -> Option
                 let (q, u, a) = at(lo);
                 // Something must be cut, or the tool would run on through what is cleared.
                 if a >= target * MIN_SHARE && a.is_finite() && g.area(q) > 0.0 {
-                    return Some((q, u));
+                    return Some((q, u, a));
                 }
                 return None;
             }
             // Nowhere near enough: into the material as far as it goes, if that takes something.
             None => {
                 let (_, (q, u, a)) = samples.into_iter().filter(|(_, (_, _, a))| a.is_finite()).max_by(|x, y| x.1.2.total_cmp(&y.1.2))?;
-                return (a >= target * MIN_SHARE && g.area(q) > 0.0).then_some((q, u));
+                return (a >= target * MIN_SHARE && g.area(q) > 0.0).then_some((q, u, a));
             }
         }
     }

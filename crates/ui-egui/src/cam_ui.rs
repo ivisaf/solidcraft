@@ -288,6 +288,8 @@ pub struct OpForm {
     pub helix_angle: String,
     pub helix_max: String,
     pub helix_min: String,
+    /// Adaptive clearing: how fast light steps may go, percent of the feed (empty: never faster).
+    pub feed_up: String,
     /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
     pub width: String,
     pub tip_offset: String,
@@ -695,6 +697,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             helix_angle: String::new(),
             helix_max: String::new(),
             helix_min: String::new(),
+            feed_up: String::new(),
             width: String::new(),
             tip_offset: String::new(),
             peck: String::new(),
@@ -974,6 +977,12 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                             p.insert(k.into(), json!(number(what, plain)?));
                         }
                     }
+                    let feed_up = f.feed_up.trim().trim_end_matches('%').trim();
+                    if !feed_up.is_empty() {
+                        p.insert("feed_up".into(), json!(number("The feed on light cuts", feed_up)?));
+                    } else if f.editing.is_some() {
+                        p.insert("feed_up".into(), Value::Null);
+                    }
                     optional(&mut p, "helix_angle", &f.helix_angle);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     match f.rest_from.trim().parse::<u64>() {
@@ -1223,6 +1232,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         helix_angle: text(inputs, "helix_angle"),
         helix_max: number(&inputs["helix_max"]),
         helix_min: number(&inputs["helix_min"]),
+        feed_up: number(&inputs["feed_up"]),
         width: text(inputs, "width"),
         tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
@@ -1912,6 +1922,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Helix angle" => "How steeply the tool goes down into the material on its entry helix (or ramp, where a helix has no room).",
         "Helix largest (%)" | "Helix smallest (%)" => {
             "The entry helix's diameter, as a percentage of the tool's: as large as there is room for, at most the largest; with less room than the smallest, a ramp instead."
+        }
+        "Light-cut feed (%)" => {
+            "How fast a step that cuts narrower than the stepover may go, in percent of the feed: its chips are thinner, so it goes faster until they are as thick as at the full stepover, at most this. Empty: always the feed."
         }
         "Chamfer width" => "How wide the chamfer is across the top. Its angle is the tool's; its depth follows from the two.",
         "Tip offset" => "How much deeper than the chamfer the tool's point goes, so that the sharp tip does not do the cutting and wear.",
@@ -2793,6 +2806,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Helix angle", &mut f.helix_angle, "5 deg");
                     field(ui, need, "Helix largest (%)", &mut f.helix_max, "100");
                     field(ui, need, "Helix smallest (%)", &mut f.helix_min, "10");
+                    field(ui, need, "Light-cut feed (%)", &mut f.feed_up, "100: the feed");
                     let mut options: Vec<(String, String)> = vec![(String::new(), "none: the whole pocket".into())];
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_adaptive_rest", "Rest of tool", &mut f.rest_from, &options);
