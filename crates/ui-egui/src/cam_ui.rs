@@ -62,6 +62,7 @@ pub enum OpKind {
     Face,
     Contour,
     Pocket,
+    Adaptive,
     Chamfer,
     Bore,
     Drill,
@@ -73,6 +74,7 @@ impl OpKind {
             OpKind::Face => "cam.op.face",
             OpKind::Contour => "cam.op.contour",
             OpKind::Pocket => "cam.op.pocket",
+            OpKind::Adaptive => "cam.op.adaptive",
             OpKind::Chamfer => "cam.op.chamfer",
             OpKind::Bore => "cam.op.bore",
             OpKind::Drill => "cam.op.drill",
@@ -83,6 +85,7 @@ impl OpKind {
             OpKind::Face => "FACE",
             OpKind::Contour => "2D CONTOUR",
             OpKind::Pocket => "2D POCKET",
+            OpKind::Adaptive => "ADAPTIVE",
             OpKind::Chamfer => "CHAMFER",
             OpKind::Bore => "BORE",
             OpKind::Drill => "DRILL",
@@ -279,6 +282,12 @@ pub struct OpForm {
     pub pitch: String,
     /// A pocket's rest machining: the larger tool (its number) that cleared it before (empty: the whole pocket).
     pub rest_from: String,
+    /// Adaptive clearing: the heaviest cut (percent of the tool's diameter), the entry helix's
+    /// slope and its diameter at most and at least (percent of the tool's).
+    pub stepover_percent: String,
+    pub helix_angle: String,
+    pub helix_max: String,
+    pub helix_min: String,
     /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
     pub width: String,
     pub tip_offset: String,
@@ -682,6 +691,10 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             finish: String::new(),
             pitch: String::new(),
             rest_from: String::new(),
+            stepover_percent: String::new(),
+            helix_angle: String::new(),
+            helix_max: String::new(),
+            helix_min: String::new(),
             width: String::new(),
             tip_offset: String::new(),
             peck: String::new(),
@@ -734,6 +747,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
         "cam.op.pocket" => Some(op(OpKind::Pocket)),
+        "cam.op.adaptive" => Some(op(OpKind::Adaptive)),
         "cam.op.chamfer" => Some(op(OpKind::Chamfer)),
         "cam.op.bore" => Some(op(OpKind::Bore)),
         "cam.op.drill" => Some(op(OpKind::Drill)),
@@ -949,6 +963,29 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
+                OpKind::Adaptive => {
+                    for (k, what, text) in [
+                        ("stepover_percent", "The stepover", &f.stepover_percent),
+                        ("helix_max", "The largest helix", &f.helix_max),
+                        ("helix_min", "The smallest helix", &f.helix_min),
+                    ] {
+                        let plain = text.trim().trim_end_matches('%').trim();
+                        if !plain.is_empty() {
+                            p.insert(k.into(), json!(number(what, plain)?));
+                        }
+                    }
+                    optional(&mut p, "helix_angle", &f.helix_angle);
+                    optional(&mut p, "stock_to_leave", &f.stock_to_leave);
+                    match f.rest_from.trim().parse::<u64>() {
+                        Ok(n) => {
+                            p.insert("rest_from".into(), json!(n));
+                        }
+                        Err(_) if f.editing.is_some() => {
+                            p.insert("rest_from".into(), Value::Null);
+                        }
+                        Err(_) => {}
+                    }
+                }
                 OpKind::Chamfer => {
                     optional(&mut p, "width", &f.width);
                     optional(&mut p, "tip_offset", &f.tip_offset);
@@ -991,7 +1028,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     p.insert("tabs".into(), Value::Null);
                 }
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Adaptive) {
                 if !f.finish.trim().is_empty() {
                     p.insert("finish".into(), json!(f.finish.trim()));
                 } else if f.editing.is_some() {
@@ -1026,7 +1063,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             if f.kind == OpKind::Chamfer {
                 p.insert("side".into(), json!(if f.side == 1 { "inside" } else { "outside" }));
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer) {
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive) {
                 p.insert("climb".into(), json!(f.climb));
             }
             p.insert("coolant".into(), json!(f.coolant));
@@ -1127,6 +1164,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         "face" => OpKind::Face,
         "contour" => OpKind::Contour,
         "pocket" => OpKind::Pocket,
+        "adaptive" => OpKind::Adaptive,
         "chamfer" => OpKind::Chamfer,
         "bore" => OpKind::Bore,
         "drill" => OpKind::Drill,
@@ -1181,6 +1219,10 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         finish: text(inputs, "finish"),
         pitch: text(inputs, "pitch"),
         rest_from: inputs["rest_from"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+        stepover_percent: number(&inputs["stepover_percent"]),
+        helix_angle: text(inputs, "helix_angle"),
+        helix_max: number(&inputs["helix_max"]),
+        helix_min: number(&inputs["helix_min"]),
         width: text(inputs, "width"),
         tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
@@ -1863,6 +1905,13 @@ fn help(label: &str) -> Option<&'static str> {
         "Toolpath colour" => "The colour toolpaths' cutting moves are drawn in; rapids stay orange and thin. Kept for the next start.",
         "Rest of tool" => {
             "Rest machining: a larger tool cleared this pocket before; this one only cuts what it could not reach, in the corners and narrow places."
+        }
+        "Stepover (%)" => {
+            "The heaviest cut, as a percentage of the tool's diameter. The tool steps through the material so that no step cuts wider, in corners and narrow places too: a steady load, so the full flute length can be used."
+        }
+        "Helix angle" => "How steeply the tool goes down into the material on its entry helix (or ramp, where a helix has no room).",
+        "Helix largest (%)" | "Helix smallest (%)" => {
+            "The entry helix's diameter, as a percentage of the tool's: as large as there is room for, at most the largest; with less room than the smallest, a ramp instead."
         }
         "Chamfer width" => "How wide the chamfer is across the top. Its angle is the tool's; its depth follows from the two.",
         "Tip offset" => "How much deeper than the chamfer the tool's point goes, so that the sharp tip does not do the cutting and wear.",
@@ -2737,6 +2786,17 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_rest_from", "Rest of tool", &mut f.rest_from, &options);
                 }
+                OpKind::Adaptive => {
+                    field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");
+                    field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    field(ui, need, "Finish allowance", &mut f.finish, "none");
+                    field(ui, need, "Helix angle", &mut f.helix_angle, "5 deg");
+                    field(ui, need, "Helix largest (%)", &mut f.helix_max, "100");
+                    field(ui, need, "Helix smallest (%)", &mut f.helix_min, "10");
+                    let mut options: Vec<(String, String)> = vec![(String::new(), "none: the whole pocket".into())];
+                    options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
+                    pick(ui, need, "sc_cam_adaptive_rest", "Rest of tool", &mut f.rest_from, &options);
+                }
                 OpKind::Chamfer => {
                     f.side = f.side.min(1);
                     choice(ui, need, "sc_cam_chamfer_side", "Side", &mut f.side, &["outside", "inside"]);
@@ -2755,7 +2815,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Chamfer) {
                 field(ui, need, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer) {
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive) {
                 row_label(ui, "Direction", None);
                 crate::ui_kit::checkbox(ui, "Climb", &mut f.climb);
                 ui.end_row();
@@ -3098,13 +3158,14 @@ struct Asked {
 }
 
 /// Why Simulate and Post Process are off on a setup without operations.
-const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket, Chamfer, Bore or Drill)";
+const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill)";
 
 /// The operations the toolbar offers, by their command and label.
-const OPERATIONS: [(&str, &str); 6] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("cam.op.face", "Face"),
     ("cam.op.contour", "2D Contour"),
     ("cam.op.pocket", "2D Pocket"),
+    ("cam.op.adaptive", "Adaptive"),
     ("cam.op.chamfer", "Chamfer"),
     ("cam.op.bore", "Bore"),
     ("cam.op.drill", "Drill"),
@@ -3146,7 +3207,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
             let tip = [
                 "The raw block and the work zero. Click to make one, or to change it.",
-                "Face, 2D Contour, 2D Pocket, Chamfer, Bore or Drill: click to choose one.",
+                "Face, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill: click to choose one.",
                 "Cut the raw block with every operation and see what is left, or cut into the part.",
                 "Write the setup's program for the machine.",
             ];
@@ -3754,6 +3815,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             let icon = match text(op, "kind").as_str() {
                 "bore" => "cam_drill".to_string(),
                 "chamfer" => "cam_contour".to_string(),
+                "adaptive" => "cam_pocket".to_string(),
                 kind => format!("cam_{kind}"),
             };
             let r = draw_row(

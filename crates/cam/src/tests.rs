@@ -1113,3 +1113,163 @@ fn a_part_edge_on_the_stock_s_border_is_no_gouge() {
     }
     assert_eq!(compare(&stock, &part).unwrap().max_gouge, 10.0);
 }
+
+/// What an adaptive path does, checked on a fine simulation: the largest new area per mm of
+/// horizontal travel at the bottom (its engagement), the pocket's material left within the
+/// tool's reach, and whether it ever cut outside `inside`.
+fn adaptive_check(path: &Toolpath, tool_d: f64, lo: Vec2, hi: Vec2, bottom: f64, inside: impl Fn(Vec2, f64) -> bool) -> (f64, f64, bool) {
+    let block = HeightField::block(lo.extend(bottom - 1.0), hi.extend(0.0), 0.1).unwrap();
+    let mut field = block.clone();
+    let t = tool(tool_d);
+    let mut worst: f64 = 0.0;
+    let mut outside = false;
+    let mut at: Option<Vec3> = None;
+    for m in &path.moves {
+        let Some(to) = m.target() else { continue };
+        if let (Some(from), Move::Feed { .. }) = (at, m) {
+            let one = Toolpath { moves: vec![Move::Rapid { to: from }, *m] };
+            let removed = simulate(&mut field, &one, &t).unwrap().removed_volume;
+            let len = Vec2::new(from.x, from.y).dist(Vec2::new(to.x, to.y));
+            if (from.z - bottom).abs() < 1e-9 && (to.z - bottom).abs() < 1e-9 && len > 0.2 {
+                worst = worst.max(removed / -bottom / len);
+            }
+        } else if let Some(from) = at {
+            let one = Toolpath { moves: vec![Move::Rapid { to: from }, *m] };
+            simulate(&mut field, &one, &t).unwrap();
+        }
+        if !matches!(m, Move::Rapid { .. }) && to.z < -1e-9 && !inside(Vec2::new(to.x, to.y), tool_d * 0.5) {
+            outside = true;
+        }
+        at = Some(to);
+    }
+    // Left where the tool could have reached (inside, with room for its centre within its radius).
+    let mut left = 0.0;
+    for j in 0..field.ny {
+        for i in 0..field.nx {
+            let c = field.centre(i, j);
+            let z = field.get(i, j).unwrap();
+            let reach = (0..16).any(|k| {
+                let q = c + Vec2::from_angle(k as f64 / 16.0 * 2.0 * PI) * (tool_d * 0.5 - 0.15);
+                inside(q, tool_d * 0.5)
+            }) || inside(c, tool_d * 0.5);
+            if inside(c, 0.15) && reach && z > bottom + 0.05 {
+                left += field.cell * field.cell;
+            }
+        }
+    }
+    (worst, left, outside)
+}
+
+fn adaptive_params() -> AdaptiveParams {
+    AdaptiveParams {
+        stepover: 0.2,
+        climb: true,
+        stock_to_leave: 0.0,
+        finish: 0.0,
+        tolerance: 0.01,
+        helix_angle: 3.0f64.to_radians(),
+        helix_max: 1.0,
+        helix_min: 0.1,
+        rest_diameter: None,
+    }
+}
+
+/// An adaptive pocket of `regions` with a 6 mm tool, 4 mm deep in one pass, checked: no cut
+/// outside the pocket, engagement at most `limit` × the target width, little left within reach.
+fn adaptive_case(name: &str, regions: &[Region2], params: AdaptiveParams, limit: f64) -> Toolpath {
+    let started = std::time::Instant::now();
+    let c = cut(0.0, -4.0, 4.0);
+    let path = adaptive(regions, &tool(6.0), &params, &c).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let shape = Shape::from_regions(regions, 0.01).unwrap();
+    let (mut lo, mut hi) = (v(f64::INFINITY, f64::INFINITY), v(f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for (a, b) in shape.loops().iter().flatten().map(|p| p.bounds()) {
+        (lo, hi) = (v(lo.x.min(a.x), lo.y.min(a.y)), v(hi.x.max(b.x), hi.y.max(b.y)));
+    }
+    let inside = |p: Vec2, m: f64| shape.dist(p) >= m - 1e-6 && shape.inside(p, m.max(1e-6));
+    let (worst, left, outside) = adaptive_check(&path, 6.0, lo - v(1.0, 1.0), hi + v(1.0, 1.0), -4.0, inside);
+    let ae = params.stepover * 6.0;
+    eprintln!("{name}: worst {worst:.3} mm (ae {ae}), left {left:.2} mm², {} moves, {:?}", path.moves.len(), started.elapsed());
+    assert!(!outside, "{name}: cut outside the pocket");
+    assert!(worst <= ae * limit, "{name}: engagement {worst} over {}", ae * limit);
+    assert!(left < 2.0, "{name}: left {left} mm²");
+    path
+}
+
+#[test]
+fn adaptive_clears_pockets_at_a_steady_load() {
+    let p = adaptive_params();
+    adaptive_case("rectangle", &[rect(0.0, 0.0, 40.0, 30.0)], p, 1.15);
+    // A sharp inner corner (30°): its tip is out of the tool's reach, the rest is cleared.
+    adaptive_case("30° corner", &[polygon(&[(0.0, 0.0), (60.0, 0.0), (0.0, 34.641)])], p, 1.15);
+    // Islands.
+    let mut islands = rect(0.0, 0.0, 60.0, 40.0);
+    islands.holes = vec![
+        polygon(&[(15.0, 15.0), (15.0, 25.0), (25.0, 25.0), (25.0, 15.0)]).outer,
+        polygon(&[(35.0, 12.0), (35.0, 28.0), (45.0, 28.0), (45.0, 12.0)]).outer,
+    ];
+    adaptive_case("islands", &[islands], p, 1.15);
+    // Two rooms joined by a narrow neck.
+    let neck = polygon(&[
+        (0.0, 0.0),
+        (30.0, 0.0),
+        (30.0, 10.0),
+        (40.0, 10.0),
+        (40.0, 0.0),
+        (70.0, 0.0),
+        (70.0, 30.0),
+        (40.0, 30.0),
+        (40.0, 20.0),
+        (30.0, 20.0),
+        (30.0, 30.0),
+        (0.0, 30.0),
+    ]);
+    adaptive_case("neck", &[neck], p, 1.15);
+    // Conventional milling, and a larger stepover.
+    adaptive_case("conventional", &[rect(0.0, 0.0, 40.0, 30.0)], AdaptiveParams { climb: false, ..p }, 1.15);
+    adaptive_case("stepover 35%", &[rect(0.0, 0.0, 40.0, 30.0)], AdaptiveParams { stepover: 0.35, ..p }, 1.15);
+}
+
+#[test]
+fn adaptive_clears_a_slot_just_wider_than_its_tool() {
+    // The steps go down the slot; the lap along the walls takes what they left in the far
+    // end's corners, a little over the target there.
+    adaptive_case("slot", &[rect(0.0, 0.0, 50.0, 7.0)], adaptive_params(), 1.25);
+}
+
+#[test]
+fn adaptive_passes_enter_finish_and_machine_the_rest() {
+    let regions = [rect(0.0, 0.0, 40.0, 30.0)];
+    let p = adaptive_params();
+    // Two passes, each entering on its helix; a finishing lap 0.3 mm further out at the full depth.
+    let c = cut(0.0, -8.0, 4.0);
+    let path = adaptive(&regions, &tool(6.0), &AdaptiveParams { finish: 0.3, ..p }, &c).unwrap();
+    assert_eq!(path.stats().lowest_z, Some(-8.0));
+    let arcs_down = path.moves.iter().filter(|m| matches!(m, Move::Arc { to, .. } if to.z < 0.0)).count();
+    assert!(arcs_down >= 4, "{arcs_down}");
+    let wall = cutting_points(&path, -7.99).iter().map(|q| q.x).fold(f64::INFINITY, f64::min);
+    close(wall, 3.0, 1e-6);
+    let before_finish = cutting_points(&path, -3.99).iter().filter(|q| q.z > -4.01).map(|q| q.x).fold(f64::INFINITY, f64::min);
+    close(before_finish, 3.3, 1e-6);
+    // No room for the smallest helix: a ramp; no room to ramp either: refused or plunged, never a panic.
+    let ramped = adaptive(&regions, &tool(6.0), &AdaptiveParams { helix_min: 4.0, helix_max: 4.0, ..p }, &c).unwrap();
+    assert!(ramped.moves.iter().all(|m| !matches!(m, Move::Arc { to, .. } if to.z < -1e-9 && to.z > -3.99)));
+    // Rest machining after a 12 mm tool: only the corners.
+    let rest = adaptive(&regions, &tool(3.0), &AdaptiveParams { rest_diameter: Some(12.0), ..p }, &c).unwrap();
+    let corners = [v(0.0, 0.0), v(40.0, 0.0), v(40.0, 30.0), v(0.0, 30.0)];
+    for q in cutting_points(&rest, -0.5) {
+        let near = corners.iter().map(|c| c.dist(Vec2::new(q.x, q.y))).fold(f64::INFINITY, f64::min);
+        assert!(near < 8.0, "{q:?}");
+    }
+    // What makes no sense is refused.
+    for bad in [
+        AdaptiveParams { stepover: 0.0, ..p },
+        AdaptiveParams { stepover: 0.9, ..p },
+        AdaptiveParams { helix_angle: 0.0, ..p },
+        AdaptiveParams { helix_min: 2.0, helix_max: 1.0, ..p },
+        AdaptiveParams { stock_to_leave: f64::NAN, ..p },
+        AdaptiveParams { rest_diameter: Some(3.0), ..p },
+    ] {
+        assert!(adaptive(&regions, &tool(6.0), &bad, &c).is_err(), "{bad:?}");
+    }
+    assert!(adaptive(&[rect(0.0, 0.0, 5.0, 5.0)], &tool(6.0), &p, &c).is_err());
+}

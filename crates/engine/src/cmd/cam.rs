@@ -4,8 +4,8 @@
 
 use serde_json::{Value, json};
 use solidcraft_cam::{
-    self as cam, BoreParams, ChamferParams, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side, Tool, ToolKind,
-    Toolpath,
+    self as cam, AdaptiveParams, BoreParams, ChamferParams, ContourParams, Cut, CuttingData, DrillParams, Feeds, Heights, PocketParams, Post, Side,
+    Tool, ToolKind, Toolpath,
 };
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
@@ -93,12 +93,13 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Face", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
+    CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); inner profiles are islands")),
     CommandSpec::new("cam.op.chamfer", "Chamfer", op_chamfer).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("width?: expr across the top (default 1 mm); tip_offset?: expr, how much deeper than the chamfer the tool's point goes (default 0.5 mm); side?: outside|inside (default outside: the profiles are the part); climb?: bool (default true); ramp_angle?: angle expr (default 3 deg); chamfers the top edges of the profiles or picked faces in one pass with a V-bit or a drill, at the tool's angle; the depth comes from the width (bottom is not used)")),
     CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, pitch, width, tip_offset, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, stepover_percent, helix_angle, helix_max, helix_min, pitch, width, tip_offset, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -598,7 +599,7 @@ fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(op) = m.setups.iter().flat_map(|x| &x.operations).find(|o| u64::from(o.tool) == number) {
         return Err(bad(cmd, format!("tool {number} is used by operation `{}`", op.name)));
     }
-    let rest_of = |o: &&CamOperation| matches!(o.kind, CamOperationKind::Pocket { rest_from: Some(n), .. } if u64::from(n) == number);
+    let rest_of = |o: &&CamOperation| matches!(o.kind, CamOperationKind::Pocket { rest_from: Some(n), .. } | CamOperationKind::Adaptive { rest_from: Some(n), .. } if u64::from(n) == number);
     if let Some(op) = m.setups.iter().flat_map(|x| &x.operations).find(rest_of) {
         return Err(bad(cmd, format!("operation `{}` machines the rest of tool {number}", op.name)));
     }
@@ -1131,7 +1132,7 @@ impl OpShape {
             CamOperationKind::Face { .. } => OpShape::Face,
             CamOperationKind::Contour { .. } => OpShape::Contour,
             CamOperationKind::Chamfer { .. } => OpShape::Chamfer,
-            CamOperationKind::Pocket { .. } => OpShape::Pocket,
+            CamOperationKind::Pocket { .. } | CamOperationKind::Adaptive { .. } => OpShape::Pocket,
             // Holes, as drilled: their heights are the same.
             CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } => OpShape::Drill,
         }
@@ -1339,6 +1340,26 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::pocket(regions, tool, &params, &cut)
         }
+        CamOperationKind::Adaptive { stepover_percent, climb, stock_to_leave, finish, helix_angle, helix_max, helix_min, rest_from } => {
+            let rest_diameter = match rest_from {
+                Some(n) => {
+                    Some(s.doc.manufacture.tool(*n).map(|t| t.diameter).ok_or_else(|| fail(format!("there is no tool {n} to machine the rest of")))?)
+                }
+                None => None,
+            };
+            let params = AdaptiveParams {
+                stepover: stepover_percent / 100.0,
+                climb: *climb,
+                stock_to_leave: len("stock_to_leave", stock_to_leave)?,
+                finish: finish.as_ref().map(|e| len("finish", e)).transpose()?.unwrap_or(0.0),
+                tolerance: TOLERANCE,
+                helix_angle: angle(helix_angle)?,
+                helix_max: helix_max / 100.0,
+                helix_min: helix_min / 100.0,
+                rest_diameter,
+            };
+            cam::adaptive(regions, tool, &params, &cut)
+        }
         CamOperationKind::Chamfer { side, climb, width, tip_offset, ramp_angle } => {
             let params = ChamferParams {
                 side: *side,
@@ -1445,7 +1466,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
         "cam.op.face" => OpShape::Face,
         "cam.op.contour" => OpShape::Contour,
         "cam.op.chamfer" => OpShape::Chamfer,
-        "cam.op.pocket" => OpShape::Pocket,
+        "cam.op.pocket" | "cam.op.adaptive" => OpShape::Pocket,
         "cam.op.drill" | "cam.op.bore" => OpShape::Drill,
         _ => return Err(bad(cmd, "not an operation")),
     };
@@ -1794,6 +1815,40 @@ fn op_drill(s: &mut Session, p: &Value) -> Result<Value> {
     add_op(s, p, cmd, "Drill", |_| CamOperationKind::Drill { peck, dwell })
 }
 
+/// A number given as `k`, between `lo` and `hi`, else `default`.
+fn number_in(p: &Value, k: &str, lo: f64, hi: f64, default: f64, cmd: &str) -> Result<f64> {
+    match p.get(k) {
+        None | Some(Value::Null) => Ok(default),
+        Some(_) => num(p, k).filter(|v| (lo..=hi).contains(v)).ok_or_else(|| bad(cmd, format!("`{k}` must be {lo} to {hi}"))),
+    }
+}
+
+fn op_adaptive(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.adaptive";
+    let helix_angle = match expr(p, "helix_angle") {
+        Some(e) => {
+            s.doc.eval(&e, Kind::Angle).map_err(|err| bad(cmd, format!("helix_angle: {err}")))?;
+            e
+        }
+        None => "5 deg".into(),
+    };
+    let (helix_max, helix_min) = (number_in(p, "helix_max", 1.0, 1000.0, 100.0, cmd)?, number_in(p, "helix_min", 1.0, 1000.0, 10.0, cmd)?);
+    if helix_min > helix_max {
+        return Err(bad(cmd, "`helix_min` must be no larger than `helix_max`"));
+    }
+    let kind = CamOperationKind::Adaptive {
+        stepover_percent: number_in(p, "stepover_percent", 2.0, 50.0, 20.0, cmd)?,
+        climb: bool_(p, "climb").unwrap_or(true),
+        stock_to_leave: stock_to_leave(p),
+        finish: finish_param(s, p, cmd)?,
+        helix_angle,
+        helix_max,
+        helix_min,
+        rest_from: rest_param(s, p, cmd)?,
+    };
+    add_op(s, p, cmd, "Adaptive", |_| kind)
+}
+
 fn op_chamfer(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.chamfer";
     let side = side_param(p, cmd)?;
@@ -1912,6 +1967,10 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "tabs",
         "finish",
         "rest_from",
+        "stepover_percent",
+        "helix_angle",
+        "helix_max",
+        "helix_min",
         "pitch",
         "width",
         "tip_offset",
@@ -1932,7 +1991,15 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 *margin = if p.get(k).is_some_and(Value::is_null) { None } else { Some(margin_param(s, p, cmd)?) }
             }
             (CamOperationKind::Contour { side, .. }, "side") => *side = side_param(p, cmd)?,
-            (CamOperationKind::Pocket { rest_from, .. }, "rest_from") => *rest_from = rest_param(s, p, cmd)?,
+            (CamOperationKind::Pocket { rest_from, .. } | CamOperationKind::Adaptive { rest_from, .. }, "rest_from") => {
+                *rest_from = rest_param(s, p, cmd)?
+            }
+            (CamOperationKind::Adaptive { stepover_percent, .. }, "stepover_percent") => {
+                *stepover_percent = number_in(p, k, 2.0, 50.0, *stepover_percent, cmd)?
+            }
+            (CamOperationKind::Adaptive { helix_angle, .. }, "helix_angle") => *helix_angle = checked(k, Kind::Angle)?,
+            (CamOperationKind::Adaptive { helix_max, .. }, "helix_max") => *helix_max = number_in(p, k, 1.0, 1000.0, *helix_max, cmd)?,
+            (CamOperationKind::Adaptive { helix_min, .. }, "helix_min") => *helix_min = number_in(p, k, 1.0, 1000.0, *helix_min, cmd)?,
             (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { width, .. }, "width") => *width = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { tip_offset, .. }, "tip_offset") => *tip_offset = checked(k, Kind::Length)?,
@@ -1941,13 +2008,15 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 CamOperationKind::Contour { climb, .. }
                 | CamOperationKind::Pocket { climb, .. }
                 | CamOperationKind::Bore { climb, .. }
-                | CamOperationKind::Chamfer { climb, .. },
+                | CamOperationKind::Chamfer { climb, .. }
+                | CamOperationKind::Adaptive { climb, .. },
                 "climb",
             ) => *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?,
             (
                 CamOperationKind::Contour { stock_to_leave, .. }
                 | CamOperationKind::Pocket { stock_to_leave, .. }
-                | CamOperationKind::Bore { stock_to_leave, .. },
+                | CamOperationKind::Bore { stock_to_leave, .. }
+                | CamOperationKind::Adaptive { stock_to_leave, .. },
                 "stock_to_leave",
             ) => *stock_to_leave = checked(k, Kind::Length)?,
             (
@@ -1957,7 +2026,10 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 "ramp_angle",
             ) => *ramp_angle = checked(k, Kind::Angle)?,
             (CamOperationKind::Contour { tabs, .. }, "tabs") => *tabs = tabs_param(s, p, cmd)?,
-            (CamOperationKind::Contour { finish, .. } | CamOperationKind::Pocket { finish, .. }, "finish") => *finish = finish_param(s, p, cmd)?,
+            (
+                CamOperationKind::Contour { finish, .. } | CamOperationKind::Pocket { finish, .. } | CamOperationKind::Adaptive { finish, .. },
+                "finish",
+            ) => *finish = finish_param(s, p, cmd)?,
             (CamOperationKind::Drill { peck, .. }, "peck") => *peck = optional(k)?,
             (CamOperationKind::Drill { dwell, .. }, "dwell") => {
                 *dwell = num(p, k).filter(|d| (0.0..=3600.0).contains(d)).ok_or_else(|| bad(cmd, "`dwell` must be 0 to 3600 seconds"))?

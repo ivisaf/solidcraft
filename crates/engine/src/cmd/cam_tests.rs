@@ -1145,6 +1145,36 @@ fn contours_hold_their_part_on_tabs_and_operations_finish_and_count_their_passes
 }
 
 #[test]
+fn adaptive_clears_a_pocket_and_is_edited_and_saved() {
+    let mut s = pocket_job(0.0, json!({}));
+    let op = run(&mut s, "cam.op.adaptive", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 15000, "feed": 900, "bottom": -6, "stepdown": 3}));
+    assert_eq!(op["lowest_z"], -6.0);
+    let listed = run(&mut s, "cam.list", json!({}));
+    let first = &listed["setups"][0]["operations"][0];
+    assert_eq!(first["kind"], "adaptive");
+    assert_eq!(
+        (first["inputs"]["stepover_percent"].clone(), first["inputs"]["helix_angle"].clone(), first["inputs"]["helix_max"].clone()),
+        (json!(20.0), json!("5 deg"), json!(100.0))
+    );
+    // A lighter cut is longer; a finishing allowance and rest machining are kept with it.
+    let light = run(&mut s, "cam.op.edit", json!({"op": op["operation"], "stepover_percent": 10}));
+    assert!(light["cut_length"].as_f64().unwrap() > op["cut_length"].as_f64().unwrap() * 1.3);
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 3, "spindle_rpm": 20000, "feed": 600}));
+    let rest = run(&mut s, "cam.op.adaptive", json!({"sketch": "Pocket", "tool": 2, "bottom": -6, "rest_from": 1, "finish": "0.2 mm"}));
+    assert!(rest["cut_length"].as_f64().unwrap() < light["cut_length"].as_f64().unwrap() * 0.5);
+    let reopened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(reopened.manufacture, s.doc.manufacture);
+    assert!(s.execute("cam.tool.remove", &json!({"number": 1})).is_err(), "the rest pass needs tool 1");
+    for bad in
+        [json!({"stepover_percent": 80}), json!({"stepover_percent": "x"}), json!({"helix_min": 50, "helix_max": 20}), json!({"helix_angle": "x"})]
+    {
+        let mut q = json!({"sketch": "Pocket", "tool": 1, "bottom": -6, "spindle_rpm": 15000, "feed": 900});
+        q.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        assert!(s.execute("cam.op.adaptive", &q).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn a_pocket_machines_the_rest_a_larger_tool_left() {
     let mut s = pocket_job(0.0, json!({}));
     run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 10000, "feed": 800}));

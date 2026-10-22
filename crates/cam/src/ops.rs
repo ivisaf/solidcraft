@@ -251,19 +251,19 @@ pub struct BoreParams {
 }
 
 /// Collects moves, keeping the tool's position.
-struct Builder {
+pub(crate) struct Builder {
     moves: Vec<Move>,
-    pos: Option<Vec3>,
+    pub(crate) pos: Option<Vec3>,
     h: Heights,
     feeds: Feeds,
 }
 
 impl Builder {
-    fn new(cut: &Cut) -> Builder {
+    pub(crate) fn new(cut: &Cut) -> Builder {
         Builder { moves: Vec::new(), pos: None, h: cut.heights, feeds: cut.feeds }
     }
 
-    fn push(&mut self, m: Move) -> Result<()> {
+    pub(crate) fn push(&mut self, m: Move) -> Result<()> {
         if self.moves.len() >= MAX_MOVES {
             return Err(CamError::TooLarge(format!("the toolpath has more than {MAX_MOVES} moves")));
         }
@@ -279,7 +279,7 @@ impl Builder {
     }
 
     /// Up to the clearance height (if below it), then across to `p`.
-    fn travel_to(&mut self, p: Vec2) -> Result<()> {
+    pub(crate) fn travel_to(&mut self, p: Vec2) -> Result<()> {
         if let Some(q) = self.pos {
             if self.at(p) && q.z >= self.h.clearance {
                 return Ok(());
@@ -292,7 +292,7 @@ impl Builder {
     }
 
     /// Straight down to `z`: rapid to the retract height, then at the plunge feed.
-    fn plunge_to(&mut self, z: f64) -> Result<()> {
+    pub(crate) fn plunge_to(&mut self, z: f64) -> Result<()> {
         let Some(q) = self.pos else { return Err(CamError::Unsafe("a plunge before the first positioning move".into())) };
         if q.z > self.h.retract {
             self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.retract) })?;
@@ -303,7 +303,7 @@ impl Builder {
         Ok(())
     }
 
-    fn cut_to(&mut self, p: Vec2, z: f64) -> Result<()> {
+    pub(crate) fn cut_to(&mut self, p: Vec2, z: f64) -> Result<()> {
         if self.at(p) && self.pos.is_some_and(|q| (q.z - z).abs() <= 1e-9) {
             return Ok(());
         }
@@ -312,7 +312,7 @@ impl Builder {
 
     /// Cuts along `piece` from wherever the tool is (within the offsetting's joining tolerance
     /// of the piece's start), going evenly from depth `z0` to `z1`.
-    fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
+    pub(crate) fn cut_piece(&mut self, piece: &Piece, z0: f64, z1: f64) -> Result<()> {
         match *piece {
             Piece::Line { b, .. } => self.cut_to(b, z1),
             Piece::Arc { c, sweep, .. } => {
@@ -404,14 +404,14 @@ impl Builder {
         self.cut_segments(segs, z, z, tab_z)
     }
 
-    fn retract(&mut self) -> Result<()> {
+    pub(crate) fn retract(&mut self) -> Result<()> {
         match self.pos {
             Some(q) if q.z < self.h.clearance => self.push(Move::Rapid { to: Vec3::new(q.x, q.y, self.h.clearance) }),
             _ => Ok(()),
         }
     }
 
-    fn finish(mut self) -> Result<Toolpath> {
+    pub(crate) fn finish(mut self) -> Result<Toolpath> {
         self.retract()?;
         let path = Toolpath { moves: self.moves };
         verify(&path, &self.h)?;

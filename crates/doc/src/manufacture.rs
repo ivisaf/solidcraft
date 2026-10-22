@@ -188,6 +188,22 @@ pub enum CamOperationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_from: Option<u32>,
     },
+    /// Clears a pocket at a steady load on the tool: a cut `stepover_percent` of its diameter
+    /// wide at most, entering on a helix (`helix_angle`, an angle expression; its diameter
+    /// `helix_max` to `helix_min` percent of the tool's).
+    Adaptive {
+        stepover_percent: f64,
+        climb: bool,
+        stock_to_leave: Expr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish: Option<Expr>,
+        helix_angle: Expr,
+        helix_max: f64,
+        helix_min: f64,
+        /// Rest machining: the larger tool (its number) that cleared the pocket before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rest_from: Option<u32>,
+    },
     /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
     /// deeper than the chamfer (length expressions).
     Chamfer {
@@ -228,6 +244,7 @@ impl CamOperationKind {
             CamOperationKind::Face { .. } => "face",
             CamOperationKind::Contour { .. } => "contour",
             CamOperationKind::Pocket { .. } => "pocket",
+            CamOperationKind::Adaptive { .. } => "adaptive",
             CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",

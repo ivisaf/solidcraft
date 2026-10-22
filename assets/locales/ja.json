@@ -454,6 +454,7 @@
   "cmd.cam_list": "製造",
   "cmd.cam_material_define": "材料を定義",
   "cmd.cam_material_remove": "材料を削除",
+  "cmd.cam_op_adaptive": "アダプティブ",
   "cmd.cam_op_bore": "ヘリカル穴加工",
   "cmd.cam_op_chamfer": "面取り",
   "cmd.cam_op_contour": "2D 輪郭",
