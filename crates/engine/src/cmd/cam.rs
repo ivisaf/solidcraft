@@ -931,6 +931,21 @@ fn round_hole(lp: &Loop2) -> Option<(Vec2, f64)> {
     (lp.segs.iter().all(same) && (turned - std::f64::consts::TAU).abs() < 1e-6).then_some((center, radius))
 }
 
+/// The regions without those that only fill another's hole: a circle drawn inside a rectangle
+/// is the rectangle's island, which pockets, contours and chamfers go round, not a second area.
+fn without_filled_holes(regions: &[Region2]) -> Vec<Region2> {
+    let fills = |r: &Region2, hole: &Loop2| {
+        let (a, b) = (r.outer.signed_area().abs(), hole.signed_area().abs());
+        (a - b).abs() <= 1e-6 * a.max(1.0) && hole.contains(r.interior_point())
+    };
+    regions
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| !regions.iter().enumerate().any(|(j, q)| j != *i && q.holes.iter().any(|h| fills(r, h))))
+        .map(|(_, r)| r.clone())
+        .collect()
+}
+
 /// Where an operation cuts, in its setup's work coordinates.
 struct Geometry {
     regions: Vec<Region2>,
@@ -1275,7 +1290,15 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
         return Err(fail("a picked face points away from the tool; machine it in a setup whose axis faces it".into()));
     }
     let cut = op_cut(s, at, op, &g)?;
-    let regions = &g.regions;
+    // Areas are cut round their islands; holes and drills want each circle as drawn.
+    let kept: Vec<Region2>;
+    let regions = match op.kind {
+        CamOperationKind::Contour { .. } | CamOperationKind::Pocket { .. } | CamOperationKind::Adaptive { .. } | CamOperationKind::Chamfer { .. } => {
+            kept = without_filled_holes(&g.regions);
+            &kept
+        }
+        _ => &g.regions,
+    };
     let path = match &op.kind {
         CamOperationKind::Face { stepover, inside, margin } => {
             let (mut min, mut max) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));

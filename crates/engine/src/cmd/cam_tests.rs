@@ -1175,6 +1175,46 @@ fn adaptive_clears_a_pocket_and_is_edited_and_saved() {
 }
 
 #[test]
+fn a_circle_drawn_inside_a_pocket_is_an_island_not_a_second_area() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "sketch.edit", json!({"sketch": "Pocket"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 15], "radius": 5}));
+    run(&mut s, "sketch.finish", json!({}));
+    let base = json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 15000, "feed": 900, "bottom": -4, "stepdown": 2});
+    let with = |extra: Value| {
+        let mut q = base.clone();
+        q.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        q
+    };
+    for (cmd, p) in [
+        ("cam.op.pocket", base.clone()),
+        ("cam.op.adaptive", base.clone()),
+        ("cam.op.contour", with(json!({"side": "inside"}))),
+        ("cam.op.contour", with(json!({"side": "on"}))),
+    ] {
+        let op = run(&mut s, cmd, p.clone());
+        let path = run(&mut s, "cam.toolpath", json!({"op": op["operation"]}));
+        let points = path["operations"][0]["points"].as_array().unwrap().clone();
+        // The tool's edge stays off the island (on the line, its centre rides the circle).
+        let keep = if p["side"] == "on" { 5.0 } else { 8.0 };
+        let closest = points
+            .iter()
+            .filter(|q| q[3].as_bool() == Some(true) && q[2].as_f64().unwrap() < -1e-6)
+            .map(|q| (q[0].as_f64().unwrap() - 20.0).hypot(q[1].as_f64().unwrap() - 15.0))
+            .fold(f64::INFINITY, f64::min);
+        assert!(closest > keep - 0.05, "{cmd} {p}: the tool comes within {closest} mm of the island's centre");
+        assert!(closest < keep + 1.0, "{cmd} {p}: it should go round the island, closest {closest}");
+        run(&mut s, "cam.op.remove", json!({"op": op["operation"]}));
+    }
+    // A drill still drills the circle's centre.
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "drill", "diameter": 5, "spindle_rpm": 3000, "feed": 150}));
+    let drill = run(&mut s, "cam.op.drill", json!({"sketch": "Pocket", "tool": 2, "bottom": -4}));
+    let path = run(&mut s, "cam.toolpath", json!({"op": drill["operation"]}));
+    let points = path["operations"][0]["points"].as_array().unwrap();
+    assert!(points.iter().any(|q| (q[0].as_f64().unwrap() - 20.0).abs() < 1e-6 && (q[1].as_f64().unwrap() - 15.0).abs() < 1e-6), "{path}");
+}
+
+#[test]
 fn a_pocket_machines_the_rest_a_larger_tool_left() {
     let mut s = pocket_job(0.0, json!({}));
     run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 10000, "feed": 800}));

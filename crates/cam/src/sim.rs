@@ -473,7 +473,46 @@ pub fn deviations(stock: &HeightField, part: &HeightField) -> Result<Vec<f64>> {
             });
         }
     }
+    // Stock standing round the part's outline (the corners a round part leaves in a square block)
+    // is waste, not material left on the part; its holes and pockets are the part's own.
+    for (k, outside) in outside_the_part(part).into_iter().enumerate() {
+        if let Some(d) = out.get_mut(k).filter(|d| outside && **d > 0.0) {
+            *d = 0.0;
+        }
+    }
     Ok(out)
+}
+
+/// The columns outside the part's outline: those without part that the field's border reaches
+/// without crossing the part (so not its holes, which the part surrounds).
+fn outside_the_part(part: &HeightField) -> Vec<bool> {
+    let (nx, ny) = (part.nx, part.ny);
+    let empty = |i: usize, j: usize| part.get(i, j).is_none_or(|z| z <= part.floor + 1e-6);
+    let mut outside = vec![false; nx * ny];
+    let mut todo: Vec<(usize, usize)> = Vec::new();
+    for i in 0..nx {
+        todo.extend([(i, 0), (i, ny.saturating_sub(1))]);
+    }
+    for j in 0..ny {
+        todo.extend([(0, j), (nx.saturating_sub(1), j)]);
+    }
+    while let Some((i, j)) = todo.pop() {
+        let k = j * nx + i;
+        if i >= nx || j >= ny || outside.get(k).copied().unwrap_or(true) || !empty(i, j) {
+            continue;
+        }
+        if let Some(o) = outside.get_mut(k) {
+            *o = true;
+        }
+        todo.extend([(i + 1, j), (i, j + 1)]);
+        if i > 0 {
+            todo.push((i - 1, j));
+        }
+        if j > 0 {
+            todo.push((i, j - 1));
+        }
+    }
+    outside
 }
 
 /// Compares the cut `stock` with the `part` (see [`deviations`]).

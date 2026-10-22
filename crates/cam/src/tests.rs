@@ -1114,6 +1114,44 @@ fn a_part_edge_on_the_stock_s_border_is_no_gouge() {
     assert_eq!(compare(&stock, &part).unwrap().max_gouge, 10.0);
 }
 
+#[test]
+fn stock_round_a_round_part_is_waste_and_an_uncut_hole_is_left_material() {
+    // A disc of radius 15 with a hole of radius 4, in a square block.
+    let mut part = HeightField::block(Vec3::new(0.0, 0.0, -10.0), Vec3::new(40.0, 40.0, 0.0), 0.5).unwrap();
+    let mut stock = part.clone();
+    for j in 0..part.ny {
+        for i in 0..part.nx {
+            let r = Vec2::new(part.origin.x + (i as f64 + 0.5) * part.cell - 20.0, part.origin.y + (j as f64 + 0.5) * part.cell - 20.0).len();
+            if let Some(z) = part.z.get_mut(j * part.nx + i) {
+                *z = if (4.0..=15.0).contains(&r) { 0.0 } else { -10.0 };
+            }
+            // The program has cut round the disc, not in the hole.
+            if let Some(z) = stock.z.get_mut(j * stock.nx + i) {
+                *z = if (15.0..18.0).contains(&r) { -10.0 } else { 0.0 };
+            }
+        }
+    }
+    // The block's corners still stand beside the disc, but only the hole counts.
+    let against = compare(&stock, &part).unwrap();
+    close(against.max_leftover, 10.0, 1e-9);
+    let hole = PI * 16.0 * 10.0;
+    assert!(against.leftover_volume < hole * 1.2, "{} counts more than the hole", against.leftover_volume);
+    // Cut out, nothing is left on the part.
+    for j in 0..stock.ny {
+        for i in 0..stock.nx {
+            if part.get(i, j) == Some(-10.0)
+                && let Some(z) = stock.z.get_mut(j * stock.nx + i)
+            {
+                let r = Vec2::new((i as f64 + 0.5) * 0.5 - 20.0, (j as f64 + 0.5) * 0.5 - 20.0).len();
+                if r < 4.0 {
+                    *z = -10.0;
+                }
+            }
+        }
+    }
+    assert_eq!(compare(&stock, &part).unwrap().max_leftover, 0.0);
+}
+
 /// What an adaptive path does, checked on a fine simulation: the largest new area per mm of
 /// horizontal travel at the bottom (its engagement), the pocket's material left within the
 /// tool's reach, and whether it ever cut outside `inside`.
