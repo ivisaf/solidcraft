@@ -1526,6 +1526,35 @@ fn an_operation_form_kept_as_default_starts_the_next_one() {
     assert_eq!((f.stepdown, f.climb, f.spindle_rpm), built_in);
 }
 
+/// A contour form sets lead-in arcs, an onion skin and dogbones; opened again it shows them.
+#[test]
+fn a_contour_form_sets_leads_an_onion_skin_and_dogbones() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.contour");
+    h.frames(2);
+    for row in ["Onion skin", "Lead-in radius", "Dogbones"] {
+        assert!(h.widget(row).is_some(), "{row}");
+    }
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.bottom, f.lead, f.skin, f.skin_last, f.dogbones) = ("-3".into(), "2 mm".into(), "0.3 mm".into(), true, true);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Op(again)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][0]) else { panic!("no form") };
+    assert_eq!((again.lead.as_str(), again.skin.as_str(), again.skin_last, again.dogbones), ("2 mm", "0.3 mm", true, true));
+    // Emptied, they are gone.
+    let mut off = again.clone();
+    (off.lead, off.skin, off.dogbones) = (String::new(), String::new(), false);
+    h.app.manufacture.form = Some(Form::Op(off));
+    apply(&mut h.app);
+    assert!(matches!(
+        &h.app.session.doc.manufacture.setups[0].operations[0].kind,
+        solidcraft_engine::doc::manufacture::CamOperationKind::Contour { lead: None, skin: None, dogbones: false, .. }
+    ));
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

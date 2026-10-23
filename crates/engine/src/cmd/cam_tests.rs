@@ -1569,6 +1569,36 @@ fn a_template_carries_a_setup_s_operations_to_another_design() {
 }
 
 #[test]
+fn a_contour_leads_in_on_arcs_cuts_dogbones_and_leaves_an_onion_skin() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    let lowest = |s: &mut Session, k: usize| run(s, "cam.list", json!({}))["setups"][0]["operations"][k]["toolpath"]["lowest_z"].as_f64().unwrap();
+    run(&mut s, "cam.op.contour", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "lead": 3, "skin": 0.4}));
+    // The skin holds it: not through, so no warning of a part coming loose.
+    assert!((lowest(&mut s, 0) + 7.6).abs() < 1e-9);
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert!(listed["setups"][0]["operations"][0].get("warning").is_none_or(|w| !w.as_str().unwrap_or("").contains("without tabs")));
+    run(&mut s, "cam.op.edit", json!({"op": "Contour1", "skin_last": true}));
+    assert!((lowest(&mut s, 0) + 8.0).abs() < 1e-9);
+    // Edited off again, and dogbones in a pocket; what makes no sense is refused.
+    run(&mut s, "cam.op.edit", json!({"op": "Contour1", "skin": null, "lead": null, "dogbones": true}));
+    let op = &s.doc.manufacture.setups[0].operations[0];
+    assert!(matches!(&op.kind, solidcraft_doc::manufacture::CamOperationKind::Contour { skin: None, lead: None, dogbones: true, .. }));
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -3, "dogbones": true}));
+    assert!(matches!(&s.doc.manufacture.setups[0].operations[1].kind, solidcraft_doc::manufacture::CamOperationKind::Pocket { dogbones: true, .. }));
+    for bad in [json!({"op": "Contour1", "skin": 20}), json!({"op": "Contour1", "dogbones": "x"}), json!({"op": "Pocket1", "lead": 3})] {
+        assert!(s.execute("cam.op.edit", &bad).is_err(), "{bad}");
+    }
+    assert!(
+        s.execute(
+            "cam.op.contour",
+            &json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "lead": 3, "tabs": {"count": 2}})
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

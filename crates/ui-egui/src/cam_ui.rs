@@ -292,6 +292,12 @@ pub struct OpForm {
     pub tab_height: String,
     /// What the depth passes leave on the walls for one finishing pass (empty: none).
     pub finish: String,
+    /// A contour's lead-in radius (empty: none), its onion skin (empty: none) and whether a last
+    /// pass takes the skin off; dogbones in sharp inside corners (contour and pocket).
+    pub lead: String,
+    pub skin: String,
+    pub skin_last: bool,
+    pub dogbones: bool,
     /// How far a bore's helix goes down in one turn.
     pub pitch: String,
     /// A pocket's rest machining: the larger tool (its number) that cleared it before (empty: the whole pocket).
@@ -722,6 +728,10 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             tab_width: String::new(),
             tab_height: String::new(),
             finish: String::new(),
+            lead: String::new(),
+            skin: String::new(),
+            skin_last: false,
+            dogbones: false,
             pitch: String::new(),
             rest_from: String::new(),
             stepover_percent: String::new(),
@@ -1081,6 +1091,19 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     p.insert("tabs".into(), Value::Null);
                 }
             }
+            if f.kind == OpKind::Contour {
+                for (k, text) in [("lead", &f.lead), ("skin", &f.skin)] {
+                    if !text.trim().is_empty() {
+                        p.insert(k.into(), json!(text.trim()));
+                    } else if f.editing.is_some() {
+                        p.insert(k.into(), Value::Null);
+                    }
+                }
+                p.insert("skin_last".into(), json!(f.skin_last));
+            }
+            if matches!(f.kind, OpKind::Contour | OpKind::Pocket) {
+                p.insert("dogbones".into(), json!(f.dogbones));
+            }
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Adaptive) {
                 if !f.finish.trim().is_empty() {
                     p.insert("finish".into(), json!(f.finish.trim()));
@@ -1276,6 +1299,10 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         tab_width: text(&inputs["tabs"], "width"),
         tab_height: text(&inputs["tabs"], "height"),
         finish: text(inputs, "finish"),
+        lead: text(inputs, "lead"),
+        skin: text(inputs, "skin"),
+        skin_last: inputs["skin_last"].as_bool().unwrap_or(false),
+        dogbones: inputs["dogbones"].as_bool().unwrap_or(false),
         pitch: text(inputs, "pitch"),
         rest_from: inputs["rest_from"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
         stepover_percent: number(&inputs["stepover_percent"]),
@@ -1375,8 +1402,9 @@ fn prefill(f: &mut OpForm, lists: &Choices) {
 macro_rules! default_rows {
     ($m:ident) => {
         $m!(text: tool, spindle_rpm, feed, plunge_feed, stepdown, stepover, stock_to_leave, ramp_angle, passes, tab_count, tab_width,
-            tab_height, finish, pitch, stepover_percent, helix_angle, helix_max, helix_min, feed_up, width, tip_offset, peck, dwell, margin);
-        $m!(flag: climb, tabs, coolant);
+            tab_height, finish, pitch, stepover_percent, helix_angle, helix_max, helix_min, feed_up, width, tip_offset, peck, dwell, margin,
+            lead, skin);
+        $m!(flag: climb, tabs, coolant, dogbones, skin_last);
         $m!(index: side, boundary, limit);
     };
 }
@@ -2106,6 +2134,12 @@ fn help(label: &str) -> Option<&'static str> {
         "Plunge feed" => "How fast the tool moves down into the material.",
         "Stepdown" => "How deep the tool goes per pass. Deep cuts are made in several passes.",
         "Passes" => "How many depth passes, instead of a stepdown: the depth is divided evenly. Empty: by the stepdown.",
+        "Onion skin" => "Material left on the bottom of a cut-out, so that the part stays held by a thin floor. Empty: none.",
+        "Skin" => "Take the onion skin off in one light last pass of this operation; otherwise it is left for another operation, or by hand.",
+        "Lead-in radius" => {
+            "Each pass goes down beside the wall, off the part, and arcs onto the wall and off it again: no mark where it starts. Empty: it ramps down along the loop."
+        }
+        "Dogbones" => "The round tool leaves a radius in sharp inside corners; a dogbone runs in to the corner, so that square parts fit into it.",
         "Finish allowance" => {
             "What the depth passes leave on the walls; one more pass at the full depth then takes it off, for a clean wall. Empty: none."
         }
@@ -3004,6 +3038,21 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                         field(ui, need, "Tab width", &mut f.tab_width, "6 mm");
                         field(ui, need, "Tab height", &mut f.tab_height, "2 mm");
                     }
+                    field(ui, need, "Onion skin", &mut f.skin, "none");
+                    if !f.skin.trim().is_empty() {
+                        row_label(ui, "Skin", None);
+                        let r = crate::ui_kit::checkbox(ui, tm("Cut it off last"), &mut f.skin_last);
+                        explained(r, "Skin", None);
+                        ui.end_row();
+                    }
+                    // Arcs onto the wall, from off the part; tabs have their own way down.
+                    if !f.tabs {
+                        field(ui, need, "Lead-in radius", &mut f.lead, "none: ramps along the loop");
+                    }
+                    row_label(ui, "Dogbones", None);
+                    let r = crate::ui_kit::checkbox(ui, tm("Into sharp inside corners"), &mut f.dogbones);
+                    explained(r, "Dogbones", None);
+                    ui.end_row();
                 }
                 OpKind::Pocket => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
@@ -3013,6 +3062,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     let mut options: Vec<(String, String)> = vec![(String::new(), tm("none: the whole pocket").into())];
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_rest_from", "Rest of tool", &mut f.rest_from, &options);
+                    row_label(ui, "Dogbones", None);
+                    let r = crate::ui_kit::checkbox(ui, tm("Into sharp inside corners"), &mut f.dogbones);
+                    explained(r, "Dogbones", None);
+                    ui.end_row();
                 }
                 OpKind::Adaptive => {
                     field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");

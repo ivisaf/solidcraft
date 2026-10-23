@@ -189,6 +189,17 @@ pub enum CamOperationKind {
         /// Allowance the depth passes leave on the wall for one finishing pass at full depth (a length expression).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         finish: Option<Expr>,
+        /// Radius of the quarter-circle lead-in and lead-out onto the wall (a length expression; none: it ramps along the loop).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lead: Option<Expr>,
+        /// Dogbones in the sharp inside corners the round tool cannot reach.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dogbones: bool,
+        /// An onion skin left on the bottom (a length expression), taken off in a last light pass when `skin_last`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skin: Option<Expr>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        skin_last: bool,
     },
     Pocket {
         stepover: Expr,
@@ -201,6 +212,9 @@ pub enum CamOperationKind {
         /// Rest machining: the larger tool (its number) that cleared the pocket before; only what it left is cut.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rest_from: Option<u32>,
+        /// Dogbones in the pocket's sharp corners.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dogbones: bool,
     },
     /// Clears a pocket at a steady load on the tool: a cut `stepover_percent` of its diameter
     /// wide at most, entering on a helix (`helix_angle`, an angle expression; its diameter

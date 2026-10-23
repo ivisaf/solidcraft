@@ -9,7 +9,7 @@ use solidcraft_geom::{Region2, Vec2, Vec3};
 use crate::check::verify;
 use crate::offset::{Shape, reversed};
 use crate::path::{MAX_MOVES, Move, Toolpath};
-use crate::piece::Piece;
+use crate::piece::{Piece, turn};
 use crate::sim::HeightField;
 use crate::tool::Tool;
 use crate::{CamError, Result, invalid};
@@ -100,10 +100,11 @@ impl Cut {
 }
 
 /// Which side of a profile the tool runs on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
     /// Around the regions: the regions are the part that stays.
+    #[default]
     Outside,
     /// Inside the regions' boundary: the regions are the opening.
     Inside,
@@ -111,7 +112,7 @@ pub enum Side {
     On,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContourParams {
     pub side: Side,
     /// Climb milling (with a clockwise spindle the wall is on the right of the tool's travel);
@@ -128,6 +129,20 @@ pub struct ContourParams {
     /// Material the depth passes leave on the wall besides `stock_to_leave` (mm), taken off by
     /// one more pass round each loop at the full depth; 0: none.
     pub finish: f64,
+    /// Radius of a quarter-circle lead-in and lead-out (mm): each pass goes down beside the wall,
+    /// off the part, and arcs onto it and off it again; 0: none (it ramps along the loop).
+    #[serde(default)]
+    pub lead: f64,
+    /// Dogbones: at a sharp inside corner the round tool cannot reach, it runs in along the
+    /// corner's bisector until its edge touches the corner, and back.
+    #[serde(default)]
+    pub dogbones: bool,
+    /// An onion skin (mm): the depth passes stop this far above the bottom, so that a part cut
+    /// out stays held by a thin floor; `skin_last` takes it off in one light last pass.
+    #[serde(default)]
+    pub skin: f64,
+    #[serde(default)]
+    pub skin_last: bool,
 }
 
 /// Tabs that hold a part being cut out: `count` on each loop, spaced evenly along it, each
@@ -140,7 +155,7 @@ pub struct Tabs {
     pub height: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PocketParams {
     /// Distance between passes (mm), at most the tool diameter.
     pub stepover: f64,
@@ -157,6 +172,9 @@ pub struct PocketParams {
     /// Rest machining: only what a larger tool this wide (mm) could not reach (corners, narrow
     /// places) is cut, the larger tool having cleared the rest to the same depth and walls.
     pub rest_diameter: Option<f64>,
+    /// Dogbones in the pocket's sharp corners (see [`ContourParams::dogbones`]).
+    #[serde(default)]
+    pub dogbones: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -644,6 +662,15 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         return invalid("a contour on the line has no finishing pass: it leaves nothing on a wall");
     }
     let depth = cut.heights.top - cut.heights.bottom;
+    if !(params.lead.is_finite() && (0.0..=10.0 * tool.diameter).contains(&params.lead)) {
+        return invalid("the lead-in radius must be 0 to ten tool diameters");
+    }
+    if params.lead > 0.0 && params.tabs.is_some() {
+        return invalid("lead-in arcs together with tabs are not supported yet");
+    }
+    if !(params.skin.is_finite() && params.skin >= 0.0 && params.skin < depth) {
+        return invalid("the onion skin must be 0 or more and thinner than the depth cut");
+    }
     if let Some(t) = &params.tabs {
         if !(1..=MAX_TABS).contains(&t.count) {
             return invalid(format!("a contour has 1 to {MAX_TABS} tabs on each loop"));
@@ -665,21 +692,32 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         })
     };
     // The depth passes leave the finishing allowance; one pass more at full depth takes it off.
-    let loops = loops_at(params.stock_to_leave + params.finish)?;
+    let dogbones = |loops: Vec<Vec<Piece>>| if params.dogbones { loops.iter().map(|lp| dogboned(lp, tool.radius())).collect() } else { loops };
+    let loops = dogbones(loops_at(params.stock_to_leave + params.finish)?);
     if loops.is_empty() {
         return invalid("the tool does not fit the profile");
     }
-    let finish = if params.finish > 0.0 { loops_at(params.stock_to_leave)? } else { Vec::new() };
+    let finish = if params.finish > 0.0 { dogbones(loops_at(params.stock_to_leave)?) } else { Vec::new() };
     // Loops come with the regions on their left. Around a part that puts the wall on the left
     // (conventional), inside an opening on the right (climb).
     let natural_is_climb = params.side != Side::Outside;
-    let levels = cut.levels()?;
+    // An onion skin: the depth passes stop above the bottom; one light pass takes the skin off when asked.
+    let skinned = Cut { heights: Heights { bottom: cut.heights.bottom + params.skin, ..cut.heights }, ..*cut };
+    let mut levels = skinned.levels()?;
+    if params.skin > 0.0 && params.skin_last {
+        levels.push(cut.heights.bottom);
+    }
+    let floor = if params.skin > 0.0 && !params.skin_last { skinned.heights.bottom } else { cut.heights.bottom };
     let tab_z = params.tabs.map_or(f64::NEG_INFINITY, |t| cut.heights.bottom + t.height);
     let mut b = Builder::new(cut);
-    let passes = loops.iter().map(|lp| (lp, levels.as_slice())).chain(finish.iter().map(|lp| (lp, std::slice::from_ref(&cut.heights.bottom))));
+    let passes = loops.iter().map(|lp| (lp, levels.as_slice())).chain(finish.iter().map(|lp| (lp, std::slice::from_ref(&floor))));
     for (lp, levels) in passes {
         let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
         let Some(first) = lp.first() else { continue };
+        if params.lead > 0.0 {
+            lead_laps(&mut b, &shape, &lp, levels, params.lead)?;
+            continue;
+        }
         let segs = match &params.tabs {
             Some(t) => tab_segments(&lp, &tab_spans(lp.iter().map(Piece::length).sum(), t, tool.diameter)),
             None => Vec::new(),
@@ -699,6 +737,56 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
         b.retract()?;
     }
     b.finish()
+}
+
+/// Smallest change of direction (radians) a dogbone is put into.
+const DOGBONE_TURN: f64 = 0.1;
+
+/// `lp` with a dogbone at each sharp corner: from the corner, along the bisector away from the
+/// turn, until the edge of a tool `r` round reaches the corner the wall makes there, and back.
+/// Offset loops have sharp corners only where the material is on the outside of the turn.
+pub(crate) fn dogboned(lp: &[Piece], r: f64) -> Vec<Piece> {
+    let mut out = Vec::with_capacity(lp.len() * 3);
+    for (piece, next) in lp.iter().zip(lp.iter().cycle().skip(1)) {
+        out.push(*piece);
+        let (v, t1, t2) = (piece.end(), piece.tangent_at(1.0), next.tangent_at(0.0));
+        let turn_by = turn(t1, t2);
+        if (next.start() - v).len() > 1e-6 || turn_by.abs() < DOGBONE_TURN || turn_by.abs() > PI - DOGBONE_TURN {
+            continue;
+        }
+        let Some(away) = (t1 - t2).normalized() else { continue };
+        let reach = r * (1.0 / (turn_by / 2.0).cos() - 1.0);
+        let tip = v + away * reach;
+        out.push(Piece::Line { a: v, b: tip });
+        out.push(Piece::Line { a: tip, b: v });
+    }
+    out
+}
+
+/// Each depth pass of a contour loop with a lead-in and lead-out: down beside the wall where
+/// the tool is off the part (the side farther from the profile), a quarter circle `radius`
+/// round onto the loop's start, round the loop, a quarter circle off it, and straight back to
+/// where it went down.
+fn lead_laps(b: &mut Builder, shape: &Shape, lp: &[Piece], levels: &[f64], radius: f64) -> Result<()> {
+    let Some(first) = lp.first() else { return Ok(()) };
+    let (p0, t) = (first.start(), first.tangent_at(0.0));
+    let left = Vec2::new(-t.y, t.x);
+    // Off the part: the side whose point is farther from the profile.
+    let away = if shape.dist(p0 + left * radius) >= shape.dist(p0 - left * radius) { left } else { -left };
+    let c = p0 + away * radius;
+    let (s, e) = (c - t * radius, c + t * radius);
+    let angle = |p: Vec2| (p.y - c.y).atan2(p.x - c.x);
+    let into = Piece::Arc { c, r: radius, a0: angle(s), sweep: turn(s - c, p0 - c) };
+    let out_of = Piece::Arc { c, r: radius, a0: angle(p0), sweep: turn(p0 - c, e - c) };
+    b.travel_to(s)?;
+    for &z in levels {
+        b.plunge_to(z)?;
+        b.cut_piece(&into, z, z)?;
+        b.cut_loop(lp, z)?;
+        b.cut_piece(&out_of, z, z)?;
+        b.cut_to(s, z)?;
+    }
+    b.retract()
 }
 
 /// Clears `regions` (holes are islands) with rings parallel to the boundary, from the inside out.
@@ -731,6 +819,12 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     }
     if let Some(big) = params.rest_diameter {
         return rest(&shape, &rings, tool, params, cut, big);
+    }
+    // Dogbones in the wall ring's corners.
+    if params.dogbones
+        && let Some(wall_ring) = rings.first_mut()
+    {
+        *wall_ring = wall_ring.iter().map(|lp| dogboned(lp, r)).collect();
     }
     // Rings more than a radius apart leave material wherever the next ring in does not run
     // within a radius: the middle of a part of the pocket it no longer fits in, a passage that
@@ -792,6 +886,7 @@ pub fn pocket(regions: &[Region2], tool: &Tool, params: &PocketParams, cut: &Cut
     if params.finish > 0.0 {
         let z = cut.heights.bottom;
         for lp in shape.offset(r + params.stock_to_leave)? {
+            let lp = if params.dogbones { dogboned(&lp, r) } else { lp };
             let lp = if params.climb { lp } else { reversed(&lp) };
             let Some(first) = lp.first() else { continue };
             // Down where the depth passes cleared, all but the allowance itself.
