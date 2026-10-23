@@ -1555,6 +1555,40 @@ fn a_contour_form_sets_leads_an_onion_skin_and_dogbones() {
     ));
 }
 
+/// A setup form sets clamps; they are drawn round the stock, and a program whose tool runs into
+/// one is written only once that is confirmed.
+#[test]
+fn clamps_are_set_in_the_setup_form_drawn_and_asked_about_before_posting() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Pocket"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [40, 30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.clamps = vec![["20".into(), "0".into(), "25".into(), "40".into(), "5".into()], Default::default()];
+    });
+    let clamps = h.app.session.doc.manufacture.setups[0].clamps.clone();
+    assert_eq!(clamps.len(), 1, "the empty row is left out");
+    assert_eq!((clamps[0].min, clamps[0].max, clamps[0].top), ([20.0, 0.0], [25.0, 40.0], 5.0));
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(again)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!(again.clamps, vec![["20".to_string(), "0".into(), "25".into(), "40".into(), "5".into()]]);
+    // Drawn: twelve edges round it.
+    h.app.manufacture.open = true;
+    h.frames(2);
+    refresh(&mut h.app);
+    let view = h.app.manufacture.cache.as_ref().and_then(|c| c.2.first().cloned()).expect("the setup's view");
+    assert_eq!(clamp_lines(&view).len(), 12);
+    // The pocket runs into it: asked before it is written.
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    menu_action(&mut h.app, &json!({"do": "post", "setup": setup}));
+    let asked = h.app.manufacture.confirm_post.clone().expect("the question");
+    assert_eq!(asked.clamped, ["Pocket1"]);
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

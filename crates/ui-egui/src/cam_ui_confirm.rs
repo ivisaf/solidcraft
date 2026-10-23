@@ -10,13 +10,24 @@ use super::pick_post;
 /// The question before a program whose rapids run into material is written.
 pub(super) fn post_confirmation(app: &mut SolveApp, ctx: &egui::Context) {
     let Some(pending) = app.manufacture.confirm_post.clone() else { return };
-    let message = tf("manufacture.rapids_before_post", &[("count", &pending.collisions.to_string())]);
-    let (closed, action) = ui_kit::Confirm::new(egui::Id::new("sc_cam_post_confirm"), "status_warning", tm("Rapid moves run into material"))
-        .tone(ui_kit::Tone::Warning)
-        .actions(tm("Write anyway"), tm("Cancel"), None)
-        .show(ctx, true, |ui| {
-            ui_kit::text(ui, &message, ui_kit::Text::Report("rapids", true));
-        });
+    let mut lines = Vec::new();
+    if pending.collisions > 0 {
+        lines.push(tf("manufacture.rapids_before_post", &[("count", &pending.collisions.to_string())]));
+    }
+    if !pending.clamped.is_empty() {
+        lines.push(tf("manufacture.clamps_before_post", &[("ops", &pending.clamped.join(", "))]));
+    }
+    let message = lines.join("\n\n");
+    let (closed, action) = ui_kit::Confirm::new(
+        egui::Id::new("sc_cam_post_confirm"),
+        "status_warning",
+        tm(if pending.collisions > 0 { "Rapid moves run into material" } else { "The tool runs into a clamp" }),
+    )
+    .tone(ui_kit::Tone::Warning)
+    .actions(tm("Write anyway"), tm("Cancel"), None)
+    .show(ctx, true, |ui| {
+        ui_kit::text(ui, &message, ui_kit::Text::Report("rapids", true));
+    });
     match action {
         ui_kit::Action::Ok => {
             app.manufacture.confirm_post = None;

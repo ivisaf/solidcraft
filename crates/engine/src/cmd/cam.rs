@@ -9,7 +9,9 @@ use solidcraft_cam::{
 };
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
-use solidcraft_doc::manufacture::{Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, FaceRef, Setup, SetupOrigin, StockDef, TabsDef};
+use solidcraft_doc::manufacture::{
+    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, FaceRef, Setup, SetupOrigin, StockDef, TabsDef,
+};
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 
@@ -49,7 +51,8 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
      (or 54 to 59; default G54), the work offset its programs run in; stock_from?: an earlier setup (id or name; null: none) whose result \
-     is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z) → setup: id, name";
+     is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z); clamps?: \
+     [{name?, min: [x, y], max: [x, y], top}] boxes in work coordinates no tool may enter (operations that do are warned about) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
@@ -90,7 +93,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, clamps as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -653,6 +656,66 @@ fn stock_from_param(s: &Session, p: &Value, at: Option<usize>, axis: Vec3, cmd: 
     }
 }
 
+/// Most clamps on one setup.
+const MAX_CLAMPS: usize = 64;
+
+/// `clamps`: `[{name?, min: [x, y], max: [x, y], top}]` in work coordinates (`null` or `[]`: none).
+fn clamps_param(p: &Value, cmd: &str) -> Result<Option<Vec<Clamp>>> {
+    let refused = || bad(cmd, "`clamps` must be a list of {name?, min: [x, y], max: [x, y], top} with min below max");
+    let list = match p.get("clamps") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(Vec::new())),
+        Some(Value::Array(a)) if a.len() <= MAX_CLAMPS => a,
+        Some(_) => return Err(refused()),
+    };
+    let mut out = Vec::new();
+    for c in list {
+        let pair = |k: &str| -> Option<[f64; 2]> {
+            let a = c.get(k)?.as_array()?;
+            let (x, y) = (a.first()?.as_f64()?, a.get(1)?.as_f64()?);
+            (x.is_finite() && y.is_finite() && x.abs() <= 1e6 && y.abs() <= 1e6).then_some([x, y])
+        };
+        let (min, max) = (pair("min").ok_or_else(refused)?, pair("max").ok_or_else(refused)?);
+        let top = c.get("top").and_then(Value::as_f64).filter(|t| t.is_finite() && t.abs() <= 1e6).ok_or_else(refused)?;
+        if !(min[0] < max[0] && min[1] < max[1]) {
+            return Err(refused());
+        }
+        let name: String = c.get("name").and_then(Value::as_str).unwrap_or_default().chars().take(MAX_NAME).collect();
+        out.push(Clamp { name, min, max, top });
+    }
+    Ok(Some(out))
+}
+
+/// The first clamp a toolpath's tool, `radius` round, comes into: anywhere below a clamp's top
+/// within `radius` of its box across. Its name, or its number counted from 1.
+fn clamp_hit(path: &cam::Toolpath, radius: f64, clamps: &[Clamp]) -> Option<String> {
+    if clamps.is_empty() {
+        return None;
+    }
+    let points = path.points(0.05);
+    let step = (radius * 0.5).max(0.05);
+    let mut samples = 0usize;
+    for w in points.windows(2) {
+        let (a, b) = (w[0].0, w[1].0);
+        let n = (((b - a).len() / step).ceil() as usize).clamp(1, 10_000);
+        for k in 0..=n {
+            samples += 1;
+            if samples > MAX_POINTS {
+                return None;
+            }
+            let q = a + (b - a) * (k as f64 / n as f64);
+            for (i, c) in clamps.iter().enumerate() {
+                let dx = (c.min[0] - q.x).max(q.x - c.max[0]).max(0.0);
+                let dy = (c.min[1] - q.y).max(q.y - c.max[1]).max(0.0);
+                if q.z < c.top - 1e-9 && dx.hypot(dy) < radius - 1e-9 {
+                    return Some(if c.name.is_empty() { format!("{}", i + 1) } else { c.name.clone() });
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Whether two tool axes are the same (`Some(true)`) or turned over (`Some(false)`).
 fn facing(a: Vec3, b: Vec3) -> Option<bool> {
     let d = a.normalized()?.dot(b.normalized()?);
@@ -705,7 +768,8 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let material = material_param(p, cmd)?.flatten();
     let work_offset = work_offset_param(p, cmd)?.unwrap_or(54);
     let stock_from = stock_from_param(s, p, None, axis, cmd)?.flatten();
-    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, operations: Vec::new() };
+    let clamps = clamps_param(p, cmd)?.unwrap_or_default();
+    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, clamps, operations: Vec::new() };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -742,6 +806,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(from) = stock_from_param(s, p, Some(i), setup.axis, cmd)? {
         setup.stock_from = from;
+    }
+    if let Some(clamps) = clamps_param(p, cmd)? {
+        setup.clamps = clamps;
     }
     // A turned axis can leave a setup it takes its stock from facing neither way.
     if let Some(from) = setup.stock_from
@@ -2392,6 +2459,7 @@ fn list_now(s: &Session) -> Value {
             let resolved = resolve(s, setup).ok();
             let part = resolved.as_ref().and_then(|at| setup_part(s, at));
             let stock_bottom = resolved.as_ref().and_then(|at| at.stock).map(|(lo, _)| lo.z);
+            let stock_top = resolved.as_ref().and_then(|at| at.stock).map(|(_, hi)| hi.z);
             let ops: Vec<Value> = setup
                 .operations
                 .iter()
@@ -2417,6 +2485,18 @@ fn list_now(s: &Session) -> Value {
                             if through && matches!(op.kind, CamOperationKind::Contour { tabs: None, .. }) {
                                 warnings.push(THROUGH_WITHOUT_TABS.to_string());
                             }
+                            if let Some(tool) = m.tool(op.tool) {
+                                if let Some(clamp) = clamp_hit(&path, tool.radius(), &setup.clamps) {
+                                    warnings.push(format!("runs into clamp {clamp}"));
+                                }
+                                // Deeper below the stock's top than the tool reaches out of its holder: the holder hits the stock.
+                                if let (Some(reach), Some(lowest), Some(top)) = (tool.length, path.stats().lowest_z, stock_top) {
+                                    let depth = top - lowest;
+                                    if depth > reach + 1e-6 {
+                                        warnings.push(format!("goes {depth:.1} mm deep but the tool reaches {reach:.1} mm out of its holder"));
+                                    }
+                                }
+                            }
                             if !warnings.is_empty() {
                                 v["warning"] = json!(warnings.join("; "));
                             }
@@ -2427,7 +2507,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {

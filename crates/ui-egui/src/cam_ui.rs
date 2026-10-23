@@ -233,6 +233,8 @@ pub struct SetupForm {
     pub work_offset: usize,
     /// The earlier setup whose result is the stock (its id; "": the stock box).
     pub stock_from: String,
+    /// Clamps no tool may enter, each as typed: X from, Y from, X to, Y to, top (work coordinates).
+    pub clamps: Vec<[String; 5]>,
 }
 
 /// The work offsets a setup's programs can run in.
@@ -477,6 +479,8 @@ pub type Path = Vec<(Vec3, bool)>;
 pub struct SetupView {
     pub frame: [Vec3; 4],
     pub stock: Option<(Vec3, Vec3)>,
+    /// Its clamps as boxes in work coordinates: from the stock's bottom up to each one's top.
+    pub clamps: Vec<(Vec3, Vec3)>,
 }
 
 pub struct CamUi {
@@ -789,6 +793,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             material: String::new(),
             work_offset: 0,
             stock_from: String::new(),
+            clamps: Vec::new(),
         }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
@@ -943,6 +948,16 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             p.insert("material".into(), if f.material.trim().is_empty() { Value::Null } else { json!(f.material.trim()) });
             p.insert("work_offset".into(), json!(WORK_OFFSETS.get(f.work_offset).copied().unwrap_or("G54")));
             p.insert("stock_from".into(), f.stock_from.trim().parse::<u64>().map_or(Value::Null, |id| json!(id)));
+            let mut clamps = Vec::new();
+            for (k, c) in f.clamps.iter().enumerate() {
+                if c.iter().all(|t| t.trim().is_empty()) {
+                    continue;
+                }
+                let what = tf("manufacture.clamp_number", &[("number", &(k + 1).to_string())]);
+                let v: Vec<f64> = c.iter().map(|t| number(&what, t)).collect::<Result<_, _>>()?;
+                clamps.push(json!({ "min": [v[0].min(v[2]), v[1].min(v[3])], "max": [v[0].max(v[2]), v[1].max(v[3])], "top": v[4] }));
+            }
+            p.insert("clamps".into(), json!(clamps));
             match f.editing {
                 Some(id) => {
                     p.insert("setup".into(), json!(id));
@@ -1237,6 +1252,15 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
             .filter(|i| *i < WORK_OFFSETS.len())
             .unwrap_or(0),
         stock_from: setup["stock_from"].as_u64().map(|id| id.to_string()).unwrap_or_default(),
+        clamps: setup["clamps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                let n = |v: &Value| v.as_f64().map(|x| x.to_string()).unwrap_or_default();
+                [n(&c["min"][0]), n(&c["min"][1]), n(&c["max"][0]), n(&c["max"][1]), n(&c["top"])]
+            })
+            .collect(),
     })))
 }
 
@@ -1885,7 +1909,19 @@ fn refresh(app: &mut SolveApp) {
         let f = &setup["frame"];
         if let (Some(o), Some(x), Some(y), Some(z)) = (point(&f["origin"]), point(&f["x"]), point(&f["y"]), point(&f["z"])) {
             let b = &setup["stock_box"];
-            views.push(SetupView { frame: [o, x, y, z], stock: point(&b["min"]).zip(point(&b["max"])) });
+            let stock = point(&b["min"]).zip(point(&b["max"]));
+            let floor = stock.map_or(0.0, |(lo, _)| lo.z);
+            let clamps = setup["clamps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|c| {
+                    let at = |k: &str, i: usize| c[k][i].as_f64();
+                    let top = c["top"].as_f64()?;
+                    Some((Vec3::new(at("min", 0)?, at("min", 1)?, floor.min(top)), Vec3::new(at("max", 0)?, at("max", 1)?, top)))
+                })
+                .collect();
+            views.push(SetupView { frame: [o, x, y, z], stock, clamps });
         }
         // A setup with an operation that cannot be cut draws no toolpath; the window says why.
         let Ok(v) = app.session.execute("cam.toolpath", &json!({ "setup": setup["id"] })) else { continue };
@@ -1925,23 +1961,35 @@ pub fn setup_views(app: &mut SolveApp) -> &[SetupView] {
 /// The world edges of a setup's stock box and the three arms of its work origin (`X`, `Y`, `Z`).
 pub fn setup_lines(view: &SetupView) -> (Vec<(Vec3, Vec3)>, [(Vec3, Vec3); 3]) {
     let [o, x, y, z] = view.frame;
-    let world = |q: Vec3| o + x * q.x + y * q.y + z * q.z;
     let mut edges = Vec::new();
     let mut size = 20.0;
     if let Some((lo, hi)) = view.stock {
-        let corner = |i: usize| {
-            world(Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }))
-        };
-        for i in 0..8usize {
-            for bit in [1usize, 2, 4] {
-                if i & bit == 0 {
-                    edges.push((corner(i), corner(i | bit)));
-                }
-            }
-        }
+        edges = box_edges(view, lo, hi);
         size = (hi - lo).len() * 0.15;
     }
     (edges, [(o, o + x * size), (o, o + y * size), (o, o + z * size)])
+}
+
+/// The twelve edges, in the world, of a box from `lo` to `hi` in a setup's work coordinates.
+fn box_edges(view: &SetupView, lo: Vec3, hi: Vec3) -> Vec<(Vec3, Vec3)> {
+    let [o, x, y, z] = view.frame;
+    let world = |q: Vec3| o + x * q.x + y * q.y + z * q.z;
+    let corner =
+        |i: usize| world(Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z }));
+    let mut edges = Vec::with_capacity(12);
+    for i in 0..8usize {
+        for bit in [1usize, 2, 4] {
+            if i & bit == 0 {
+                edges.push((corner(i), corner(i | bit)));
+            }
+        }
+    }
+    edges
+}
+
+/// A setup's clamps' edges in the world.
+pub fn clamp_lines(view: &SetupView) -> Vec<(Vec3, Vec3)> {
+    view.clamps.iter().flat_map(|(lo, hi)| box_edges(view, *lo, *hi)).collect()
 }
 
 /// The screen segments of the toolpaths: `(from, to, cutting)`.
@@ -1986,6 +2034,11 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
             for (a, b) in edges {
                 if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
                     painter.line_segment([a, b], Stroke::new(1.0, t.text_dim));
+                }
+            }
+            for (a, b) in clamp_lines(view) {
+                if let (Some(a), Some(b)) = (proj.to_screen(a), proj.to_screen(b)) {
+                    painter.line_segment([a, b], Stroke::new(1.5, t.warning));
                 }
             }
             for ((a, b), (label, colour)) in arms.into_iter().zip([("X", t.error), ("Y", t.sketch_accent), ("Z", t.accent)]) {
@@ -2154,6 +2207,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
+        "Clamps" => {
+            "What holds the stock and no tool may touch: a box from-to across, in the setup's work coordinates, up to its top. Operations whose tool comes into one are warned about."
+        }
         "Stock from" => {
             "Where this setup's stock comes from: its own box round the part, or what an earlier setup leaves of it (the part turned over for its other side, say: the earlier setup's tool axis turned over)."
         }
@@ -2901,6 +2957,32 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             let here = f.editing.map(|id| id.to_string());
             earlier.extend(choices.setups.iter().take_while(|(id, _)| Some(id) != here.as_ref()).cloned());
             pick(ui, need, "sc_cam_setup_stock_from", "Stock from", &mut f.stock_from, &earlier);
+            // Clamps: from-to across and their top, each on a row of its own.
+            let mut gone = None;
+            for (k, c) in f.clamps.iter_mut().enumerate() {
+                let label = tf("manufacture.clamp_number", &[("number", &(k + 1).to_string())]);
+                explained(ui.label(&label), "Clamps", None);
+                ui.horizontal(|ui| {
+                    for (i, (text, hint)) in c.iter_mut().zip(["X from", "Y from", "X to", "Y to", "top Z"]).enumerate() {
+                        ui.scope(|ui| {
+                            ui.set_max_width(52.0);
+                            crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_clamp", k, i)), text, tm(hint), false);
+                        });
+                    }
+                    if ui_kit::compact_button(ui, "×", tm("Remove this clamp"), true, false).clicked() {
+                        gone = Some(k);
+                    }
+                });
+                ui.end_row();
+            }
+            if let Some(k) = gone {
+                f.clamps.remove(k);
+            }
+            ui.label("");
+            if button(ui, tm("Add Clamp"), Button::Small).on_hover_text(tm(help("Clamps").unwrap_or_default())).clicked() && f.clamps.len() < 64 {
+                f.clamps.push(Default::default());
+            }
+            ui.end_row();
             let mut materials: Vec<(String, String)> = vec![(String::new(), tm("not said").into())];
             materials.extend(choices.materials.iter().map(|m| (m.clone(), m.clone())));
             pick(ui, need, "sc_cam_setup_material", "Material", &mut f.material, &materials);
@@ -3480,6 +3562,14 @@ fn engine_text(w: &str) -> String {
         return w.split("; ").map(engine_text).collect::<Vec<_>>().join("; ");
     }
     let between = |s: &str, a: &str, b: &str| s.strip_prefix(a).and_then(|r| r.strip_suffix(b)).map(str::to_string);
+    if let Some(clamp) = w.strip_prefix("runs into clamp ") {
+        return tf("manufacture.runs_into_named_clamp", &[("clamp", clamp)]);
+    }
+    if let Some((depth, reach)) = between(w, "goes ", " mm out of its holder")
+        .and_then(|r| r.split_once(" mm deep but the tool reaches ").map(|(d, r)| (d.to_string(), r.to_string())))
+    {
+        return tf("manufacture.deeper_than_the_tool_reaches", &[("depth", &depth), ("reach", &reach)]);
+    }
     if let Some(depth) = between(w, "cuts up to ", " mm into the part") {
         return tf("manufacture.op_cuts_into_part", &[("depth", &depth)]);
     }
@@ -4035,8 +4125,9 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
     if let Some((setup, op, post)) = asked.post {
         // Rapids that run into material drive the tool through the stock at full speed: confirmed first.
         let collisions = rapid_collisions(app, setup, op.as_ref().map(|o| o.0));
-        if collisions > 0 {
-            app.manufacture.confirm_post = Some(PendingPost { setup, op, post, collisions });
+        let clamped = clamped_ops(app, setup, op.as_ref().map(|o| o.0));
+        if collisions > 0 || !clamped.is_empty() {
+            app.manufacture.confirm_post = Some(PendingPost { setup, op, post, collisions, clamped });
         } else {
             pick_post(app, setup, op, post);
         }
@@ -4051,6 +4142,23 @@ pub struct PendingPost {
     pub op: Option<(u64, String)>,
     pub post: String,
     pub collisions: u64,
+    /// Its operations that run into a clamp.
+    pub clamped: Vec<String>,
+}
+
+/// The operations of a setup (or the one given) that run into one of its clamps.
+fn clamped_ops(app: &mut SolveApp, setup: u64, op: Option<u64>) -> Vec<String> {
+    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    listed["setups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|x| x["id"].as_u64() == Some(setup))
+        .flat_map(|x| x["operations"].as_array().cloned().unwrap_or_default())
+        .filter(|o| op.is_none_or(|id| o["id"].as_u64() == Some(id)))
+        .filter(|o| o["warning"].as_str().is_some_and(|w| w.contains("runs into clamp")))
+        .map(|o| text(&o, "name"))
+        .collect()
 }
 
 /// How many rapid moves of a setup's program (or of one operation of it, on what the ones

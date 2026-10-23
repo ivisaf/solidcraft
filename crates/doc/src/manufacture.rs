@@ -49,8 +49,22 @@ pub struct Setup {
     /// An earlier setup whose result is this one's stock (the part turned over, say): its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stock_from: Option<u64>,
+    /// What holds the stock that no tool may touch (clamps, vices), in the setup's work coordinates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clamps: Vec<Clamp>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<CamOperation>,
+}
+
+/// A box no tool may enter: from `min` to `max` across, in the setup's work coordinates, up to
+/// `top` (it stands on whatever is below).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Clamp {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    pub min: [f64; 2],
+    pub max: [f64; 2],
+    pub top: f64,
 }
 
 fn g54() -> u8 {

@@ -1599,6 +1599,43 @@ fn a_contour_leads_in_on_arcs_cuts_dogbones_and_leaves_an_onion_skin() {
 }
 
 #[test]
+fn clamps_in_the_way_and_a_tool_too_short_are_warned_about() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "length": 20}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    // A clamp along the far edge, out of the way.
+    run(&mut s, "cam.setup.create", json!({"origin": top, "clamps": [{"name": "Edge", "min": [52, 0], "max": [60, 40], "top": 5}]}));
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Window", "tool": 1, "bottom": -3}));
+    let warning = |s: &mut Session| run(s, "cam.list", json!({}))["setups"][0]["operations"][0]["warning"].as_str().unwrap_or("").to_string();
+    assert!(!warning(&mut s).contains("clamp"), "{}", warning(&mut s));
+    // One over the window: the pocket runs into it.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": [{"name": "Vice", "min": [20, 0], "max": [25, 40], "top": 5}]}));
+    assert!(warning(&mut s).contains("runs into clamp Vice"), "{}", warning(&mut s));
+    assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["clamps"][0]["name"], "Vice");
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": null}));
+    assert!(s.doc.manufacture.setups[0].clamps.is_empty());
+    // A tool that reaches 2 mm out of its holder cannot go 3 mm deep.
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "flute_length": 2, "length": 2}),
+    );
+    let w = warning(&mut s);
+    assert!(w.contains("goes 3.0 mm deep but the tool reaches 2.0 mm out of its holder"), "{w}");
+    for bad in
+        [json!({"clamps": "x"}), json!({"clamps": [{"min": [5, 5], "max": [1, 9], "top": 1}]}), json!({"clamps": [{"min": [0, 0], "max": [1, 1]}]})]
+    {
+        let mut p = bad.clone();
+        p["setup"] = json!("Setup1");
+        assert!(s.execute("cam.setup.edit", &p).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));
