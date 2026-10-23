@@ -3236,10 +3236,8 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                         explained(r, "Skin", None);
                         ui.end_row();
                     }
-                    // Arcs onto the wall, from off the part; tabs have their own way down.
-                    if !f.tabs {
-                        field(ui, need, "Lead-in radius", &mut f.lead, "none: ramps along the loop");
-                    }
+                    // Arcs onto the wall, from off the part.
+                    field(ui, need, "Lead-in radius", &mut f.lead, "none: ramps along the loop");
                     row_label(ui, "Dogbones", None);
                     let r = crate::ui_kit::checkbox(ui, tm("Into sharp inside corners"), &mut f.dogbones);
                     explained(r, "Dogbones", None);

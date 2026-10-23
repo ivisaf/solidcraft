@@ -738,9 +738,6 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     if !(params.lead.is_finite() && (0.0..=10.0 * tool.diameter).contains(&params.lead)) {
         return invalid("the lead-in radius must be 0 to ten tool diameters");
     }
-    if params.lead > 0.0 && params.tabs.is_some() {
-        return invalid("lead-in arcs together with tabs are not supported yet");
-    }
     if !(params.skin.is_finite() && params.skin >= 0.0 && params.skin < depth) {
         return invalid("the onion skin must be 0 or more and thinner than the depth cut");
     }
@@ -787,14 +784,14 @@ pub fn contour(regions: &[Region2], tool: &Tool, params: &ContourParams, cut: &C
     for (lp, levels) in passes {
         let lp = if params.climb == natural_is_climb { lp.clone() } else { reversed(lp) };
         let Some(first) = lp.first() else { continue };
-        if params.lead > 0.0 {
-            lead_laps(&mut b, &shape, &lp, levels, params.lead)?;
-            continue;
-        }
         let segs = match &params.tabs {
             Some(t) => tab_segments(&lp, &tab_spans(lp.iter().map(Piece::length).sum(), t, tool.diameter)),
             None => Vec::new(),
         };
+        if params.lead > 0.0 {
+            lead_laps(&mut b, &shape, &lp, levels, params.lead, (&segs, tab_z))?;
+            continue;
+        }
         b.travel_to(first.start())?;
         // Down to the last pass (through what it cut), then into the material along the loop.
         b.plunge_to(cut.heights.top)?;
@@ -839,8 +836,10 @@ pub(crate) fn dogboned(lp: &[Piece], r: f64) -> Vec<Piece> {
 /// Each depth pass of a contour loop with a lead-in and lead-out: down beside the wall where
 /// the tool is off the part (the side farther from the profile), a quarter circle `radius`
 /// round onto the loop's start, round the loop, a quarter circle off it, and straight back to
-/// where it went down.
-fn lead_laps(b: &mut Builder, shape: &Shape, lp: &[Piece], levels: &[f64], radius: f64) -> Result<()> {
+/// where it went down. Below the tabs' top (`tabs`: the loop split at them, and that height)
+/// the lap goes up over each tab; the loop never starts on one.
+fn lead_laps(b: &mut Builder, shape: &Shape, lp: &[Piece], levels: &[f64], radius: f64, tabs: (&[(Piece, bool)], f64)) -> Result<()> {
+    let (segs, tab_z) = tabs;
     let Some(first) = lp.first() else { return Ok(()) };
     let (p0, t) = (first.start(), first.tangent_at(0.0));
     let left = Vec2::new(-t.y, t.x);
@@ -855,7 +854,11 @@ fn lead_laps(b: &mut Builder, shape: &Shape, lp: &[Piece], levels: &[f64], radiu
     for &z in levels {
         b.plunge_to(z)?;
         b.cut_piece(&into, z, z)?;
-        b.cut_loop(lp, z)?;
+        if z < tab_z - 1e-9 && segs.iter().any(|(_, tab)| *tab) {
+            b.cut_segments(segs, z, z, tab_z)?;
+        } else {
+            b.cut_loop(lp, z)?;
+        }
         b.cut_piece(&out_of, z, z)?;
         b.cut_to(s, z)?;
     }

@@ -1589,13 +1589,12 @@ fn a_contour_leads_in_on_arcs_cuts_dogbones_and_leaves_an_onion_skin() {
     for bad in [json!({"op": "Contour1", "skin": 20}), json!({"op": "Contour1", "dogbones": "x"}), json!({"op": "Pocket1", "lead": 3})] {
         assert!(s.execute("cam.op.edit", &bad).is_err(), "{bad}");
     }
-    assert!(
-        s.execute(
-            "cam.op.contour",
-            &json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "lead": 3, "tabs": {"count": 2}})
-        )
-        .is_err()
+    // Lead-in arcs and tabs together.
+    let together = s.execute(
+        "cam.op.contour",
+        &json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "lead": 3, "tabs": {"count": 2}}),
     );
+    assert!(together.is_ok(), "{together:?}");
 }
 
 #[test]

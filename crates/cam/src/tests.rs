@@ -367,13 +367,14 @@ fn dogbones_reach_the_corners_lead_arcs_start_off_the_part_and_an_onion_skin_hol
     close(freed.stats().lowest_z.unwrap(), -6.0, 1e-9);
     assert!(cutting_points(&freed, -5.4).iter().any(|q| (q.z + 5.5).abs() < 1e-9), "the skin's level first");
     // What it cannot do is refused.
+    // With tabs too: down off the part, over each tab in the passes below its top, never into the part.
     let tabs = Some(Tabs { count: 2, width: 4.0, height: 1.0 });
-    for bad in [
-        ContourParams { tabs, ..outside },
-        ContourParams { skin: 6.0, ..skin },
-        ContourParams { skin: -1.0, ..skin },
-        ContourParams { lead: f64::NAN, ..outside },
-    ] {
+    let held = contour(&part, &tool(6.0), &ContourParams { tabs, ..outside }, &c).unwrap();
+    assert!(cutting_points(&held, -0.01).iter().all(|q| off(*q) > 3.0 - 0.02), "into the part");
+    let bottom = cutting_points(&held, -5.99);
+    let over = cutting_points(&held, -4.99).iter().filter(|q| (q.z + 5.0).abs() < 1e-9).count();
+    assert!(!bottom.is_empty() && over > 0, "the last pass at the bottom, rising to the tabs' top over them");
+    for bad in [ContourParams { skin: 6.0, ..skin }, ContourParams { skin: -1.0, ..skin }, ContourParams { lead: f64::NAN, ..outside }] {
         assert!(contour(&part, &tool(6.0), &bad, &c).is_err(), "{bad:?}");
     }
 }
