@@ -189,7 +189,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     h.app.start("cam.simulate");
     let (found, warnings) = h.app.manufacture.simulation.clone().expect("a simulation");
     // The tool runs round the outside of the box: it removes nothing and cuts into nothing.
-    assert_eq!(found, ["Removed 0.00 cm³", "Does not cut into the part", "Leaves up to 0.00 mm on the part (0.00 cm³)"]);
+    assert_eq!(found, ["Simulated: Setup1", "Removed 0.00 cm³", "Does not cut into the part", "Leaves up to 0.00 mm on the part (0.00 cm³)"]);
     assert!(warnings.is_empty(), "{warnings:?}");
     // Nothing was cut: the whole stock is drawn as the part, its top at the box's top.
     let field = h.app.manufacture.stock.clone().expect("the cut stock");
@@ -223,7 +223,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     h.frames(2);
     let (found, warnings) = h.app.manufacture.simulation.clone().unwrap();
     assert!(
-        found[1].starts_with("Cuts up to 10.000 mm into the part") && warnings.iter().any(|w| w.contains("into the part")),
+        found[2].starts_with("Cuts up to 10.000 mm into the part") && warnings.iter().any(|w| w.contains("into the part")),
         "{found:?} {warnings:?}"
     );
 }
@@ -1099,6 +1099,17 @@ fn a_simulated_program_plays_with_the_tool_cutting_the_stock() {
     assert!(h.widget("Pause").is_some() && h.widget("Contour1  T1   X 0  Y 0  Z 0   rapid").is_none(), "where the tool is, as it goes");
     // Halfway, less is cut than in the end; at the end, the simulation's stock is back.
     let total = play.data.playback.minutes;
+    // On to where each cut ends: the next rapid up, one after the other.
+    let mut last = -1.0;
+    for _ in 0..2 {
+        h.step(&json!({"widget": ">R"})).unwrap();
+        h.frames(2);
+        let play = h.app.manufacture.play.as_ref().unwrap();
+        let k = play.data.playback.step_at(play.t).unwrap();
+        let at = &play.data.playback.steps[k];
+        assert!(!play.playing && at.feed.is_none() && at.to.z > at.from.z && play.t > last, "{at:?} at {}", play.t);
+        last = play.t;
+    }
     let volume = |f: &StockField| f.z.iter().sum::<f64>();
     if let Some(play) = h.app.manufacture.play.as_mut() {
         play.seek = Some(total * 0.5);
@@ -1353,6 +1364,51 @@ fn a_click_in_the_browser_shows_that_operation_s_form() {
     h.frames(1);
     click(&mut h, "Setup1");
     assert_eq!(editing(&h), "Setup1", "a setup shows its own form");
+}
+
+/// One operation simulates on the stock the operations before it leave: from its form as it
+/// stands (not applied; the result goes when the form closes), from its browser menu, and a
+/// setup without its hidden operations; what plays is what was simulated.
+#[test]
+fn an_operation_simulates_on_what_the_ones_before_it_leave() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Pocket"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [40, 30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    for bottom in [-2, -4] {
+        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
+    }
+    let ids: Vec<u64> = h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.id).collect();
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    let title = |h: &Harness| h.app.manufacture.simulation.as_ref().map(|s| s.0[0].clone()).unwrap_or_default();
+    // From the form, deeper than the operation is: simulated so, the design untouched.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Op(mut form)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][1]) else { panic!("no form") };
+    form.bottom = "-6 mm".into();
+    h.app.manufacture.form = Some(Form::Op(form));
+    h.app.manufacture.open = true;
+    h.frames(2);
+    // What the form's Simulate, beside OK and Cancel, asks for.
+    answer(&mut h.app, Asked { simulate_form: true, ..Default::default() });
+    h.frames(1);
+    assert_eq!(title(&h), "Simulated: Pocket2 with the form's values (not applied yet)", "{:?} {:?}", h.app.manufacture.error, h.app.status);
+    assert_eq!(h.app.session.doc.manufacture.setups[0].operations[1].bottom.as_deref(), Some("-4"));
+    assert!(h.app.manufacture.form.is_some(), "the form stays open");
+    start_play(&mut h.app, setup);
+    assert_eq!(h.app.manufacture.play.as_ref().map(|p| p.data.ops.clone()), Some(vec!["Pocket2".to_string()]));
+    h.app.manufacture.form = None;
+    h.frames(1);
+    assert!(h.app.manufacture.simulation.is_none(), "the form's simulation goes with it");
+    // From the browser menu: the operation as it is, on what the first left.
+    menu_action(&mut h.app, &json!({"do": "simulate", "setup": setup, "op": ids[1]}));
+    assert_eq!(title(&h), "Simulated: Pocket2, on what the operations before it leave");
+    // The setup, with the first operation hidden in the browser.
+    h.app.manufacture.hidden.insert(ids[0]);
+    simulate_setup(&mut h.app, setup);
+    assert_eq!(title(&h), "Simulated: Setup1, 1 of 2 operations (hidden ones are left out)");
 }
 
 /// Every text one frame paints, whole and in the parts a composed one is made of.

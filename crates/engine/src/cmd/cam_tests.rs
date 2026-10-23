@@ -1376,6 +1376,37 @@ fn a_setup_s_program_plays_back_to_what_its_simulation_leaves() {
 }
 
 #[test]
+fn one_operation_simulates_and_plays_on_the_stock_the_ones_before_it_left() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    run(&mut s, "cam.op.pocket", pocket_op());
+    run(&mut s, "cam.op.contour", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "side": "inside"}));
+    let field = |v: &Value| v["field"]["z"].as_array().unwrap().iter().map(|z| z.as_f64().unwrap()).collect::<Vec<f64>>();
+    let all = run(&mut s, "cam.simulate", json!({"columns": 80, "field": true}));
+    let pocket = run(&mut s, "cam.simulate", json!({"columns": 80, "field": true, "ops": ["Pocket1"]}));
+    let after = run(&mut s, "cam.simulate", json!({"columns": 80, "field": true, "ops": ["Contour1"], "first": ["Pocket1"]}));
+    // Only the contour reports, cutting what the pocket left; together they leave what the whole setup does.
+    assert_eq!(after["operations"].as_array().unwrap().iter().map(|o| o["name"].clone()).collect::<Vec<_>>(), [json!("Contour1")]);
+    let volume = |v: &Value| v["removed_volume"].as_f64().unwrap();
+    assert!((volume(&pocket) + volume(&after) - volume(&all)).abs() < 1e-6, "{} + {} vs {}", volume(&pocket), volume(&after), volume(&all));
+    assert!(field(&after).iter().zip(field(&all)).all(|(a, b)| (a - b).abs() < 1e-9));
+    // From the raw stock the contour alone would cut more.
+    let contour = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][1]["id"].clone();
+    let alone = run(&mut s, "cam.simulate", json!({"columns": 80, "ops": [contour]}));
+    assert!(volume(&alone) > volume(&after) + 1.0, "{} vs {}", volume(&alone), volume(&after));
+    // Played, it starts from the stock the pocket left and plays only itself.
+    let play = crate::cam_playback(&s, &json!({"columns": 80, "ops": ["Contour1"], "first": ["Pocket1"]})).unwrap();
+    assert_eq!(play.ops, ["Contour1"]);
+    assert!(play.playback.steps.iter().all(|st| st.op == 0));
+    assert!(play.stock.z.iter().zip(field(&pocket)).all(|(a, b)| (a - b).abs() < 1e-9));
+    // Lists that are no lists, name no operation of the setup, or nothing at all are refused.
+    for bad in [json!({"ops": "Pocket1"}), json!({"ops": ["Drill9"]}), json!({"ops": []}), json!({"first": [true]}), json!({"ops": [1, 2, 3]})] {
+        assert!(s.execute("cam.simulate", &bad).is_err(), "{bad}");
+        assert!(crate::cam_playback(&s, &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

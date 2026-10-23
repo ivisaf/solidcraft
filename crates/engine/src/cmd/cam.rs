@@ -115,7 +115,9 @@ pub static COMMANDS: &[CommandSpec] = &[
          rapid_length, cut_minutes, lowest_z, points: [[x, y, z, cutting]] in world coordinates}]; heights?: bool, also each one's heights: {clearance, retract, top, bottom, levels: [depth passes]} in the setup's Z",
     ),
     CommandSpec::new("cam.simulate", "Simulate", simulate).at("MANUFACTURE", "ACTIONS").icon("cam_simulate").noundo().params(
-        "setup?: id or name; stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
+        "setup?: id or name; ops?: [id or name, …] the operations to cut and report (default: every one); first?: [id or name, …] operations cut \
+         before them without a report, for the stock they leave (one operation on the stock the ones before it left: ops [it], first [those before]); \
+         stock?: {min: [x, y, z], max: [x, y, z]} in the setup's work coordinates (default: the setup's stock); cell?: column \
          width in mm (default: the stock's longer side / 300) — or columns?: how many along the stock's longer side (10 to 2000) → per operation removed_volume, rapid_collisions, max_engagement and warnings; and \
          against the bodies: max_gouge, gouge_area (cut into the part), max_leftover, leftover_volume (left on it); field?: bool, also the cut stock as columns {frame, origin, cell, nx, ny, floor, z: [nx × ny heights], \
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
@@ -1906,6 +1908,38 @@ fn op_bore(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+/// The operations a simulation cuts and shows (`ops`, default every one) and those it cuts
+/// first, unseen, for the stock they leave (`first`): positions in the setup's order. A list
+/// is of ids or names, at most one entry per operation of the setup.
+fn simulated_ops(setup: &Setup, p: &Value, cmd: &str) -> Result<(Vec<usize>, Vec<usize>)> {
+    let list = |k: &str| -> Result<Option<Vec<usize>>> {
+        let Some(v) = p.get(k).filter(|v| !v.is_null()) else { return Ok(None) };
+        let items = v.as_array().ok_or_else(|| bad(cmd, format!("`{k}` must be a list of operations (ids or names)")))?;
+        if items.len() > setup.operations.len() {
+            return Err(bad(cmd, format!("`{k}` names more operations than the setup has")));
+        }
+        let mut at = Vec::new();
+        for item in items {
+            let name = match item {
+                Value::Number(n) => n.to_string(),
+                Value::String(t) => t.trim().to_string(),
+                _ => return Err(bad(cmd, format!("`{k}` must be a list of operations (ids or names)"))),
+            };
+            at.push(op_position(setup, &name).ok_or_else(|| bad(cmd, format!("no operation `{name}`")))?);
+        }
+        // In the setup's order, each once.
+        at.sort_unstable();
+        at.dedup();
+        Ok(Some(at))
+    };
+    let shown = list("ops")?.unwrap_or_else(|| (0..setup.operations.len()).collect());
+    if shown.is_empty() {
+        return Err(bad(cmd, "`ops` names no operation to simulate"));
+    }
+    let first: Vec<usize> = list("first")?.unwrap_or_default().into_iter().filter(|i| !shown.contains(i)).collect();
+    Ok((shown, first))
+}
+
 fn op_position(setup: &Setup, k: &str) -> Option<usize> {
     setup.operations.iter().position(|o| o.id.to_string() == k).or_else(|| setup.operations.iter().position(|o| o.name.eq_ignore_ascii_case(k)))
 }
@@ -2271,9 +2305,15 @@ pub fn cam_playback(s: &Session, p: &Value) -> Result<CamPlayback> {
         return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
     }
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
-    let (stock, _) = sim_block(p, cmd, &at)?;
+    let (mut stock, _) = sim_block(p, cmd, &at)?;
+    let (shown, first) = simulated_ops(setup, p, cmd)?;
+    // The operations cut first leave the stock the played ones start from.
+    for op in first.iter().filter_map(|i| setup.operations.get(*i)) {
+        let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
+        cam::simulate(&mut stock, &build_in(s, &at, op)?, tool).map_err(cam_error)?;
+    }
     let (mut paths, mut ops, mut tools) = (Vec::new(), Vec::new(), Vec::new());
-    for op in &setup.operations {
+    for op in shown.iter().filter_map(|i| setup.operations.get(*i)) {
         paths.push(build_in(s, &at, op)?);
         tools.push(s.doc.manufacture.tool(op.tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?);
         ops.push(op.name.clone());
@@ -2298,14 +2338,25 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
     let (mut stock, (min, max)) = sim_block(p, cmd, &at)?;
     let cell = stock.cell;
+    let (shown, first) = simulated_ops(setup, p, cmd)?;
     let mut ops = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut removed = 0.0;
     // Chamfers cut the part's edges on purpose, and the model has none: the stock without them
     // is what is checked against the part.
     let is_chamfer = |op: &CamOperation| matches!(op.kind, CamOperationKind::Chamfer { .. });
-    let mut plain = setup.operations.iter().any(is_chamfer).then(|| stock.clone());
-    for op in &setup.operations {
+    let cut = |i: &usize| setup.operations.get(*i);
+    let mut plain = shown.iter().chain(&first).filter_map(cut).any(is_chamfer).then(|| stock.clone());
+    // The operations cut first leave the stock the reported ones start from; they report nothing.
+    for op in first.iter().filter_map(cut) {
+        let path = build_in(s, &at, op)?;
+        let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
+        cam::simulate(&mut stock, &path, tool).map_err(cam_error)?;
+        if let Some(plain) = plain.as_mut().filter(|_| !is_chamfer(op)) {
+            cam::simulate(plain, &path, tool).map_err(cam_error)?;
+        }
+    }
+    for op in shown.iter().filter_map(cut) {
         let path = build_in(s, &at, op)?;
         let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         let report = cam::simulate(&mut stock, &path, tool).map_err(cam_error)?;

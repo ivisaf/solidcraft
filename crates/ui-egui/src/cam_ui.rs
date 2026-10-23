@@ -516,8 +516,9 @@ pub struct CamUi {
     /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
     pub look: PanelLook,
     pub tools_look: PanelLook,
-    /// The setup last simulated (simulated again when the detail changes).
+    /// The setup last simulated (simulated again when the detail changes), and what of it.
     simulated: Option<u64>,
+    scope: SimScope,
     /// The design revision a program was last written at, and whether that is the revision now.
     posted_at: Option<u64>,
     posted_now: bool,
@@ -610,6 +611,7 @@ impl Default for CamUi {
             look: PanelLook { width: 0.0, fade: 1, resizing: false },
             tools_look: PanelLook { width: 0.0, fade: 1, resizing: false },
             simulated: None,
+            scope: SimScope::default(),
             posted_at: None,
             posted_now: false,
             form_seen: None,
@@ -1443,18 +1445,116 @@ pub fn simulate(app: &mut SolveApp) {
     }
 }
 
-/// Runs `cam.simulate` on a setup and keeps what it found for the window.
+/// What a simulation covers: the setup's operations it cuts and shows (`None`: every one),
+/// those it cuts first for the stock they leave, and an open form's operation as it stands
+/// (its command, run on a copy of the design: the form is not applied); `title` says which.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SimScope {
+    pub ops: Option<Vec<u64>>,
+    pub first: Vec<u64>,
+    pub draft: Option<(&'static str, Value)>,
+    pub title: String,
+}
+
+impl SimScope {
+    /// `cam.simulate`'s and `cam_playback`'s parameters for it.
+    fn params(&self, setup: u64, columns: u32) -> Value {
+        let mut p = json!({ "setup": setup, "columns": columns, "first": self.first });
+        if let Some(ops) = &self.ops {
+            p["ops"] = json!(ops);
+        }
+        p
+    }
+
+    /// Runs `f` on the design, or on a copy with the form's operation applied.
+    fn run<T>(
+        &self,
+        session: &mut solidcraft_engine::Session,
+        f: impl FnOnce(&mut solidcraft_engine::Session) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match &self.draft {
+            Some((cmd, p)) => {
+                let mut copy = session.scratch();
+                copy.execute(cmd, p).map_err(|e| e.to_string())?;
+                f(&mut copy)
+            }
+            None => f(session),
+        }
+    }
+}
+
+/// Simulates a setup: the operations shown in the browser (a hidden one is left out), or every one.
 pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
     let _language = crate::i18n::scope(&app.preferences.language);
+    let Some(s) = app.session.doc.manufacture.setups.iter().find(|s| s.id == setup) else { return };
+    let ids: Vec<u64> = s.operations.iter().map(|o| o.id).collect();
+    let shown: Vec<u64> = ids.iter().copied().filter(|id| !app.manufacture.hidden.contains(id)).collect();
+    let scope = if shown.is_empty() || shown.len() == ids.len() {
+        SimScope { title: tf("manufacture.simulated_setup", &[("setup", &s.name)]), ..Default::default() }
+    } else {
+        let (count, total) = (shown.len().to_string(), ids.len().to_string());
+        SimScope {
+            title: tf("manufacture.simulated_some", &[("setup", &s.name), ("count", &count), ("total", &total)]),
+            ops: Some(shown),
+            ..Default::default()
+        }
+    };
+    simulate_scope(app, setup, scope);
+}
+
+/// Simulates one operation on the stock the operations before it leave.
+pub fn simulate_op(app: &mut SolveApp, setup: u64, op: u64) {
+    let _language = crate::i18n::scope(&app.preferences.language);
+    let Some(s) = app.session.doc.manufacture.setups.iter().find(|s| s.id == setup) else { return };
+    let Some(at) = s.operations.iter().position(|o| o.id == op) else { return };
+    let first: Vec<u64> = s.operations.iter().take(at).map(|o| o.id).collect();
+    let name = s.operations.get(at).map(|o| o.name.clone()).unwrap_or_default();
+    let title = if first.is_empty() { "manufacture.simulated_op" } else { "manufacture.simulated_op_after" };
+    let scope = SimScope { ops: Some(vec![op]), first, draft: None, title: tf(title, &[("op", &name)]) };
+    simulate_scope(app, setup, scope);
+}
+
+/// Simulates the open operation form as it stands, on a copy of the design (the form stays
+/// open, not applied), on the stock the operations before it leave.
+pub fn simulate_form(app: &mut SolveApp) {
+    let _language = crate::i18n::scope(&app.preferences.language);
+    let Some(form) = app.manufacture.form.clone() else { return };
+    let Form::Op(f) = &form else { return };
+    let made = command(&form).and_then(|(cmd, p)| {
+        let mut copy = app.session.scratch();
+        let made = copy.execute(cmd, &p).map_err(|e| e.to_string())?;
+        let (setup, op) = match &f.editing {
+            Some(e) => (e.setup, e.op),
+            None => (made["setup"].as_u64().unwrap_or(0), made["operation"].as_u64().unwrap_or(0)),
+        };
+        let s = copy.doc.manufacture.setups.iter().find(|s| s.id == setup).ok_or_else(|| tm("There is no setup to simulate").to_string())?;
+        let at = s.operations.iter().position(|o| o.id == op).ok_or_else(|| tm("There is no setup to simulate").to_string())?;
+        let first: Vec<u64> = s.operations.iter().take(at).map(|o| o.id).collect();
+        let name = s.operations.get(at).map(|o| o.name.clone()).unwrap_or_default();
+        Ok((setup, SimScope { ops: Some(vec![op]), first, draft: Some((cmd, p)), title: tf("manufacture.simulated_draft", &[("op", &name)]) }))
+    });
+    match made {
+        Ok((setup, scope)) => simulate_scope(app, setup, scope),
+        Err(e) => app.manufacture.error = Some(e),
+    }
+}
+
+/// Runs `cam.simulate` for what `scope` covers and keeps what it found for the window.
+fn simulate_scope(app: &mut SolveApp, setup: u64, scope: SimScope) {
     app.manufacture.play = None;
     app.manufacture.stock_stamp += 1;
     app.manufacture.simulated = Some(setup);
     let columns = SIM_DETAIL.get(app.manufacture.sim_detail).map_or(300, |d| d.1);
-    match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true, "columns": columns })) {
+    let mut p = scope.params(setup, columns);
+    p["field"] = json!(true);
+    let result = scope.run(&mut app.session, |s| s.execute("cam.simulate", &p).map_err(|e| e.to_string()));
+    let title = scope.title.clone();
+    app.manufacture.scope = scope;
+    match result {
         Ok(v) => {
             let number = |k: &str| v[k].as_f64();
             let removed = format!("{:.2}", number("removed_volume").unwrap_or(0.0) / 1000.0);
-            let mut found = vec![tf("manufacture.removed", &[("volume", &removed)])];
+            let mut found = vec![title, tf("manufacture.removed", &[("volume", &removed)])];
             if let (Some(gouge), Some(left), Some(volume)) = (number("max_gouge"), number("max_leftover"), number("leftover_volume")) {
                 found.push(if gouge > 1e-3 {
                     tf("manufacture.cuts_into_part", &[("depth", &format!("{gouge:.3}"))])
@@ -1481,8 +1581,11 @@ pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
 /// Starts playing a setup's program from its beginning, on the simulation's columns.
 pub fn start_play(app: &mut SolveApp, setup: u64) {
     let columns = SIM_DETAIL.get(app.manufacture.sim_detail).map_or(300, |d| d.1);
-    let rapid_rate = app.manufacture.rapid_rate;
-    match solidcraft_engine::cam_playback(&app.session, &json!({ "setup": setup, "columns": columns, "rapid_rate": rapid_rate })) {
+    // What the simulation covered is what plays.
+    let scope = app.manufacture.scope.clone();
+    let mut p = scope.params(setup, columns);
+    p["rapid_rate"] = json!(app.manufacture.rapid_rate);
+    match scope.run(&mut app.session, |s| solidcraft_engine::cam_playback(s, &p).map_err(|e| e.to_string())) {
         Ok(data) => {
             let speed = app.manufacture.play.as_ref().map_or(1, |p| p.speed);
             let finished = app.manufacture.play.take().map_or_else(|| app.manufacture.stock.clone(), |p| p.finished);
@@ -1609,6 +1712,11 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
         if button(ui, ">", Button::Small).on_hover_text(tm("On one move")).clicked() {
             let on = steps.get(k).map_or(total, |s| s.start + s.minutes);
             (play.seek, play.playing) = (Some(on), false);
+        }
+        // Where the cut it is in ends: the next rapid up.
+        if button(ui, ">R", Button::Small).on_hover_text(tm("On to the next retract: where the cut being played ends")).clicked() {
+            let up = steps.iter().skip(k + 1).find(|s| s.feed.is_none() && s.to.z > s.from.z + 1e-9).map_or(total, |s| s.start);
+            (play.seek, play.playing) = (Some(up), false);
         }
         if button(ui, ">|", Button::Small).on_hover_text(tm("To the end")).clicked() {
             (play.seek, play.playing) = (Some(total), false);
@@ -2945,7 +3053,7 @@ fn need_text(need: &[Need]) -> String {
 }
 
 /// The form's title, grid and OK / Cancel; `true` when OK was pressed.
-fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], lists: &Choices) -> bool {
+fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], lists: &Choices, asked: &mut Asked) -> bool {
     let Some(form) = &mut cam.form else { return false };
     ui.add_space(6.0);
     let title = match form {
@@ -2970,6 +3078,13 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
         ui.horizontal(|ui| {
             ok = button(ui, tm("OK"), ui_kit::Button::Enabled(need.is_empty())).on_disabled_hover_text(&wanted).clicked();
             cancel = button(ui, tm("Cancel"), Button::Normal).clicked();
+            // An operation is simulated as the form has it, before OK.
+            if matches!(form, Form::Op(_)) {
+                asked.simulate_form = button(ui, tm("Simulate"), ui_kit::Button::Enabled(need.is_empty()))
+                    .on_hover_text(tm("Cut this operation, with the values in the form, on what the operations before it leave; OK still applies it"))
+                    .on_disabled_hover_text(&wanted)
+                    .clicked();
+            }
         });
         if !need.is_empty() {
             ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
@@ -3189,6 +3304,12 @@ struct Asked {
     from_browser: bool,
     apply: bool,
     simulate: Option<u64>,
+    /// Simulate what was simulated last again (its detail changed).
+    resimulate: bool,
+    /// One operation to simulate on the stock the ones before it leave: its setup and itself.
+    simulate_op: Option<(u64, u64)>,
+    /// Simulate the open operation form as it stands.
+    simulate_form: bool,
     /// A setup whose simulated program to play.
     play: Option<u64>,
     /// Write a program: the setup, one operation of it or all (`None`), and the setup's post.
@@ -3448,7 +3569,7 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                 ui.add(egui::Label::new(RichText::new(line).color(colour)).wrap());
             }
             if matches!(cam.form, Some(Form::Tool(_))) {
-                asked.apply |= form_block(ui, cam, &[], lists);
+                asked.apply |= form_block(ui, cam, &[], lists, asked);
             }
             ui.add_space(6.0);
             materials_block(ui, cam, library, asked);
@@ -3481,7 +3602,8 @@ fn manufacture_window(
             }
             // While a form is open the panel is the form; the browser shows the setups and operations.
             if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
-                asked.apply |= form_block(ui, cam, selected, lists);
+                asked.apply |= form_block(ui, cam, selected, lists, asked);
+                simulation_block(ui, cam, asked);
                 return;
             }
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
@@ -3527,24 +3649,7 @@ fn manufacture_window(
                     asked.post = Some((id, None, text(setup, "post")));
                 }
             }
-            if let Some((found, warnings)) = &cam.simulation {
-                ui.separator();
-                for line in found {
-                    ui.label(RichText::new(line).color(t.text_dim));
-                }
-                for line in warnings {
-                    ui.label(RichText::new(engine_text(line)).color(t.warning));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    crate::ui_kit::checkbox(ui, tm("Simulated stock"), &mut cam.show_stock);
-                    // Finer shows the cut stock closer to the toolpaths, and takes longer.
-                    let detail = SIM_DETAIL.map(|d| d.0);
-                    if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
-                        asked.simulate = cam.simulated;
-                    }
-                });
-                play_controls(ui, cam, asked);
-            }
+            simulation_block(ui, cam, asked);
         }
     });
     cam.folded = folded;
@@ -3553,6 +3658,29 @@ fn manufacture_window(
     (cam.look.width, cam.look.resizing) = (look.width, look.resizing);
     cam.panel = rect;
     cam.open = open;
+}
+
+/// What the last simulation found (its first line says what it covered), and its playback.
+fn simulation_block(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
+    let t = Tokens::get();
+    let Some((found, warnings)) = &cam.simulation else { return };
+    ui.separator();
+    for (k, line) in found.iter().enumerate() {
+        let text = RichText::new(line);
+        ui.label(if k == 0 { text.strong() } else { text.color(t.text_dim) });
+    }
+    for line in warnings {
+        ui.label(RichText::new(engine_text(line)).color(t.warning));
+    }
+    ui.horizontal_wrapped(|ui| {
+        crate::ui_kit::checkbox(ui, tm("Simulated stock"), &mut cam.show_stock);
+        // Finer shows the cut stock closer to the toolpaths, and takes longer.
+        let detail = SIM_DETAIL.map(|d| d.0);
+        if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
+            asked.resimulate = true;
+        }
+    });
+    play_controls(ui, cam, asked);
 }
 
 /// Draw the windows that are open, and keep what the viewport shows up to date. Called once per frame.
@@ -3609,6 +3737,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     (app.preferences.cam_panel_width, app.preferences.cam_tools_width, app.preferences.cam_panel_fade) =
         (cam.look.width, cam.tools_look.width, cam.look.fade);
     app.preferences.cam_rapid_rate = cam.rapid_rate as f32;
+    // A simulation of a form as it stood goes when the form closes.
+    if cam.form.is_none() && cam.scope.draft.is_some() {
+        (cam.simulation, cam.stock, cam.play, cam.scope) = (None, None, None, SimScope::default());
+    }
     // A form opened some other way (an automation setting it) counts as opened as first drawn.
     if cam.form.is_none() {
         cam.form_opened = None;
@@ -3690,6 +3822,15 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
     }
     if let Some(setup) = asked.simulate {
         simulate_setup(app, setup);
+    }
+    if let (true, Some(setup)) = (asked.resimulate, app.manufacture.simulated) {
+        simulate_scope(app, setup, app.manufacture.scope.clone());
+    }
+    if let Some((setup, op)) = asked.simulate_op {
+        simulate_op(app, setup, op);
+    }
+    if asked.simulate_form {
+        simulate_form(app);
     }
     if let Some(setup) = asked.play {
         start_play(app, setup);
@@ -3993,6 +4134,7 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
             let at = ops.iter().position(|o| *o == op);
             vec![
                 menu_item("Edit Operation", "edit", "edit", setup, Some(op)),
+                menu_item("Simulate", "cam_simulate", "simulate", setup, Some(op)),
                 menu_item("Post Process", "cam_post", "post", setup, Some(op)),
                 Item::sep(),
                 disable(menu_item("Move Up", "", "up", setup, Some(op)), at.is_some_and(|i| i > 0)),
@@ -4030,6 +4172,7 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         ("edit", None) => asked.form = setup_form(&s),
         ("edit", Some(o)) => asked.edit_op = Some((s.clone(), o.clone())),
         ("simulate", None) => asked.simulate = Some(setup),
+        ("simulate", Some(o)) => asked.simulate_op = o["id"].as_u64().map(|op| (setup, op)),
         ("post", None) => asked.post = Some((setup, None, text(&s, "post"))),
         ("post", Some(o)) => asked.post = Some((setup, o["id"].as_u64().map(|id| (id, text(o, "name"))), text(&s, "post"))),
         ("up" | "down", Some(o)) => {
