@@ -243,7 +243,12 @@ pub struct SetupForm {
     pub clamps: Vec<[String; 5]>,
     /// Copies of the part as typed: how many along X and Y, and how far apart (empty: one part).
     pub copies: [String; 4],
+    /// Index into [`X_DIRECTIONS`].
+    pub x_axis: usize,
 }
+
+/// A setup's X directions: worked out from the axis, or along a world axis.
+const X_DIRECTIONS: [&str; 5] = ["automatic", "+x", "-x", "+y", "-y"];
 
 /// The work offsets a setup's programs can run in.
 const WORK_OFFSETS: [&str; 6] = ["G54", "G55", "G56", "G57", "G58", "G59"];
@@ -817,6 +822,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             stock_from: String::new(),
             clamps: Vec::new(),
             copies: Default::default(),
+            x_axis: 0,
         }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
@@ -998,6 +1004,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 json!({ "nx": count(&f.copies[0])?, "ny": count(&f.copies[1])?, "dx": gap(&f.copies[2])?, "dy": gap(&f.copies[3])? })
             };
             p.insert("copies".into(), copies);
+            p.insert("x_axis".into(), X_DIRECTIONS.get(f.x_axis).filter(|d| **d != "automatic").map_or(Value::Null, |d| json!(d)));
             match f.editing {
                 Some(id) => {
                     p.insert("setup".into(), json!(id));
@@ -1331,6 +1338,16 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
             let c = &setup["copies"];
             let n = |v: &Value| v.as_f64().map(|x| x.to_string()).unwrap_or_default();
             if c.is_object() { [n(&c["nx"]), n(&c["ny"]), n(&c["dx"]), n(&c["dy"])] } else { Default::default() }
+        },
+        x_axis: {
+            let v: Vec<f64> = setup["x_axis"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+            match v.as_slice() {
+                [x, _, _] if *x > 0.5 => 1,
+                [x, _, _] if *x < -0.5 => 2,
+                [_, y, _] if *y > 0.5 => 3,
+                [_, y, _] if *y < -0.5 => 4,
+                _ => 0,
+            }
         },
     })))
 }
@@ -2297,6 +2314,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
+        "X direction" => {
+            "Which way the setup's X runs, across the tool axis. Automatic: worked out from the axis. From below (-z), +x means the part is turned over about X, -x about Y."
+        }
         "Copies" => {
             "Copies of the part side by side on the stock, in rows along X and columns along Y: each operation cuts every copy before the next operation. Empty: one part."
         }
@@ -3046,6 +3066,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             choice(ui, need, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
             choice(ui, need, "sc_cam_setup_offset", "Work offset", &mut f.work_offset, &WORK_OFFSETS);
+            choice(ui, need, "sc_cam_setup_x", "X direction", &mut f.x_axis, &X_DIRECTIONS);
             // The setups before this one.
             let mut earlier: Vec<(String, String)> = vec![(String::new(), tm("its own stock box").into())];
             let here = f.editing.map(|id| id.to_string());
@@ -4599,7 +4620,8 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
             disable(menu_item("Simulate", "cam_simulate", "simulate", setup, None), !ops.is_empty()),
             disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
             disable(menu_item("Setup Sheet…", "cam_post", "sheet", setup, None), !ops.is_empty()),
-            menu_item("New Setup, Turned Over", "cam_setup", "turn", setup, None),
+            menu_item("New Setup, Turned Over about X", "cam_setup", "turn", setup, None),
+            menu_item("New Setup, Turned Over about Y", "cam_setup", "turn_y", setup, None),
             disable(menu_item("Order by Tool", "", "order", setup, None), ops.len() > 1),
             disable(menu_item("Save as Template…", "", "template_save", setup, None), !ops.is_empty()),
             menu_item("Apply Template…", "", "template_apply", setup, None),
@@ -4651,15 +4673,26 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         ("simulate", Some(o)) => asked.simulate_op = o["id"].as_u64().map(|op| (setup, op)),
         ("post", None) => asked.post = Some((setup, None, text(&s, "post"))),
         // The part turned over: the tool from the other side, the stock what this setup leaves.
-        ("turn", None) => {
+        // The part turned over about the setup's X (its Y reversed) or about its Y (its X reversed).
+        (turn @ ("turn" | "turn_y"), None) => {
             let axis: Vec<f64> = s["axis"].as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| -v).collect();
+            let sign = if turn == "turn_y" { -1.0 } else { 1.0 };
+            let x_axis: Vec<f64> = s["frame"]["x"].as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| v * sign).collect();
             // The origin as the command takes it: a point, or where on a box.
             let o = &s["origin"];
             let origin = match o["type"].as_str() {
                 Some("point") => o["at"].clone(),
                 _ => json!({ "of": o["of"], "x": o["x"], "y": o["y"], "z": o["z"] }),
             };
-            let mut p = json!({ "axis": axis, "origin": origin, "stock": s["stock"], "post": s["post"], "work_offset": s["work_offset"], "stock_from": setup });
+            let mut p = json!({
+                "axis": axis,
+                "x_axis": x_axis,
+                "origin": origin,
+                "stock": s["stock"],
+                "post": s["post"],
+                "work_offset": s["work_offset"],
+                "stock_from": setup,
+            });
             if let Some(material) = s["material"].as_str() {
                 p["material"] = json!(material);
             }

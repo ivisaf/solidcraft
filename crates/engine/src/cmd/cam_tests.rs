@@ -1507,7 +1507,11 @@ fn a_setup_starts_from_what_an_earlier_one_leaves_also_turned_over() {
     assert!((removed - 6000.0).abs() < 300.0, "{removed}");
     run(&mut s, "cam.setup.create", json!({"name": "Again", "origin": top, "stock_from": "Front"}));
     run(&mut s, "cam.setup.create", json!({"name": "Back", "axis": "-z", "origin": top, "stock_from": "Front"}));
-    for name in ["Again", "Back"] {
+    // Turned over about Y: the tool from below, X the other way, Y as it was.
+    run(&mut s, "cam.setup.create", json!({"name": "Side", "axis": "-z", "x_axis": "-x", "origin": top, "stock_from": "Front"}));
+    let frame = run(&mut s, "cam.list", json!({}))["setups"][3]["frame"].clone();
+    assert_eq!((frame["x"].clone(), frame["y"].clone()), (json!([-1.0, 0.0, 0.0]), json!([0.0, 1.0, -0.0])), "{frame}");
+    for name in ["Again", "Back", "Side"] {
         run(&mut s, "cam.op.face", json!({"setup": name, "tool": 1, "bottom": -0.5}));
         let play = crate::cam_playback(&s, &json!({"setup": name, "columns": 120})).unwrap();
         // It starts with the hole already there, seen from its own side.
@@ -1518,6 +1522,9 @@ fn a_setup_starts_from_what_an_earlier_one_leaves_also_turned_over() {
     assert_eq!(listed["setups"][1]["stock_from"], listed["setups"][0]["id"]);
     // Turned over, its program says how to turn the part.
     assert!(run(&mut s, "cam.post", json!({"setup": "Back"}))["gcode"].as_str().unwrap().contains("part flipped about the X axis"));
+    assert!(run(&mut s, "cam.post", json!({"setup": "Side"}))["gcode"].as_str().unwrap().contains("part flipped about the Y axis"));
+    // An X direction along the tool axis is no direction across it.
+    assert!(s.execute("cam.setup.edit", &json!({"setup": "Side", "x_axis": "+z"})).is_err());
     // Only an earlier setup, facing the same way or turned over; removing it leaves the later ones on their own stock.
     for bad in
         [json!({"setup": "Front", "stock_from": "Back"}), json!({"setup": "Again", "stock_from": "Nowhere"}), json!({"setup": "Again", "axis": "+x"})]

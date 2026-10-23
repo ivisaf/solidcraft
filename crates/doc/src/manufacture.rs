@@ -35,6 +35,10 @@ pub struct Setup {
     /// The tool axis: the setup's +Z as a direction in the world (the tool points along −Z).
     #[serde(default = "world_up")]
     pub axis: Vec3,
+    /// The setup's +X as a direction in the world, across the tool axis (none: worked out from
+    /// the axis). Turned over from below, world +X turns the part about X, −X about Y.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_axis: Option<Vec3>,
     pub origin: SetupOrigin,
     #[serde(default)]
     pub stock: StockDef,

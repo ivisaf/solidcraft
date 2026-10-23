@@ -51,7 +51,8 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
      (or 54 to 59; default G54), the work offset its programs run in; stock_from?: an earlier setup (id or name; null: none) whose result \
-     is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z); clamps?: \
+     is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z); x_axis?: the setup's X direction across its \
+     axis, as axis is given (default: worked out from the axis; from -z, +x turns the part about X and -x about Y); clamps?: \
      [{name?, min: [x, y], max: [x, y], top}] boxes in work coordinates no tool may enter (operations that do are warned about); copies?: \
      {nx, ny, dx, dy}: copies of the part in rows along X and columns along Y, dx and dy apart, each cut by every operation (null: one) → setup: id, name";
 
@@ -94,7 +95,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, clamps, copies as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, x_axis, clamps, copies as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -770,6 +771,17 @@ fn facing(a: Vec3, b: Vec3) -> Option<bool> {
     }
 }
 
+/// `x_axis`: the setup's X direction, as `axis` is given (`null`: worked out from the axis).
+fn x_axis_param(p: &Value, cmd: &str) -> Result<Option<Option<Vec3>>> {
+    match p.get("x_axis") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => {
+            axis_param(v, cmd).map(|x| Some(Some(x))).map_err(|_| bad(cmd, "`x_axis` must be +x, -x, +y, -y, +z, -z or a direction [x, y, z]"))
+        }
+    }
+}
+
 /// `work_offset`: 54 to 59, or `G54` to `G59`.
 fn work_offset_param(p: &Value, cmd: &str) -> Result<Option<u8>> {
     let refused = || bad(cmd, "`work_offset` must be G54 to G59 (or 54 to 59)");
@@ -810,10 +822,24 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let material = material_param(p, cmd)?.flatten();
     let work_offset = work_offset_param(p, cmd)?.unwrap_or(54);
     let stock_from = stock_from_param(s, p, None, axis, cmd)?.flatten();
+    let x_axis = x_axis_param(p, cmd)?.flatten();
     let clamps = clamps_param(p, cmd)?.unwrap_or_default();
     let copies = copies_param(p, cmd)?.flatten();
-    let mut setup =
-        Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, clamps, copies, operations: Vec::new() };
+    let mut setup = Setup {
+        id: 0,
+        name: name.clone(),
+        axis,
+        origin,
+        stock,
+        material,
+        post,
+        work_offset,
+        stock_from,
+        clamps,
+        copies,
+        x_axis,
+        operations: Vec::new(),
+    };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -856,6 +882,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(copies) = copies_param(p, cmd)? {
         setup.copies = copies;
+    }
+    if let Some(x) = x_axis_param(p, cmd)? {
+        setup.x_axis = x;
     }
     // A turned axis can leave a setup it takes its stock from facing neither way.
     if let Some(from) = setup.stock_from
@@ -974,6 +1003,17 @@ fn axes(axis: Vec3) -> Option<(Vec3, Vec3, Vec3)> {
     Some((x, z.cross(x), z))
 }
 
+/// A setup's work X, Y and Z: its own X direction where it has one (made square to the axis),
+/// else as [`axes`] works them out.
+fn setup_axes(setup: &Setup) -> Option<(Vec3, Vec3, Vec3)> {
+    let (x, _, z) = axes(setup.axis)?;
+    let x = match setup.x_axis {
+        Some(v) => (v - z * v.dot(z)).normalized().filter(|x| x.is_finite())?,
+        None => x,
+    };
+    Some((x, z.cross(x), z))
+}
+
 /// A box in work coordinates.
 type Box3 = (Vec3, Vec3);
 
@@ -987,7 +1027,7 @@ pub(crate) struct Resolved {
 }
 
 fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> {
-    let (x, y, z) = axes(setup.axis).ok_or("the setup's tool axis is not a direction")?;
+    let (x, y, z) = setup_axes(setup).ok_or("the setup's tool axis is not a direction, or its X direction runs along it")?;
     // The bodies' extent along the setup's axes, measured from the world origin.
     let state = s.model.state();
     let mut part: Option<Box3> = None;
@@ -2699,7 +2739,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "copies": setup.copies, "tool_changes": tool_changes(setup), "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "x_axis": setup.x_axis, "stock_from": setup.stock_from, "clamps": setup.clamps, "copies": setup.copies, "tool_changes": tool_changes(setup), "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -3013,7 +3053,14 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
     });
     // Seen from below: how the part is turned over for it.
     if setup.axis.z < -1.0 + 1e-9 {
-        notes.push("Turned over: part flipped about the X axis, the tool comes from below".to_string());
+        let about = if at.frame.x.x > 0.5 {
+            "X"
+        } else if at.frame.x.x < -0.5 {
+            "Y"
+        } else {
+            "Z and over"
+        };
+        notes.push(format!("Turned over: part flipped about the {about} axis, the tool from below"));
     }
     if let Some(c) = setup.copies {
         notes.push(format!("Copies: {} x {}, {} x {} mm apart", c.nx, c.ny, mm(c.dx), mm(c.dy)));

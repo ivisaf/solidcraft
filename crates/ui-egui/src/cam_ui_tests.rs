@@ -1484,6 +1484,14 @@ fn a_setup_turned_over_takes_its_stock_from_the_first() {
     assert_eq!(setups.len(), 2, "{:?}", h.app.manufacture.error);
     let turned = &setups[1];
     assert_eq!((turned.axis.z, turned.stock_from, turned.work_offset), (-1.0, Some(first), 55));
+    assert_eq!(turned.x_axis.map(|x| x.x), Some(1.0), "about X: X as it was");
+    menu_action(&mut h.app, &json!({"do": "turn_y", "setup": first}));
+    let about_y = h.app.session.doc.manufacture.setups.get(2).cloned().expect("the setup turned about Y");
+    assert_eq!((about_y.axis.z, about_y.x_axis.map(|x| x.x)), (-1.0, Some(-1.0)), "about Y: X the other way");
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(form)) = setup_form(&listed["setups"][2]) else { panic!("no form") };
+    assert_eq!(form.x_axis, 2, "the form shows -x");
+    h.app.run("cam.setup.remove", json!({"setup": about_y.id})).unwrap();
     // Its form shows where the stock comes from; set back to its own box, it is.
     let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
     let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][1]) else { panic!("no form") };
