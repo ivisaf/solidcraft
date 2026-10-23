@@ -11,6 +11,7 @@
 //! state; [`items`] lists them and [`run_item`] runs one, so the control channel (`ui.menu`,
 //! `ui.menuPick`) and tests reach everything a click does.
 
+use crate::ui_kit::{Container, Surface};
 use egui::{Color32, Pos2, Rect, Sense, Vec2, pos2, vec2};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -220,6 +221,8 @@ pub struct MenuState {
     pub rename: Option<Rename>,
     /// A delete waiting for its confirmation (it takes or breaks other features).
     pub confirm: Option<crate::delete::Pending>,
+    /// Identical copies Extract to File found, waiting to be linked too.
+    pub link_copies: Option<crate::linked_source::Copies>,
     /// The Properties window: title and measurements.
     pub props: Option<(String, Value)>,
     /// The viewport menu opened over something: it offers Select Other.
@@ -506,6 +509,10 @@ fn viewport_items(app: &SolveApp) -> Vec<Item> {
         let face = sel.iter().find_map(|s| if let Sel::Face { body, .. } = s { Some(body.clone()) } else { None }).unwrap_or_default();
         let (feature, sketch) = feature_and_sketch(app, picked_face_feature(app));
         let hidden = app.session.visibility.hidden_bodies.contains(&face);
+        if app.preferences.nav == "solidworks" {
+            v.push(cmd(app, "view.normal_to", "Normal to Selection").with(json!({"camera": app.cam})));
+            v.push(Item::sep());
+        }
         v.push(cmd(app, "sketch.create", "Create Sketch"));
         v.push(cmd(app, "solid.extrude", "Extrude"));
         v.push(cmd(app, "construct.plane.offset", "Offset Plane"));
@@ -801,6 +808,8 @@ fn component_items(app: &SolveApp, id: u64) -> Vec<Item> {
     v.push(act("ui.properties", "Properties", "measure").with(json!({ "component": id })));
     if doc.links.contains_key(&id) {
         v.push(act("ui.relinkSource", "Relink Source (All Instances)…", "update").with(json!({"component": id})));
+    } else if id != 0 && app.session.can_extract(id) {
+        v.push(act("ui.extractComponent", "Extract to File…", "export").with(json!({"component": id})));
     }
     if id == 0 {
         v.push(act("ui.designProperties", "Design Properties", "settings"));
@@ -908,7 +917,7 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
     if !lines.is_empty() {
         v.push(cmd(app, "sketch.infinite", "Infinite Line").with(json!({ "curves": lines })));
     }
-    if curves.len() == 1 && ss.sketch.freeform_offsets.iter().any(|offset| offset.output == curves[0]) {
+    if curves.len() == 1 && ss.sketch.offset_distance(&curves[0]).is_some() {
         v.push(cmd(app, "sketch.offset.break", "Break Offset Association").with(json!({"curve":curves[0]})));
     }
     v.push(act("ui.fix", "Fix/Unfix", "c_fix").with(json!({ "entities": ents })));
@@ -935,7 +944,8 @@ fn sketch_entity_items(app: &SolveApp) -> Vec<Item> {
         c.push(cmd(app, "sketch.constraint.parallel", "Parallel").with(ab.clone()));
         c.push(cmd(app, "sketch.constraint.perpendicular", "Perpendicular").with(ab.clone()));
         c.push(cmd(app, "sketch.constraint.collinear", "Collinear").with(ab.clone()));
-        c.push(cmd(app, "sketch.constraint.equal", "Equal").with(ab));
+        c.push(cmd(app, "sketch.constraint.equal", "Equal").with(ab.clone()));
+        c.push(cmd(app, "sketch.constraint.midpoint", "MidPoint").with(ab));
     }
     if r == 2 && n == 2 {
         let ab = json!({ "a": rounds[0], "b": rounds[1] });
@@ -995,6 +1005,11 @@ pub fn run_item(app: &mut SolveApp, item: &Item, at: Pos2) {
         "ui.relinkSource" => {
             if let Some(component) = id_of(&p, "component") {
                 crate::linked_source::start(app, component);
+            }
+        }
+        "ui.extractComponent" => {
+            if let Some(component) = id_of(&p, "component") {
+                crate::linked_source::extract(app, component);
             }
         }
         "ui.copy" => drop(crate::edit_clipboard::copy(app)),
@@ -1724,10 +1739,14 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         let area = Rect::from_center_size(c, vec2(2.0 * (RX + 4.0), 2.0 * (RY + 4.0)));
         inside |= pointer.is_some_and(|p| area.contains(p));
         let hot = pointer.and_then(|p| sector(p - c));
-        let resp = crate::frame::area(egui::Id::new("sc_marking_menu")).fixed_pos(area.min).order(egui::Order::Foreground).show(ctx, |ui| {
-            let _ = ui.allocate_exact_size(area.size(), Sense::hover());
-            picked = crate::ui_kit::radial_menu(ui, c, &radial, hot).or(picked.take());
-        });
+        let resp = Container::new(ctx, Surface::Popup)
+            .area(egui::Id::new("sc_marking_menu"))
+            .fixed_pos(area.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let _ = ui.allocate_exact_size(area.size(), Sense::hover());
+                picked = crate::ui_kit::radial_menu(ui, c, &radial, hot).or(picked.take());
+            });
         inside |= resp.response.contains_pointer();
         list_place(c, list_height(&list), screen)
     } else {
@@ -1755,8 +1774,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let mut submenu_row = None;
     let key_row = app.menu.key_row;
-    let resp =
-        crate::frame::area(egui::Id::new("sc_context_menu")).fixed_pos(list_at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
+    let resp = Container::new(ctx, Surface::Popup)
+        .area(egui::Id::new("sc_context_menu"))
+        .fixed_pos(list_at)
+        .constrain(true)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
             if target == Target::Workspace {
                 picked = crate::ui_kit::workspace_menu(ui, &list, key_row, (screen.bottom() - list_at.y).max(160.0)).or(picked.take());
             } else {
@@ -1893,9 +1916,13 @@ fn show_rename(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let Some(mut r) = app.menu.rename.take() else { return };
     let mut done: Option<bool> = None;
-    let resp = crate::frame::area(egui::Id::new("sc_rename")).fixed_pos(r.at).constrain(true).order(egui::Order::Foreground).show(ctx, |ui| {
-        done = crate::ui_kit::rename_menu(ui, &mut r.text, &mut r.focused);
-    });
+    let resp =
+        Container::new(ctx, Surface::Popup).area(egui::Id::new("sc_rename")).fixed_pos(r.at).constrain(true).order(egui::Order::Foreground).show(
+            ctx,
+            |ui| {
+                done = crate::ui_kit::rename_menu(ui, &mut r.text, &mut r.focused);
+            },
+        );
     if ctx.input(|i| i.pointer.any_pressed()) && !resp.response.contains_pointer() && r.focused {
         done = Some(true);
     }
@@ -1921,6 +1948,86 @@ pub fn finish_rename(app: &mut SolveApp, text: Option<&str>, commit: bool) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_offset_context_menu_breaks_association_and_allows_trim() {
+        use solidcraft_engine::{geom::Vec2, sketch::Shape};
+
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+        let source = h.app.run("sketch.line", json!({"points":[[0,0],[20,0]],"connect":false,"infer":false})).unwrap()["curves"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let output =
+            h.app.run("sketch.offset", json!({"curves":[source],"distance":2,"chain":false})).unwrap()["curves"][0].as_str().unwrap().to_owned();
+        h.app.run("sketch.line", json!({"points":[[10,-5],[10,5]],"connect":false,"infer":false})).unwrap();
+        let sid = h.app.session.active_sketch.unwrap();
+        let state = h.app.session.world_state();
+        let sk = &state.sketch(sid).unwrap().sketch;
+        let Shape::Line { a, b } = sk.shape(sk.curve_index(&output).unwrap()).unwrap() else { panic!("offset must be a line") };
+        let cut = Vec2::new(15.0, a.y);
+        assert!((a.dist(b) - 20.0).abs() < 1e-6);
+        assert!(h.app.run("sketch.trim", json!({"curve":output,"at":[cut.x,cut.y]})).is_err());
+
+        h.call("ui.view", json!({"view":"top"}));
+        h.app.cam.distance = 60.0;
+        h.settle();
+        h.step(&json!({"click":{"world":[cut.x,cut.y,0]},"button":"right"})).unwrap();
+        assert_eq!(h.app.session.selection, vec![Sel::SketchCurve { id: output.clone() }]);
+        let menu = items(&h.app, &Target::Viewport);
+        let item = menu.iter().find(|item| item.id == "sketch.offset.break").expect("offset line must offer Break Offset Association");
+        assert_eq!(item.label, "Break Offset Association");
+        assert!(item.enabled);
+        assert_eq!(item.params, Some(json!({"curve":output})));
+        h.step(&json!({"click":{"handle":"menu:sketch.offset.break"}})).unwrap();
+        assert!(h.app.session.world_state().sketch(sid).unwrap().sketch.offset_distance(&output).is_none());
+        h.app.run("sketch.trim", json!({"curve":output,"at":[cut.x,cut.y]})).unwrap();
+        let state = h.app.session.world_state();
+        let sk = &state.sketch(sid).unwrap().sketch;
+        let remaining = sk.shape(sk.curve_index(&output).unwrap()).unwrap();
+        assert!(matches!(remaining, Shape::Line { a, b } if (a.dist(b) - 10.0).abs() < 1e-6), "{remaining:?}");
+        assert!(remaining.dist(cut) > 1.0);
+    }
+
+    #[test]
+    fn solidworks_face_menu_runs_normal_to_selection_and_rejects_curved_faces() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.run("solid.cylinder", json!({"diameter":30,"height":20})).unwrap();
+        let state = h.app.session.world_state();
+        let body = state.bodies.first().unwrap();
+        let faces = body.body.faces(0.1).unwrap();
+        let flat = faces.iter().find(|f| f.plane_normal.is_some()).unwrap();
+        let curved = faces.iter().find(|f| f.plane_normal.is_none()).unwrap();
+        h.app.session.selection = vec![Sel::Face { body: body.name.clone(), index: flat.index, point: flat.centroid }];
+        assert!(items(&h.app, &Target::Viewport).iter().all(|i| i.id != "view.normal_to"));
+        h.app.preferences.nav = "solidworks".into();
+        h.app.preferences.language = "ja".into();
+        h.settle();
+        let before = h.app.cam;
+        open_for(&mut h.app, pos2(800.0, 400.0), Target::Viewport);
+        h.settle();
+        assert!(items(&h.app, &Target::Viewport).iter().any(|i| i.id == "view.normal_to" && i.enabled));
+        h.step(&json!({"click":{"handle":"menu:view.normal_to"}})).unwrap();
+        h.frames(90);
+        assert!(h.app.cam.back().dist(flat.plane_normal.unwrap()) < 2e-6);
+        assert_eq!((h.app.cam.distance, h.app.cam.fov), (before.distance, before.fov));
+        assert!(h.app.viewport.context_menu.is_none());
+        assert_eq!(crate::i18n::Locale::for_language("ja").label("Normal to Selection"), "選択アイテムに垂直");
+        // Ctrl+8 and the context menu share Look At, including its repeat-to-flip behavior.
+        h.step(&json!({"key":"8","cmd":true})).unwrap();
+        h.frames(90);
+        assert!(h.app.cam.back().dist(-flat.plane_normal.unwrap()) < 2e-6);
+        open_for(&mut h.app, pos2(800.0, 400.0), Target::Viewport);
+        h.settle();
+        h.step(&json!({"click":{"handle":"menu:view.normal_to"}})).unwrap();
+        h.frames(90);
+        assert!(h.app.cam.back().dist(flat.plane_normal.unwrap()) < 2e-6);
+        h.app.session.selection = vec![Sel::Face { body: body.name.clone(), index: curved.index, point: curved.centroid }];
+        assert!(items(&h.app, &Target::Viewport).iter().any(|i| i.id == "view.normal_to" && !i.enabled));
+    }
 
     #[test]
     fn viewport_right_click_keeps_list_menu_and_radial_is_opt_in() {

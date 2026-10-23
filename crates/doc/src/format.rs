@@ -578,6 +578,7 @@ pub fn read(s: &str) -> Result<Document> {
     validate_body_transfers(&v)?;
     FORMATS.upgrade(&mut v, version, applied.as_deref())?;
     let mut d: Document = serde_json::from_value(v).map_err(|e| DocError::Invalid(format!("design file: {e}")))?;
+    check_typed_numbers(&d)?;
     let mut legacy_by_feature = std::collections::BTreeMap::<usize, Vec<usize>>::new();
     for (feature, wire) in legacy_wires {
         legacy_by_feature.entry(feature).or_default().push(wire);
@@ -674,6 +675,9 @@ pub fn read(s: &str) -> Result<Document> {
         d.features.iter().map(|f| f.id).chain(d.components.iter().map(|c| c.id)).chain(d.occurrences.iter().map(|o| o.id)).max().unwrap_or(0);
     let floor = largest.checked_add(1).ok_or_else(|| DocError::Invalid("damaged design: the id space is exhausted".into()))?;
     d.next_id = d.next_id.max(floor).max(1);
+    // These lists used to allocate independently. Keep their existing identities, but never
+    // let a later deletion make them available again after loading an older design.
+    d.next_id = d.next_item_id()?;
     d.format = format_string(FORMAT);
     d.format_pending = pending_names();
     Ok(d)
@@ -1041,6 +1045,16 @@ fn check_design_numbers(v: &Value) -> Result<()> {
         Value::Object(m) => m.iter().filter(|(k, _)| k.as_str() != "metadata").try_for_each(|(_, x)| check_numbers(x, 1)),
         v => check_numbers(v, 0),
     }
+}
+
+/// The range check again, on the typed design: an integer such as `9223372036854775808` passes
+/// [`check_numbers`] in the file (ids and counters are integers and may be large), but once it
+/// lands in a coordinate or size it is a float, and floats are written as floats. Integer fields
+/// (ids, counters, indexes) stay integers and are never limited, so the field's type decides
+/// what is checked, not its name.
+fn check_typed_numbers(d: &Document) -> Result<()> {
+    let typed = serde_json::to_value(d).map_err(|e| DocError::Invalid(format!("design file: {e}")))?;
+    check_design_numbers(&typed)
 }
 
 /// Every non-integer number in the file is finite and within ±`MAX_REAL` (a damaged or hostile
@@ -2039,6 +2053,46 @@ mod tests {
     }
 
     #[test]
+    fn older_auxiliary_ids_advance_the_saved_counter_before_deletion() {
+        use serde_json::json;
+
+        let origin = json!({"occurrence": 0, "snap": {"type": "point", "point": [0, 0, 0]}});
+        let cases = [
+            ("browser_groups", json!({"id": 100, "name": "Group", "component": 0, "folder": "bodies", "items": []})),
+            ("timeline_groups", json!({"id": 100, "name": "Folder", "features": []})),
+            (
+                "canvases",
+                json!({"id": 100, "name": "Canvas", "format": "png", "data": "", "pixels": [1, 1],
+                    "plane": {"type": "origin", "name": "XY"}, "center": [0, 0], "width": 10,
+                    "angle": 0, "opacity": 0.5, "flip": false, "visible": true}),
+            ),
+            ("joints", json!({"id": 100, "name": "Joint", "kind": "rigid", "a": origin, "b": origin})),
+            ("contact_sets", json!({"id": 100, "name": "Contact", "occurrences": []})),
+            ("studies", json!({"id": 100, "name": "Study", "steps": 10, "keys": []})),
+            ("exploded", json!({"id": 100, "name": "View", "moves": []})),
+        ];
+        for (field, item) in cases {
+            let json = edited(&Document::new("Legacy IDs"), |v| {
+                v.as_object_mut().unwrap().remove("next_id");
+                if matches!(field, "browser_groups" | "timeline_groups" | "canvases") {
+                    v[field] = json!([item]);
+                } else {
+                    v["assembly"] = json!({field: [item]});
+                }
+            });
+            let mut back = read(&json).unwrap_or_else(|e| panic!("{field}: {e}"));
+            assert_eq!(back.next_id, 101, "{field}");
+            back.browser_groups.clear();
+            back.timeline_groups.clear();
+            back.canvases.clear();
+            back.assembly = Default::default();
+            let mut reopened = read(&back.to_json()).unwrap();
+            assert_eq!(reopened.allocate_id().unwrap(), 101, "{field}: deleted legacy id was forgotten");
+            assert_eq!(reopened.allocate_id().unwrap(), 102, "{field}");
+        }
+    }
+
+    #[test]
     fn duplicate_component_or_occurrence_ids_are_a_damaged_design() {
         let d = two_components_one_occurrence();
         let dup_component = edited(&d, |v| v["components"][1]["id"] = v["components"][0]["id"].clone());
@@ -2050,6 +2104,38 @@ mod tests {
             let error = read(&json).unwrap_err().to_string();
             assert!(error.contains("damaged design"), "{error}");
         }
+    }
+
+    /// An integer-valued coordinate is range-checked like a float one, while ids and counters
+    /// may still be large integers (solidcraft#5021).
+    #[test]
+    fn integer_valued_coordinates_are_range_checked_and_large_ids_still_load() {
+        let mut sketch = solidcraft_sketch::Sketch::new();
+        sketch.add_point(solidcraft_geom::Vec2::new(40.0, 0.0), None).unwrap();
+        let mut d = Document::new("range");
+        d.add_feature(crate::FeatureKind::Sketch { plane: crate::PlaneRef::Origin { name: "XY".into() }, sketch }, None).unwrap();
+        let last = |v: &Value| v["features"][0]["sketch"]["points"].as_array().map_or(0, |a| a.len() - 1);
+        for huge in ["9223372036854775808", "4294967295", "2000000000", "-2000000000"] {
+            let json = edited(&d, |v| {
+                let i = last(v);
+                v["features"][0]["sketch"]["points"][i]["pos"][1] = serde_json::from_str(huge).unwrap();
+            });
+            let error = read(&json).unwrap_err().to_string();
+            assert!(error.contains("damaged design") && error.contains("out of range"), "{huge}: {error}");
+        }
+        // In range, an integer-valued coordinate is fine.
+        let json = edited(&d, |v| {
+            let i = last(v);
+            v["features"][0]["sketch"]["points"][i]["pos"][1] = 1_000_000_000u64.into();
+        });
+        assert!(read(&json).is_ok());
+        // Ids and counters are integers and may be past the coordinate limit.
+        let json = edited(&d, |v| {
+            v["features"][0]["id"] = 5_000_000_000u64.into();
+            v["next_id"] = 5_000_000_001u64.into();
+        });
+        let back = read(&json).unwrap();
+        assert_eq!(back.features[0].id, 5_000_000_000);
     }
 
     #[test]

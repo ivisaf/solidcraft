@@ -716,11 +716,12 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind) -> Option<(Kind, Vec<SelI
 // ---- view ----
 
 /// The direction an edge flange or hem grows from its first edge: out of the sheet's larger
-/// neighbouring face (flipped with Flip).
+/// neighbouring face for a flange, toward it for a hem (flipped with Flip).
 pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
     let Kind::Sheet(k) = &d.kind else { return None };
     let flip = match k {
-        Sm::Flange { ty: 1, flip, .. } | Sm::Hem { flip, .. } => *flip,
+        Sm::Flange { ty: 1, flip, .. } => *flip,
+        Sm::Hem { flip, .. } => !flip,
         _ => return None,
     };
     let Sel::Edge { body, index, point } = d.inputs.first()?.items.first()? else { return None };

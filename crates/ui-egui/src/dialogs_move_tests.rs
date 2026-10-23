@@ -99,3 +99,52 @@ fn point_to_point_takes_the_origin_point() {
     let p = params(&h.app, &d).unwrap();
     assert_eq!(p["translate"], json!([mm(-hi.x), mm(-hi.y), mm(-hi.z)]), "the corner goes onto the origin");
 }
+
+/// #4776: the box shows the value of the handle dragged: the distance along the Y arrow after
+/// dragging it, the angle of a ring after turning it; typing then edits that value.
+#[test]
+fn the_box_shows_the_dragged_axis() {
+    let mut s = Session::default();
+    s.execute("solid.box", &json!({"length": 20, "width": 20, "height": 20})).unwrap();
+    let app = SolveApp::new(s, Services::default());
+    let mut d = move_dialog(FREE);
+    let g = |handle, change| crate::gizmo::Drag { handle, change, started: true, done: true };
+    drag(&app, &mut d, g(crate::gizmo::Handle::Axis(1), Change::Translate(Vec3::new(0.0, 5.0, 0.0))));
+    let (label, kind, value) = d.primary().unwrap();
+    assert_eq!((label, kind, value.as_str()), ("Y", ValueKind::Length, "5 mm"));
+    *value = "7 mm".into();
+    let Kind::Move { x, y, .. } = &d.kind else { panic!("not a move") };
+    assert_eq!((x.as_str(), y.as_str()), ("0 mm", "7 mm"), "typing edits Y");
+    drag(&app, &mut d, g(crate::gizmo::Handle::Ring(2), Change::Rotate { axis: 2, angle: 0.5 }));
+    assert_eq!(d.primary().map(|p| (p.0, p.1)), Some(("Z Angle", ValueKind::Angle)));
+    // Translate has no rings: a ring index past its values leaves the box on a distance.
+    let mut t = move_dialog(TRANSLATE);
+    drag(&app, &mut t, g(crate::gizmo::Handle::Axis(2), Change::Translate(Vec3::new(0.0, 0.0, 3.0))));
+    assert_eq!(t.primary().map(|p| p.0), Some("Z"));
+}
+
+/// #4776: Tab in the box goes to the next value (X, Y, Z, then the angles in Free Move) and
+/// Shift+Tab back, the keyboard staying in the box; Enter moves the body by what was typed.
+#[test]
+fn tab_in_the_box_goes_to_the_next_axis() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length": 20, "width": 20, "height": 20})).unwrap();
+    h.settle();
+    h.app.run("select.set", json!({"items": [Sel::Body { name: "Body1".into() }]})).unwrap();
+    h.app.start("solid.move");
+    h.frames(3);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("X"));
+    h.step(&json!({"key": "Tab"})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("Y"));
+    h.step(&json!({"key": "Tab"})).unwrap();
+    h.step(&json!({"key": "Tab", "shift": true})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.dialog.as_mut().and_then(|d| d.primary()).map(|p| p.0), Some("Y"), "Shift+Tab goes back");
+    h.step(&json!({"text": "12"})).unwrap();
+    h.frames(1);
+    h.step(&json!({"key": "Enter"})).unwrap();
+    h.settle();
+    let b = h.app.session.model.state().body("Body1").unwrap().mesh().bounds();
+    assert!((b.min.y - 12.0).abs() < 1e-6 && b.min.x.abs() < 1e-6, "moved along Y: {b:?}");
+}

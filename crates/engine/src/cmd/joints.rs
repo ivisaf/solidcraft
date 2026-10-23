@@ -106,6 +106,14 @@ pub fn resolve(s: &mut Session) -> joints::Solution {
     resolve_holding(s, &BTreeMap::new())
 }
 
+/// Update placements after an edit without computing a DOF report that the caller discards.
+/// Expressions and geometry-dependent couplings are refreshed just as in [`resolve`].
+pub fn place(s: &mut Session) -> joints::Solution {
+    reexpress(s);
+    recouple(s);
+    place_holding(s, &BTreeMap::new())
+}
+
 /// Work out the offsets, angles and values joints were given as expressions again (a parameter
 /// may have changed). One that can't be worked out (its parameter gone) keeps its numbers; the
 /// solve leaves that joint out and says why.
@@ -165,8 +173,22 @@ fn recouple(s: &mut Session) {
 /// Re-solve the joints, keeping the `held` values (the ones being driven, mapped to the values
 /// they move from) where loops are closed.
 pub fn resolve_holding(s: &mut Session, held: &joints::Held) -> joints::Solution {
-    let st = s.model.state();
-    let sol = joints::solve_holding(&s.doc, &st, held);
+    resolve_with_analysis(s, held, joints::Analysis::DegreesOfFreedom)
+}
+
+/// Contact and loop-search trials need placements and conflicts, not a DOF report.
+pub(super) fn place_holding(s: &mut Session, held: &joints::Held) -> joints::Solution {
+    resolve_with_analysis(s, held, joints::Analysis::Placement)
+}
+
+fn solution(s: &Session, held: &joints::Held, analysis: joints::Analysis) -> joints::Solution {
+    #[cfg(test)]
+    solve_counts::record(analysis);
+    joints::solve_holding_with_analysis(&s.doc, &s.model.state(), held, analysis)
+}
+
+fn resolve_with_analysis(s: &mut Session, held: &joints::Held, analysis: joints::Analysis) -> joints::Solution {
+    let sol = solution(s, held, analysis);
     if !sol.world.is_empty() {
         let mut next = (*s.doc).clone();
         if next.apply_joint_solution(&sol) {
@@ -175,6 +197,11 @@ pub fn resolve_holding(s: &mut Session, held: &joints::Held) -> joints::Solution
         }
     }
     sol
+}
+
+/// A quiet drive/reach does not publish DOF, so it needs only placement and constraint checks.
+fn response_analysis(p: &Value) -> joints::Analysis {
+    if bool_(p, "quiet").unwrap_or(false) { joints::Analysis::Placement } else { joints::Analysis::DegreesOfFreedom }
 }
 
 /// A solve's answer; `quiet: true` in the command's params leaves out the per-occurrence lists.
@@ -313,7 +340,7 @@ pub(crate) fn occurrence_at(s: &Session, p: Vec3) -> Option<u64> {
 }
 
 /// A joint origin from parameters: a named origin, or a snap given in world coordinates.
-fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin> {
+pub(crate) fn origin_param(s: &Session, v: Option<&Value>, cmd: &str) -> Result<JointOrigin> {
     let v = v.ok_or_else(|| bad(cmd, "joint origins `a` and `b` are required"))?;
     if let Value::String(name) = v {
         return s
@@ -407,7 +434,13 @@ fn origin_by_name(s: &Session, v: &Value, what: &str, name: &str, cmd: &str) -> 
         return Err(bad(cmd, "a face name is 1…512 characters"));
     }
     let st = s.model.state();
-    let (component, pick) = joints::named_face_spot(&s.doc, &st, str_(v, "body"), name).map_err(|why| bad(cmd, why))?;
+    let (component, pick) = joints::named_face_spot(&s.doc, &st, str_(v, "body"), name).map_err(|why| {
+        if s.doc.assembly.origins.iter().any(|o| o.name == name) {
+            bad(cmd, format!("`{name}` is a joint origin: pass it as the whole origin, not as a `{what}` name"))
+        } else {
+            bad(cmd, why)
+        }
+    })?;
     let occurrence = match v.get("occurrence") {
         Some(o) => occurrence_id(s, Some(o), cmd)?,
         None if component == 0 => 0,
@@ -576,10 +609,6 @@ fn limits_param(s: &Session, p: &Value, kind: JointKind, cmd: &str) -> Result<Ve
     Ok(out)
 }
 
-fn next_joint_id(s: &Session, cmd: &str) -> Result<u64> {
-    super::next_free_id(cmd, s.doc.assembly.joints.iter().map(|j| j.id))
-}
-
 fn add_joint(s: &mut Session, mut j: Joint, p: &Value) -> Result<Value> {
     if s.doc.assembly.joints.len() >= 10_000 {
         return Err(EngineError::Other("too many joints".into()));
@@ -619,7 +648,7 @@ fn add_joint(s: &mut Session, mut j: Joint, p: &Value) -> Result<Value> {
     j.values = q;
     let id = j.id;
     let name = j.name.clone();
-    // A new joint can take a deleted one's id; it starts shown.
+    // A new joint starts shown, even if a stale visibility entry came from an older design.
     s.visibility.hidden_joints.retain(|h| *h != id);
     s.doc_mut().assembly.joints.push(j);
     let sol = resolve(s);
@@ -652,13 +681,21 @@ fn kind_param(p: &Value, cmd: &str) -> Result<JointKind> {
         .ok_or_else(|| bad(cmd, "`type` must be rigid, revolute, slider, cylindrical, pin_slot, planar, ball, parallel, perpendicular, angle, point_on_plane, point_on_line or line_on_plane"))
 }
 
+fn new_joint_name(s: &Session, p: &Value) -> String {
+    str_(p, "name").map(str::to_string).unwrap_or_else(|| {
+        let names: std::collections::BTreeSet<_> = s.doc.assembly.joints.iter().map(|j| j.name.as_str()).collect();
+        let number = (1..=s.doc.assembly.joints.len().saturating_add(1)).find(|n| !names.contains(format!("Joint{n}").as_str())).unwrap_or(1);
+        format!("Joint{number}")
+    })
+}
+
 fn joint(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "joint.create";
     let kind = kind_param(p, cmd)?;
     let a = origin_param(s, p.get("a"), cmd)?;
     let b = origin_param(s, p.get("b"), cmd)?;
-    let id = next_joint_id(s, cmd)?;
-    let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("Joint{id}"));
+    let id = s.doc_mut().allocate_id()?;
+    let name = new_joint_name(s, p);
     let offset = match p.get("offset") {
         Some(v) => value(s, v, false, cmd)?,
         None => 0.0,
@@ -716,8 +753,8 @@ fn as_built(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let fa = side(oa)?;
     let fb = side(ob)?;
-    let id = next_joint_id(s, cmd)?;
-    let name = str_(p, "name").map(str::to_string).unwrap_or_else(|| format!("Joint{id}"));
+    let id = s.doc_mut().allocate_id()?;
+    let name = new_joint_name(s, p);
     let n = kind.dofs().len();
     let j = Joint {
         id,
@@ -783,7 +820,7 @@ fn drive(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let before = super::motion::positions(s);
     let r = super::motion::drive_joint(s, id, q, given)?;
-    let sol = joints::solve(&s.doc, &s.model.state());
+    let sol = solution(s, &BTreeMap::new(), response_analysis(p));
     let mut out = sol_json(&sol, p);
     out["joint"] = json!(id);
     out["values"] = json!(effective_values(s, id));
@@ -848,7 +885,7 @@ fn reach(s: &mut Session, p: &Value) -> Result<Value> {
         Err(_) => joints::Reached::default(),
     };
     // Loops closed again from there, and where it ended up.
-    let sol = resolve(s);
+    let sol = if response_analysis(p) == joints::Analysis::Placement { place(s) } else { resolve(s) };
     let t = joints::occurrence_world(&s.doc, occ);
     let got = solidcraft_doc::apply_point(&t, at);
     let mut out = sol_json(&sol, p);
@@ -1435,3 +1472,25 @@ mod tests;
 #[cfg(test)]
 #[path = "joints_turn_tests.rs"]
 mod turn_tests;
+
+/// Per-thread work counts for ordinary engine regression tests; no production instrumentation.
+#[cfg(test)]
+pub(super) mod solve_counts {
+    use solidcraft_doc::joints::Analysis;
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub fn record(analysis: Analysis) {
+        COUNTS.with(|c| {
+            let (all, full) = c.get();
+            c.set((all + 1, full + usize::from(analysis == Analysis::DegreesOfFreedom)));
+        });
+    }
+
+    pub fn take() -> (usize, usize) {
+        COUNTS.with(|c| c.replace((0, 0)))
+    }
+}

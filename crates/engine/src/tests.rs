@@ -682,6 +682,12 @@ pub(crate) fn hostile_values() -> Vec<Value> {
         json!("nope"),
         json!("1/0"),
         json!("((((((((((1"),
+        json!("w = 20"),
+        json!("w ="),
+        json!("= 20"),
+        json!("mm = 5"),
+        json!("w = w"),
+        json!("w == 1/0"),
         json!([]),
         json!([1e308, -1e308]),
         json!([0, 0, 0]),
@@ -3236,6 +3242,39 @@ fn computed_import_preserves_file_and_earlier_undo_history() {
     assert!(s.model.state().bodies.is_empty());
 }
 
+/// Commands evaluated ahead (off the window thread) and then run for real take what was
+/// evaluated: on a design whose states are past the shared cache's budget the second run
+/// evaluated everything again, so an off-thread command cost twice its time.
+#[test]
+fn commands_evaluated_ahead_are_not_evaluated_again() {
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "w", "expression": "40 mm"}));
+    run(&mut s, "solid.box", json!({"length": "w", "width": 30, "height": 10, "body_name": "Block"}));
+    run(&mut s, "solid.chamfer", json!({"edges": [[10, 0, 10]], "distance": 1}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 5, "height": 20, "corner": [2, 2, 0], "operation": "cut"}));
+    let commands = vec![("parameters.change".to_string(), json!({"name": "w", "expression": "50 mm"}))];
+    let evaluated = s.ahead().evaluate(&commands).unwrap();
+    // The shared cache dropped those results (as it does past its budget).
+    s.model.cache = Default::default();
+    let mut unprimed = s.scratch();
+    s.prime(&evaluated);
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    s.unprime();
+    assert_eq!((&r["recomputed"], &r["restored"]), (&json!(0), &json!(3)), "every feature taken from the evaluation ahead: {r}");
+    let r = run(&mut unprimed, "parameters.change", json!({"name": "w", "expression": "50 mm"}));
+    assert_eq!(r["recomputed"], 3, "without it, all evaluated again: {r}");
+    for (a, b) in s.model.state().bodies.iter().zip(&unprimed.model.state().bodies) {
+        assert_eq!(a.mesh().bounds(), b.mesh().bounds());
+    }
+    // Inputs that differ from those evaluated ahead are evaluated, as usual.
+    s.model.cache = Default::default();
+    s.prime(&evaluated);
+    let r = run(&mut s, "parameters.change", json!({"name": "w", "expression": "60 mm"}));
+    s.unprime();
+    assert_eq!(r["recomputed"], 3, "{r}");
+    assert!((s.model.state().body("Block").unwrap().mesh().bounds().max.x - 60.0).abs() < 1e-9);
+}
+
 #[test]
 fn adopting_a_computed_component_keeps_its_warm_world_geometry() {
     let mut s = Session::default();
@@ -3340,6 +3379,47 @@ fn deleting_a_sketch_leaves_no_silently_failing_feature() {
             join["error"]
         );
     }
+}
+
+#[test]
+fn default_extrude_profiles_preserve_two_holes() {
+    let mut sketch = Session::default();
+    run(&mut sketch, "sketch.create", json!({"plane": "XY"}));
+    run(&mut sketch, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    for x in [15, 45] {
+        run(&mut sketch, "sketch.circle.center", json!({"center": [x, 20], "radius": 5}));
+    }
+    run(&mut sketch, "sketch.finish", json!({}));
+    for (selection, expected) in [
+        (None, (2400.0 - 50.0 * PI) * 5.0),
+        (Some(json!([0])), (2400.0 - 50.0 * PI) * 5.0),
+        (Some(json!("all")), 12000.0),
+        (Some(json!([0, 1, 2])), 12000.0),
+    ] {
+        let mut s = Session::new((*sketch.doc).clone());
+        let mut params = json!({"distance": 5});
+        if let Some(selection) = selection {
+            params["profiles"] = selection;
+        }
+        run(&mut s, "solid.extrude", params);
+        let actual = volume(&mut s);
+        assert!(rel(actual, expected) < 1e-4, "{actual} vs {expected}");
+    }
+}
+
+#[test]
+fn default_extrude_profiles_keep_even_depth_islands_and_separate_outlines() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    for (p0, p1) in [([0, 0], [30, 30]), ([5, 5], [25, 25]), ([10, 10], [20, 20]), ([40, 0], [50, 10])] {
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": p0, "p1": p1}));
+    }
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5}));
+    assert_eq!(s.model.state().bodies.len(), 3);
+    let expected = (900.0 - 400.0 + 100.0 + 100.0) * 5.0;
+    let actual = volume(&mut s);
+    assert!(rel(actual, expected) < 1e-6, "{actual} vs {expected}");
 }
 
 /// Every body a multi-profile `new` extrude creates carries its `body_name`, not a generic BodyN (#266).
@@ -3505,6 +3585,36 @@ fn a_pattern_repeats_a_fillet_on_the_edges_it_found() {
     let pocket = 143.65 * h * 12.7 - 4.0 * (1.0 - PI / 4.0) * 3.2 * 3.2 * 12.7;
     let expect = 150.0 * 422.275 * 19.05 - n * pocket;
     assert!(rel(volume(&mut s), expect) < 1e-5, "{} vs {expect}", volume(&mut s));
+}
+
+/// A body renamed after a join: the next new body does not take the name the rename freed
+/// (#4957). The join changed the body, so the rename is followed by a full evaluation of the
+/// design; the numbers the design handed out must not go back with it, or a script that names
+/// a body finds another one.
+#[test]
+fn a_renamed_body_keeps_its_number_from_the_next_body() {
+    for join in [false, true] {
+        let mut s = Session::default();
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "new"}));
+        if join {
+            // A second box joined to the first: the join changes the body, so the rename
+            // cannot be followed without evaluating the design again.
+            run(&mut s, "sketch.create", json!({"plane": "XY"}));
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0": [5, 0], "p1": [15, 10]}));
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "join"}));
+        }
+        run(&mut s, "body.rename", json!({"body": "Body1", "name": "First"}));
+        run(&mut s, "sketch.create", json!({"plane": "XY"}));
+        run(&mut s, "sketch.rectangle.two_point", json!({"p0": [20, 0], "p1": [30, 10]}));
+        run(&mut s, "sketch.finish", json!({}));
+        run(&mut s, "solid.extrude", json!({"distance": 5, "operation": "new"}));
+        let names: Vec<String> = s.model.state().bodies.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(names, ["First", "Body2"], "with a join: {join}");
+    }
 }
 
 /// A copy added by raising the count after a rename takes the next number, not the freed one (#372).
@@ -3947,4 +4057,51 @@ fn cheap_commands_on_thousands_of_bodies_evaluate_nothing() {
         }
     }
     assert_eq!(meshes(&s), shown, "every body keeps its mesh");
+}
+
+/// #3397: a new, empty component changes nothing a feature reads, so creating one recomputes
+/// nothing, the first component of a design included: not a targeted cut, a Combine, a To
+/// Object extrude or a sketch on a face without a construction certificate (a legacy face
+/// plane, which reads every placed body), all of which read placements.
+#[test]
+fn creating_a_component_recomputes_nothing() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 30, "width": 30, "height": 10, "operation": "new", "body_name": "Block"}));
+    run(&mut s, "solid.cylinder", json!({"diameter": 8, "height": 12, "base": [15, 15, -1], "operation": "cut", "targets": ["Block"]}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 30, "height": 20, "corner": [0, 0, 10], "operation": "new", "body_name": "Tab"}));
+    run(&mut s, "solid.combine", json!({"target": "Block", "tools": ["Tab"], "operation": "join"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Post sketch"}));
+    run(&mut s, "sketch.circle.center", json!({"center": [25, 25], "radius": 2}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Post sketch", "to": [25, 25, 10], "operation": "new", "body_name": "Post"}));
+    // A plate whose top face loses its certificate: a patterned cut, a pad joined flush with
+    // the top, then one more cut. Extruding that face makes a sketch on a legacy face plane.
+    run(&mut s, "solid.box", json!({"length": 100, "width": 100, "height": 10, "corner": [200, 0, 0], "operation": "new", "body_name": "Plate"}));
+    run(
+        &mut s,
+        "solid.cylinder",
+        json!({"diameter": 4, "height": 12, "base": [210, 10, -1], "operation": "cut", "targets": ["Plate"], "name": "Pilot"}),
+    );
+    run(
+        &mut s,
+        "solid.pattern.rectangular",
+        json!({"features": ["Pilot"], "dir1": [1, 0, 0], "count1": 4, "spacing1": 20, "dir2": [0, 1, 0], "count2": 4, "spacing2": 20}),
+    );
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": "5 mm", "name": "Pad sketch"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [260, 60], "p1": [295, 95]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pad sketch", "distance": 5, "operation": "join", "targets": ["Plate"]}));
+    run(&mut s, "solid.box", json!({"length": 5, "width": 100, "height": 12, "corner": [199, 0, -1], "operation": "cut", "targets": ["Plate"]}));
+    run(&mut s, "solid.extrude", json!({"face": [240, 40, 10], "distance": 1, "operation": "join", "name": "Face layer"}));
+    let legacy_face = s
+        .doc
+        .features
+        .iter()
+        .any(|f| matches!(&f.kind, solidcraft_doc::FeatureKind::Sketch { plane: solidcraft_doc::PlaneRef::Face { anchor: None, .. }, .. }));
+    assert!(legacy_face, "the face extrude's sketch is on a legacy face plane");
+    for name in ["First", "Second"] {
+        run(&mut s, "component.create", json!({"name": name}));
+        assert_eq!(s.model.last_recomputed, 0, "creating {name} recomputed a feature");
+        run(&mut s, "component.activate", json!({"component": "root"}));
+    }
 }

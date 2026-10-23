@@ -1803,8 +1803,16 @@ fn cam_surfaces_speak_the_chosen_language() {
         ("zh", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json"))),
     ] {
         let messages: Messages = serde_json::from_str(catalog).unwrap();
-        // English where the catalog has nothing, or something else, for one of the text's ids.
-        let english_left = |text: &str| english.iter().any(|(id, en)| en == text && !en.contains('{') && messages.get(id) != Some(en));
+        // English where the catalog has something else for one of the text's ids, or (a CAM
+        // text) nothing: the rest of the window is the other catalogs' business.
+        // A text the language also keeps as it is, in another entry ("Design"), is no leak.
+        let kept = |text: &str| english.iter().any(|(id, en)| en == text && messages.get(id).is_some_and(|t| t == en));
+        let english_left = |text: &str| {
+            !kept(text)
+                && english
+                    .iter()
+                    .any(|(id, en)| en == text && !en.contains('{') && messages.get(id).map_or(id.starts_with("manufacture."), |t| t != en))
+        };
         let leaks: Vec<String> = cam_surfaces(language)
             .into_iter()
             .flat_map(|(surface, texts)| texts.into_iter().filter(|t| english_left(t)).map(move |t| format!("{surface}: {t:?}")))

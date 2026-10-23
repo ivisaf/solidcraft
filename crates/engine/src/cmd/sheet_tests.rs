@@ -38,6 +38,27 @@ fn rectangle_tool(s: &mut Session, name: &str, p0: [f64; 2], p1: [f64; 2]) {
 }
 
 #[test]
+fn plain_solid_sheet_operations_explain_how_to_start_sheet_metal() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 100, "width": 60, "height": 2.5}));
+    let before = s.doc.to_json();
+    for (command, params) in [
+        ("sheet.flange", json!({"type": "edge", "edges": [[50, 0, 2.5]], "height": 15})),
+        ("sheet.flat_pattern", json!({})),
+        ("sheet.export_dxf", json!({"per_body": true})),
+    ] {
+        let error = s.execute(command, &params).unwrap_err();
+        let crate::EngineError::BadParams { cmd, msg } = error else { panic!("{error}") };
+        assert_eq!(cmd, command);
+        assert_eq!(
+            msg,
+            "there is no sheet metal body: start one with Flange > Base, or turn a plate into sheet metal with Convert to Sheet Metal (pick its large flat face)"
+        );
+        assert_eq!(s.doc.to_json(), before);
+    }
+}
+
+#[test]
 fn side_edge_flanges_across_a_bend_keep_their_relief_through_rebuild_and_reopen() {
     use solidcraft_geom::Vec3;
 

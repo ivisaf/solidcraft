@@ -182,12 +182,14 @@ impl Ahead {
     }
 
     /// Run `commands` (their results stay in the shared evaluation cache, and in [`Ahead::kept`]),
-    /// then make the display meshes and plans of the bodies they end with: the bodies the run
-    /// here finds share them, so the window draws, fits and picks without tessellating anything.
-    pub fn evaluate(self, commands: &[(String, Value)]) -> Result<()> {
-        let (s, _) = self.0.preview_in_place(commands)?;
-        s.world_state().warm_display();
-        Ok(())
+    /// then make the display meshes and plans of the bodies they end with, so the window draws,
+    /// fits and picks without tessellating anything. What they evaluated comes back for
+    /// [`Session::prime`], so running them for real evaluates nothing again: the shared cache
+    /// drops results past its budget, and a large design's states are past it.
+    pub fn evaluate(self, commands: &[(String, Value)]) -> Result<Evaluated> {
+        let (after, _) = self.0.preview_in_place(commands)?;
+        after.world_state().warm_display();
+        Ok(Evaluated(after.model))
     }
 
     /// Run `commands` one after another, each reply or error in turn (what they evaluate stays
@@ -197,6 +199,10 @@ impl Ahead {
         commands.iter().map(|(id, params)| self.0.execute(id, params)).collect()
     }
 }
+
+/// The model a session copy evaluated ahead ([`Ahead::evaluate`]).
+#[derive(Clone, Debug)]
+pub struct Evaluated(solidcraft_doc::Model);
 
 /// What some commands would make, evaluated on a scratch copy of a session
 /// ([`Session::preview`]). The session itself is not changed.
@@ -275,6 +281,9 @@ pub struct Session {
     /// Recent body renames: the design before and after each, and the names, so undo and redo
     /// follow them without evaluating either.
     body_renames: Vec<BodyRename>,
+    /// Bodies' contact meshes (shared with scratch copies): a joint driven again meshes no body
+    /// that did not change.
+    contact_meshes: std::sync::Arc<std::sync::Mutex<cmd::motion::contact_sweep::ContactMeshes>>,
     /// Features copied with `timeline.copy` (pasted by `timeline.paste`).
     pub clipboard: Vec<solidcraft_doc::Feature>,
     /// Sketch geometry copied with `sketch.copy` (pasted by `sketch.paste`).
@@ -308,6 +317,8 @@ pub struct Session {
     /// Full model evaluations (`refresh`), for tests.
     #[cfg(test)]
     pub(crate) evaluations: usize,
+    /// Resolved associative trace inputs, independent of the document revision and view state.
+    pub(crate) motion_traces: cmd::motion::associative::Cache,
 }
 
 /// A sketch changed by one frame of an interactive gesture (`live: true`).
@@ -430,6 +441,7 @@ impl Session {
             cam_list_cache: Default::default(),
             clearance_cache: Default::default(),
             body_renames: Vec::new(),
+            contact_meshes: Default::default(),
             clipboard: Vec::new(),
             sketch_clipboard: None,
             section: None,
@@ -444,6 +456,7 @@ impl Session {
             render_jobs: Default::default(),
             #[cfg(test)]
             evaluations: 0,
+            motion_traces: Default::default(),
             crash_journal: false,
         }
     }
@@ -650,8 +663,9 @@ impl Session {
         self.prune_occurrence_state();
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
-            cmd::joints::resolve(self);
+            cmd::joints::place(self);
         }
+        cmd::motion::associative::refresh(self);
         if let Some(id) = self.active_sketch
             && self.doc.feature(id).is_none()
         {
@@ -668,7 +682,7 @@ impl Session {
         {
             self.revision += 1;
             if !self.doc.assembly.joints.is_empty() {
-                cmd::joints::resolve(self);
+                cmd::joints::place(self);
             }
             return;
         }
@@ -963,6 +977,7 @@ impl Session {
             cam_list_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             body_renames: Vec::new(),
+            contact_meshes: self.contact_meshes.clone(),
             clipboard: self.clipboard.clone(),
             sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
@@ -977,6 +992,7 @@ impl Session {
             saved_visibility: self.saved_visibility.clone(),
             #[cfg(test)]
             evaluations: 0,
+            motion_traces: self.motion_traces.clone(),
             crash_journal: false,
         }
     }
@@ -986,6 +1002,19 @@ impl Session {
     pub fn invalidate_view(&mut self, previous_revision: u64) {
         let old = self.revision;
         self.revision = old.max(previous_revision) + 1;
+    }
+
+    /// Offer what a copy of this session evaluated ahead for the commands about to run
+    /// ([`Ahead::evaluate`]): until [`Session::unprime`], evaluating takes each feature result
+    /// whose inputs match instead of computing it again (a design changed meanwhile matches
+    /// less, or nothing, and is evaluated as usual).
+    pub fn prime(&mut self, evaluated: &Evaluated) {
+        self.model.prime(&evaluated.0);
+    }
+
+    /// Stop offering what [`Session::prime`] offered.
+    pub fn unprime(&mut self) {
+        self.model.unprime();
     }
 
     /// Commit commands evaluated on a scratch copy without losing this session's file,

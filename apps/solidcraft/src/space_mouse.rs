@@ -7,7 +7,11 @@
 mod hidraw;
 #[cfg(target_os = "linux")]
 mod spacenavd;
+#[cfg(target_os = "windows")]
+mod windows_hid;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,8 +19,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::Context;
+#[cfg(target_os = "macos")]
+use hidapi::DeviceInfo;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use hidapi::{DeviceInfo, HidApi};
+use hidapi::HidApi;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use solidcraft_space_mouse::Layout;
@@ -256,8 +262,9 @@ fn at_rest(calibration: Option<Calibration>) -> Axes {
 }
 
 /// The Generic Desktop "Multi-Axis Controller" usage names a 3D mouse's motion interface, whoever
-/// made it, and excludes ordinary mice and the keyboard interfaces of 3D mice.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
+/// made it, and excludes ordinary mice and the keyboard interfaces of 3D mice. (Windows asks Plug
+/// and Play for the same usage: `windows_hid`.)
+#[cfg(target_os = "macos")]
 fn is_3d_mouse(info: &DeviceInfo) -> bool {
     info.usage_page() == 0x01 && info.usage() == 0x08
 }
@@ -277,15 +284,18 @@ fn decode_report(report: &[u8], layout: Layout, reading: &mut Reading, now: Inst
     true
 }
 
-/// Publishes one input report from the device to the egui thread.
+/// Publishes one input report from the device to the egui thread. A report that reads the same as
+/// the reading it replaces is no news — a device may repeat its report at rest — so it asks for no
+/// frame; while the cap moves, the view asks for the next frame itself.
 fn publish(ctx: &Context, shared: &Mutex<Reading>, layout: Layout, report: &[u8]) {
     if DRIVER_CONNECTED.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut reading) = shared.lock()
-        && decode_report(report, layout, &mut reading, Instant::now())
-    {
-        ctx.request_repaint();
+    if let Ok(mut reading) = shared.lock() {
+        let before = reading.axes;
+        if decode_report(report, layout, &mut reading, Instant::now()) && reading.axes != before {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -317,18 +327,48 @@ fn reset(ctx: &Context, shared: &Mutex<Reading>) {
     ctx.request_repaint();
 }
 
+/// The HID interfaces that are 3D mice, by path. Windows asks Plug and Play, which sends nothing to
+/// the devices: hidapi's enumeration would ask every keyboard and mouse for its strings on each scan
+/// (#2614, `windows_hid`).
+#[cfg(target_os = "windows")]
+fn candidates(_api: &mut HidApi) -> Vec<CString> {
+    windows_hid::multi_axis_controllers()
+}
+
+/// The HID interfaces that are 3D mice, by path, from hidapi's enumeration (IOKit's registry).
+#[cfg(target_os = "macos")]
+fn candidates(api: &mut HidApi) -> Vec<CString> {
+    if let Err(error) = api.refresh_devices() {
+        log::warn!("3D mouse: device scan failed: {error}");
+        return Vec::new();
+    }
+    api.device_list().filter(|info| is_3d_mouse(info)).map(|info| info.path().to_owned()).collect()
+}
+
+/// The HID context. On Windows hidapi's own device discovery is off, so making it asks no device
+/// anything either (`candidates` finds the 3D mice). Turning discovery off panics only once a
+/// context with discovery exists; the reader is the one place the app makes a context, once.
+#[cfg(target_os = "windows")]
+fn hid_api() -> hidapi::HidResult<HidApi> {
+    HidApi::disable_device_discovery();
+    HidApi::new()
+}
+
+#[cfg(target_os = "macos")]
+fn hid_api() -> hidapi::HidResult<HidApi> {
+    HidApi::new()
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn reader(ctx: Context, shared: Arc<Mutex<Reading>>) {
-    let Ok(mut api) = HidApi::new() else {
+    let Ok(mut api) = hid_api() else {
         log::warn!("3D mouse: HID initialization failed");
         return;
     };
     loop {
-        if let Err(error) = api.refresh_devices() {
-            log::warn!("3D mouse: device scan failed: {error}");
-        } else if let Some((device, layout, ids)) = api.device_list().filter(|info| is_3d_mouse(info)).find_map(|info| {
-            let device = info
-                .open_device(&api)
+        if let Some((device, layout, ids)) = candidates(&mut api).into_iter().find_map(|path| {
+            let device = api
+                .open_path(&path)
                 .inspect_err(|error| {
                     // On macOS: missing Input Monitoring permission, or the 3DxWare helper holding the device.
                     // The driver having the device is the reason it cannot be opened, not a problem.
@@ -337,6 +377,8 @@ fn reader(ctx: Context, shared: Arc<Mutex<Reading>>) {
                     }
                 })
                 .ok()?;
+            // Read when the device was opened, from this device alone.
+            let info = device.get_device_info().ok()?;
             let layout = device_layout(&device, info.vendor_id())?;
             Some((device, layout, (info.vendor_id(), info.product_id())))
         }) {
@@ -845,6 +887,31 @@ mod tests {
             assert!(!decode_report(&[0x17, 80], layout, &mut reading, at));
         }
         assert_eq!(reading.current(now + STALE_AFTER, Axes::default()).translation, [0; 3]);
+    }
+
+    /// A device that repeats its reading at rest asks for no frame; a reading that changes does.
+    #[test]
+    fn a_repeated_report_at_rest_asks_for_no_frame() {
+        let ctx = Context::default();
+        let shared = Mutex::new(Reading::new(Instant::now()));
+        let layout = Layout::default();
+        let frame = || {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+            out.textures_delta.clear();
+        };
+        let asked = || {
+            frame();
+            ctx.repaint_causes().iter().any(|c| c.file.ends_with("space_mouse.rs"))
+        };
+        frame();
+        // Report 1 carries translation (see the split-layout test).
+        let report = [1, 0x9c, 0xff, 0x2c, 0x01, 0, 0];
+        publish(&ctx, &shared, layout, &report);
+        assert!(asked(), "a report that moves the cap asks for a frame");
+        publish(&ctx, &shared, layout, &report);
+        assert!(!asked(), "the same reading at rest is no news");
+        publish(&ctx, &shared, layout, &[1, 0x9d, 0xff, 0x2c, 0x01, 0, 0]);
+        assert!(asked(), "a changed reading asks for a frame");
     }
 
     #[test]

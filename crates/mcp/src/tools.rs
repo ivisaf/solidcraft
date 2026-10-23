@@ -304,6 +304,21 @@ pub fn tool_definitions() -> Vec<Value> {
             ),
             Effect::Files,
         ),
+        tool(
+            "skill_reference",
+            "Skill reference",
+            "Read a document of SolidCraft's bundled agent skills (solidcraft-modeling, solidcraft-mechanisms, \
+             solidcraft-editing, solidcraft-checking) from the copy built into SolidCraft. `file` defaults to reference.md; \
+             each skill also has SKILL.md. Unknown skills or files are refused with the available ones.",
+            obj(
+                json!({
+                    "skill": string("Skill name, such as solidcraft-modeling"),
+                    "file": {"type": "string", "description": "Document of that skill", "default": "reference.md"},
+                }),
+                &["skill"],
+            ),
+            Effect::ReadOnly,
+        ),
     ]
 }
 
@@ -387,7 +402,65 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> Value {
 }
 
 fn exec(b: &mut dyn Backend, command: &str, params: Value) -> Result<Value, String> {
-    b.call("engine.execute", json!({"command": command, "params": params}))
+    b.call("engine.execute", json!({"command": command, "params": params})).map_err(|error| command_error(command, error))
+}
+
+/// Enrich an unknown-id error without retrying or changing the command that was requested.
+fn command_error(command: &str, error: String) -> String {
+    if !error.starts_with(&format!("unknown command `{command}`")) {
+        return error;
+    }
+    // Bound the quadratic comparison work, including for direct callers without a line cap.
+    if command.len() > 128 {
+        return error;
+    }
+    let id = command.split(['{', '(']).next().unwrap_or(command).trim();
+    let packed = id != command.trim();
+    let normalize = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect::<String>();
+    let normalized = normalize(id);
+    if normalized.is_empty() {
+        return error;
+    }
+    let words: Vec<_> = id.split(|c: char| !c.is_ascii_alphanumeric()).filter(|s| !s.is_empty()).collect();
+    let mut closest: Vec<_> = solidcraft_engine::command_specs()
+        .into_iter()
+        .filter_map(|spec| {
+            let candidate = normalize(spec.id);
+            let distance = command_distance(&normalized, &candidate);
+            let shared = spec.id.split('.').filter(|word| words.iter().any(|w| w.eq_ignore_ascii_case(word))).count();
+            (distance <= (normalized.len() / 4).max(2) || shared > 0).then_some((
+                normalized != candidate,
+                distance,
+                std::cmp::Reverse(shared),
+                spec.id,
+            ))
+        })
+        .collect();
+    closest.sort_unstable();
+    let hints: Vec<_> = closest.iter().take(3).map(|(_, _, _, id)| format!("`{id}`")).collect();
+    let mut message = format!("unknown command `{command}`");
+    if !hints.is_empty() {
+        message.push_str(&format!("; closest: {}", hints.join(", ")));
+    }
+    if packed {
+        message.push_str("; command ids have no parameters; pass them in `params`");
+    }
+    message
+}
+
+fn command_distance(a: &str, b: &str) -> usize {
+    let mut row: Vec<usize> = (1..=b.len()).collect();
+    for (i, ca) in a.bytes().enumerate() {
+        let mut diagonal = i;
+        let mut left = i + 1;
+        for (cell, cb) in row.iter_mut().zip(b.bytes()) {
+            let next = (diagonal + usize::from(ca != cb)).min(*cell + 1).min(left + 1);
+            diagonal = *cell;
+            *cell = next;
+            left = next;
+        }
+    }
+    row.last().copied().unwrap_or(a.len())
 }
 
 fn pick(a: &Map<String, Value>, keys: &[&str]) -> Value {
@@ -464,6 +537,7 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Map<String, Value>) -> Result<V
             Some(_) => exec(b, "diagnostics.crash_report", pick(a, &["id"])),
             None => exec(b, "diagnostics.crash_reports", pick(a, &["limit"])),
         },
+        "skill_reference" => crate::skill_reference::read(a),
         "running" => b.call("control.running", json!({})),
         "undo" => exec(b, "edit.undo", json!({})),
         "redo" => exec(b, "edit.redo", json!({})),
@@ -566,7 +640,17 @@ fn batch(b: &mut dyn Backend, a: &Map<String, Value>) -> Value {
     }
     if params.to_string().len() + 64 * 1024 <= solidcraft_engine::MAX_LINE {
         match b.call("engine.batch", params) {
-            Ok(r) => return batch_reply(&r, rollback, verbose),
+            Ok(mut r) => {
+                if let Some(failed) = r.get_mut("failed")
+                    && let (Some(command), Some(error)) = (failed.get("command").and_then(Value::as_str), failed.get("error").and_then(Value::as_str))
+                {
+                    let error = command_error(command, error.to_string());
+                    if let Some(failed) = failed.as_object_mut() {
+                        failed.insert("error".into(), Value::String(error));
+                    }
+                }
+                return batch_reply(&r, rollback, verbose);
+            }
             // Older apps and the headless session, or the app wants the steps one by one.
             Err(e) if e.starts_with("unknown method") || e.starts_with("engine.batch unavailable") => {}
             // Never sent: no app to send it to.

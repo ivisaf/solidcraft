@@ -45,6 +45,11 @@ fn session(script: &[(&str, serde_json::Value)]) -> Session {
 fn opengl_viewport_pipelines_render_a_model() {
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
     desc.backends = wgpu::Backends::GL;
+    // NVIDIA's EGL answers wgpu's request for GL 3.3 with exactly 3.3 yet lists
+    // GL_ARB_compute_shader, so wgpu builds its indirect-call validation pipeline, naga cannot
+    // emit compute GLSL below 4.30, and request_device fails as Device(Lost). The test draws
+    // nothing indirect, so the validation is not needed here.
+    desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
     let instance = wgpu::Instance::new(desc);
     let adapter = match pollster::block_on(instance.request_adapter(&Default::default())) {
         Ok(adapter) => adapter,

@@ -150,6 +150,7 @@ pub fn hint(id: &str) -> String {
         "sketch.dimension" => "Dimension: pick one or two entities and type the value (or click to place it first); Enter applies".into(),
         "sketch.constraint.horizontal_vertical" => "Horizontal/Vertical: pick a line or two points; hold Shift to pick a line midpoint".into(),
         "sketch.slot.center_to_center" | "sketch.slot.overall" => "Slot: click both ends, then the width".into(),
+        "sketch.constraint.midpoint" => "MidPoint: pick a point and a line, or two lines to centre the second on the first".into(),
         _ if id.starts_with("sketch.constraint.") => "Constraint: pick the sketch entities".into(),
         _ => crate::sketch_tools::hint(id).unwrap_or_else(|| "Click in the sketch".into()),
     }
@@ -424,7 +425,14 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
             json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "radius": crate::sketch_dims::rounded_radius_value(app, t, p[0].0, p[1].0)})
         }
         "sketch.rectangle.three_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "p2": xy(&p[2])}),
-        "sketch.circle.center" => json!({"center": arg(&p[0]), "radius": d(0, 1)}),
+        "sketch.circle.center" => {
+            // A second click snapped to a point keeps the circle on that point (#3099).
+            let mut v = json!({"center": arg(&p[0]), "radius": d(0, 1)});
+            if p[1].1.is_some() {
+                v["through"] = arg(&p[1]);
+            }
+            v
+        }
         "sketch.circle.two_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1])}),
         "sketch.circle.three_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "p2": xy(&p[2])}),
         "sketch.arc.three_point" => json!({"start": arg(&p[0]), "end": arg(&p[1]), "through": arg(&p[2])}),
@@ -444,7 +452,12 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
             let width = crate::sketch_dims::locked_value(app, t, "Width").unwrap_or_else(|| (2.0 * dir.cross(p[2].0 - p[0].0).abs()).max(1e-3));
             json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "width": width})
         }
-        "sketch.point" => json!({"point": xy(&p[0])}),
+        // A midpoint or on-curve snap goes as itself, so the point is held there (#4691); a
+        // snap to an existing point goes as its place, where `connect` joins them.
+        "sketch.point" => match &p[0].1 {
+            Some(id) if ["mid:", "on:", "vertex:"].iter().any(|k| id.starts_with(k)) => json!({"point": id}),
+            _ => json!({"point": xy(&p[0])}),
+        },
         _ => return Err(format!("drawing {} is not supported", t.cmd)),
     };
     let result = draw(app, t, params)?;
@@ -487,6 +500,7 @@ pub(crate) fn constraint_preselection(command: &str, selection: &[solidcraft_eng
             "sketch.constraint.midpoint",
             [SketchPoint { id: point }, SketchCurve { id: line }] | [SketchCurve { id: line }, SketchPoint { id: point }],
         ) => Some(json!({"point":point,"line":line})),
+        ("sketch.constraint.midpoint", [SketchCurve { id: a }, SketchCurve { id: b }]) if a != b => Some(json!({"a":a,"b":b})),
         ("sketch.constraint.symmetry", [a, b, c]) => {
             let mut points = Vec::new();
             let mut lines = Vec::new();
@@ -560,7 +574,8 @@ fn run_pick(app: &mut SolveApp, t: &Tool) {
     let params = match t.cmd {
         "sketch.constraint.fix" => json!({"entity": k[0]}),
         "sketch.constraint.coincident" => json!({"a": k[0], "b": k[1]}),
-        "sketch.constraint.midpoint" => json!({"point": k[0], "line": k[1]}),
+        // In pick order: a point and a line either way round, or two lines to centre.
+        "sketch.constraint.midpoint" => json!({"a": k[0], "b": k[1]}),
         "sketch.constraint.symmetry" => json!({"a": k[0], "b": k[1], "line": k[2]}),
         _ => json!({"a": k[0], "b": k[1]}),
     };

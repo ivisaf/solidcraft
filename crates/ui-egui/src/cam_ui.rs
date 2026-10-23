@@ -3513,6 +3513,8 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
 struct Dock {
     /// The panel's top right corner.
     anchor: egui::Pos2,
+    /// The window's layout, which the kit's panel frame follows.
+    layout: crate::shell::LayoutMode,
     max_height: f32,
     /// The viewport, which a dragged panel stays inside.
     viewport: egui::Rect,
@@ -3566,7 +3568,8 @@ fn docked_panel(
 ) -> (bool, Option<egui::Rect>) {
     use crate::frame::Side;
     let t = Tokens::get();
-    let mut frame = crate::frame::dock_frame(ctx, Side::Right);
+    // The kit's feature frame, with a window's margin round what the panel holds.
+    let mut frame = crate::ui_kit::Panel::feature_frame(ctx, dock.layout, Side::Right).inner_margin(egui::Margin::same(6));
     // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
     let widest = (dock.viewport.width() - 40.0).max(PANEL_MIN_W);
     let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { DIALOG_WIDE_MAX_W.min(widest) };
@@ -3590,60 +3593,65 @@ fn docked_panel(
     let anchor = egui::pos2(x, y);
     let max_height = dock.max_height - (anchor.y - dock.anchor.y);
     let mut keep = true;
-    let response = crate::ui_kit::Panel::new(title, egui::Id::new(id), anchor, dock.viewport, Side::Right, frame).width(w).window().show(ctx, |ui| {
-        // Long texts (errors, notes) wrap instead of widening the panel.
-        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-        let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
-        ui.set_min_width(min_w);
-        ui.set_max_width(w - margin);
-        // What it was last frame, but never more than the panel's width now (once dragged narrower).
-        let total = content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
-        let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
-        drag_header(ui, id, band, offset, anchor - dock.anchor);
-        ui.horizontal(|ui| {
-            if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, tm(if *folded { "Expand" } else { "Collapse" }), true, false)
-                .clicked()
-            {
-                *folded = !*folded;
-            }
-            // Not selectable: a drag on the title moves the panel.
-            ui.add(egui::Label::new(RichText::new(tm(title)).strong().size(t.font_label)).selectable(false))
-                .on_hover_text(tm("Drag to move, double-click to dock again"));
-            let width = ui.spacing().interact_size.x;
-            right_aligned(ui, total, width, |ui| {
-                if crate::ui_kit::compact_button(ui, "×", tm("Close"), true, false).clicked() {
-                    keep = false;
+    let response =
+        crate::ui_kit::Panel::new(title, egui::Id::new(id), anchor, dock.viewport, Side::Right, frame).width(w).window(ctx).show(ctx, |ui| {
+            // Long texts (errors, notes) wrap instead of widening the panel.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
+            ui.set_min_width(min_w);
+            ui.set_max_width(w - margin);
+            // What it was last frame, but never more than the panel's width now (once dragged narrower).
+            let total = content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
+            let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
+            drag_header(ui, id, band, offset, anchor - dock.anchor);
+            ui.horizontal(|ui| {
+                if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, tm(if *folded { "Expand" } else { "Collapse" }), true, false)
+                    .clicked()
+                {
+                    *folded = !*folded;
                 }
+                // Not selectable: a drag on the title moves the panel.
+                ui.add(egui::Label::new(RichText::new(tm(title)).strong().size(t.font_label)).selectable(false))
+                    .on_hover_text(tm("Drag to move, double-click to dock again"));
+                let width = ui.spacing().interact_size.x;
+                right_aligned(ui, total, width, |ui| {
+                    if crate::ui_kit::compact_button(ui, "×", tm("Close"), true, false).clicked() {
+                        keep = false;
+                    }
+                });
             });
+            if *folded {
+                return;
+            }
+            ui.add_space(2.0);
+            let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
+            // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
+            egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
+            remember_width(ui, egui::Id::new((id, "w")));
         });
-        if *folded {
-            return;
-        }
-        ui.add_space(2.0);
-        let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
-        // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
-        egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
-        remember_width(ui, egui::Id::new((id, "w")));
-    });
     let rect = response.map(|r| r.response.rect);
     // A grip along the left edge: drag to make the panel wider or narrower, double-click for its usual width.
     look.resizing = false;
     if let Some(rect) = rect {
         let grip = egui::Rect::from_min_max(egui::pos2(rect.left() - 4.0, rect.top()), egui::pos2(rect.left() + 3.0, rect.bottom()));
-        egui::Area::new(egui::Id::new((id, "grip"))).order(egui::Order::Foreground).fixed_pos(grip.min).show(ctx, |ui| {
-            let (_, r) = ui.allocate_exact_size(grip.size(), egui::Sense::click_and_drag());
-            if r.hovered() || r.dragged() {
-                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-            }
-            if r.dragged() {
-                look.width = (rect.width() - r.drag_delta().x).clamp(PANEL_MIN_W, widest);
-                look.resizing = true;
-            }
-            if r.double_clicked() {
-                look.width = 0.0;
-            }
-            r.on_hover_text(tm("Drag to make the panel wider or narrower; double-click for its usual width"));
-        });
+        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Feature)
+            .area(egui::Id::new((id, "grip")))
+            .order(egui::Order::Foreground)
+            .fixed_pos(grip.min)
+            .show(ctx, |ui| {
+                let (_, r) = ui.allocate_exact_size(grip.size(), egui::Sense::click_and_drag());
+                if r.hovered() || r.dragged() {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+                if r.dragged() {
+                    look.width = (rect.width() - r.drag_delta().x).clamp(PANEL_MIN_W, widest);
+                    look.resizing = true;
+                }
+                if r.double_clicked() {
+                    look.width = 0.0;
+                }
+                r.on_hover_text(tm("Drag to make the panel wider or narrower; double-click for its usual width"));
+            });
     }
     (keep, rect)
 }
@@ -3820,7 +3828,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
                 .on_disabled_hover_text(tm(why.get(k).copied().unwrap_or_default()));
             if k == 1 {
                 // The operations to choose from, under the step.
-                egui::Popup::menu(&r).show(|ui| {
+                crate::ui_kit::Container::new(ui.ctx(), crate::ui_kit::Surface::Feature).menu(&r).show(|ui| {
                     for cmd in OPERATIONS {
                         // The toolbar's own name for it.
                         if button(ui, crate::i18n::tr(&format!("cmd.{}", cmd.replace('.', "_"))), Button::Normal).clicked() {
@@ -4160,16 +4168,25 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     (app.manufacture.look.width, app.manufacture.tools_look.width) = (prefs.cam_panel_width, prefs.cam_tools_width);
     (app.manufacture.look.fade, app.manufacture.tools_look.fade) = (prefs.cam_panel_fade, prefs.cam_panel_fade);
     app.manufacture.rapid_rate = f64::from(prefs.cam_rapid_rate);
+    let layout = app.ui.layout;
     let mut cam = std::mem::take(&mut app.manufacture);
     if cam.open {
-        manufacture_window(ctx, &mut cam, &listed, &lists, &selected, Dock { anchor: egui::pos2(right, top), max_height, viewport: vp }, &mut asked);
+        manufacture_window(
+            ctx,
+            &mut cam,
+            &listed,
+            &lists,
+            &selected,
+            Dock { anchor: egui::pos2(right, top), layout, max_height, viewport: vp },
+            &mut asked,
+        );
     }
     if cam.tools_open {
         // Beside where the Manufacture panel docks, wherever it was dragged to.
         // The kit's panels keep `space_8` off the viewport's right edge.
         let docked = right.min(vp.right() - Tokens::get().space_8);
         let beside = if cam.open { docked - cam.panel.map_or(DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
-        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), max_height, viewport: vp }, &mut asked);
+        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), layout, max_height, viewport: vp }, &mut asked);
     }
     (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =
         (cam.sim_detail, cam.path_width, cam.path_colour);

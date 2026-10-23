@@ -109,8 +109,8 @@ file dialogs are never limited.
 ### Tool annotations
 
 Each tool says what it may do, for clients that ask before running tools (or auto-approve on
-these hints). `list_commands`, `describe_command`, `inspect_design`, `measure`, `body_topology`
-and `crash_reports` are read-only. `set_parameter`, `undo` and `redo` change the design undoably.
+these hints). `list_commands`, `describe_command`, `inspect_design`, `measure`, `body_topology`,
+`skill_reference` and `crash_reports` are read-only. `set_parameter`, `undo` and `redo` change the design undoably.
 `new_design` replaces it (destructive). `execute`, `batch`, `open`, `save`, `export` and
 `screenshot` (whose `path` writes a file) can read, write, overwrite or delete files: they are
 not read-only, `destructiveHint` and `openWorldHint` are true.
@@ -148,6 +148,8 @@ Claude Desktop (`claude_desktop_config.json`), bridged to a running app:
 
 They cover the workflow, the command shapes, how to verify with `measure`, and the known traps. With them an agent builds a part in a few `batch` calls and reads far less output. To install them for Claude Code, copy the folders into `~/.claude/skills/`; [skills/README.md](https://github.com/bherbruck/solidcraft/blob/main/skills/README.md) has the details.
 
+The `skill_reference` tool returns these documents from the copies built into SolidCraft, so an agent without file access can follow them: `{"skill": "solidcraft-modeling"}` returns its `reference.md`, the default file. Mechanisms also has `reference.md`, checking has `reference/porting.md`, and every skill has `SKILL.md` (editing uses modeling's reference). It never reads a path from disk, and an unknown skill or file is refused with the available choices. SolidCraft's own chat turns the agent's file tools off, so this is how its agent reads the skills there.
+
 ## Tools
 
 | Tool | Arguments | What it does |
@@ -164,6 +166,7 @@ They cover the workflow, the command shapes, how to verify with `measure`, and t
 | `export` | `path`, `format?` (step, 3mf, 3mf-tagged, stl, stla, obj, urdf), `bodies?`, `mesh_prefix?`, `effort?`, `velocity?` | STEP, 3MF or mesh export; URDF writes the whole assembly with its meshes next to it (`docs/urdf.md`). |
 | `undo`, `redo` | — | Undo / redo one change. |
 | `crash_reports` | `id?`, `limit?` | The crash reports on this computer, newest first; with `id`, the whole report (backtrace, command, recent commands, `design_path`/`replay_path`). See [crash-reports.md](crash-reports.md). |
+| `skill_reference` | `skill`, `file?` (default `reference.md`) | Read a bundled skill document. Skills: `solidcraft-modeling`, `solidcraft-mechanisms`, `solidcraft-editing`, `solidcraft-checking`. |
 | `running` | - | What the app is running or has queued, for every client (`control.running`, see [control-protocol.md](control-protocol.md#limits)): each request's connection and id, method, command id or a batch's step count, `running_s` and `queued`, never its parameters. Answers at once while the app is busy: ask it when a call timed out before sending a change again. Headless: always `{"running": []}`. |
 | `new_design` | `name?` | Start an empty design. |
 | `open` | `path` | Open a `.solidcraft` design, a STEP file (`.step`/`.stp`) as a new design holding its bodies (an Import base feature), or a 3MF/STL file as mesh bodies. |

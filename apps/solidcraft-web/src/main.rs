@@ -17,13 +17,21 @@ mod install;
 #[cfg(any(target_arch = "wasm32", test))]
 mod space_mouse;
 
+/// The browser switches tabs with Ctrl+Tab and Ctrl+Shift+Tab, so the page leaves those keys to
+/// it (#5227); plain Tab and Shift+Tab still move between the app's fields. (Ctrl+PageUp and
+/// Ctrl+PageDown already reach the browser.)
+#[cfg(any(target_arch = "wasm32", test))]
+fn browser_switches_tabs(key: &str, ctrl: bool) -> bool {
+    ctrl && key == "Tab"
+}
+
 #[cfg(target_arch = "wasm32")]
 mod web {
     use std::rc::Rc;
 
     use solidcraft_engine::Session;
     use solidcraft_engine::io::vfs;
-    use solidcraft_ui_egui::{Services, SolveApp};
+    use solidcraft_ui_egui::{Services, SolveApp, ui_kit};
     use wasm_bindgen::JsCast as _;
 
     use crate::api::Api;
@@ -84,6 +92,20 @@ mod web {
         on_unload.forget();
     }
 
+    /// eframe cancels the browser's action for every Tab it gets, so the browser couldn't switch
+    /// tabs while the app has the keyboard. Its tab-switching keys stop here, on the way down to
+    /// the canvas, before eframe sees them; the browser then acts on them as usual.
+    fn leave_tab_switching_to_browser(window: &web_sys::Window) {
+        let on_key = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(|e: web_sys::KeyboardEvent| {
+            if crate::browser_switches_tabs(&e.key(), e.ctrl_key()) {
+                e.stop_propagation();
+            }
+        });
+        let _ = window.add_event_listener_with_callback_and_bool("keydown", on_key.as_ref().unchecked_ref(), true);
+        // The listener lives as long as the page.
+        on_key.forget();
+    }
+
     const JAPANESE_FONT_PATH: &str = "./fonts/BIZUDPGothic-Regular.ttf";
 
     type FontLoadResult = Rc<std::cell::RefCell<Option<Result<Vec<u8>, String>>>>;
@@ -109,6 +131,7 @@ mod web {
         /// The language the fonts were last set up for (a CJK UI leads with the CJK face).
         font_language: String,
         space_mouse: SpaceMouse,
+        wheel_gestures: solidcraft_ui_egui::WebWheelGestures,
     }
 
     impl Shell {
@@ -229,24 +252,21 @@ mod web {
             if !self.files.panel.get() {
                 return;
             }
-            let mut open = true;
             let mut act: Option<(&'static str, String)> = None;
-            egui::Window::new("Files in this browser")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(true)
-                .default_width(520.0)
-                .pivot(egui::Align2::CENTER_CENTER)
-                .default_pos(ctx.content_rect().center())
-                .show(ctx, |ui| {
+            let closed = solidcraft_ui_egui::ui_kit::Window::new(egui::Id::new("sc_browser_files"), "folder", "Files in this browser")
+                .cards(3.0)
+                .show_body(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if ui.button("Open from computer…").clicked() {
+                        if ui_kit::button(ui, "Open from computer…", ui_kit::Button::Normal).clicked() {
                             files::pick_from_disk(&self.files, Intent::Open);
                         }
-                        if ui.button("Insert from computer…").on_hover_text("STEP, 3MF or STL into the open design").clicked() {
+                        if ui_kit::button(ui, "Insert from computer…", ui_kit::Button::Normal)
+                            .on_hover_text("STEP, 3MF or STL into the open design")
+                            .clicked()
+                        {
                             files::pick_from_disk(&self.files, Intent::Insert);
                         }
-                        if ui.button("Download open design").clicked() {
+                        if ui_kit::button(ui, "Download open design", ui_kit::Button::Normal).clicked() {
                             act = Some(("download_open", String::new()));
                         }
                     });
@@ -270,7 +290,7 @@ mod web {
                             for e in &entries {
                                 match &mut self.renaming {
                                     Some((from, to)) if *from == e.name => {
-                                        let r = ui.add(egui::TextEdit::singleline(to).desired_width(200.0));
+                                        let r = ui_kit::cell_editor(ui, ui.make_persistent_id(("stored_file_name", from.as_str())), to, "", false);
                                         if std::mem::take(&mut self.rename_focus) {
                                             r.request_focus();
                                         }
@@ -288,28 +308,31 @@ mod web {
                                 }
                                 ui.label(format!("{:.1} KB", e.size as f64 / 1024.0));
                                 ui.horizontal(|ui| {
-                                    if ui.small_button("Open").clicked() {
+                                    if ui_kit::button(ui, "Open", ui_kit::Button::Small).clicked() {
                                         act = Some(("open", e.name.clone()));
                                     }
                                     let design = solidcraft_engine::io::is_design_path(&e.name);
-                                    if !design && ui.small_button("Insert").on_hover_text("Into the open design (STEP, 3MF, STL)").clicked() {
+                                    if !design
+                                        && ui_kit::button(ui, "Insert", ui_kit::Button::Small)
+                                            .on_hover_text("Into the open design (STEP, 3MF, STL)")
+                                            .clicked()
+                                    {
                                         act = Some(("insert", e.name.clone()));
                                     }
-                                    if ui.small_button("Rename").clicked() {
+                                    if ui_kit::button(ui, "Rename", ui_kit::Button::Small).clicked() {
                                         self.renaming = Some((e.name.clone(), e.name.clone()));
                                         self.rename_focus = true;
                                     }
-                                    if ui
-                                        .small_button("Save to computer…")
+                                    if ui_kit::button(ui, "Save to computer…", ui_kit::Button::Small)
                                         .on_hover_text("A copy in a file you choose; the stored design stays here")
                                         .clicked()
                                     {
                                         act = Some(("save_copy", e.name.clone()));
                                     }
-                                    if ui.small_button("Download").clicked() {
+                                    if ui_kit::button(ui, "Download", ui_kit::Button::Small).clicked() {
                                         act = Some(("download", e.name.clone()));
                                     }
-                                    if ui.small_button("Delete").clicked() {
+                                    if ui_kit::button(ui, "Delete", ui_kit::Button::Small).clicked() {
                                         act = Some(("delete", e.name.clone()));
                                     }
                                 });
@@ -318,7 +341,7 @@ mod web {
                         });
                     });
                 });
-            if !open {
+            if closed {
                 self.files.panel.set(false);
                 self.renaming = None;
             }
@@ -386,20 +409,19 @@ mod web {
         fn recovery_prompt(&mut self, ctx: &egui::Context) {
             let Some((name, path)) = self.files.recovery.borrow().clone() else { return };
             let mut answer = None;
-            egui::Window::new("Recover unsaved work?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(
-                ctx,
-                |ui| {
+            let _ = solidcraft_ui_egui::ui_kit::Window::new(egui::Id::new("sc_browser_recovery"), "restore", "Recover unsaved work?")
+                .required()
+                .show_body(ctx, |ui| {
                     ui.label(format!("“{name}” had unsaved changes when this page last closed."));
                     ui.horizontal(|ui| {
-                        if ui.button("Recover").clicked() {
+                        if ui_kit::button(ui, "Recover", ui_kit::Button::Normal).clicked() {
                             answer = Some(true);
                         }
-                        if ui.button("Discard").clicked() {
+                        if ui_kit::button(ui, "Discard", ui_kit::Button::Normal).clicked() {
                             answer = Some(false);
                         }
                     });
-                },
-            );
+                });
             let Some(recover) = answer else { return };
             *self.files.recovery.borrow_mut() = None;
             if recover {
@@ -488,6 +510,10 @@ mod web {
             UNSAVED.with(|u| u.set(solidcraft_ui_egui::documents::any_dirty(&self.app)));
         }
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+            let now = raw.time.unwrap_or_else(|| ctx.input(|i| i.time));
+            if let Some(delay) = self.wheel_gestures.update(raw, now) {
+                ctx.request_repaint_after(delay);
+            }
             files::take_drops(&self.files, raw);
             // Before the app's own hook, which adds the control channel's events.
             self.space_mouse.raw_input_hook(ctx, self.app.preferences.space_mouse_enabled, raw);
@@ -554,6 +580,7 @@ mod web {
         wasm_bindgen_futures::spawn_local(async {
             let Some(window) = web_sys::window() else { return };
             ask_before_unload(&window);
+            leave_tab_switching_to_browser(&window);
             let Some(document) = window.document() else { return };
             let Some(canvas) = document.get_element_by_id(CANVAS_ID).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok()) else {
                 log::error!("missing <canvas id=\"{CANVAS_ID}\">");
@@ -651,6 +678,7 @@ mod web {
                             cjk_bytes: None,
                             font_language,
                             space_mouse: SpaceMouse::default(),
+                            wheel_gestures: solidcraft_ui_egui::WebWheelGestures::default(),
                         }))
                     }),
                 )
@@ -675,4 +703,18 @@ fn main() {
 #[cfg(not(target_arch = "wasm32"))]
 fn main() {
     eprintln!("solidcraft-web only runs in the browser: build it with `trunk build --release` in apps/solidcraft-web");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_ctrl_tab_is_left_to_the_browser() {
+        // Ctrl+Tab and Ctrl+Shift+Tab (the event's key is "Tab" either way) switch browser tabs.
+        assert!(browser_switches_tabs("Tab", true));
+        // Tab and Shift+Tab move between the app's fields; Ctrl with other keys stays the app's.
+        assert!(!browser_switches_tabs("Tab", false));
+        assert!(!browser_switches_tabs("s", true));
+    }
 }

@@ -103,6 +103,19 @@ fn read_step(path: &str, names: solidcraft_io::StepNames) -> Result<solidcraft_i
     solidcraft_io::step_import_feature_named(&bytes, path, names).map_err(|e| EngineError::Other(format!("{path}: {e}")))
 }
 
+/// Which way is up in a STEP or IGES file, from the program its header names: `("y", name)` for
+/// an exporter whose files have Y up, `("z", name)` for SolidCraft's own (its STEP and IGES exports both name it), else `None`. Only
+/// SolidWorks is listed as Y up: its STEP and IGES writers are well known to keep that program's
+/// Y-up front view, and its name is in FILE_NAME (originating system, preprocessor version) and
+/// often FILE_DESCRIPTION. Programs we aren't sure of stay unknown, so the file is only offered.
+fn exporter_up(import: &solidcraft_kernel::StepImport) -> Option<(&'static str, &'static str)> {
+    if import.system.trim().starts_with("SolidCraft") {
+        return Some(("z", "SolidCraft"));
+    }
+    let named = [&import.system, &import.preprocessor, &import.description].iter().any(|h| h.to_ascii_lowercase().contains("solidworks"));
+    named.then_some(("y", "SolidWorks"))
+}
+
 /// A quarter turn about X through the origin: a file's Y up becomes Z up.
 fn quarter_turn_x() -> solidcraft_doc::Mat {
     solidcraft_doc::rigid(solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::ZERO, solidcraft_geom::Vec3::X, std::f64::consts::FRAC_PI_2)
@@ -120,7 +133,11 @@ fn add_step(s: &mut Session, path: &str, name: Option<&str>, options: &StepOptio
     let turned = if options.y_up { turn_up(s, &placed)? } else { None };
     let created = created_bodies(s, id);
     let fname = s.doc.feature(id).map(|f| f.name.clone()).unwrap_or_default();
-    let mut out = json!({"path": path, "feature": id, "name": fname, "bodies": created, "created_bodies": created, "warnings": sf.warnings});
+    let mut out = json!({"path": path, "feature": id, "name": fname, "bodies": created, "created_bodies": created, "warnings": sf.warnings, "system": sf.import.system});
+    if let Some((up, exporter)) = exporter_up(&sf.import) {
+        out["exporter"] = json!(exporter);
+        out["exporter_up"] = json!(up);
+    }
     placed.report(&mut out);
     if let Some(turned) = turned {
         out["stand_up"] = json!(turned);
@@ -261,7 +278,7 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
         s.replace_design(fresh);
         let errors = s.model.results.iter().filter(|r| r.error.is_some()).count();
         let mut out = json!({"path": path, "features": s.doc.features.len(), "errors": errors, "bodies": r["bodies"], "warnings": r["warnings"]});
-        for k in ["component", "component_name", "occurrence", "subcomponents", "rigid_joints", "stand_up"] {
+        for k in ["component", "component_name", "occurrence", "subcomponents", "rigid_joints", "stand_up", "system", "exporter", "exporter_up"] {
             if let Some(v) = r.get(k) {
                 out[k] = v.clone();
             }
@@ -752,9 +769,7 @@ mod tests {
         let mut preview = saved_preview(&s).unwrap();
         // A checksum-valid but forged cached shape must not become editable geometry.
         for mesh in &mut preview.meshes {
-            for coordinate in &mut mesh.positions {
-                *coordinate *= 10.0;
-            }
+            mesh.positions = mesh.positions.iter().map(|c| c * 10.0).collect();
         }
         let bytes = solidcraft_io::write_design_container_with_preview(&s.doc, solidcraft_io::DesignCompression::Fast, Some(&preview)).unwrap();
         let path = std::env::temp_dir().join(format!("solidcraft-preview-{}.solidcraft", std::process::id()));
@@ -1079,5 +1094,34 @@ mod tests {
         assert!(stopped.model.results.iter().all(|r| r.skipped), "no feature was rebuilt after Cancel");
         assert!(stopped.world_state().bodies.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Every option the format registry offers is a parameter its owning command documents,
+    /// so the registry and the commands can't drift apart.
+    #[test]
+    fn registry_options_name_documented_command_parameters() {
+        use solidcraft_io::formats;
+        let params_of = |id: &str| crate::find_command(id).map(|c| c.params).unwrap_or_else(|| panic!("registry names unknown command {id}"));
+        for f in formats::FORMATS {
+            if let Some(import) = &f.import {
+                for o in import.options {
+                    for id in ["doc.open", if import.target == formats::ImportTarget::Mesh { "file.insert_mesh" } else { "file.insert_step" }] {
+                        assert!(params_of(id).contains(o.param), "{}: `{}` is not a documented parameter of {id}", f.id, o.param);
+                    }
+                }
+            }
+            if let Some(export) = &f.export {
+                let params = params_of(export.command);
+                if let Some(format) = export.format {
+                    assert!(params.contains(format), "{}: `{format}` is not a documented format of {}", f.id, export.command);
+                }
+                for o in export.options {
+                    assert!(params.contains(o.param), "{}: `{}` is not a documented parameter of {}", f.id, o.param, export.command);
+                }
+            }
+        }
+        for o in formats::DESIGN_SAVE_OPTIONS {
+            assert!(params_of("file.save_as").contains(o.param), "`{}` is not a documented parameter of file.save_as", o.param);
+        }
     }
 }

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
-use solidcraft_engine::command_specs;
+use solidcraft_engine::{CommandSpec, command_specs};
 
 use crate::SolveApp;
 use crate::ui_kit;
@@ -101,14 +101,47 @@ pub fn effective(app: &SolveApp, id: &str) -> Option<String> {
     }
 }
 
+/// Use the spec already available when walking the command list.
+fn effective_for_spec<'a>(app: &'a SolveApp, command: &CommandSpec) -> Option<&'a str> {
+    app.keymap.custom.get(command.id).map(String::as_str).or(command.shortcut).filter(|key| !key.is_empty())
+}
+
 /// Commands bound to `key` now.
 pub fn commands_for(app: &SolveApp, key: &str) -> Vec<&'static str> {
     command_specs().into_iter().filter(|c| effective(app, c.id).as_deref() == Some(key)).map(|c| c.id).collect()
 }
 
-/// The enabled command a key press runs, if any.
+/// Where a command's shortcut works: in a sketch (the SKETCH tab's tools), in the model (the
+/// other tabs), or everywhere (commands on no tab: undo, views, files).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    Sketch,
+    Model,
+    Everywhere,
+}
+
+fn scope(id: &str) -> Scope {
+    match solidcraft_engine::find_command(id).map(|c| c.tab) {
+        Some("SKETCH") => Scope::Sketch,
+        Some("") | None => Scope::Everywhere,
+        Some(_) => Scope::Model,
+    }
+}
+
+/// Whether two commands can't share a key: a sketch tool and a model command can (#4163), each
+/// running where it belongs; anything else can't.
+fn clash(a: &str, b: &str) -> bool {
+    let (x, y) = (scope(a), scope(b));
+    x == y || x == Scope::Everywhere || y == Scope::Everywhere
+}
+
+/// The enabled command a key press runs, if any: one of the mode the view is in (a sketch tool
+/// while a sketch is open, a model command otherwise) before any other.
 pub fn command_for(app: &SolveApp, key: &str) -> Option<&'static str> {
-    commands_for(app, key).into_iter().find(|id| solidcraft_engine::find_command(id).is_some_and(|c| c.info(&app.session).enabled))
+    let here = if app.session.active_sketch.is_some() { Scope::Sketch } else { Scope::Model };
+    let enabled: Vec<&'static str> =
+        commands_for(app, key).into_iter().filter(|id| solidcraft_engine::find_command(id).is_some_and(|c| c.info(&app.session).enabled)).collect();
+    enabled.iter().find(|id| scope(id) == here).or(enabled.first()).copied()
 }
 
 /// Run a shortcut key: its enabled command; outside a sketch, a sketch tool's key opens Create
@@ -137,14 +170,15 @@ fn sketch_tool_for(app: &SolveApp, key: &str) -> Option<&'static str> {
 }
 
 /// Bind `key` to a command (`""` clears it). Refused for reserved keys, and when other commands
-/// use the key unless `replace` (they lose it).
+/// use the key unless `replace` (they lose it). A sketch tool and a model command may share a
+/// key: each runs in its own mode.
 pub fn bind(app: &mut SolveApp, id: &str, key: &str, replace: bool) -> Result<(), String> {
     let spec = solidcraft_engine::find_command(id).ok_or_else(|| format!("no command `{id}`"))?;
     if RESERVED.contains(&key) {
         return Err(format!("{key} is used by SolidCraft itself"));
     }
     if !key.is_empty() {
-        let others: Vec<&'static str> = commands_for(app, key).into_iter().filter(|o| *o != id).collect();
+        let others: Vec<&'static str> = commands_for(app, key).into_iter().filter(|o| *o != id && clash(o, id)).collect();
         if !others.is_empty() && !replace {
             let names: Vec<&str> = others.iter().filter_map(|o| solidcraft_engine::find_command(o).map(|c| c.label)).collect();
             return Err(format!("{key} is already used by {}", names.join(", ")));
@@ -197,23 +231,34 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
     }
     let mut action: Option<(String, &str)> = None;
     ui_kit::scope(ui, |ui| {
-        let filter =
-            ui_kit::search_field(ui, egui::Id::new("sc_keymap_filter"), &mut app.keymap.filter, crate::i18n::tr_label("Filter commands or keys"));
+        let actions = [
+            ui_kit::SearchAction { label: app.tr_label("Reset All"), icon: None, visible: !app.keymap.read_only, tooltip: None },
+            ui_kit::SearchAction { label: app.tr_label("Import…"), icon: Some("import_tray"), visible: !app.keymap.read_only, tooltip: None },
+            ui_kit::SearchAction {
+                label: app.tr_label("Export…"),
+                icon: Some("export_tray"),
+                visible: true,
+                tooltip: Some(app.tr_label("Keys, S box favourites and the toolbar, as a file")),
+            },
+        ];
+        let (filter, toolbar_action) = ui_kit::search_actions_row(
+            ui,
+            egui::Id::new("sc_keymap_filter"),
+            &mut app.keymap.filter,
+            crate::i18n::tr_label("Filter commands or keys"),
+            &actions,
+        );
         crate::scenario::publish_target("keymap:filter", filter.rect);
-        ui.horizontal_wrapped(|ui| {
-            if !app.keymap.read_only && ui_kit::button(ui, app.tr_label("Reset All"), ui_kit::Button::Normal).clicked() {
-                action = Some((String::new(), "reset_all"));
-            }
-            if ui_kit::button(ui, app.tr_label("Export…"), ui_kit::Button::Normal)
-                .on_hover_text(app.tr_label("Keys, S box favourites and the toolbar, as a file"))
-                .clicked()
-            {
-                action = Some((String::new(), "export"));
-            }
-            if !app.keymap.read_only && ui_kit::button(ui, app.tr_label("Import…"), ui_kit::Button::Normal).clicked() {
-                action = Some((String::new(), "import"));
-            }
-        });
+        if let Some(index) = toolbar_action {
+            action = Some((
+                String::new(),
+                match index {
+                    0 => "reset_all",
+                    1 => "import",
+                    _ => "export",
+                },
+            ));
+        }
         if let Some(m) = &app.keymap.message {
             ui_kit::text(ui, m, ui_kit::Text::Report("keymap_message", true));
         }
@@ -231,72 +276,86 @@ pub fn page(app: &mut SolveApp, ui: &mut egui::Ui) {
         }
         ui_kit::text(ui, app.tr_label("Select Other: hold the left button still on the model (or right-click › Select Other…) to list everything under the cursor; click again on the same spot to select the next thing there. Double-click the middle button to go Home (Preferences › Navigation)."), ui_kit::Text::Note("navigation"));
         let q = app.keymap.filter.to_lowercase();
-        egui::ScrollArea::vertical()
-            .id_salt("sc_keymap_scroll")
-            .max_height(crate::theme::Tokens::get().control_height * 14.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                let columns = [
-                    ui_kit::Column::new("Command", 1.5),
-                    ui_kit::Column::new(crate::i18n::tr("keymap.command_id"), 1.8),
-                    ui_kit::Column::new("Keyboard Shortcuts", 1.0),
-                    ui_kit::Column::new("", 1.2),
-                ];
-                ui_kit::table(ui, "keymap", &columns, crate::i18n::tr("keymap.empty"), |ui, table| {
-                    for c in command_specs() {
-                        let key = effective(app, c.id).unwrap_or_default();
-                        let translated_label = app.tr_label(c.label);
-                        if !q.is_empty() && ![c.label, c.id, key.as_str(), translated_label].iter().any(|s| s.to_lowercase().contains(&q)) {
-                            continue;
-                        }
-                        table.row(ui, c.id, app.keymap.capturing.as_deref() == Some(c.id), |row| {
-                            row.cell(|ui| {
-                                ui_kit::text(ui, translated_label, ui_kit::Text::Cell);
-                            });
-                            row.cell(|ui| {
-                                ui_kit::text(ui, c.id, ui_kit::Text::Cell);
-                            });
-                            let capturing = app.keymap.capturing.as_deref() == Some(c.id);
-                            let changed = app.keymap.custom.contains_key(c.id);
-                            let text = if capturing {
-                                app.tr_label("press a key…").to_string()
-                            } else if key.is_empty() {
-                                "—".to_string()
-                            } else {
-                                key.clone()
-                            };
-                            row.cell(|ui| {
-                                if app.keymap.read_only {
-                                    ui_kit::text(ui, &text, ui_kit::Text::Cell);
-                                } else {
-                                    let capture = ui_kit::button(ui, &text, ui_kit::Button::Normal)
-                                        .on_hover_text(app.tr_label("Click, then press the new key"));
-                                    crate::scenario::publish_target(&format!("keymap:capture:{}", c.id), capture.rect);
-                                    if capture.clicked() {
-                                        action = Some((c.id.to_string(), "capture"));
-                                    }
-                                }
-                            });
-                            row.cell(|ui| {
-                                if !app.keymap.read_only {
-                                    ui.horizontal(|ui| {
-                                        let clear = ui_kit::button(ui, app.tr_label("Clear"), ui_kit::Button::Enabled(!key.is_empty()));
-                                        crate::scenario::publish_target(&format!("keymap:clear:{}", c.id), clear.rect);
-                                        if clear.clicked() {
-                                            action = Some((c.id.to_string(), "clear"));
-                                        }
-                                        let reset = ui_kit::button(ui, app.tr_label("Reset"), ui_kit::Button::Enabled(changed));
-                                        crate::scenario::publish_target(&format!("keymap:reset:{}", c.id), reset.rect);
-                                        if reset.clicked() {
-                                            action = Some((c.id.to_string(), "reset"));
-                                        }
-                                    });
-                                }
-                            });
+        let commands: Vec<_> = command_specs()
+            .into_iter()
+            .filter_map(|c| {
+                let key = effective_for_spec(app, c).unwrap_or_default();
+                let label = app.tr_label(c.label);
+                (q.is_empty() || [c.label, c.id, key, label].iter().any(|s| s.to_lowercase().contains(&q))).then_some((c, key, label))
+            })
+            .collect();
+        let t = crate::theme::Tokens::get();
+        let key_width = commands
+            .iter()
+            .map(|(_, key, _)| ui_kit::ContentWidth::button(ui, key))
+            .fold(ui_kit::ContentWidth::button(ui, app.tr_label("press a key…")), f32::max)
+            .max(ui_kit::ContentWidth::label(ui, app.tr_label("Keyboard Shortcuts")) + t.space_8);
+        let action_width = if app.keymap.read_only {
+            t.control_height
+        } else {
+            ui_kit::ContentWidth::button(ui, app.tr_label("Clear")) + ui_kit::ContentWidth::button(ui, app.tr_label("Reset")) + t.space_4
+        };
+        ui_kit::settings_scroll(ui, "sc_keymap_scroll", |ui| {
+            let columns = [
+                ui_kit::Column::new("Command", 1.5).flex().min_content_width(t.form_label_width),
+                ui_kit::Column::new(crate::i18n::tr("keymap.command_id"), 1.8).flex().min_content_width(t.form_label_width),
+                ui_kit::Column::new("Keyboard Shortcuts", 1.0).flex().min_content_width(key_width),
+                ui_kit::Column::new("", 0.0).icon_only().min_content_width(action_width),
+            ];
+            ui_kit::table(ui, "keymap", &columns, crate::i18n::tr("keymap.empty"), |ui, table| {
+                for (c, key, translated_label) in commands {
+                    table.row_visible(ui, c.id, app.keymap.capturing.as_deref() == Some(c.id), false, |row| {
+                        row.cell(|ui| {
+                            ui_kit::text(ui, translated_label, ui_kit::Text::Cell);
                         });
-                    }
-                });
+                        row.cell(|ui| {
+                            ui_kit::text(ui, c.id, ui_kit::Text::Cell);
+                        });
+                        let capturing = app.keymap.capturing.as_deref() == Some(c.id);
+                        let changed = app.keymap.custom.contains_key(c.id);
+                        let text = if capturing {
+                            app.tr_label("press a key…").to_string()
+                        } else if key.is_empty() {
+                            "—".to_string()
+                        } else {
+                            key.to_string()
+                        };
+                        row.cell(|ui| {
+                            if app.keymap.read_only {
+                                ui_kit::text(ui, &text, ui_kit::Text::Cell);
+                            } else {
+                                let capture = if key.is_empty() && !capturing {
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(t.control_height, t.control_height), egui::Sense::hover());
+                                    ui_kit::quiet_icon_button_at(ui, rect, "plus", app.tr_label("Click, then press the new key"))
+                                } else {
+                                    ui_kit::button(ui, &text, ui_kit::Button::Normal).on_hover_text(app.tr_label("Click, then press the new key"))
+                                };
+                                crate::scenario::publish_target(&format!("keymap:capture:{}", c.id), capture.rect);
+                                if capture.clicked() {
+                                    action = Some((c.id.to_string(), "capture"));
+                                }
+                            }
+                        });
+                        row.cell(|ui| {
+                            if !app.keymap.read_only {
+                                ui.horizontal(|ui| {
+                                    let clear = ui_kit::button(ui, app.tr_label("Clear"), ui_kit::Button::Enabled(!key.is_empty()));
+                                    crate::scenario::publish_target(&format!("keymap:clear:{}", c.id), clear.rect);
+                                    if clear.clicked() {
+                                        action = Some((c.id.to_string(), "clear"));
+                                    }
+                                    let reset = ui_kit::button(ui, app.tr_label("Reset"), ui_kit::Button::Enabled(changed));
+                                    crate::scenario::publish_target(&format!("keymap:reset:{}", c.id), reset.rect);
+                                    if reset.clicked() {
+                                        action = Some((c.id.to_string(), "reset"));
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
             });
+        });
     });
     match action {
         Some((id, "capture")) => {
@@ -361,6 +420,26 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_page_only_builds_visible_rows_and_reveals_filtered_rows() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.call("ui.resize", json!({"width": 1200, "height": 600}));
+        h.call("ui.prefs", json!({"open": "Keyboard Shortcuts"}));
+        h.frames(3);
+        let commands = command_specs();
+        let first = commands.first().unwrap().id;
+        let last = commands.last().unwrap().id;
+        let handle = |id| format!("keymap:capture:{id}");
+        assert!(crate::scenario::handle_at(&handle(first)).is_some());
+        assert!(crate::scenario::handle_at(&handle(last)).is_none(), "off-screen cells should not be built");
+
+        h.app.keymap.filter = last.to_string();
+        h.frames(3);
+        assert!(crate::scenario::handle_at(&handle(last)).is_some(), "filtering brings the last command into view");
+        assert!(crate::scenario::handle_at(&handle(first)).is_none());
+    }
+
+    #[test]
     fn rebinding_detects_conflicts_and_resets() {
         let mut a = app();
         assert_eq!(effective(&a, "solid.extrude").as_deref(), Some("E"));
@@ -382,6 +461,42 @@ mod tests {
         reset(&mut b, None);
         assert_eq!(effective(&b, "solid.move").as_deref(), Some("M"));
         assert_eq!(key_name(egui::Key::K, egui::Modifiers { ctrl: true, shift: true, ..Default::default() }), "Ctrl+Shift+K");
+    }
+
+    /// #4163: one key for a model command and a sketch tool. Binding it to both is allowed (a
+    /// second model command still clashes); outside a sketch it runs the model command, in a
+    /// sketch the tool.
+    #[test]
+    fn a_sketch_tool_and_a_model_command_share_a_key() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        bind(&mut h.app, "sketch.create", "Shift+S", false).unwrap();
+        bind(&mut h.app, "sketch.point", "Shift+S", false).unwrap();
+        assert_eq!(effective(&h.app, "sketch.create").as_deref(), Some("Shift+S"), "the model command keeps it");
+        let e = bind(&mut h.app, "solid.revolve", "Shift+S", false).unwrap_err();
+        assert!(e.contains("already used by"), "{e}");
+        assert!(bind(&mut h.app, "sketch.line", "Shift+S", false).is_err(), "two sketch tools still clash");
+        assert_eq!(command_for(&h.app, "Shift+S"), Some("sketch.create"));
+        h.app.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        h.frames(2);
+        assert_eq!(command_for(&h.app, "Shift+S"), Some("sketch.point"), "in a sketch the tool runs");
+        h.step(&json!({"key": "S", "shift": true})).unwrap();
+        h.frames(1);
+        assert_eq!(h.app.tool.as_ref().map(|t| t.cmd.to_string()).as_deref(), Some("sketch.point"));
+        assert!(h.app.dialog.is_none(), "no second Create Sketch");
+    }
+
+    /// A command on no tab (undo, views) can't share its key with anything.
+    #[test]
+    fn commands_used_everywhere_share_no_key() {
+        let mut a = app();
+        let everywhere = command_specs().into_iter().find(|c| c.tab.is_empty()).unwrap();
+        bind(&mut a, everywhere.id, "Shift+Q", false).unwrap();
+        assert!(bind(&mut a, "sketch.point", "Shift+Q", false).is_err(), "{}", everywhere.id);
+        assert!(bind(&mut a, "solid.revolve", "Shift+Q", false).is_err(), "{}", everywhere.id);
+        // And the other way round.
+        bind(&mut a, "sketch.point", "Shift+W", false).unwrap();
+        assert!(bind(&mut a, everywhere.id, "Shift+W", false).is_err(), "{}", everywhere.id);
     }
 
     /// #3045: Shift+R starts the last tool again (here a sketch's Line after Escape put it

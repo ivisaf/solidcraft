@@ -155,6 +155,45 @@ fn edit_joint_keeps_an_offset_typed_as_an_expression() {
     assert_eq!((j.exprs.offset.as_deref(), j.exprs.angle.as_deref()), (Some("gap"), None));
 }
 
+#[test]
+fn as_built_animation_drives_the_new_shared_id_and_handles_exhaustion() {
+    let mut app = two_boxes();
+    app.session.doc_mut().next_id = 500;
+    app.session.selection = vec![Sel::Body { name: "Body1".into() }, Sel::Body { name: "Body2".into() }];
+    app.start("joint.as_built");
+    let mut d = app.dialog.take().unwrap();
+    let Kind::Assembly(Asm::Joint(f)) = &mut d.kind else { panic!("expected joint dialog") };
+    f.kind = 1;
+    f.animate = true;
+    f.phase = 0.25;
+    let cmds = preview_commands(&app, &d).unwrap();
+    assert_eq!(cmds[1].0, "joint.drive");
+    assert_eq!(cmds[1].1["joint"], 500);
+    let mut preview = app.session.scratch();
+    for (command, params) in &cmds {
+        preview.execute(command, params).unwrap();
+    }
+    let joint = &preview.doc.assembly.joints[0];
+    assert_eq!(joint.id, 500);
+    assert!((joint.values[0] - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    assert_eq!(app.session.doc.next_id, 500, "a preview must not reserve live ids");
+
+    app.session.doc_mut().next_id = u64::MAX;
+    let cmds = preview_commands(&app, &d).unwrap();
+    let result = app.session.scratch().execute(&cmds[0].0, &cmds[0].1);
+    assert!(result.is_err() && !matches!(result, Err(solidcraft_engine::EngineError::Internal(..))), "{result:?}");
+
+    // A programmatic document can also contain the largest possible joint id. The old
+    // preview added one to that id without checking, before the engine's panic guard.
+    let mut largest = joint.clone();
+    largest.id = u64::MAX;
+    app.session.doc_mut().assembly.joints.push(largest);
+    let cmds = preview_commands(&app, &d).unwrap();
+    assert_eq!(cmds.len(), 1, "an exhausted preview must not invent a drive target");
+    let result = app.session.scratch().execute(&cmds[0].0, &cmds[0].1);
+    assert!(result.is_err() && !matches!(result, Err(solidcraft_engine::EngineError::Internal(..))), "{result:?}");
+}
+
 /// As-built joints and rigid groups take components from body picks; New Component makes one
 /// from bodies when bodies are picked.
 #[test]
@@ -635,4 +674,19 @@ fn motion_trace_keeps_the_picked_point_path() {
         apply_point(&seen, apply_point(&mat_inverse(&put).unwrap(), at(&json!({"point": start}))))
     };
     assert!(drawn.dist(shown) < 1e-6, "{drawn:?} wants {shown:?}");
+    // The dialog retained the picked face, rather than its old coordinates. Resizing that
+    // part raises its top face and the whole saved trajectory by the same amount.
+    let component = app.session.doc.find_component("Coupler").unwrap();
+    let height = app
+        .session
+        .doc
+        .features
+        .iter()
+        .find(|f| f.component == component && matches!(f.kind, solidcraft_engine::doc::FeatureKind::Box { .. }))
+        .unwrap()
+        .param_names[2]
+        .clone();
+    app.run("parameters.change", json!({"name":height,"expression":"4 mm"})).unwrap();
+    let updated = &app.session.doc.sketch(sketch).unwrap().wires[0].fit;
+    assert!(updated.len() == wire.fit.len() && updated.iter().zip(&wire.fit).all(|(a, b)| (*a - *b - Vec3::new(0.0, 0.0, 2.0)).len() < 1e-6));
 }

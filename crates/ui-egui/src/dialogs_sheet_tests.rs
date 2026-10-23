@@ -69,6 +69,33 @@ fn flange_follows_the_picks() {
     }
 }
 
+#[test]
+fn hem_arrow_points_to_the_side_the_hem_builds_on() {
+    for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+        for z in [0.0, 2.5] {
+            for flipped in [false, true] {
+                let mut app = plate(mode);
+                app.run("sheet.flange", json!({"sketch": "Base"})).unwrap();
+                let body = app.session.model.state().sheets[0].body.clone();
+                let before = app.session.world_state().body(&body).unwrap().mesh().bounds();
+                app.session.selection = vec![edge_sel(&app.session, Vec3::new(50.0, 0.0, z)).unwrap()];
+                app.start("sheet.hem");
+                let mut d = app.dialog.clone().unwrap();
+                let Kind::Sheet(Sm::Hem { flip, .. }) = &mut d.kind else { panic!("hem dialog") };
+                *flip = flipped;
+                let direction = arrow(&app, &d).unwrap();
+                let commands = apply_commands(&app, &d).unwrap();
+                run_all(&mut app, commands);
+                let after = app.session.world_state().body(&body).unwrap().mesh().bounds();
+                assert!(
+                    direction.dot(after.center() - before.center()) > 1e-6,
+                    "the arrow must point toward the added hem: z={z}, flip={flipped}, arrow={direction:?}, before={before:?}, after={after:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Hem takes edges and an optional gap; rules make and pick a rule with its expressions.
 #[test]
 fn hem_and_rules() {
@@ -206,7 +233,7 @@ fn flat_pattern_islands_fit_before_the_actual_command_panel() {
                 ctx.run_ui(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), ..Default::default() }, |ui| {
                     crate::ui_kit::Panel::new("FLAT PATTERN", id, pos2(1400.0, 294.0), viewport, crate::frame::Side::Right, egui::Frame::NONE)
                         .width(360.0)
-                        .window()
+                        .window(&ctx)
                         .show(ui.ctx(), |ui| {
                             ui.label("Flat size: 50 × 10 × 2.5 mm");
                         });

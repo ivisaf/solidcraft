@@ -19,6 +19,7 @@
 #[path = "../../../assets/icons/app/shared/source/app_icon.rs"]
 mod app_icon;
 mod control_server;
+mod device_lost;
 #[cfg(target_os = "windows")]
 mod native_crash;
 #[cfg(target_os = "windows")]
@@ -76,6 +77,8 @@ struct App {
     frames: u32,
     /// Started over the control channel: the window doesn't ask for the foreground.
     take_focus_unwanted: bool,
+    /// The graphics device: lost, it can't draw again (`App::watch_device`, #4172).
+    gpu: Option<LostWatch>,
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     space_mouse: space_mouse::SpaceMouse,
 }
@@ -107,6 +110,7 @@ impl eframe::App for App {
                 }
             }
         }
+        self.watch_device();
         // The design on screen is the one whose commands a crash report replays.
         self.solve.session.crash_journal = solidcraft_engine::crash::enabled();
         // The OS closing the window (Alt+F4, Cmd+Q, the window manager): ask about unsaved
@@ -147,6 +151,9 @@ impl eframe::App for App {
         solidcraft_ui_egui::save_job::tick(&mut self.solve, true);
         solidcraft_ui_egui::recovery_ui::close(&mut self.solve);
         solidcraft_engine::crash::end_session();
+        if let Some(lost_at) = self.gpu.as_ref().and_then(|g| g.lost_at) {
+            device_lost::restart(self.gpu.as_ref().is_some_and(|g| g.restart_on_software), lost_at);
+        }
         // An update asked to restart into the new version or to run its installer.
         if let Some((program, args)) = solidcraft_ui_egui::update::take_launch(&mut self.solve) {
             let mut command = std::process::Command::new(&program);
@@ -166,6 +173,48 @@ impl eframe::App for App {
     }
 }
 
+/// The window's graphics device, watched for its loss.
+struct LostWatch {
+    lost: eframe::egui_wgpu::DeviceLost,
+    /// Where the next start runs once this device is lost ([`device_lost::restart_on_software`]).
+    restart_on_software: bool,
+    /// When the loss was seen: the app is closing to start again.
+    lost_at: Option<u64>,
+}
+
+impl App {
+    /// The graphics device was lost (#4172): the window can't draw again, so close, keeping
+    /// unsaved changes for recovery as a forced quit does (the window can't ask about them), and
+    /// start again once closed ([`device_lost::restart`]).
+    fn watch_device(&mut self) {
+        let Some(gpu) = self.gpu.as_mut().filter(|g| g.lost_at.is_none() && g.lost.is_lost()) else { return };
+        let reason = gpu.lost.reason().unwrap_or_default();
+        log::error!("graphics: the device was lost ({reason}); closing to start again");
+        eprintln!("SolidCraft graphics: the device was lost ({reason}); starting again");
+        solidcraft_engine::crash::phase(&format!("graphics device lost: {reason}"));
+        gpu.lost_at = Some(device_lost::now_secs());
+        self.solve.quit_requested = true;
+    }
+}
+
+/// Linux file dialogs match patterns by case, so each extension goes in as lower and upper
+/// case, plus FreeCAD's own mixed casing.
+fn case_variants(exts: &[&str]) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for e in exts {
+        let mut forms = vec![e.to_ascii_lowercase(), e.to_ascii_uppercase()];
+        if e.eq_ignore_ascii_case("fcstd") {
+            forms.push("FCStd".into());
+        }
+        for v in forms {
+            if !all.contains(&v) {
+                all.push(v);
+            }
+        }
+    }
+    all
+}
+
 fn services(cc: &eframe::CreationContext<'_>) -> Services {
     let parent = rfd::AsyncFileDialog::new().set_parent(cc);
     let open_parent = parent.clone();
@@ -177,48 +226,14 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
             let mut dialog = open_parent.clone();
             if !first.is_empty() {
                 let label = first.iter().map(|e| e.to_uppercase()).collect::<Vec<_>>().join(", ");
-                let both: Vec<String> = first.iter().flat_map(|e| [e.to_lowercase(), e.to_uppercase()]).collect();
-                dialog = dialog.add_filter(label, &both);
+                dialog = dialog.add_filter(label, &case_variants(first));
             }
-            let future = dialog
-                .add_filter(
-                    "Designs, CAD files and meshes",
-                    &[
-                        io::DESIGN_EXT,
-                        io::LEGACY_DESIGN_EXT,
-                        "json",
-                        "step",
-                        "stp",
-                        "STEP",
-                        "STP",
-                        "igs",
-                        "iges",
-                        "IGS",
-                        "IGES",
-                        "FCStd",
-                        "fcstd",
-                        "3dm",
-                        "3DM",
-                        "3mf",
-                        "3MF",
-                        "stl",
-                        "STL",
-                        "obj",
-                        "OBJ",
-                        "glb",
-                        "GLB",
-                        "gltf",
-                        "GLTF",
-                    ],
-                )
-                .add_filter("SolidCraft design (container or JSON)", &[io::DESIGN_EXT, io::LEGACY_DESIGN_EXT, "json"])
-                .add_filter("STEP", &["step", "stp", "STEP", "STP"])
-                .add_filter("IGES", &["igs", "iges", "IGS", "IGES"])
-                .add_filter("FreeCAD and Rhino", &["FCStd", "fcstd", "3dm", "3DM"])
-                .add_filter("Mesh (3MF, STL, OBJ, glTF)", &["3mf", "3MF", "stl", "STL", "obj", "OBJ", "glb", "GLB", "gltf", "GLTF"])
-                .add_filter("Sketch drawings (DXF, SVG)", &["dxf", "DXF", "svg", "SVG"])
-                .add_filter("All files", &["*"])
-                .pick_file();
+            // The groups come from the format registry, so a new format joins this dialog by itself.
+            dialog = dialog.add_filter("Designs, CAD files and meshes", &case_variants(&io::formats::open_extensions(true)));
+            for (label, exts) in io::formats::import_filters(true) {
+                dialog = dialog.add_filter(label, &case_variants(&exts));
+            }
+            let future = dialog.add_filter("All files", &["*"]).pick_file();
             Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
         })),
         // One kind of file (the agent chat's attachments): only the types it names, as given and in
@@ -483,6 +498,18 @@ fn backend_preference() -> Option<String> {
     graphics().and_then(|v| v.get("backend").and_then(serde_json::Value::as_str).map(str::to_string))
 }
 
+/// The viewport scene's sample count: the app's anti-aliasing (the window's pass is 1x), clamped
+/// by the backend's policy (OpenGL renders 1x, see `effective_msaa_samples`). A count the device
+/// cannot render with falls back to the supported default.
+fn scene_samples(backend: eframe::wgpu::Backend, samples: u32, supported: &[u32]) -> u32 {
+    let requested = eframe::egui_wgpu::effective_msaa_samples(backend, samples.max(1));
+    if requested <= 1 || supported.is_empty() || supported.contains(&requested) {
+        requested
+    } else {
+        supported.iter().copied().filter(|&n| n <= solidcraft_ui_egui::prefs::Prefs::default().msaa).max().unwrap_or(1)
+    }
+}
+
 /// Anti-aliasing samples from Preferences (4 when unset).
 fn msaa() -> u16 {
     graphics()
@@ -579,6 +606,11 @@ fn main() -> eframe::Result {
         notes.push(format!("The last {failed_starts} launches stopped before the window opened, so this one is in safe mode."));
     }
     let cpu_renderer = safe_mode || startup::cpu_renderer_env(std::env::var(startup::RENDERER_ENV).ok().as_deref());
+    // The launch before this one closed because its graphics device was lost (`App::watch_device`).
+    let after_loss = device_lost::recent(std::env::var(device_lost::LOST_ENV).ok().as_deref(), device_lost::now_secs());
+    if after_loss {
+        notes.push(device_lost::note(cpu_renderer));
+    }
     if safe_mode {
         notes.push("Safe mode: default settings (yours are kept for the next normal start), no recovery offer, software rendering.".into());
     }
@@ -604,9 +636,11 @@ fn main() -> eframe::Result {
     solidcraft_engine::crash::phase("window");
     let options = eframe::NativeOptions {
         viewport: app_viewport()?,
-        depth_buffer: depth_bits,
-        stencil_buffer: STENCIL_BITS,
-        multisampling: samples,
+        // The window's pass (egui's) has no depth and one sample: the viewport draws its scene
+        // offscreen with its own depth and MSAA, then blits it, so the UI pass pays for neither.
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 1,
         // Kept with the other settings, not in a folder named after the app id. Safe mode reads
         // and writes a scratch copy, leaving the user's settings as they were.
         persistence_path: if safe_mode {
@@ -669,10 +703,16 @@ fn main() -> eframe::Result {
                 app.load_prefs(&p);
             }
             mark("app state and prefs");
+            let gpu = cc.wgpu_render_state.as_ref().map(|rs| LostWatch {
+                lost: rs.device_lost.clone(),
+                restart_on_software: device_lost::restart_on_software(after_loss, cpu_renderer),
+                lost_at: None,
+            });
             if let Some(rs) = &cc.wgpu_render_state {
-                eprintln!("SolidCraft graphics: {:?}, MSAA {}x (requested {}x)", rs.adapter.get_info().backend, rs.msaa_samples, samples);
+                let scene_samples = scene_samples(rs.adapter.get_info().backend, u32::from(samples), &rs.msaa_supported);
+                eprintln!("SolidCraft graphics: {:?}, MSAA {scene_samples}x (requested {}x)", rs.adapter.get_info().backend, samples);
                 solidcraft_engine::crash::phase("viewport pipelines (shader compile)");
-                app.set_wgpu(rs, depth_bits, STENCIL_BITS, rs.msaa_samples);
+                app.set_wgpu_split(rs, depth_bits, STENCIL_BITS, scene_samples);
                 solidcraft_ui_egui::gpu::install_picture_renderer(rs);
                 // The graphics driver is loaded now; it may have put its own exception filter
                 // in front of ours.
@@ -682,8 +722,8 @@ fn main() -> eframe::Result {
                 solidcraft_ui_egui::prefs::check_msaa(&mut app, u32::from(samples));
                 let info = rs.adapter.get_info();
                 solidcraft_engine::crash::set_environment(&format!(
-                    "Renderer: {:?} {} ({}), MSAA {}x",
-                    info.backend, info.name, info.driver, rs.msaa_samples
+                    "Renderer: {:?} {} ({}), MSAA {scene_samples}x",
+                    info.backend, info.name, info.driver
                 ));
             }
             mark("viewport pipelines");
@@ -746,6 +786,7 @@ fn main() -> eframe::Result {
                 starting,
                 frames: 0,
                 take_focus_unwanted: control_port.is_some(),
+                gpu,
                 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
                 space_mouse,
             }))
@@ -908,5 +949,14 @@ mod msaa_tests {
                 assert_eq!(eframe::egui_wgpu::effective_msaa_samples(backend, requested), requested);
             }
         }
+    }
+
+    #[test]
+    fn the_scene_follows_the_backend_policy_too() {
+        use eframe::wgpu::Backend;
+        assert_eq!(super::scene_samples(Backend::Gl, 4, &[1, 4]), 1);
+        assert_eq!(super::scene_samples(Backend::Gl, 4, &[]), 1);
+        assert_eq!(super::scene_samples(Backend::Vulkan, 4, &[1, 4]), 4);
+        assert_eq!(super::scene_samples(Backend::Dx12, 8, &[1, 2, 4]), 4);
     }
 }

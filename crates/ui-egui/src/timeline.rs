@@ -1,15 +1,30 @@
 //! The timeline (bottom): features in order, the rollback marker, errors and warnings.
 
-pub(crate) use crate::icons::glyphs::transport_glyph;
-use egui::{Rect, Sense, Stroke, UiBuilder, pos2, vec2};
+use crate::ui_kit::{Container, Edge, Surface};
+use egui::{Rect, Sense, UiBuilder, pos2, vec2};
 use serde_json::{Value, json};
 use solidcraft_engine::doc::{
     FeatureKind, PlaneRef, SketchId,
     construct::{AxisDef, PointDef},
 };
 
+use crate::SolveApp;
 use crate::theme::Tokens;
-use crate::{SolveApp, icons};
+
+/// Apply transport actions from the current marker; endpoints stay bounded, including an
+/// empty design. All orientations reach the same rollback command.
+pub(crate) fn run_transport(app: &mut SolveApp, control: crate::ui_kit::HistoryTransport) {
+    let n = app.session.doc.features.len();
+    let marker = app.session.doc.marker.unwrap_or(n);
+    let position = match control {
+        crate::ui_kit::HistoryTransport::First => 0,
+        crate::ui_kit::HistoryTransport::Back => marker.saturating_sub(1),
+        crate::ui_kit::HistoryTransport::Forward => marker.saturating_add(1).min(n),
+        crate::ui_kit::HistoryTransport::Last => n,
+    };
+    let params = if position < n { json!({"position":position}) } else { json!({}) };
+    let _ = app.run_heavy("timeline.roll_to", params);
+}
 
 // Snapshot only the data used by timeline interactions. Cloning FeatureKind here would
 // also copy imported mesh vertices and triangles on every frame.
@@ -159,12 +174,22 @@ pub(crate) fn delete_features(app: &mut SolveApp, ids: Vec<u64>) {
 
 /// [`delete_features`] once each feature's `timeline.dependents` report is in.
 pub(crate) fn delete_checked_features(app: &mut SolveApp, ids: Vec<u64>, reports: &[Value]) {
+    // Each report is about one feature alone, so it names the others being deleted too: those
+    // go anyway and are left out of the confirmation.
+    let deleting: Vec<&str> = ids.iter().filter_map(|id| app.session.doc.feature(*id)).map(|f| f.name.as_str()).collect();
     let mut with = std::collections::BTreeSet::new();
     let mut fail = std::collections::BTreeSet::new();
     for deps in reports {
         for (key, output) in [("deleted_with_it", &mut with), ("would_fail", &mut fail)] {
-            output
-                .extend(deps.get(key).and_then(|value| value.as_array()).into_iter().flatten().filter_map(|value| value.as_str().map(String::from)));
+            output.extend(
+                deps.get(key)
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str())
+                    .filter(|name| !deleting.contains(name))
+                    .map(String::from),
+            );
         }
     }
     if with.is_empty() && fail.is_empty() {
@@ -187,17 +212,45 @@ pub(crate) fn selected_feature_ids(app: &SolveApp) -> Vec<u64> {
         .collect()
 }
 
-/// What Copy in a feature's menu copies: the selected features when the right-clicked one is
-/// among them, else that feature alone.
-pub(crate) fn copy_targets(app: &SolveApp, id: u64) -> Vec<u64> {
+/// What Copy and Delete in a feature's menu act on: the selected features when the
+/// right-clicked one is among them, else that feature alone.
+pub(crate) fn menu_targets(app: &SolveApp, id: u64) -> Vec<u64> {
     let selected = selected_feature_ids(app);
     if selected.contains(&id) { selected } else { vec![id] }
+}
+
+/// The features from timeline position `from` to the end.
+fn features_from(app: &SolveApp, from: usize) -> Vec<u64> {
+    app.session.doc.features.iter().skip(from).map(|f| f.id).collect()
+}
+
+/// In the menu of a feature after the history marker (feature `id` at timeline position
+/// `index`): delete every feature after the marker, labelled with how many, in one delete
+/// through [`delete_features`] so the confirmation still lists what would fail. Not offered
+/// before the marker, nor when the menu acts on several selected features: an entry that acts
+/// partly on the selection and partly beyond it is hard to read.
+pub(crate) fn delete_after_marker_button(app: &mut SolveApp, ui: &mut egui::Ui, id: u64, index: usize, marker: usize) {
+    if index < marker || menu_targets(app, id).len() > 1 {
+        return;
+    }
+    let ids = features_from(app, marker);
+    let key = if ids.len() == 1 { "timeline.delete_after_marker_one" } else { "timeline.delete_after_marker_other" };
+    let label = crate::i18n::format(key, &[("count", &ids.len().to_string())]);
+    if crate::context_menu::button(ui, &label, "delete").clicked() {
+        delete_features(app, ids);
+        ui.close();
+    }
+}
+
+/// The timeline anchor of a feature: the last one clicked, where a Shift+click range starts.
+pub(crate) fn anchor_key(id: u64) -> String {
+    format!("f:{id}")
 }
 
 /// Copy and Paste in a feature's timeline menu. Paste puts the copies at the history marker.
 pub(crate) fn clipboard_buttons(app: &mut SolveApp, ui: &mut egui::Ui, id: u64) {
     if crate::context_menu::button(ui, crate::i18n::tr_label("Copy"), "copy").clicked() {
-        let features = copy_targets(app, id);
+        let features = menu_targets(app, id);
         let _ = app.run("timeline.copy", json!({ "features": features }));
         ui.close();
     }
@@ -241,8 +294,32 @@ pub(crate) fn message_button(app: &SolveApp, ui: &mut egui::Ui, id: u64) {
     }
 }
 
+/// Shift+click on a feature: select the features from the anchor (the last feature clicked, or
+/// the last selected one) to this one. `order` is the timeline as drawn this frame, taken before
+/// drawing so the range never mixes two orders. Ctrl as well adds the range to the selection.
+fn select_range(app: &mut SolveApp, order: &[u64], id: u64, add: bool) {
+    let anchor = app.tree.timeline_anchor.clone().or_else(|| selected_feature_ids(app).last().map(|f| anchor_key(*f)));
+    let from = anchor.and_then(|key| order.iter().position(|f| anchor_key(*f) == key));
+    let (Some(from), Some(to)) = (from, order.iter().position(|f| *f == id)) else {
+        select_one(app, id);
+        return;
+    };
+    let range = order.get(from.min(to)..=from.max(to)).unwrap_or_default();
+    let items: Vec<_> = range.iter().map(|f| json!({"type": "feature", "id": f})).collect();
+    let _ = app.run("select.set", json!({ "items": items, "add": add }));
+}
+
+/// A plain click on a feature: select it alone.
+fn select_one(app: &mut SolveApp, id: u64) {
+    app.tree.picked_joints.clear();
+    app.tree.picked_timeline_groups.clear();
+    app.tree.timeline_anchor = Some(anchor_key(id));
+    let _ = app.run("select.set", json!({"items": [{"type": "feature", "id": id}]}));
+}
+
 /// Ctrl+click on a feature: add it to the selection, or take it out.
 fn toggle_feature(app: &mut SolveApp, id: u64) {
+    app.tree.timeline_anchor = Some(anchor_key(id));
     let selected = selected_feature_ids(app);
     if selected.contains(&id) {
         let rest: Vec<_> =
@@ -255,7 +332,8 @@ fn toggle_feature(app: &mut SolveApp, id: u64) {
 
 pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    if app.ui.layout == crate::shell::LayoutMode::Floating {
+    app.shell.history_dock_space = Some(ui.available_rect_before_wrap());
+    if Container::for_layout(app.ui.layout, Surface::Panel).floating() {
         let rect = floating_rect(ui.available_rect_before_wrap());
         // A window too short for the card (the ribbon already fills it) leaves the history out
         // rather than drawing into a negative-size rectangle.
@@ -266,13 +344,18 @@ pub fn timeline(app: &mut SolveApp, ui: &mut egui::Ui) {
         app.shell.history = Some(rect);
         crate::scenario::publish_rect("history:card", rect);
         let mut child = ui.new_child(UiBuilder::new().id_salt("sc_timeline").max_rect(rect));
-        ui.painter().add(crate::frame::shell_card(t.timeline).paint(rect));
+        ui.painter().add(Container::new(ui.ctx(), Surface::Panel).frame(ui.ctx(), t.timeline, crate::frame::Side::Left).paint(rect));
         child.set_clip_rect(rect);
         timeline_contents(app, &mut child, true);
     } else {
-        let response = egui::Panel::bottom("sc_timeline").exact_size(40.0).frame(egui::Frame::NONE.fill(t.timeline)).show(ui, |ui| {
-            timeline_contents(app, ui, false);
-        });
+        let response = Container::new(ui.ctx(), Surface::Panel)
+            .edge("sc_timeline", Edge::Bottom)
+            .exact_size(40.0)
+            .frame(Container::new(ui.ctx(), Surface::Panel).edge_frame(t.timeline))
+            .show(ui, |ui| {
+                timeline_contents(app, ui, false);
+            });
+        app.shell.history = Some(response.response.rect);
         crate::scenario::publish_rect("history:strip", response.response.rect);
     }
 }
@@ -288,43 +371,32 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
     let accent = crate::theme::TabAccent::for_tab(&t, &app.ui.tab);
     let r = ui.max_rect();
     let p = ui.painter().clone();
-    if !floating {
-        p.line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.border));
-    }
+
     let n = app.session.doc.features.len();
     let marker = app.session.doc.marker.unwrap_or(n);
     // Playback controls.
     let mut x = r.left() + t.space_10;
-    if floating {
-        let label = p.layout_no_wrap(crate::i18n::tr("ui.history_title").to_string(), egui::FontId::proportional(t.font_label), t.text);
-        p.galley(pos2(x, r.center().y - label.size().y / 2.0), label.clone(), t.text);
+    let grip_rect = Rect::from_center_size(pos2(x + t.space_10 / 2.0, r.center().y), vec2(t.space_10, t.space_16 + t.space_2));
+    let mut grip_ui = ui.new_child(UiBuilder::new().max_rect(grip_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let grip = crate::ui_kit::panel_grip(&mut grip_ui).rect;
+    x += t.space_10 + t.space_8;
+    let mut drag_rect = grip;
+    let label = p.layout_no_wrap(crate::i18n::tr("ui.history_title").to_string(), crate::fonts::semibold(t.font_heading), t.text);
+    if x + label.size().x + t.space_12 + crate::ui_kit::history_transport_width() <= r.right() {
+        let title_rect = Rect::from_min_size(pos2(x, r.center().y - label.size().y / 2.0), label.size());
+        p.galley(title_rect.min, label.clone(), t.text);
+        drag_rect = drag_rect.union(title_rect);
         x += label.size().x + t.space_12;
     }
-    let controls = [("first", Some(0usize)), ("back", Some(marker.saturating_sub(1))), ("forward", Some((marker + 1).min(n))), ("last", None)];
-    for (what, target) in controls {
-        let br = Rect::from_center_size(pos2(x + 11.0, r.center().y), vec2(22.0, 22.0));
-        crate::scenario::publish_handle(&format!("history:{what}"), br.center());
-        let resp = ui.interact(br, ui.id().with(("tl", what)), Sense::click());
-        if resp.hovered() {
-            p.rect_filled(br, 3.0, t.hover);
+    let response = ui.interact(drag_rect, egui::Id::new("sc_history_dock_grip"), Sense::drag());
+    crate::scenario::publish_handle("history:grip", drag_rect.center());
+    crate::timeline_left::dock_drag(app, ui, &response);
+    for control in crate::ui_kit::HistoryTransport::ALL {
+        let br = Rect::from_center_size(pos2(x + t.space_24 / 2.0, r.center().y), vec2(t.space_24, t.space_24));
+        if control.show(ui, br).clicked() {
+            run_transport(app, control);
         }
-        transport_glyph(&p, br.center(), what, t.icon);
-        if resp
-            .on_hover_text(match what {
-                "first" => "Roll back to the start",
-                "back" => "Step back one feature",
-                "forward" => "Step forward one feature",
-                _ => "Play to the end",
-            })
-            .clicked()
-        {
-            let pos = match target {
-                Some(k) if k < n => json!({"position": k}),
-                _ => json!({}),
-            };
-            let _ = app.run_heavy("timeline.roll_to", pos);
-        }
-        x += 24.0;
+        x += t.space_24 + t.space_2;
     }
     x += 14.0;
     // The features scroll horizontally in the space right of the playback controls.
@@ -343,6 +415,7 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                 .iter()
                 .map(|f| (f.id, f.name.clone(), icon_of(&f.kind), f.suppressed, f.kind.type_name(), TimelineKind::of(&f.kind)))
                 .collect();
+            let order: Vec<u64> = feats.iter().map(|f| f.0).collect();
             // The feature whose body is under the cursor in the viewport.
             let st = app.session.world_state();
             let from_view = match &app.viewport.hover {
@@ -360,8 +433,8 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
             let mut marker_rect: Option<Rect> = None;
             for (i, (id, name, icon, suppressed, ty, kind)) in feats.iter().enumerate() {
                 if i == marker {
-                    marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(6.0, r.height() - 10.0)));
-                    x += 10.0;
+                    marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(t.space_12, r.height() - 10.0)));
+                    x += t.space_16;
                 }
                 xs.push(x);
                 let br = Rect::from_min_size(pos2(x, r.top() + 6.0), vec2(28.0, 28.0));
@@ -376,49 +449,20 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                 if resp.hovered() {
                     hovered = Some(*id);
                 }
-                let bg = if err.is_some() {
-                    t.timeline_item_error
-                } else if sel || (floating && marker > 0 && i == marker - 1) {
-                    accent.soft
-                } else if resp.hovered() || from_view == Some(*id) {
-                    t.hover
-                } else {
-                    t.timeline_item
-                };
-                let edge = if err.is_some() {
-                    t.error
-                } else if from_view == Some(*id) || (floating && marker > 0 && i == marker - 1) {
-                    accent.color
-                } else {
-                    t.border
-                };
-                p.rect(br, 3.0, bg, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
-                let ink = if rolled || *suppressed { t.border } else { t.icon };
-                icons::paint(
-                    &p,
-                    br.shrink(4.0),
+                crate::ui_kit::HistoryChip {
                     icon,
-                    ink,
-                    if rolled { t.panel_header } else { t.icon_fill },
-                    if rolled { t.border } else { t.accent },
-                );
-                if *suppressed {
-                    p.line_segment([br.left_bottom() + vec2(4.0, -4.0), br.right_top() + vec2(-4.0, 4.0)], Stroke::new(1.5, t.text_dim));
+                    name,
+                    kind: ty,
+                    selected: sel || (floating && marker > 0 && i == marker - 1),
+                    hovered: resp.hovered() || from_view == Some(*id),
+                    dim: rolled,
+                    suppressed: *suppressed,
+                    error: err.is_some(),
+                    warning: warn.is_some(),
+                    // A dragged feature takes the colour of its drop bar.
+                    accent: if drag == Some(Drag::Feature(*id)) { crate::theme::TabAccent::for_tab(&t, "SKETCH") } else { accent },
                 }
-                // A failed feature has a mark of its own, not only its colour (#972).
-                if err.is_some() {
-                    icons::paint(&p, Rect::from_min_size(br.right_top() - vec2(10.0, 0.0), vec2(10.0, 10.0)), "error", t.panel, t.error, t.error);
-                }
-                if warn.is_some() && err.is_none() {
-                    icons::paint(
-                        &p,
-                        Rect::from_min_size(br.right_top() - vec2(10.0, 0.0), vec2(10.0, 10.0)),
-                        "warning",
-                        t.icon,
-                        t.warning,
-                        t.warning,
-                    );
-                }
+                .paint(&p, br, crate::ui_kit::HistoryStyle::Bottom);
                 let mut tip = status_text(name, ty, err.as_deref(), warn.as_deref());
                 if let Some(r) = res {
                     tip += &format!("\n{:.1} ms", r.ms);
@@ -436,12 +480,15 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                             d.pick(&app.session, solidcraft_engine::Sel::Feature { id: *id });
                             app.dialog = Some(d);
                         }
-                    } else if ui.input(|i| i.modifiers.command || i.modifiers.ctrl) {
-                        toggle_feature(app, *id);
                     } else {
-                        app.tree.picked_joints.clear();
-                        app.tree.picked_timeline_groups.clear();
-                        let _ = app.run("select.set", json!({"items": [{"type": "feature", "id": id}]}));
+                        let modifiers = ui.input(|i| i.modifiers);
+                        if modifiers.shift {
+                            select_range(app, &order, *id, modifiers.command || modifiers.ctrl);
+                        } else if modifiers.command || modifiers.ctrl {
+                            toggle_feature(app, *id);
+                        } else {
+                            select_one(app, *id);
+                        }
                     }
                 }
                 if resp.double_clicked() {
@@ -479,16 +526,22 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                     clipboard_buttons(app, ui, *id);
                     message_button(app, ui, *id);
                     ui.separator();
-                    if crate::context_menu::button(ui, "Delete", "delete").clicked() {
-                        delete_feature(app, *id);
+                    let targets = menu_targets(app, *id);
+                    let label = match targets.len() {
+                        1 => crate::i18n::tr_label("Delete").to_string(),
+                        n => crate::i18n::format("timeline.delete_many", &[("count", &n.to_string())]),
+                    };
+                    if crate::context_menu::button(ui, &label, "delete").clicked() {
+                        delete_features(app, targets);
                         ui.close();
                     }
+                    delete_after_marker_button(app, ui, *id, i, marker);
                 });
                 x += 32.0;
             }
             let end = x;
             if marker >= feats.len() {
-                marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(6.0, r.height() - 10.0)));
+                marker_rect = Some(Rect::from_min_size(pos2(x, r.top() + 5.0), vec2(t.space_12, r.height() - 10.0)));
             }
             // The history marker: drag it to roll the model back or forward.
             if let Some(mr) = marker_rect {
@@ -497,26 +550,46 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                 if resp.drag_started() {
                     drag = Some(Drag::Marker);
                 }
-                let col = if resp.hovered() || drag == Some(Drag::Marker) {
-                    accent.color
-                } else if !floating && accent.color == t.accent {
-                    t.timeline_marker
-                } else {
-                    accent.color
-                };
-                p.rect_filled(mr, 1.0, col);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                crate::ui_kit::history_marker(&p, mr, false, accent);
                 resp.on_hover_text("History marker: drag to roll the model back; new features go here");
             }
             let content_end = crate::dialogs_assembly::timeline_joints(app, ui, &p, end + 10.0, r);
             // The scroll range follows the drawn content (the buttons don't take layout space themselves).
             ui.allocate_exact_size(vec2((content_end - origin).max(0.0), r.height()), Sense::hover());
             // Drag feedback, and the drop.
-            if let (Some(dg), Some(pp)) = (drag.as_ref(), pointer) {
-                let slot = slot_at(&xs, end, pp.x);
-                let sx = xs.get(slot).copied().unwrap_or(end) - 4.0;
-                p.line_segment(
-                    [pos2(sx, r.top() + 3.0), pos2(sx, r.bottom() - 3.0)],
-                    Stroke::new(2.0, if matches!(dg, Drag::Marker) { accent.color } else { t.sketch_accent }),
+            if drag.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            let marker_slot = marker.min(n);
+            // At the marker's slot, which side of the marker the pointer is on: before it, a
+            // dropped feature stays in the model; after it, the feature is rolled back.
+            let before_marker = |slot: usize, x: f32| slot < marker_slot || (slot == marker_slot && marker_rect.is_none_or(|mr| x < mr.center().x));
+            // The marker dropped where it already is needs no bar: the marker shows the spot.
+            if let (Some(dg), Some(pp)) = (drag.as_ref(), pointer)
+                && let slot = slot_at(&xs, end, pp.x)
+                && !(matches!(dg, Drag::Marker) && slot == marker_slot)
+            {
+                // Centred in the gap between two chips, or beside the marker at its slot.
+                let sx = match marker_rect {
+                    Some(mr) if slot == marker_slot => {
+                        if before_marker(slot, pp.x) {
+                            mr.left() - 2.0
+                        } else {
+                            mr.right() + 2.0
+                        }
+                    }
+                    _ => xs.get(slot).copied().unwrap_or(end) - 2.0,
+                };
+                // Kept inside the strip so the slot before the first feature stays visible.
+                let sx = sx.max(origin + t.space_2);
+                crate::ui_kit::history_drop_bar(
+                    &p,
+                    Rect::from_min_max(pos2(sx, r.top() + 3.0), pos2(sx, r.bottom() - 3.0)),
+                    false,
+                    if matches!(dg, Drag::Marker) { accent.color } else { t.sketch_accent },
                 );
             }
             let released = ui.input(|i| i.pointer.any_released());
@@ -534,8 +607,10 @@ fn timeline_contents(app: &mut SolveApp, ui: &mut egui::Ui, floating: bool) {
                         let from = app.session.doc.feature_index(id).unwrap_or(0);
                         // Dropping after itself means the slot shifts by one.
                         let to = if slot > from { slot - 1 } else { slot };
-                        if to != from {
-                            let _ = app.run_heavy("timeline.reorder", json!({ "feature": id, "position": to }));
+                        // Crossing the marker rolls the feature back or forward, in the same step.
+                        let active = before_marker(slot, pp.x);
+                        if to != from || active != (from < marker_slot) {
+                            let _ = app.run_heavy("timeline.reorder", json!({ "feature": id, "position": to, "active": active }));
                         }
                     }
                 }
@@ -784,6 +859,124 @@ mod tests {
         let first = h.app.session.doc.find_feature("First").map(|f| f.id).unwrap();
         assert_eq!(super::selected_feature_ids(&h.app), [first]);
     }
+    fn three_boxes(left: bool) -> Harness {
+        let mut h = two_boxes(left);
+        h.app
+            .run(
+                "solid.box",
+                json!({"length": 10, "width": 10, "height": 10, "corner": [40, 0, 0], "operation": "new_body", "name": "Third", "body_name": "Three"}),
+            )
+            .unwrap();
+        h.app.run("select.clear", json!({})).unwrap();
+        h.frames(4);
+        h
+    }
+
+    fn names(h: &Harness) -> Vec<String> {
+        h.app.session.doc.features.iter().map(|f| f.name.clone()).collect()
+    }
+
+    fn ids(h: &Harness, names: &[&str]) -> Vec<u64> {
+        names.iter().map(|name| h.app.session.doc.find_feature(name).map(|f| f.id).unwrap()).collect()
+    }
+
+    /// Shift+click selects the range from the last feature clicked to this one, either way
+    /// round; with nothing clicked yet it starts at the last selected feature (#5005).
+    #[test]
+    fn shift_click_selects_a_range_of_features() {
+        let mut h = three_boxes(false);
+        h.step(&json!({"click": {"handle": "timeline:Third"}})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:First"}, "shift": true})).unwrap();
+        assert_eq!(super::selected_feature_ids(&h.app), ids(&h, &["First", "Second", "Third"]));
+        h.step(&json!({"click": {"handle": "timeline:Second"}, "shift": true})).unwrap();
+        assert_eq!(super::selected_feature_ids(&h.app), ids(&h, &["Second", "Third"]), "the range starts at the anchor, Third");
+
+        h.app.tree.timeline_anchor = None;
+        h.app.run("select.set", json!({"items": [{"type": "feature", "id": ids(&h, &["First"])[0]}]})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Second"}, "shift": true})).unwrap();
+        assert_eq!(super::selected_feature_ids(&h.app), ids(&h, &["First", "Second"]));
+    }
+
+    /// Delete in the menu of a selected feature deletes the whole selection in one undo step,
+    /// and says how many; on a feature outside the selection it deletes that one (#5005).
+    #[test]
+    fn the_feature_menu_deletes_the_selected_features() {
+        let mut h = three_boxes(false);
+        h.step(&json!({"click": {"handle": "timeline:Third"}, "button": "right"})).unwrap();
+        assert!(h.widget("Delete").is_some());
+        h.step(&json!({"key": "Escape"})).unwrap();
+
+        h.step(&json!({"click": {"handle": "timeline:First"}})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Second"}, "ctrl": true})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Second"}, "button": "right"})).unwrap();
+        h.step(&json!({"widget": "Delete 2 Selected Features"})).unwrap();
+        h.settle();
+        assert!(h.app.dialog.is_none(), "nothing else depends on them");
+        assert_eq!(names(&h), ["Third"]);
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(names(&h), ["First", "Second", "Third"]);
+    }
+
+    /// The menu of a feature after the history marker deletes every feature after the marker,
+    /// and says how many; features before the marker, and a selection of several, don't offer
+    /// it. In both timelines (#5005).
+    #[test]
+    fn a_feature_after_the_marker_deletes_everything_after_the_marker() {
+        for left in [false, true] {
+            let mut h = three_boxes(left);
+            h.app.run("timeline.roll_to", json!({"position": 1})).unwrap();
+            h.settle();
+            h.step(&json!({"click": {"handle": "timeline:First"}, "button": "right"})).unwrap();
+            assert!(h.widget("Delete 2 Features After History Marker").is_none(), "left: {left}");
+            h.step(&json!({"key": "Escape"})).unwrap();
+            h.step(&json!({"click": {"handle": "timeline:Second"}})).unwrap();
+            h.step(&json!({"click": {"handle": "timeline:Third"}, "ctrl": true})).unwrap();
+            h.step(&json!({"click": {"handle": "timeline:Third"}, "button": "right"})).unwrap();
+            // (The history beside the browser has its own Delete Selected Features….)
+            assert!(left || h.widget("Delete 2 Selected Features").is_some());
+            assert!(h.widget("Delete 2 Features After History Marker").is_none(), "left: {left}");
+            h.step(&json!({"key": "Escape"})).unwrap();
+            h.app.run("select.clear", json!({})).unwrap();
+            h.frames(2);
+
+            h.step(&json!({"click": {"handle": "timeline:Third"}, "button": "right"})).unwrap();
+            h.step(&json!({"widget": "Delete 2 Features After History Marker"})).unwrap();
+            h.settle();
+            assert_eq!(names(&h), ["First"], "left: {left}");
+            h.app.run("edit.undo", json!({})).unwrap();
+            assert_eq!(names(&h), ["First", "Second", "Third"], "left: {left}");
+        }
+    }
+
+    /// Deleting a sketch together with the extrude that uses it asks nothing: the extrude is
+    /// one of the features deleted, not one that goes with it or fails. The Delete key, with
+    /// the features picked in the timeline, does the same (#5005).
+    #[test]
+    fn deleting_a_feature_with_its_dependents_does_not_ask() {
+        let mut h = Harness::new();
+        h.app.run("sketch.create", json!({"plane": "XY", "name": "Base"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [10, 10]})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.run("solid.extrude", json!({"sketch": "Base", "distance": 10, "operation": "new", "name": "Depth"})).unwrap();
+        h.app.run("select.clear", json!({})).unwrap();
+        h.frames(4);
+        h.step(&json!({"click": {"handle": "timeline:Base"}})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Depth"}, "shift": true})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Depth"}, "button": "right"})).unwrap();
+        h.step(&json!({"widget": "Delete 2 Selected Features"})).unwrap();
+        h.settle();
+        assert!(h.app.dialog.is_none());
+        assert!(names(&h).is_empty());
+
+        h.app.run("edit.undo", json!({})).unwrap();
+        h.frames(4);
+        h.step(&json!({"click": {"handle": "timeline:Base"}})).unwrap();
+        h.step(&json!({"click": {"handle": "timeline:Depth"}, "shift": true})).unwrap();
+        h.step(&json!({"key": "Delete"})).unwrap();
+        h.settle();
+        assert!(names(&h).is_empty());
+    }
+
     #[test]
     fn both_strips_keep_selection_reorder_marker_and_transport() {
         use crate::scenario::{handle_at, rect_of};
@@ -822,6 +1015,33 @@ mod tests {
             assert_eq!(h.app.session.doc.marker, None);
         }
     }
+    /// A feature dropped just past the history marker is rolled back, and dropped just before it
+    /// is active again, in both strips.
+    #[test]
+    fn dragging_a_feature_across_the_marker_rolls_it_back_and_forward() {
+        use crate::scenario::{handle_at, rect_of};
+        for left in [false, true] {
+            let mut h = two_boxes(left);
+            h.settle();
+            let second = handle_at("timeline:Second").unwrap();
+            let marker = rect_of("history:marker").unwrap();
+            let behind = if left { [second.x, marker.bottom() + 3.0] } else { [marker.right() + 4.0, second.y] };
+            let undo = h.app.session.undo.len();
+            h.step(&json!({"drag":[[second.x,second.y],behind]})).unwrap();
+            h.settle();
+            assert_eq!(h.app.session.doc.marker, Some(1), "left={left}: dropped behind the marker, Second is rolled back");
+            assert_eq!(h.app.session.undo.len(), undo + 1, "left={left}: crossing the marker is one undo step");
+            let second = handle_at("timeline:Second").unwrap();
+            let marker = rect_of("history:marker").unwrap();
+            let before = if left { [second.x, marker.top() - 2.0] } else { [marker.left() - 3.0, second.y] };
+            h.step(&json!({"drag":[[second.x,second.y],before]})).unwrap();
+            h.settle();
+            assert_eq!(h.app.session.doc.marker, None, "left={left}: dropped before the marker, Second is active again");
+            let names: Vec<_> = h.app.session.doc.features.iter().map(|feature| feature.name.as_str()).collect();
+            assert_eq!(names, ["First", "Second"], "left={left}: crossing the marker keeps the order");
+        }
+    }
+
     #[test]
     fn floating_strip_has_only_history_text_and_accents_the_last_done_chip_and_marker() {
         let mut h = two_boxes(false);
@@ -852,6 +1072,7 @@ mod tests {
         assert_eq!(chips.last().unwrap().fill, accent.soft);
         assert_eq!(chips.last().unwrap().stroke.color, accent.color);
         let marker = crate::scenario::rect_of("history:marker").unwrap();
-        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect == marker && r.fill == accent.color)));
+        assert!(out.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Circle(c)
+            if marker.contains(c.center) && c.fill == t.timeline && c.stroke == egui::Stroke::new(t.space_2, accent.color))));
     }
 }
