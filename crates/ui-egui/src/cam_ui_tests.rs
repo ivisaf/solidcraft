@@ -1446,17 +1446,11 @@ fn cam_surfaces_speak_the_chosen_language() {
     }
 }
 
-/// The heights picture stands beside the height rows, in German's longer labels too: the
-/// panel, at its usual width, grows to make room for it.
+/// The heights picture stands left of the height rows' labels, each height's line level with
+/// its row and ending before its label, in German's longer labels too, and already while the
+/// form still misses something.
 #[test]
-fn the_heights_picture_stands_beside_the_rows() {
-    fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
-        match shape {
-            egui::Shape::Text(t) => out.push((t.galley.job.text.clone(), t.pos)),
-            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
-            _ => {}
-        }
-    }
+fn the_heights_picture_lines_up_with_the_height_rows() {
     for language in ["en", "de"] {
         let mut h = lab();
         h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
@@ -1466,18 +1460,24 @@ fn the_heights_picture_stands_beside_the_rows() {
         define_tool(&mut h);
         fill(&mut h, "cam.setup.create", |_| {});
         h.app.preferences.language = language.into();
-        let clearance = crate::i18n::Locale::for_language(language).manufacture_label("Clearance").to_string();
-        for id in ["cam.op.pocket", "cam.op.adaptive"] {
+        let locale = crate::i18n::Locale::for_language(language);
+        for (id, bottom) in [("cam.op.pocket", ""), ("cam.op.adaptive", "-3 mm")] {
             h.app.start(id);
             if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
-                op.bottom = "-3 mm".into();
+                op.bottom = bottom.into();
             }
-            h.frames(8);
-            let mut painted = Vec::new();
-            h.painted_frame().iter().for_each(|s| texts(&s.shape, &mut painted));
-            let at = |text: &str| painted.iter().find(|(t, _)| t == text).map(|(_, p)| *p);
-            let (row, line) = (at(&clearance).unwrap(), at(&format!("{clearance} 10")).unwrap());
-            assert!(line.x > row.x + 200.0 && (line.y - row.y).abs() < 40.0, "{language} {id}: the row at {row:?}, its line at {line:?}");
+            h.frames(3);
+            let mut last = f32::NEG_INFINITY;
+            for (line, label) in [("Clearance", "Clearance"), ("Retract", "Retract"), ("Top", "Top"), ("Bottom", "Bottom")] {
+                let end = crate::scenario::handle_at(&format!("cam_height:{line}")).unwrap_or_else(|| panic!("{language} {id}: no {line} line"));
+                let [x, y] = h.widget(locale.manufacture_label(label)).unwrap();
+                let row = egui::pos2(x as f32, y as f32);
+                assert!(
+                    (end.y - row.y).abs() < 3.0 && end.x < row.x && end.y > last,
+                    "{language} {id} {line}: line ends at {end:?}, label at {row:?}"
+                );
+                last = end.y;
+            }
             h.app.manufacture.form = None;
         }
     }

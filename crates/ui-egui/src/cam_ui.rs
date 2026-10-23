@@ -2054,10 +2054,15 @@ fn tinted<R>(ui: &mut egui::Ui, fill: Option<egui::Color32>, stroke: Option<Stro
 /// [`field`] for a height, with a button beside it that takes `picked`: the selection's height
 /// (its highest point for a top, its lowest for a bottom; `None` with nothing selected).
 /// `true` while the row is pointed at or typed in (the heights picture lights its line).
-fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) -> bool {
+fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) -> (bool, f32, f32) {
     let need = needed(need, label);
-    let mut lit = false;
-    row_label(ui, label, need);
+    // Its label leaves room on the left for the heights picture.
+    let left = ui.cursor().left();
+    let r = ui.horizontal(|ui| {
+        ui.add_space(SCHEME_W);
+        row_label(ui, label, need);
+    });
+    let (mut lit, middle) = (r.response.hovered(), r.response.rect.center().y);
     ui.horizontal(|ui| {
         let r = text_box(ui, label, value, hint, need.is_some());
         lit |= r.hovered() || r.has_focus();
@@ -2085,7 +2090,7 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
         }
     });
     ui.end_row();
-    lit
+    (lit, middle, left)
 }
 
 /// [`field`], also saying whether its row is pointed at or typed in.
@@ -2116,56 +2121,42 @@ enum HeightLine {
     Passes,
 }
 
-/// The heights of an operation as a side view: the material with the cut in it, its depth
-/// passes, the tool above it, and a line at each height with its value. `lit` is drawn stronger.
-fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit: Option<HeightLine>, height: f32) {
+/// The heights of an operation as a side view, not to scale: each height's line level with
+/// its row and running to its label, the material from Top down with the cut to Bottom in it,
+/// its depth passes, and the tool waiting at Retract. The line of the row pointed at, or typed
+/// in, is drawn stronger.
+fn heights_picture(painter: &egui::Painter, p: &Picture) {
     let t = Tokens::get();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(PICTURE_W, height), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    // Z from a little below the bottom to a little above the clearance, onto the picture's height.
-    let depth = (h.top - h.bottom).max(1e-3);
-    let (lo, hi) = (h.bottom - depth * 0.35, h.clearance.max(h.retract).max(h.top) + depth * 0.1);
-    let span = (hi - lo).max(1e-3);
-    let y = |z: f64| rect.bottom() - 6.0 - ((z - lo) / span) as f32 * (rect.height() - 12.0);
-    // The material: a block from the top down past the bottom, with the cut taken out of its left half.
-    let (block_l, block_r, cut_r) = (rect.left() + 4.0, rect.left() + 70.0, rect.left() + 36.0);
-    let (top_y, bottom_y, floor_y) = (y(h.top), y(h.bottom), rect.bottom() - 2.0);
+    let at = |line: HeightLine| p.rows.iter().find(|r| r.0 == line).map(|r| r.1);
+    let Some(top_y) = at(HeightLine::Top) else { return };
+    // A chamfer has no Bottom row: its cut is shown a little under the top.
+    let bottom_y = at(HeightLine::Bottom).unwrap_or(top_y + 18.0);
+    let (left, right) = (p.left, p.left + SCHEME_W - 8.0);
+    let (block_l, cut_r, block_r) = (left + 4.0, left + 30.0, left + 52.0);
+    let floor_y = bottom_y + 14.0;
     let material = t.text_dim.gamma_multiply(0.35);
     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(cut_r, top_y), egui::pos2(block_r, floor_y)), 0.0, material);
     painter.rect_filled(egui::Rect::from_min_max(egui::pos2(block_l, bottom_y), egui::pos2(cut_r, floor_y)), 0.0, material);
-    // The depth passes: where each one cuts, in the cut.
-    let passes = lit == Some(HeightLine::Passes);
-    for z in &h.levels {
-        let stroke = Stroke::new(if passes { 1.6 } else { 1.0 }, t.accent.gamma_multiply(if passes { 1.0 } else { 0.55 }));
-        painter.add(egui::Shape::dashed_line(&[egui::pos2(block_l, y(*z)), egui::pos2(cut_r, y(*z))], stroke, 4.0, 3.0));
+    // The depth passes, evenly between Top and Bottom (the last is Bottom's own line).
+    let lit_passes = p.lit == Some(HeightLine::Passes);
+    let stroke = Stroke::new(if lit_passes { 1.6 } else { 1.0 }, t.accent.gamma_multiply(if lit_passes { 1.0 } else { 0.55 }));
+    for k in 1..p.passes.max(1) {
+        let y = top_y + (bottom_y - top_y) * k as f32 / p.passes as f32;
+        painter.add(egui::Shape::dashed_line(&[egui::pos2(block_l, y), egui::pos2(cut_r, y)], stroke, 4.0, 3.0));
     }
-    // The tool, waiting at the retract height over the cut.
-    let tool_x = (block_l + cut_r) * 0.5;
-    let tool = egui::Rect::from_min_max(egui::pos2(tool_x - 5.0, y(h.retract) - 22.0), egui::pos2(tool_x + 5.0, y(h.retract)));
-    painter.rect_filled(tool, 2.0, t.text_dim);
-    // A line at each height across the picture, with its name and value on the right; labels are
-    // kept apart where heights lie close together.
-    let lines = [
-        (HeightLine::Clearance, "Clearance", h.clearance, t.text_dim),
-        (HeightLine::Retract, "Retract", h.retract, t.warning),
-        (HeightLine::Top, "Top", h.top, t.accent),
-        (HeightLine::Bottom, "Bottom", h.bottom, t.accent),
-    ];
-    let mut label_y = f32::NEG_INFINITY;
-    let mut labels: Vec<(f32, String, egui::Color32, bool)> = Vec::new();
-    for (line, name, z, colour) in lines.iter().rev() {
-        let on = lit == Some(*line);
-        let ly = y(*z);
-        let stroke = Stroke::new(if on { 2.0 } else { 1.0 }, if on { t.text } else { *colour });
-        painter.add(egui::Shape::dashed_line(&[egui::pos2(rect.left(), ly), egui::pos2(block_r + 4.0, ly)], stroke, 5.0, 3.0));
-        // Bottom first, upwards: each label at least a line above the last.
-        let place = if label_y.is_finite() { ly.min(label_y - 13.0) } else { ly };
-        label_y = place;
-        labels.push((place, format!("{} {}", tm(name), shown(*z, 2)), if on { t.text } else { *colour }, on));
+    // The tool, its tip at Retract over the cut.
+    if let Some(y) = at(HeightLine::Retract) {
+        let x = (block_l + cut_r) * 0.5;
+        painter.rect_filled(egui::Rect::from_min_max(egui::pos2(x - 5.0, y - 20.0), egui::pos2(x + 5.0, y)), 2.0, t.text_dim);
     }
-    for (ly, text, colour, on) in labels {
-        let font = egui::FontId::proportional(if on { t.font_caption } else { t.font_small });
-        painter.text(egui::pos2(block_r + 8.0, ly), egui::Align2::LEFT_CENTER, text, font, colour);
+    for (line, colour) in
+        [(HeightLine::Clearance, t.text_dim), (HeightLine::Retract, t.warning), (HeightLine::Top, t.accent), (HeightLine::Bottom, t.accent)]
+    {
+        let Some(y) = at(line) else { continue };
+        let on = p.lit == Some(line);
+        let stroke = Stroke::new(if on { 2.0 } else { 1.0 }, if on { t.text } else { colour });
+        painter.add(egui::Shape::dashed_line(&[egui::pos2(left, y), egui::pos2(right, y)], stroke, 5.0, 3.0));
+        crate::scenario::publish_handle(&format!("cam_height:{line:?}"), egui::pos2(right, y));
     }
 }
 
@@ -2342,43 +2333,23 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
         tool_assistant(ui, f, need, &choices.materials);
         return;
     }
-    // An operation form's heights, as a picture beside the rows (or under them in a narrow panel).
+    // An operation form's heights, as a picture left of their rows' labels.
     let mut picture: Option<Picture> = None;
-    let below = ui
-        .horizontal_top(|ui| {
-            let top = ui.cursor().top();
-            form_grid(ui, form, selected, choices, need, &mut picture);
-            let Some(p) = &picture else { return false };
-            // The panel, at its usual width, grows by what the picture lacks (and gives back what it has to spare).
-            let room = egui::Id::new((MANUFACTURE_PANEL, "room"));
-            let lacking = PICTURE_W + 12.0 - ui.available_width();
-            ui.ctx().data_mut(|d| {
-                let grown = d.get_temp::<f32>(room).unwrap_or(0.0);
-                d.insert_temp(room, (grown + lacking).max(0.0));
-            });
-            if lacking > 0.0 {
-                return true;
-            }
-            ui.add_space(12.0);
-            // Level with the height rows, from Clearance down to the last of them.
-            let (from, to) = p.rows;
-            ui.vertical(|ui| {
-                ui.add_space((from - top).max(0.0));
-                heights_or_note(ui, p.seen.as_ref(), p.lit, (to - from).max(120.0));
-            });
-            false
-        })
-        .inner;
-    if below && let Some(p) = &picture {
-        heights_or_note(ui, p.seen.as_ref(), p.lit, 160.0);
+    form_grid(ui, form, selected, choices, need, &mut picture);
+    if let Some(p) = &picture {
+        heights_picture(ui.painter(), p);
     }
 }
 
 /// An operation form's heights picture: what it shows, the row lit, and where the height rows are (their top and bottom).
 struct Picture {
-    seen: Option<solidcraft_engine::PreviewHeights>,
+    /// Where the label column starts: the picture stands there, left of the height rows' labels.
+    left: f32,
+    /// Each height's row, by the middle of its line.
+    rows: Vec<(HeightLine, f32)>,
+    /// How many depth passes the preview cuts (none known yet: a few, to show what they are).
+    passes: usize,
     lit: Option<HeightLine>,
-    rows: (f32, f32),
 }
 
 /// A dimension of a tool's picture, lit while its row is pointed at or typed in.
@@ -2669,21 +2640,9 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
     });
 }
 
-/// The heights picture, or what it waits for.
-fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHeights>, lit: Option<HeightLine>, height: f32) {
-    match seen {
-        Some(h) => heights_picture(ui, h, lit, height),
-        None => {
-            ui.set_max_width(PICTURE_W);
-            ui.add(
-                egui::Label::new(RichText::new(tm("A picture of the heights shows once nothing is missing")).color(Tokens::get().text_dim)).wrap(),
-            );
-        }
-    }
-}
-
 /// The heights picture's width (points).
-const PICTURE_W: f32 = 170.0;
+/// How wide the heights picture is, left of the height rows' labels.
+const SCHEME_W: f32 = 64.0;
 
 /// How wide a form's text boxes are, and its drop-downs at least.
 const FIELD_W: f32 = 140.0;
@@ -2789,20 +2748,22 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 z.map_or_else(|| tm(what).to_string(), |z| tf("manufacture.height_automatic", &[("height", &shown(z, 3))]))
             };
             let mut lit = None;
-            // Where the height rows are: the picture beside them stands as tall as they are.
-            let first_row = ui.cursor().top();
-            if height_field(ui, need, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high) {
-                lit = Some(HeightLine::Clearance);
-            }
-            if height_field(ui, need, "Retract", &mut f.retract, &automatic(seen.map(|h| h.retract), "2 mm over the top"), high) {
-                lit = Some(HeightLine::Retract);
-            }
-            if height_field(ui, need, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high) {
-                lit = Some(HeightLine::Top);
-            }
+            // Where the height rows are: the picture left of them draws each line level with its row.
+            let (mut rows, mut left) = (Vec::new(), 0.0);
+            let mut row = |ui: &mut egui::Ui, line: HeightLine, label: &str, value: &mut String, hint: &str, picked: Option<f64>| {
+                let (on, middle, x) = height_field(ui, need, label, value, hint, picked);
+                rows.push((line, middle));
+                left = x;
+                if on {
+                    lit = Some(line);
+                }
+            };
+            row(ui, HeightLine::Clearance, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high);
+            row(ui, HeightLine::Retract, "Retract", &mut f.retract, &automatic(seen.map(|h| h.retract), "2 mm over the top"), high);
+            row(ui, HeightLine::Top, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high);
             // A chamfer's depth comes from its width.
-            if f.kind != OpKind::Chamfer && height_field(ui, need, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low) {
-                lit = Some(HeightLine::Bottom);
+            if f.kind != OpKind::Chamfer {
+                row(ui, HeightLine::Bottom, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low);
             }
             // Drilling has no stepdown (its peck depth is further down).
             // Not used while a number of passes divides the depth.
@@ -2817,9 +2778,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if levels && field_seen(ui, need, "Passes", &mut f.passes, "by the stepdown").0 {
                 lit = Some(HeightLine::Passes);
             }
-            let last_row = ui.cursor().top() - ui.spacing().item_spacing.y;
-            // The picture of these heights goes beside the form.
-            *picture = Some(Picture { seen: seen.cloned(), lit, rows: (first_row, last_row) });
+            // The passes the preview cuts; until there is one, a few to show what the line is.
+            let passes = if levels { seen.map_or(3, |h| h.levels.len().max(1)) } else { 1 };
+            *picture = Some(Picture { left, rows, passes, lit });
             match f.kind {
                 OpKind::Face => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or half its diameter");
@@ -3097,8 +3058,7 @@ fn docked_panel(
     let mut frame = crate::frame::dock_frame(ctx, Side::Right);
     // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
     let widest = (dock.viewport.width() - 40.0).max(PANEL_MIN_W);
-    let grown = ctx.data(|d| d.get_temp::<f32>(egui::Id::new((id, "room")))).unwrap_or(0.0);
-    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { (DIALOG_WIDE_MAX_W + grown).min(widest) };
+    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { DIALOG_WIDE_MAX_W.min(widest) };
     // The background fades while the pointer is elsewhere and nothing in the panel is being typed into.
     let last = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
     let over = ctx.pointer_latest_pos().is_some_and(|p| last.is_some_and(|r| r.expand(6.0).contains(p)));
