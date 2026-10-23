@@ -3866,6 +3866,8 @@ fn manufacture_window(
                     if !ops.is_empty() {
                         let total: f64 = ops.iter().filter_map(|o| o["toolpath"]["cut_minutes"].as_f64()).sum();
                         ui.label(RichText::new(minutes_text(total)).color(t.text_dim));
+                        let loaded = setup["tool_changes"].as_u64().unwrap_or(0).to_string();
+                        ui.label(RichText::new(tf("manufacture.tools_loaded", &[("count", &loaded)])).color(t.text_dim));
                     }
                 });
                 if let Some(e) = setup.get("error").and_then(Value::as_str) {
@@ -4458,6 +4460,7 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
             disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
             disable(menu_item("Setup Sheet…", "cam_post", "sheet", setup, None), !ops.is_empty()),
             menu_item("New Setup, Turned Over", "cam_setup", "turn", setup, None),
+            disable(menu_item("Order by Tool", "", "order", setup, None), ops.len() > 1),
             disable(menu_item("Save as Template…", "", "template_save", setup, None), !ops.is_empty()),
             menu_item("Apply Template…", "", "template_apply", setup, None),
             Item::sep(),
@@ -4522,6 +4525,13 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
             }
             asked.run.push(("cam.setup.create", p));
         }
+        ("order", None) => match run(app, "cam.setup.order", json!({ "setup": setup })) {
+            Ok(v) => {
+                let n = |i: usize| v["tool_changes"][i].as_u64().unwrap_or(0).to_string();
+                app.set_status(tf("manufacture.ordered_by_tool", &[("before", &n(0)), ("after", &n(1))]), false);
+            }
+            Err(e) => app.manufacture.error = Some(e),
+        },
         ("template_save", None) => {
             let name: String = text(&s, "name").chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
             app.pick_save(&format!("{name} template.json"), &["json"], move |app, path| {

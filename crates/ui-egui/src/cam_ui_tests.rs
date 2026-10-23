@@ -1589,6 +1589,23 @@ fn clamps_are_set_in_the_setup_form_drawn_and_asked_about_before_posting() {
     assert_eq!(asked.clamped, ["Pocket1"]);
 }
 
+/// A setup's menu orders its operations by tool and says how many tool loads that saves.
+#[test]
+fn a_setup_s_menu_orders_its_operations_by_tool() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    h.app.run("cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 3, "spindle_rpm": 15000, "feed": 500})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    for (tool, bottom) in [(1, -2), (2, -2), (1, -4)] {
+        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": tool, "bottom": bottom})).unwrap();
+    }
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    menu_action(&mut h.app, &json!({"do": "order", "setup": setup}));
+    let names: Vec<String> = h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.name.clone()).collect();
+    assert_eq!(names, ["Pocket1", "Pocket3", "Pocket2"]);
+    assert!(h.app.status.as_ref().is_some_and(|s| s.0.contains("3 → 2")), "{:?}", h.app.status);
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

@@ -107,6 +107,10 @@ pub static COMMANDS: &[CommandSpec] = &[
          names. Sketches are found by name; a tool the design does not have is added from the template; an operation whose sketch \
          or faces this design does not have is added all the same, and says so until it is edited",
     ),
+    CommandSpec::new("cam.setup.order", "Order by Tool", setup_order).icon("reorder").params(
+        "setup?: id or name → order: the operations' names, tool_changes: before and after. Puts each tool's operations together, the tools \
+         in the order they are first used and each tool's operations in their own order, so that the program changes tools as seldom as it can",
+    ),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).icon("delete").params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Facing", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("lead?: expr, the radius of a quarter-circle lead-in and lead-out onto the wall (default none: it ramps along the loop; not with tabs); dogbones?: bool, into the sharp inside corners; skin?: expr, an onion skin left on the bottom, taken off in a last pass with skin_last?: bool; side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
@@ -970,6 +974,34 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     let shift = Vec3::new(o.dot(x), o.dot(y), o.dot(z));
     let moved = |b: Box3| (b.0 - shift, b.1 - shift);
     Ok(Resolved { frame: Frame { o, x, y, z }, part: part.map(moved), stock: stock.map(moved) })
+}
+
+/// How many tools a setup's program loads: one for its first operation, and one each time the
+/// next operation's tool is another.
+fn tool_changes(setup: &Setup) -> usize {
+    let mut last = None;
+    setup.operations.iter().filter(|op| last.replace(op.tool) != Some(op.tool)).count()
+}
+
+/// Groups a setup's operations by tool (see the command's description).
+fn setup_order(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.setup.order";
+    let si = setup_index(s, p, cmd)?;
+    let setup = s.doc.manufacture.setups.get(si).ok_or_else(|| bad(cmd, "no such setup"))?;
+    let before = tool_changes(setup);
+    let mut tools: Vec<u32> = Vec::new();
+    for op in &setup.operations {
+        if !tools.contains(&op.tool) {
+            tools.push(op.tool);
+        }
+    }
+    let mut ordered = setup.operations.clone();
+    // Stable: each tool's operations keep their order.
+    ordered.sort_by_key(|op| tools.iter().position(|t| *t == op.tool).unwrap_or(usize::MAX));
+    let setup = s.doc_mut().manufacture.setups.get_mut(si).ok_or_else(|| bad(cmd, "no such setup"))?;
+    setup.operations = ordered;
+    let after = tool_changes(setup);
+    Ok(json!({ "order": setup.operations.iter().map(|o| o.name.clone()).collect::<Vec<_>>(), "tool_changes": [before, after] }))
 }
 
 /// What a template file says it is.
@@ -2507,7 +2539,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "tool_changes": tool_changes(setup), "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -2835,6 +2867,9 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
             notes.push(format!("T{}: D{} {}{about}", t.number, mm(t.diameter), t.kind.label()));
         }
     }
+    let mut last = None;
+    let changes = ops.iter().filter(|op| last.replace(op.tool.number) != Some(op.tool.number)).count();
+    notes.push(format!("Tools loaded: {changes}"));
     notes.push(format!("Cutting time about {} min", mm((minutes * 10.0).round() / 10.0)));
     notes
 }

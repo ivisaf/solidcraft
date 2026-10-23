@@ -1636,6 +1636,26 @@ fn clamps_in_the_way_and_a_tool_too_short_are_warned_about() {
 }
 
 #[test]
+fn ordering_by_tool_loads_each_tool_once() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 3}));
+    let op = |s: &mut Session, tool: u32, bottom: f64| {
+        run(s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": tool, "spindle_rpm": 12000, "feed": 600, "bottom": bottom}));
+    };
+    op(&mut s, 1, -2.0);
+    op(&mut s, 2, -2.0);
+    op(&mut s, 1, -4.0);
+    op(&mut s, 2, -4.0);
+    assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["tool_changes"], 4);
+    let ordered = run(&mut s, "cam.setup.order", json!({}));
+    // Tool 1's two, in their order, then tool 2's.
+    assert_eq!(ordered["order"], json!(["Pocket1", "Pocket3", "Pocket2", "Pocket4"]));
+    assert_eq!(ordered["tool_changes"], json!([4, 2]));
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("(Tools loaded: 2)"), "{gcode}");
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));
