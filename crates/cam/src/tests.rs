@@ -406,7 +406,7 @@ fn a_v_carve_goes_deeper_away_from_the_walls_down_to_its_limit() {
 fn a_thread_rises_one_pitch_a_turn_out_to_its_full_depth() {
     // M8 × 1.25 in a 6.8 mm hole, with a 6 mm thread mill: from the bottom up, in two passes.
     let mill = tool(6.0);
-    let params = ThreadParams { pitch: 1.25, diameter: 8.0, internal: true, climb: true, passes: 2 };
+    let params = ThreadParams { pitch: 1.25, diameter: 8.0, internal: true, climb: true, passes: 2, left_hand: false };
     let c = cut(0.0, -10.0, 10.0);
     let path = thread_mill(&[v(20.0, 20.0)], &mill, &params, &c).unwrap();
     let arcs: Vec<(Vec3, bool)> = path
@@ -436,6 +436,22 @@ fn a_thread_rises_one_pitch_a_turn_out_to_its_full_depth() {
         })
         .fold(f64::INFINITY, f64::min);
     assert!(nearest >= 4.0 - 1.2269 * 0.625 + 3.0 - 1e-6, "{nearest}");
+    // Left-hand: turning the same way, it goes from the top down, so the helix winds the other way.
+    let left = thread_mill(&[v(20.0, 20.0)], &mill, &ThreadParams { left_hand: true, ..params }, &c).unwrap();
+    let zs: Vec<f64> = left
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Arc { to, ccw, .. } => Some((to.z, *ccw)),
+            _ => None,
+        })
+        .map(|(z, ccw)| {
+            assert!(ccw);
+            z
+        })
+        .collect();
+    // Down in each of the two passes: up again only where the second starts.
+    assert!(zs.windows(2).filter(|w| w[1] > w[0] + 1e-9).count() == 1 && (zs.last().copied().unwrap_or(0.0) + 10.0).abs() < 1e-9, "{zs:?}");
     // A tool too large, a pitch past the tool, no passes: refused.
     assert!(thread_mill(&[v(0.0, 0.0)], &tool(7.0), &params, &c).is_err());
     assert!(thread_mill(&[v(0.0, 0.0)], &mill, &ThreadParams { pitch: 7.0, ..params }, &c).is_err());

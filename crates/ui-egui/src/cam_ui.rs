@@ -317,6 +317,8 @@ pub struct OpForm {
     pub thread_diameter: String,
     pub thread_outside: bool,
     pub thread_passes: String,
+    /// A left-hand thread.
+    pub thread_left: bool,
     /// A pocket's rest machining: the larger tool (its number) that cleared it before (empty: the whole pocket).
     pub rest_from: String,
     /// Adaptive clearing: the heaviest cut (percent of the tool's diameter), the entry helix's
@@ -751,6 +753,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             thread_diameter: String::new(),
             thread_outside: false,
             thread_passes: String::new(),
+            thread_left: false,
             lead: String::new(),
             skin: String::new(),
             skin_last: false,
@@ -1109,6 +1112,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                         p.insert("diameter".into(), Value::Null);
                     }
                     p.insert("side".into(), json!(if f.thread_outside { "outside" } else { "inside" }));
+                    p.insert("hand".into(), json!(if f.thread_left { "left" } else { "right" }));
                     if let Ok(n) = f.thread_passes.trim().parse::<u64>() {
                         p.insert("thread_passes".into(), json!(n));
                     } else if !f.thread_passes.trim().is_empty() {
@@ -1396,6 +1400,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         thread_diameter: text(inputs, "diameter"),
         thread_outside: inputs["internal"].as_bool() == Some(false),
         thread_passes: inputs["passes"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
+        thread_left: inputs["left_hand"].as_bool().unwrap_or(false),
         lead: text(inputs, "lead"),
         skin: text(inputs, "skin"),
         skin_last: inputs["skin_last"].as_bool().unwrap_or(false),
@@ -2265,6 +2270,9 @@ fn help(label: &str) -> Option<&'static str> {
             "The thread's major (nominal) diameter: 8 mm for M8. Empty: a hole drawn at its core diameter plus its depth, a boss as drawn."
         }
         "Thread side" => "Inside a hole (a nut's thread) or round a boss (a bolt's).",
+        "Hand" => {
+            "Which way the thread winds: right-hand (the usual) or left-hand. A right-hand thread is cut from the bottom up, a left-hand one from the top down."
+        }
         "Thread passes" => "How many passes out to the full thread depth: more are gentler on a small thread mill. Empty: one.",
         "Deepest" => {
             "The deepest the V-bit's point goes below the top: wider parts of the shape are carved flat at this depth. Empty: as deep as the shape asks."
@@ -3274,6 +3282,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     let mut side = usize::from(f.thread_outside);
                     choice(ui, need, "sc_cam_thread_side", "Thread side", &mut side, &["inside a hole", "round a boss"]);
                     f.thread_outside = side == 1;
+                    let mut hand = usize::from(f.thread_left);
+                    choice(ui, need, "sc_cam_thread_hand", "Hand", &mut hand, &["right-hand", "left-hand"]);
+                    f.thread_left = hand == 1;
                     field(ui, need, "Thread passes", &mut f.thread_passes, "1");
                 }
                 OpKind::VCarve => {

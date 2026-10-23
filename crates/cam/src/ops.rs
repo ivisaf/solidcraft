@@ -1223,6 +1223,9 @@ pub struct ThreadParams {
     pub climb: bool,
     /// Passes out to the full thread depth, evenly apart.
     pub passes: u32,
+    /// A left-hand thread (it rises turning clockwise); otherwise right-hand.
+    #[serde(default)]
+    pub left_hand: bool,
 }
 
 /// Most radial passes of a thread.
@@ -1230,8 +1233,9 @@ const MAX_THREAD_PASSES: u32 = 20;
 
 /// Mills a thread at each centre: in passes out to the thread's full depth (ISO metric: the
 /// minor diameter 1.0825 pitches less than the major inside a hole, 1.2269 round a boss), each
-/// from the bottom up on a helix rising one pitch a turn, in from the middle (inside) or from
-/// outside the boss and away again before it goes up.
+/// on a helix one pitch a turn, in from the middle (inside) or from outside the boss and away
+/// again before it goes up. The helix turns the way climb or conventional milling wants: a
+/// right-hand thread is cut from the bottom up, a left-hand one from the top down.
 pub fn thread_mill(centres: &[Vec2], tool: &Tool, params: &ThreadParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
     cut.heights.validate()?;
@@ -1283,11 +1287,13 @@ pub fn thread_mill(centres: &[Vec2], tool: &Tool, params: &ThreadParams, cut: &C
             // In and out where the tool is free: the hole's middle, or beyond the boss.
             let free = if params.internal { c } else { c + Vec2::new(at + r + 1.0, 0.0) };
             let start = c + Vec2::new(at, 0.0);
+            // Turning the same way, a right-hand thread rises and a left-hand one falls.
+            let (from, by) = if params.left_hand { (h.top, -params.pitch) } else { (h.bottom, params.pitch) };
             b.travel_to(free)?;
-            b.plunge_to(h.bottom)?;
-            b.cut_to(start, h.bottom)?;
+            b.plunge_to(from)?;
+            b.cut_to(start, from)?;
             for k in 1..=half_turns {
-                let z = (h.bottom + params.pitch * 0.5 * k as f64).min(h.top);
+                let z = (from + by * 0.5 * k as f64).clamp(h.bottom, h.top);
                 let to = if k % 2 == 0 { start } else { c - Vec2::new(at, 0.0) };
                 b.push(Move::Arc { to: to.extend(z), center: c, ccw, feed: cut.feeds.cut })?;
             }

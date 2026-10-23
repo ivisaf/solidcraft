@@ -1655,6 +1655,14 @@ fn a_thread_form_mills_a_thread_in_a_hole() {
     let op = &listed["setups"][0]["operations"][0];
     let Some(Form::Op(again)) = edit_form(&h.app, &listed["setups"][0], op) else { panic!("no form") };
     assert_eq!((again.kind, again.pitch.as_str(), again.thread_passes.as_str(), again.thread_outside), (OpKind::Thread, "1.25 mm", "2", false));
+    let mut left = again.clone();
+    left.thread_left = true;
+    h.app.manufacture.form = Some(Form::Op(left));
+    apply(&mut h.app);
+    assert!(matches!(
+        &h.app.session.doc.manufacture.setups[0].operations[0].kind,
+        solidcraft_engine::doc::manufacture::CamOperationKind::Thread { left_hand: true, .. }
+    ));
 }
 
 /// A setup form sets copies of the part; opened again it shows them, and emptied there is one.

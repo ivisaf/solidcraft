@@ -302,6 +302,9 @@ pub enum CamOperationKind {
         climb: bool,
         /// Passes out to the full thread depth.
         passes: u32,
+        /// A left-hand thread; otherwise right-hand.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        left_hand: bool,
     },
     /// Mills round holes larger than the tool on a helix, `pitch` (a length expression) down a turn.
     Bore { climb: bool, stock_to_leave: Expr, pitch: Expr },

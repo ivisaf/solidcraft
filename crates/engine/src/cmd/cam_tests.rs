@@ -1704,6 +1704,10 @@ fn a_thread_is_milled_in_a_hole_drawn_at_its_core_diameter() {
         solidcraft_doc::manufacture::CamOperationKind::Thread { passes: 1, diameter: Some(_), .. }
     ));
     assert!(s.execute("cam.op.thread", &json!({"sketch": "Holes", "tool": 4, "bottom": -8})).is_err(), "a pitch is needed");
+    // Left-hand: from the top down.
+    run(&mut s, "cam.op.edit", json!({"op": "Thread1", "hand": "left"}));
+    assert!(matches!(&s.doc.manufacture.setups[0].operations[0].kind, solidcraft_doc::manufacture::CamOperationKind::Thread { left_hand: true, .. }));
+    assert!(s.execute("cam.op.edit", &json!({"op": "Thread1", "hand": "up"})).is_err());
 }
 
 #[test]
