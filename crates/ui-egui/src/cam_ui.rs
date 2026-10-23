@@ -1732,7 +1732,12 @@ pub fn setup_lines(view: &SetupView) -> (Vec<(Vec3, Vec3)>, [(Vec3, Vec3); 3]) {
 /// The screen segments of the toolpaths: `(from, to, cutting)`.
 /// Whether the toolpaths are drawn: while the Manufacture panel is open, or kept on by the browser's eye.
 pub fn paths_drawn(app: &SolveApp) -> bool {
-    app.manufacture.show_paths && (app.manufacture.open || app.manufacture.pinned_paths)
+    paths_drawn_by(&app.manufacture)
+}
+
+/// [`paths_drawn`], from the Manufacture state alone.
+fn paths_drawn_by(cam: &CamUi) -> bool {
+    cam.show_paths && (cam.open || cam.pinned_paths)
 }
 
 pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, bool)> {
@@ -3507,27 +3512,11 @@ fn manufacture_window(
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));
             }
-            ui.horizontal_wrapped(|ui| {
-                if button(ui, tm("Tool Library…"), Button::Normal).clicked() {
-                    cam.tools_open = true;
-                }
-                crate::ui_kit::checkbox(ui, tm("Toolpaths"), &mut cam.show_paths);
-                let widths = PATH_WIDTHS.map(|w| w.0);
-                small_choice(ui, "sc_cam_path_colour", "Colour", "Toolpath colour", &mut cam.path_colour, &PATH_COLOURS);
-                small_choice(ui, "sc_cam_path_width", "Width", "Toolpath width", &mut cam.path_width, &widths);
-                let fades = PANEL_FADES.map(|f| f.0);
-                small_choice(ui, "sc_cam_panel_fade", "Fade", "Panel fade", &mut cam.look.fade, &fades);
-                crate::ui_kit::checkbox(ui, tm("Stock and origin"), &mut cam.show_setups);
-                if cam.stock.is_some() {
-                    crate::ui_kit::checkbox(ui, tm("Simulated stock"), &mut cam.show_stock);
-                    // Finer shows the cut stock closer to the toolpaths, and takes longer.
-                    let detail = SIM_DETAIL.map(|d| d.0);
-                    if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
-                        asked.simulate = cam.simulated;
-                    }
-                }
-            });
-            ui.add_space(4.0);
+            // While a form is open the panel is the form; the browser shows the setups and operations.
+            if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
+                asked.apply |= form_block(ui, cam, selected, lists);
+                return;
+            }
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
             steps(ui, cam, &setups, asked);
             ui.add_space(4.0);
@@ -3536,104 +3525,40 @@ fn manufacture_window(
             }
             for setup in &setups {
                 let id = setup["id"].as_u64().unwrap_or(0);
-                // Each setup in a frame of its own, with its operations.
-                egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(text(setup, "name")).strong());
-                        ui.label(RichText::new(tf("manufacture.post_name", &[("post", &text(setup, "post"))])).color(t.text_dim));
-                        if button(ui, tm("Edit"), Button::Small).clicked() {
-                            asked.form = setup_form(setup);
-                        }
-                        let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
-                        if ui
-                            .add_enabled_ui(has_ops, |ui| button(ui, tm("Simulate"), Button::Small))
-                            .inner
-                            .on_hover_text(tm("Cut the raw block with every operation and show what is left"))
-                            .on_disabled_hover_text(tm(NO_OPS))
-                            .clicked()
-                        {
-                            asked.simulate = Some(id);
-                        }
-                        if button(ui, tm("Remove"), Button::Small).clicked() {
-                            asked.run.push(("cam.setup.remove", json!({ "setup": id })));
-                        }
-                    });
-                    if let Some(e) = setup.get("error").and_then(Value::as_str) {
-                        ui.label(RichText::new(e).color(t.error));
-                    }
-                    for op in setup["operations"].as_array().into_iter().flatten() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.label(format!(
-                                "{}  ({}, T{})",
-                                text(op, "name"),
-                                kind_name("op_kind", &text(op, "kind")),
-                                op["tool"].as_u64().unwrap_or(0)
-                            ));
-                            match op.get("error").and_then(Value::as_str) {
-                                Some(e) => {
-                                    ui.label(RichText::new(engine_text(e)).color(t.error));
-                                }
-                                None => {
-                                    ui.label(
-                                        RichText::new(format!("{:.1} min", op["toolpath"]["cut_minutes"].as_f64().unwrap_or(0.0))).color(t.text_dim),
-                                    );
-                                }
-                            }
-                            for (label, by) in [("Up", -1), ("Down", 1)] {
-                                if button(ui, tm(label), Button::Small).clicked() {
-                                    asked.run.push(("cam.op.move", json!({ "setup": id, "op": op["id"], "by": by })));
-                                }
-                            }
-                            if button(ui, tm("Edit"), Button::Small).clicked() {
-                                asked.edit_op = Some((setup.clone(), op.clone()));
-                            }
-                            if ui
-                                .add_enabled_ui(op.get("error").is_none(), |ui| button(ui, tm("Post"), Button::Small))
-                                .inner
-                                .on_hover_text(tm("Write this operation alone as G-code"))
-                                .on_disabled_hover_text(tm("This operation cannot be cut: fix what it says first (Edit)"))
-                                .clicked()
-                                && let Some(op_id) = op["id"].as_u64()
-                            {
-                                asked.post = Some((id, Some((op_id, text(op, "name"))), text(setup, "post")));
-                            }
-                            if button(ui, tm("Remove"), Button::Small).clicked() {
-                                asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
-                            }
-                        });
-                        // On a line of its own, under the operation's buttons.
-                        if let Some(w) = op.get("warning").and_then(Value::as_str) {
-                            ui.horizontal(|ui| {
-                                ui.add_space(24.0);
-                                ui.label(RichText::new(engine_text(w)).color(t.warning)).on_hover_text(tm(
-                                    "The toolpath runs into the part. Simulate shows where; change the operation's heights or geometry.",
-                                ));
-                            });
-                        }
-                    }
-                    // The setup's whole program: the one thing everything here leads to.
-                    ui.add_space(6.0);
-                    let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
-                    let label =
-                        RichText::new(format!("{}  ({})", tm("Post Process"), text(setup, "post"))).strong().size(t.font_heading).color(t.text);
-                    let post = ui.add_enabled_ui(has_ops, |ui| {
-                        ui.vertical_centered_justified(|ui| {
-                            ui.spacing_mut().button_padding.y = t.space_8;
-                            tinted(ui, Some(t.accent_soft), None, |ui| button(ui, label, Button::Normal))
-                        })
-                        .inner
-                    });
-                    if post
-                        .inner
-                        .on_hover_text(tm("Write every operation of this setup, in order, as one G-code program"))
-                        .on_disabled_hover_text(tm(NO_OPS))
-                        .clicked()
-                    {
-                        asked.post = Some((id, None, text(setup, "post")));
+                let ops = setup["operations"].as_array().cloned().unwrap_or_default();
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text(setup, "name")).strong());
+                    if !ops.is_empty() {
+                        let total: f64 = ops.iter().filter_map(|o| o["toolpath"]["cut_minutes"].as_f64()).sum();
+                        ui.label(RichText::new(minutes_text(total)).color(t.text_dim));
                     }
                 });
+                if let Some(e) = setup.get("error").and_then(Value::as_str) {
+                    ui.label(RichText::new(e).color(t.error));
+                }
+                let to_check = ops.iter().filter(|o| o.get("error").is_some() || o.get("warning").is_some()).count();
+                if to_check > 0 {
+                    ui.label(RichText::new(tf("manufacture.ops_to_check", &[("count", &to_check.to_string())])).color(t.warning));
+                }
+                // The setup's whole program: the one thing everything here leads to.
                 ui.add_space(4.0);
+                let label = RichText::new(format!("{}  ({})", tm("Post Process"), text(setup, "post"))).strong().size(t.font_heading).color(t.text);
+                let post = ui.add_enabled_ui(!ops.is_empty(), |ui| {
+                    ui.vertical_centered_justified(|ui| {
+                        ui.spacing_mut().button_padding.y = t.space_8;
+                        tinted(ui, Some(t.accent_soft), None, |ui| button(ui, label, Button::Normal))
+                    })
+                    .inner
+                });
+                if post
+                    .inner
+                    .on_hover_text(tm("Write every operation of this setup, in order, as one G-code program"))
+                    .on_disabled_hover_text(tm(NO_OPS))
+                    .clicked()
+                {
+                    asked.post = Some((id, None, text(setup, "post")));
+                }
             }
             if let Some((found, warnings)) = &cam.simulation {
                 ui.separator();
@@ -3643,10 +3568,15 @@ fn manufacture_window(
                 for line in warnings {
                     ui.label(RichText::new(engine_text(line)).color(t.warning));
                 }
+                ui.horizontal_wrapped(|ui| {
+                    crate::ui_kit::checkbox(ui, tm("Simulated stock"), &mut cam.show_stock);
+                    // Finer shows the cut stock closer to the toolpaths, and takes longer.
+                    let detail = SIM_DETAIL.map(|d| d.0);
+                    if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
+                        asked.simulate = cam.simulated;
+                    }
+                });
                 play_controls(ui, cam, asked);
-            }
-            if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
-                asked.apply |= form_block(ui, cam, selected, lists);
             }
         }
     });
@@ -3853,6 +3783,9 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     } else if r.fold || r.clicked {
         toggle(app, key, true);
     }
+    if let Some(at) = r.secondary {
+        crate::context_menu::open_for(app, at, crate::context_menu::Target::CamFolder);
+    }
     if !open {
         return;
     }
@@ -3863,6 +3796,8 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         let sopen = is_open(app, &skey, true);
         let name = text(setup, "name");
         let ops = setup["operations"].as_array().cloned().unwrap_or_default();
+        let total: f64 = ops.iter().filter_map(|o| o["toolpath"]["cut_minutes"].as_f64()).sum();
+        let total = if ops.is_empty() { String::new() } else { minutes_text(total) };
         let r = draw_row(
             ui,
             ui.id().with(("cam_setup", id)),
@@ -3875,6 +3810,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 label: &name,
                 name: true,
                 selected: app.manufacture.picked == Some((id, None)),
+                detail: &total,
                 ..Default::default()
             },
         );
@@ -3904,9 +3840,11 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         if !sopen {
             continue;
         }
-        for op in &ops {
+        for (at, op) in ops.iter().enumerate() {
             let Some(op_id) = op["id"].as_u64() else { continue };
             let error = op.get("error").and_then(Value::as_str);
+            let warning = op.get("warning").and_then(Value::as_str);
+            let minutes = op["toolpath"]["cut_minutes"].as_f64().map(minutes_text).unwrap_or_default();
             let label = text(op, "name");
             // A bore is a hole too: it shares the drill's icon.
             let icon = match text(op, "kind").as_str() {
@@ -3926,7 +3864,8 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                     label: &label,
                     name: true,
                     selected: app.manufacture.picked == Some((id, Some(op_id))),
-                    color: error.map(|_| Tokens::get().error),
+                    color: if error.is_some() { Some(Tokens::get().error) } else { warning.map(|_| Tokens::get().warning) },
+                    detail: &minutes,
                     ..Default::default()
                 },
             );
@@ -3936,11 +3875,28 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                     || {
                         let tool = op["tool"].as_u64().unwrap_or(0).to_string();
                         let minutes = format!("{:.1}", op["toolpath"]["cut_minutes"].as_f64().unwrap_or(0.0));
-                        tf("manufacture.op_summary", &[("kind", &kind_name("op_kind", &text(op, "kind"))), ("tool", &tool), ("minutes", &minutes)])
+                        let summary = tf(
+                            "manufacture.op_summary",
+                            &[("kind", &kind_name("op_kind", &text(op, "kind"))), ("tool", &tool), ("minutes", &minutes)],
+                        );
+                        match warning {
+                            Some(w) => format!("{summary}\n\n{}", tf("manufacture.toolpath_warning", &[("warning", &engine_text(w))])),
+                            None => summary,
+                        }
                     },
                     str::to_string,
                 );
                 resp.clone().on_hover_text(hover);
+                // Dragged onto another operation of its setup, it is cut before that one (or after it, from its lower half).
+                if resp.drag_started() && !r.on_control {
+                    resp.dnd_set_drag_payload(OpDrag { setup: id, op: op_id, at });
+                }
+                let after = resp.hover_pos().or_else(|| ui.input(|i| i.pointer.hover_pos())).is_some_and(|p| p.y > resp.rect.center().y);
+                let mark = if after { crate::browser::DropMark::Below } else { crate::browser::DropMark::Above };
+                if let Some(d) = crate::browser::drop_target(ui, resp, |d: &OpDrag| d.setup == id && d.op != op_id, mark) {
+                    let to = if d.at < at { at - usize::from(!after) } else { at + usize::from(after) };
+                    asked.run.push(("cam.op.move", json!({ "setup": id, "op": d.op, "to": to })));
+                }
             }
             if r.eye {
                 toggle_hidden(app, op_id);
@@ -3960,6 +3916,18 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     answer(app, asked);
 }
 
+/// An operation dragged in the browser: its setup, its id and where it is in the setup's order.
+struct OpDrag {
+    setup: u64,
+    op: u64,
+    at: usize,
+}
+
+/// A cutting time for the browser, as "1.5 min".
+fn minutes_text(minutes: f64) -> String {
+    tf("manufacture.minutes", &[("minutes", &format!("{minutes:.1}"))])
+}
+
 /// Shows or hides the toolpaths of a setup or an operation (by its id).
 fn toggle_hidden(app: &mut SolveApp, id: u64) {
     let hidden = &mut app.manufacture.hidden;
@@ -3973,6 +3941,57 @@ fn menu_item(label: &str, icon: &str, what: &str, setup: u64, op: Option<u64>) -
     let mut item = crate::context_menu::Item::action("ui.cam", tm(label), icon);
     item.params = Some(json!({ "do": what, "setup": setup, "op": op }));
     item
+}
+
+/// The menu of the browser's Manufacture folder: what the 3D view shows of the toolpaths, the
+/// stock and the setups, and how toolpaths are drawn (as the Preferences' Manufacture section).
+pub fn folder_menu_items(app: &SolveApp) -> Vec<crate::context_menu::Item> {
+    use crate::context_menu::Item;
+    let cam = &app.manufacture;
+    let prefs = &app.preferences;
+    let entry = |label: &str, what: &str, index: Option<usize>, on: bool| {
+        let mut item = Item::action("ui.cam", tm(label), "");
+        item.params = Some(json!({ "do": what, "index": index }));
+        if on {
+            item.shortcut = "current".into();
+        }
+        item
+    };
+    let choices = |label: &str, what: &str, names: &[&str], current: usize| {
+        let mut item = Item::action("ui.cam", tm(label), "");
+        item.children = names.iter().enumerate().map(|(i, name)| entry(name, what, Some(i), i == current)).collect();
+        item
+    };
+    let mut items = vec![entry("Toolpaths", "paths", None, paths_drawn_by(cam)), entry("Stock and origin", "setups", None, cam.show_setups)];
+    if cam.stock.is_some() {
+        items.push(entry("Simulated stock", "stock", None, cam.show_stock));
+    }
+    items.extend([
+        Item::sep(),
+        choices("Toolpath colour", "colour", &PATH_COLOURS, prefs.cam_path_colour),
+        choices("Toolpath width", "width", &PATH_WIDTHS.map(|w| w.0), prefs.cam_path_width),
+        choices("Panel fade", "fade", &PANEL_FADES.map(|f| f.0), prefs.cam_panel_fade),
+    ]);
+    items
+}
+
+/// The Manufacture section of the Preferences' Graphics page: how toolpaths are drawn and
+/// simulated, the panels' fade and the machine's rapid rate.
+pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
+    let prefs = &mut app.preferences;
+    crate::ui_kit::section(ui, "cam_preferences", tm("Manufacture"), true, |ui| {
+        let choice = |ui: &mut egui::Ui, id: &str, label: &str, index: &mut usize, names: &[&str]| {
+            let names: Vec<&str> = names.iter().map(|n| tm(n)).collect();
+            crate::ui_kit::row(ui, tm(label), |ui| crate::ui_kit::dropdown(ui, id, index, &names))
+                .on_hover_text(help(label).map(tm).unwrap_or_default());
+        };
+        choice(ui, "pref_cam_colour", "Toolpath colour", &mut prefs.cam_path_colour, &PATH_COLOURS);
+        choice(ui, "pref_cam_width", "Toolpath width", &mut prefs.cam_path_width, &PATH_WIDTHS.map(|w| w.0));
+        choice(ui, "pref_cam_fade", "Panel fade", &mut prefs.cam_panel_fade, &PANEL_FADES.map(|f| f.0));
+        choice(ui, "pref_cam_detail", "Simulation detail", &mut prefs.cam_sim_detail, &SIM_DETAIL.map(|d| d.0));
+        crate::ui_kit::row(ui, tm("Rapid rate"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_rapid_rate, 100.0..=100_000.0, 50.0, " mm/min"))
+            .on_hover_text(help("Rapid rate").map(tm).unwrap_or_default());
+    });
 }
 
 /// The menu of a setup, or of one operation of it, in the browser.
@@ -4009,6 +4028,21 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
 
 /// Does a browser menu's entry (`ui.cam`): `p` is `{do, setup, op?}`.
 pub fn menu_action(app: &mut SolveApp, p: &Value) {
+    let index = p["index"].as_u64().and_then(|i| usize::try_from(i).ok()).unwrap_or(0);
+    let (cam, prefs) = (&mut app.manufacture, &mut app.preferences);
+    match p["do"].as_str().unwrap_or("") {
+        "paths" => {
+            let shown = !paths_drawn_by(cam);
+            (cam.show_paths, cam.pinned_paths) = (shown, shown);
+            return;
+        }
+        "setups" => return cam.show_setups = !cam.show_setups,
+        "stock" => return cam.show_stock = !cam.show_stock,
+        "colour" => return prefs.cam_path_colour = index.min(PATH_COLOURS.len() - 1),
+        "width" => return prefs.cam_path_width = index.min(PATH_WIDTHS.len() - 1),
+        "fade" => return prefs.cam_panel_fade = index.min(PANEL_FADES.len() - 1),
+        _ => {}
+    }
     let (Some(setup), op) = (p["setup"].as_u64(), p["op"].as_u64()) else { return };
     let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
     let Some(s) = listed["setups"].as_array().into_iter().flatten().find(|s| s["id"].as_u64() == Some(setup)).cloned() else { return };

@@ -93,6 +93,8 @@ pub enum Target {
         setup: u64,
         op: Option<u64>,
     },
+    /// The browser's Manufacture folder: how toolpaths and stock are shown.
+    CamFolder,
 }
 
 /// One menu entry: a command id (run with `params` when given, else started like a toolbar
@@ -362,6 +364,7 @@ pub fn items(app: &SolveApp, target: &Target) -> Vec<Item> {
         Target::Section => crate::browser::section_items(app),
         Target::Joint { id } => joint_items(app, *id),
         Target::Cam { setup, op } => crate::cam_ui::menu_items(app, *setup, *op),
+        Target::CamFolder => crate::cam_ui::folder_menu_items(app),
         Target::ToolbarCommand { id } => crate::toolbar_custom::command_items(app, id),
         Target::Toolbar => crate::toolbar_custom::toolbar_items(app),
         Target::Workspace => {

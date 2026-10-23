@@ -307,6 +307,8 @@ pub(crate) struct Row<'a> {
     pub(crate) radio: Option<bool>,
     /// Trailing badges: "lock", "pin".
     pub(crate) badges: &'a [&'a str],
+    /// A short note after the label, in the dim colour (an operation's time).
+    pub(crate) detail: &'a str,
     /// Lit by the selection or the 3D view's pointer: the item's own row, or a row leading to it.
     pub(crate) mark: Mark,
 }
@@ -433,7 +435,10 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     // The label stops before the badges and the card's edge; a longer name ends in an ellipsis
     // and its full text is in the tooltip.
     let badges_width = row.badges.len() as f32 * 15.0;
-    let room = (r.right() - 4.0 - badges_width - x).max(0.0);
+    let detail =
+        (!row.detail.is_empty()).then(|| ui.painter().layout_no_wrap(row.detail.to_string(), FontId::proportional(t.font_small), t.text_dim));
+    let detail_width = detail.as_ref().map_or(0.0, |g| g.size().x + 8.0);
+    let room = (r.right() - 4.0 - badges_width - detail_width - x).max(0.0);
     let mut job = egui::text::LayoutJob::simple(label_display.to_string(), font, col, room);
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -444,6 +449,11 @@ pub(crate) fn draw_row(ui: &mut egui::Ui, id: egui::Id, row: &Row) -> RowResp {
     crate::scenario::publish_rect(&format!("row_label:{}", row.label), Rect::from_min_size(pos2(x, cy - galley.size().y / 2.0), galley.size()));
     ui.painter().with_clip_rect(ui.painter().clip_rect().intersect(r)).galley(pos2(x, cy - galley.size().y / 2.0), galley, col);
     let mut bx = (x + lw + 6.0).min(r.right() - 16.0);
+    if let Some(g) = detail {
+        let size = g.size();
+        ui.painter().with_clip_rect(ui.painter().clip_rect().intersect(r)).galley(pos2(x + lw + 8.0, cy - size.y / 2.0), g, t.text_dim);
+        bx += detail_width;
+    }
     for b in row.badges {
         let br = Rect::from_center_size(pos2(bx + 6.0, cy), vec2(12.0, 12.0));
         badge(ui.painter(), br, b, t.text_dim);
@@ -2010,29 +2020,37 @@ fn selected_keys(app: &SolveApp, comp: u64, folder: &str) -> Vec<String> {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum DropMark {
+pub(crate) enum DropMark {
     /// A line above the row: the items go before it.
     Above,
+    /// A line under the row: the items go after it.
+    Below,
     /// A box around the row: the items go into it.
     Box,
 }
 
 /// While a matching payload hovers the row, mark where it would land; on release, the payload.
-fn drop_target(ui: &egui::Ui, resp: &egui::Response, accept: impl Fn(&Drag) -> bool, mark: DropMark) -> Option<std::sync::Arc<Drag>> {
+pub(crate) fn drop_target<T: std::any::Any + Send + Sync>(
+    ui: &egui::Ui,
+    resp: &egui::Response,
+    accept: impl Fn(&T) -> bool,
+    mark: DropMark,
+) -> Option<std::sync::Arc<T>> {
     let t = Tokens::get();
-    let hovering = resp.dnd_hover_payload::<Drag>().filter(|d| accept(d));
+    let hovering = resp.dnd_hover_payload::<T>().filter(|d| accept(d));
     if hovering.is_some() {
         let r = resp.rect;
         match mark {
             DropMark::Above => ui.painter().hline(r.x_range(), r.top(), Stroke::new(2.0, t.accent)),
+            DropMark::Below => ui.painter().hline(r.x_range(), r.bottom(), Stroke::new(2.0, t.accent)),
             DropMark::Box => ui.painter().rect_stroke(r.shrink(0.5), 3.0, Stroke::new(1.5, t.accent), egui::StrokeKind::Inside),
         };
     }
     // Taking a payload takes it whatever its type: leave other drags (appearance swatches) be.
-    if !egui::DragAndDrop::has_payload_of_type::<Drag>(ui.ctx()) {
+    if !egui::DragAndDrop::has_payload_of_type::<T>(ui.ctx()) {
         return None;
     }
-    resp.dnd_release_payload::<Drag>().filter(|d| accept(d))
+    resp.dnd_release_payload::<T>().filter(|d| accept(d))
 }
 
 /// A drop, applied after the tree is drawn.

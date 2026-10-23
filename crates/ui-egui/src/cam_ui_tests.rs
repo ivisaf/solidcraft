@@ -58,7 +58,8 @@ fn toolbar_forms_make_a_job_and_its_toolpath_is_drawn() {
     assert_eq!((m.tools.len(), m.setups.len(), m.setups[0].operations.len()), (1, 1, 1));
 
     h.frames(3);
-    assert!(h.widget("Toolpaths").is_some() && h.widget("Pocket1  (pocket, T1)").is_some(), "the window lists the operation");
+    let rows = crate::browser::drawn_rows();
+    assert!(rows.iter().any(|r| r.0 == "Pocket1") && h.widget("Pocket1  (pocket, T1)").is_none(), "the browser lists the operation, the panel not");
     let proj = crate::viewport::projection(&h.app, h.app.viewport.rect.unwrap());
     let drawn = segments(&h.app, &proj);
     assert!(drawn.iter().any(|s| s.2) && drawn.iter().any(|s| !s.2), "cuts and rapids are drawn: {}", drawn.len());
@@ -168,7 +169,7 @@ fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
     assert_eq!((ops.len(), ops[0].id, ops[0].name.as_str(), ops[0].bottom.as_deref()), (1, before.setups[0].operations[0].id, "Deep", Some("-6 mm")));
     assert_eq!(paths(&mut h.app).iter().flatten().map(|p| p.0.z).fold(f64::INFINITY, f64::min), -6.0);
     h.frames(2);
-    assert!(h.widget("Edit").is_some() && h.widget("Up").is_some() && h.widget("Down").is_some());
+    assert!(crate::browser::drawn_rows().iter().any(|r| r.0 == "Deep") && h.widget("Up").is_none(), "renamed in the browser; no list in the panel");
     // An open form offers the design's sketches and the library's tools.
     h.app.start("cam.op.contour");
     h.frames(2);
@@ -251,7 +252,8 @@ fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
     assert!(close(min, [-5.0, -5.0, 0.0]) && close(max, [65.0, 45.0, 12.0]));
     assert!(arms.iter().all(|a| close(a.0, [-5.0, -5.0, 12.0])) && (arms[2].1 - arms[2].0).normalized().is_some_and(|d| close(d, [0.0, 0.0, 1.0])));
     h.frames(2);
-    assert!(h.widget("Stock and origin").is_some());
+    let shown = folder_menu_items(&h.app).into_iter().find(|i| i.label == "Stock and origin").expect("the folder menu's entry");
+    assert_eq!(shown.shortcut, "current", "checked while the stock is shown");
 
     // Edit shows what the setup has; turned over with the origin in the middle of the part's far face.
     let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
@@ -436,7 +438,7 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     // The design took a copy of the tool, which the library window says.
     assert_eq!(h.app.session.doc.manufacture.tool(1).and_then(|t| t.feed), Some(1500.0));
     h.frames(2);
-    assert!(h.widget("in use").is_some() && h.widget("Tool Library…").is_some());
+    assert!(h.widget("in use").is_some());
 
     // A second tool with other data: choosing it in an open form brings its data in.
     fill(&mut h, "cam.tool.define", |f| {
@@ -1258,6 +1260,61 @@ fn an_adaptive_form_clears_a_pocket_at_a_steady_load() {
     );
     h.frames(2);
     assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Adaptive1"));
+}
+
+/// In the browser an operation shows its time, and is dragged before another of its setup
+/// (onto its upper half) or after it (onto its lower half).
+#[test]
+fn browser_operations_show_their_time_and_are_dragged_into_order() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    for _ in 0..3 {
+        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    }
+    let order = |h: &Harness| h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.name.clone()).collect::<Vec<_>>();
+    assert_eq!(order(&h), ["Pocket1", "Pocket2", "Pocket3"]);
+    h.frames(2);
+    let minutes = h.app.session.execute("cam.list", &json!({})).unwrap()["setups"][0]["operations"][0]["toolpath"]["cut_minutes"].as_f64().unwrap();
+    assert!(painted_texts(&mut h).contains(&minutes_text(minutes)), "the time beside the operation");
+    let row = |name: &str| crate::browser::drawn_rows().into_iter().find(|r| r.0 == name).map(|r| r.1).unwrap();
+    let (from, onto) = (row("Pocket3").center(), row("Pocket1"));
+    h.step(&json!({"drag": [[from.x, from.y], [onto.center().x, onto.top() + 3.0]], "steps": 6})).unwrap();
+    h.frames(2);
+    assert_eq!(order(&h), ["Pocket3", "Pocket1", "Pocket2"], "before the first");
+    let (from, onto) = (row("Pocket3").center(), row("Pocket2"));
+    h.step(&json!({"drag": [[from.x, from.y], [onto.center().x, onto.bottom() - 3.0]], "steps": 6})).unwrap();
+    h.frames(2);
+    assert_eq!(order(&h), ["Pocket1", "Pocket2", "Pocket3"], "after the last");
+}
+
+/// The Manufacture folder's menu shows and hides toolpaths and stock and sets how toolpaths
+/// are drawn; the same choices are in the Preferences' Graphics page.
+#[test]
+fn the_manufacture_folder_menu_and_preferences_set_the_display() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    let showing = h.app.manufacture.show_setups;
+    menu_action(&mut h.app, &json!({"do": "setups"}));
+    assert_eq!(h.app.manufacture.show_setups, !showing);
+    menu_action(&mut h.app, &json!({"do": "colour", "index": 2}));
+    menu_action(&mut h.app, &json!({"do": "width", "index": 99}));
+    assert_eq!(
+        (h.app.preferences.cam_path_colour, h.app.preferences.cam_path_width),
+        (2, PATH_WIDTHS.len() - 1),
+        "an index past the end is the last"
+    );
+    let colours = folder_menu_items(&h.app).into_iter().find(|i| i.label == "Toolpath colour").unwrap();
+    let checked: Vec<&str> = colours.children.iter().filter(|c| c.shortcut == "current").map(|c| c.label.as_str()).collect();
+    assert_eq!(checked, ["white"]);
+    h.app.prefs_window.open = true;
+    h.app.prefs_window.section = crate::prefs::PAGE_GRAPHICS;
+    h.frames(3);
+    for row in ["Toolpath colour", "Toolpath width", "Panel fade", "Simulation detail", "Rapid rate"] {
+        assert!(h.widget(row).is_some(), "{row} in the Preferences");
+    }
 }
 
 /// Every text one frame paints, whole and in the parts a composed one is made of.

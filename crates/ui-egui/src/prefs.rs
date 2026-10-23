@@ -1524,6 +1524,7 @@ fn page(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
             response.on_hover_text(app.tr("settings.measure_axis_distances_help"));
             setting::show_frame_rate(app, ui);
             ui_kit::text(ui, app.tr("settings.frame_rate_note"), ui_kit::Text::Note("frame_rate"));
+            crate::cam_ui::preferences(app, ui);
         }
         5 => {
             let mut auto = app.session.auto_project;
