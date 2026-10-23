@@ -48,10 +48,15 @@ fn small_choice(ui: &mut egui::Ui, id: &str, label: &str, help_label: &str, inde
     let before = *index;
     explained(ui.label(tm(label)), help_label, None);
     let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
-    // Only as wide as its longest option: the kit's drop-down otherwise fills the row.
-    let width = ui_kit::ContentWidth::dropdown(ui, &options) + ui_kit::ContentWidth::label(ui, " ");
-    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| crate::ui_kit::dropdown(ui, id, index, &options));
+    fitted_dropdown(ui, id, index, &options, 0.0);
     *index != before
+}
+
+/// The kit's drop-down, only as wide as its longest option (and at least `least`): it
+/// otherwise fills the row, and a form's grid then leaves no room for the heights picture.
+fn fitted_dropdown(ui: &mut egui::Ui, id: &str, index: &mut usize, options: &[&str], least: f32) -> egui::Response {
+    let width = (ui_kit::ContentWidth::dropdown(ui, options) + ui_kit::ContentWidth::label(ui, " ")).max(least);
+    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| crate::ui_kit::dropdown(ui, id, index, options)).inner
 }
 
 /// The simulation's detail: a name and how many columns along the stock's longer side.
@@ -2013,7 +2018,7 @@ fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
 /// A form's text box, 140 pt wide; `invalid` draws it in the error colour (its value is still needed).
 fn text_box(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, invalid: bool) -> egui::Response {
     ui.scope(|ui| {
-        ui.set_max_width(140.0);
+        ui.set_max_width(FIELD_W);
         crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, tm(hint), invalid)
     })
     .inner
@@ -2195,7 +2200,7 @@ fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut 
 fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut usize, options: &[&str]) {
     row_label(ui, label, needed(need, label));
     let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
-    let r = crate::ui_kit::dropdown(ui, id, index, &options);
+    let r = fitted_dropdown(ui, id, index, &options, FIELD_W);
     explained(r, label, None);
     ui.end_row();
 }
@@ -2211,7 +2216,7 @@ fn pick(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, value: &mut Str
         labels.len() - 1
     });
     let before = index;
-    let r = crate::ui_kit::dropdown(ui, id, &mut index, &labels);
+    let r = fitted_dropdown(ui, id, &mut index, &labels, FIELD_W);
     if index != before
         && let Some((v, _)) = options.get(index)
     {
@@ -2334,7 +2339,14 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
             let top = ui.cursor().top();
             form_grid(ui, form, selected, choices, need, &mut picture);
             let Some(p) = &picture else { return false };
-            if ui.available_width() < PICTURE_W + 12.0 {
+            // The panel, at its usual width, grows by what the picture lacks (and gives back what it has to spare).
+            let room = egui::Id::new((MANUFACTURE_PANEL, "room"));
+            let lacking = PICTURE_W + 12.0 - ui.available_width();
+            ui.ctx().data_mut(|d| {
+                let grown = d.get_temp::<f32>(room).unwrap_or(0.0);
+                d.insert_temp(room, (grown + lacking).max(0.0));
+            });
+            if lacking > 0.0 {
                 return true;
             }
             ui.add_space(12.0);
@@ -2662,6 +2674,9 @@ fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHe
 
 /// The heights picture's width (points).
 const PICTURE_W: f32 = 170.0;
+
+/// How wide a form's text boxes are, and its drop-downs at least.
+const FIELD_W: f32 = 140.0;
 
 /// The form's rows; an operation form leaves its heights in `picture` for beside them.
 fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need], picture: &mut Option<Picture>) {
@@ -3072,7 +3087,8 @@ fn docked_panel(
     let mut frame = crate::frame::dock_frame(ctx, Side::Right);
     // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
     let widest = (dock.viewport.width() - 40.0).max(PANEL_MIN_W);
-    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { DIALOG_WIDE_MAX_W.min(widest) };
+    let grown = ctx.data(|d| d.get_temp::<f32>(egui::Id::new((id, "room")))).unwrap_or(0.0);
+    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { (DIALOG_WIDE_MAX_W + grown).min(widest) };
     // The background fades while the pointer is elsewhere and nothing in the panel is being typed into.
     let last = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
     let over = ctx.pointer_latest_pos().is_some_and(|p| last.is_some_and(|r| r.expand(6.0).contains(p)));
@@ -3184,6 +3200,8 @@ pub struct PanelLook {
 
 /// How far a panel's background fades while the pointer is elsewhere: a name and its opacity.
 const PANEL_FADES: [(&str, f32); 3] = [("off", 1.0), ("light", 0.5), ("strong", 0.25)];
+/// The Manufacture panel's id.
+const MANUFACTURE_PANEL: &str = "sc_cam_window";
 /// Narrowest a panel is dragged to (points).
 const PANEL_MIN_W: f32 = 400.0;
 
@@ -3484,7 +3502,7 @@ fn manufacture_window(
     let mut folded = cam.folded;
     let mut offset = cam.offset;
     let mut look = cam.look;
-    let (open, rect) = docked_panel(ctx, "sc_cam_window", "MANUFACTURE", dock, &mut folded, &mut offset, &mut look, |ui| {
+    let (open, rect) = docked_panel(ctx, MANUFACTURE_PANEL, "MANUFACTURE", dock, &mut folded, &mut offset, &mut look, |ui| {
         {
             if let Some(e) = &cam.error {
                 ui.label(RichText::new(e).color(t.error));

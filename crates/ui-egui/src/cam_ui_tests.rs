@@ -1350,3 +1350,40 @@ fn cam_surfaces_speak_the_chosen_language() {
         assert!(leaks.is_empty(), "English left on the CAM surfaces in {language}:\n{}", leaks.join("\n"));
     }
 }
+
+/// The heights picture stands beside the height rows, in German's longer labels too: the
+/// panel, at its usual width, grows to make room for it.
+#[test]
+fn the_heights_picture_stands_beside_the_rows() {
+    fn texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::Shape::Text(t) => out.push((t.galley.job.text.clone(), t.pos)),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+    for language in ["en", "de"] {
+        let mut h = lab();
+        h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+        h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Pocket"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [40, 30]})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        define_tool(&mut h);
+        fill(&mut h, "cam.setup.create", |_| {});
+        h.app.preferences.language = language.into();
+        let clearance = crate::i18n::Locale::for_language(language).manufacture_label("Clearance").to_string();
+        for id in ["cam.op.pocket", "cam.op.adaptive"] {
+            h.app.start(id);
+            if let Some(Form::Op(op)) = &mut h.app.manufacture.form {
+                op.bottom = "-3 mm".into();
+            }
+            h.frames(8);
+            let mut painted = Vec::new();
+            h.painted_frame().iter().for_each(|s| texts(&s.shape, &mut painted));
+            let at = |text: &str| painted.iter().find(|(t, _)| t == text).map(|(_, p)| *p);
+            let (row, line) = (at(&clearance).unwrap(), at(&format!("{clearance} 10")).unwrap());
+            assert!(line.x > row.x + 200.0 && (line.y - row.y).abs() < 40.0, "{language} {id}: the row at {row:?}, its line at {line:?}");
+            h.app.manufacture.form = None;
+        }
+    }
+}
