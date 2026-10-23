@@ -231,6 +231,8 @@ pub struct SetupForm {
     pub material: String,
     /// Index into [`WORK_OFFSETS`].
     pub work_offset: usize,
+    /// The earlier setup whose result is the stock (its id; "": the stock box).
+    pub stock_from: String,
 }
 
 /// The work offsets a setup's programs can run in.
@@ -776,6 +778,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             post: 0,
             material: String::new(),
             work_offset: 0,
+            stock_from: String::new(),
         }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
@@ -926,6 +929,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(f.post).copied().unwrap_or("rs274")));
             p.insert("material".into(), if f.material.trim().is_empty() { Value::Null } else { json!(f.material.trim()) });
             p.insert("work_offset".into(), json!(WORK_OFFSETS.get(f.work_offset).copied().unwrap_or("G54")));
+            p.insert("stock_from".into(), f.stock_from.trim().parse::<u64>().map_or(Value::Null, |id| json!(id)));
             match f.editing {
                 Some(id) => {
                     p.insert("setup".into(), json!(id));
@@ -1206,6 +1210,7 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
             .and_then(|n| usize::try_from(n.saturating_sub(54)).ok())
             .filter(|i| *i < WORK_OFFSETS.len())
             .unwrap_or(0),
+        stock_from: setup["stock_from"].as_u64().map(|id| id.to_string()).unwrap_or_default(),
     })))
 }
 
@@ -2069,6 +2074,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
+        "Stock from" => {
+            "Where this setup's stock comes from: its own box round the part, or what an earlier setup leaves of it (the part turned over for its other side, say: the earlier setup's tool axis turned over)."
+        }
         "Work offset" => "Which of the machine's work offsets the program runs in: the one you zeroed on this stock. G54 is the usual one.",
         "Material" => {
             "What the stock is made of. A setup's material picks each tool's cutting data for it (a tool without any cuts with its own); in a tool, the rows below are for the material chosen here."
@@ -2392,6 +2400,8 @@ struct Choices {
     materials: Vec<String>,
     /// The material of the setup an operation form adds to (its tools' data is for it).
     material: Option<String>,
+    /// The design's setups in order, by id and name: what a setup can take its stock from.
+    setups: Vec<(String, String)>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -2455,7 +2465,8 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             },
         ));
     }
-    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material }
+    let setups = listed["setups"].as_array().into_iter().flatten().filter_map(|x| Some((x["id"].as_u64()?.to_string(), text(x, "name")))).collect();
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups }
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
@@ -2805,6 +2816,11 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             choice(ui, need, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
             choice(ui, need, "sc_cam_setup_offset", "Work offset", &mut f.work_offset, &WORK_OFFSETS);
+            // The setups before this one.
+            let mut earlier: Vec<(String, String)> = vec![(String::new(), tm("its own stock box").into())];
+            let here = f.editing.map(|id| id.to_string());
+            earlier.extend(choices.setups.iter().take_while(|(id, _)| Some(id) != here.as_ref()).cloned());
+            pick(ui, need, "sc_cam_setup_stock_from", "Stock from", &mut f.stock_from, &earlier);
             let mut materials: Vec<(String, String)> = vec![(String::new(), tm("not said").into())];
             materials.extend(choices.materials.iter().map(|m| (m.clone(), m.clone())));
             pick(ui, need, "sc_cam_setup_material", "Material", &mut f.material, &materials);
@@ -4210,6 +4226,7 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
             disable(menu_item("Simulate", "cam_simulate", "simulate", setup, None), !ops.is_empty()),
             disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
             disable(menu_item("Setup Sheet…", "cam_post", "sheet", setup, None), !ops.is_empty()),
+            menu_item("New Setup, Turned Over", "cam_setup", "turn", setup, None),
             Item::sep(),
             menu_item("Remove Setup", "delete", "remove", setup, None),
         ],
@@ -4257,6 +4274,21 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         ("simulate", None) => asked.simulate = Some(setup),
         ("simulate", Some(o)) => asked.simulate_op = o["id"].as_u64().map(|op| (setup, op)),
         ("post", None) => asked.post = Some((setup, None, text(&s, "post"))),
+        // The part turned over: the tool from the other side, the stock what this setup leaves.
+        ("turn", None) => {
+            let axis: Vec<f64> = s["axis"].as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| -v).collect();
+            // The origin as the command takes it: a point, or where on a box.
+            let o = &s["origin"];
+            let origin = match o["type"].as_str() {
+                Some("point") => o["at"].clone(),
+                _ => json!({ "of": o["of"], "x": o["x"], "y": o["y"], "z": o["z"] }),
+            };
+            let mut p = json!({ "axis": axis, "origin": origin, "stock": s["stock"], "post": s["post"], "work_offset": s["work_offset"], "stock_from": setup });
+            if let Some(material) = s["material"].as_str() {
+                p["material"] = json!(material);
+            }
+            asked.run.push(("cam.setup.create", p));
+        }
         ("sheet", None) => {
             let name: String = format!("{} sheet", text(&s, "name")).chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
             app.pick_save(&format!("{name}.md"), &["md"], move |app, path| {

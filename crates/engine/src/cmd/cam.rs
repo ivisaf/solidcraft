@@ -48,7 +48,8 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
-     (or 54 to 59; default G54), the work offset its programs run in → setup: id, name";
+     (or 54 to 59; default G54), the work offset its programs run in; stock_from?: an earlier setup (id or name; null: none) whose result \
+     is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
@@ -89,7 +90,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -616,6 +617,45 @@ fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "removed": number }))
 }
 
+/// `stock_from`: an earlier setup (id or name) whose result is the stock, or null for none. The
+/// earlier setup's tool axis must be the same as `axis` or turned over. `at`: the setup's own
+/// place in the list (a new one is last).
+fn stock_from_param(s: &Session, p: &Value, at: Option<usize>, axis: Vec3, cmd: &str) -> Result<Option<Option<u64>>> {
+    match p.get("stock_from") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(_) => {
+            let k = key(p, "stock_from").ok_or_else(|| bad(cmd, "`stock_from` must be a setup (id or name) or null"))?;
+            let setups = &s.doc.manufacture.setups;
+            let before = at.unwrap_or(setups.len());
+            let j = setups
+                .iter()
+                .position(|x| x.id.to_string() == k || x.name.eq_ignore_ascii_case(&k))
+                .ok_or_else(|| bad(cmd, format!("no setup `{k}`")))?;
+            if j >= before {
+                return Err(bad(cmd, "a setup takes its stock from one before it"));
+            }
+            let earlier = setups.get(j).ok_or_else(|| bad(cmd, format!("no setup `{k}`")))?;
+            if facing(earlier.axis, axis).is_none() {
+                return Err(bad(cmd, "a setup takes its stock from one whose tool axis is the same or turned over"));
+            }
+            Ok(Some(Some(earlier.id)))
+        }
+    }
+}
+
+/// Whether two tool axes are the same (`Some(true)`) or turned over (`Some(false)`).
+fn facing(a: Vec3, b: Vec3) -> Option<bool> {
+    let d = a.normalized()?.dot(b.normalized()?);
+    if d > 1.0 - 1e-9 {
+        Some(true)
+    } else if d < -1.0 + 1e-9 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// `work_offset`: 54 to 59, or `G54` to `G59`.
 fn work_offset_param(p: &Value, cmd: &str) -> Result<Option<u8>> {
     let refused = || bad(cmd, "`work_offset` must be G54 to G59 (or 54 to 59)");
@@ -655,7 +695,8 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let post = Post::builtin(post).ok_or_else(|| bad(cmd, format!("unknown post `{post}` (known: {})", Post::BUILTIN.join(", "))))?.name;
     let material = material_param(p, cmd)?.flatten();
     let work_offset = work_offset_param(p, cmd)?.unwrap_or(54);
-    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, operations: Vec::new() };
+    let stock_from = stock_from_param(s, p, None, axis, cmd)?.flatten();
+    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, operations: Vec::new() };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -689,6 +730,16 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(offset) = work_offset_param(p, cmd)? {
         setup.work_offset = offset;
+    }
+    if let Some(from) = stock_from_param(s, p, Some(i), setup.axis, cmd)? {
+        setup.stock_from = from;
+    }
+    // A turned axis can leave a setup it takes its stock from facing neither way.
+    if let Some(from) = setup.stock_from
+        && let Some(earlier) = s.doc.manufacture.setups.iter().find(|x| x.id == from)
+        && facing(earlier.axis, setup.axis).is_none()
+    {
+        return Err(bad(cmd, "a setup takes its stock from one whose tool axis is the same or turned over"));
     }
     if let Some(material) = material_param(p, cmd)? {
         setup.material = material;
@@ -851,7 +902,14 @@ fn setup_remove(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "`setup` is required"));
     }
     let i = setup_index(s, p, cmd)?;
-    let removed = s.doc_mut().manufacture.setups.remove(i);
+    let doc = s.doc_mut();
+    let removed = doc.manufacture.setups.remove(i);
+    // Setups that took their stock from it start from their own stock box again.
+    for later in &mut doc.manufacture.setups {
+        if later.stock_from == Some(removed.id) {
+            later.stock_from = None;
+        }
+    }
     Ok(json!({ "removed": removed.id, "name": removed.name }))
 }
 
@@ -2233,7 +2291,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -2299,6 +2357,48 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// The raw block a simulation starts from, on its columns: `stock` ({min, max}) or the setup's,
 /// `cell` wide or `columns` across its longer side (default 300); and its corners.
+/// A setup's stock before its operations: its block, or (`stock_from`, without a `stock` of
+/// `p`'s) what the earlier setup leaves of its own, seen along this setup's axis. Turned over,
+/// a column is whole where the earlier setup left material in it and empty where it cut through:
+/// how deep it cut from the other side is under the material this setup sees.
+fn start_stock(s: &Session, setup: &Setup, at: &Resolved, p: &Value, cmd: &str) -> Result<(cam::HeightField, Box3)> {
+    let (mut field, block) = sim_block(p, cmd, at)?;
+    let earlier = setup.stock_from.filter(|_| p.get("stock").is_none()).and_then(|id| {
+        let setups = &s.doc.manufacture.setups;
+        let here = setups.iter().position(|x| x.id == setup.id)?;
+        // Only an earlier one: the chain ends.
+        setups.iter().take(here).find(|x| x.id == id)
+    });
+    let Some(earlier) = earlier else { return Ok((field, block)) };
+    let Some(same) = facing(earlier.axis, setup.axis) else { return Ok((field, block)) };
+    let before = resolve(s, earlier).map_err(|e| bad(cmd, e))?;
+    let (mut left, _) = start_stock(s, earlier, &before, &json!({ "cell": field.cell }), cmd)?;
+    for op in &earlier.operations {
+        let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
+        cam::simulate(&mut left, &build_in(s, &before, op)?, tool).map_err(cam_error)?;
+    }
+    let top = block.1.z;
+    for j in 0..field.ny {
+        for i in 0..field.nx {
+            let c = field.centre(i, j);
+            // The column's line in the earlier setup's work coordinates.
+            let there = before.frame.local(at.frame.world(Vec3::new(c.x, c.y, 0.0)));
+            let z = left.at(Vec2::new(there.x, there.y));
+            let height = if same {
+                at.frame.local(before.frame.world(Vec3::new(there.x, there.y, z))).z
+            } else if z > left.floor + 1e-9 {
+                top
+            } else {
+                field.floor
+            };
+            if let Some(cell) = field.z.get_mut(j * field.nx + i) {
+                *cell = height.clamp(field.floor, top);
+            }
+        }
+    }
+    Ok((field, block))
+}
+
 fn sim_block(p: &Value, cmd: &str, at: &Resolved) -> Result<(cam::HeightField, Box3)> {
     let (min, max) = match p.get("stock") {
         Some(v) => {
@@ -2343,7 +2443,7 @@ pub fn cam_playback(s: &Session, p: &Value) -> Result<CamPlayback> {
         return Err(bad(cmd, format!("setup `{}` has no operation", setup.name)));
     }
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
-    let (mut stock, _) = sim_block(p, cmd, &at)?;
+    let (mut stock, _) = start_stock(s, setup, &at, p, cmd)?;
     let (shown, first) = simulated_ops(setup, p, cmd)?;
     // The operations cut first leave the stock the played ones start from.
     for op in first.iter().filter_map(|i| setup.operations.get(*i)) {
@@ -2374,7 +2474,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     let state = s.model.state();
     let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
-    let (mut stock, (min, max)) = sim_block(p, cmd, &at)?;
+    let (mut stock, (min, max)) = start_stock(s, setup, &at, p, cmd)?;
     let cell = stock.cell;
     let (shown, first) = simulated_ops(setup, p, cmd)?;
     let mut ops = Vec::new();
@@ -2503,6 +2603,10 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
         }
         SetupOrigin::Point { at } => format!("Work zero G{}: the world point {}, {}, {}", setup.work_offset, mm(at.x), mm(at.y), mm(at.z)),
     });
+    // Seen from below: how the part is turned over for it.
+    if setup.axis.z < -1.0 + 1e-9 {
+        notes.push("Turned over: part flipped about the X axis, the tool comes from below".to_string());
+    }
     if let Some(material) = &setup.material {
         notes.push(format!("Material: {material}"));
     }

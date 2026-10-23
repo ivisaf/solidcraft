@@ -46,6 +46,9 @@ pub struct Setup {
     /// The work offset its programs run in: 54 to 59 (`G54` to `G59`).
     #[serde(default = "g54", skip_serializing_if = "is_g54")]
     pub work_offset: u8,
+    /// An earlier setup whose result is this one's stock (the part turned over, say): its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stock_from: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<CamOperation>,
 }

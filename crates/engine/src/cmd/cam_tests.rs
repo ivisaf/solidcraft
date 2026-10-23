@@ -1491,6 +1491,44 @@ fn a_setup_runs_in_its_work_offset_and_has_a_sheet_for_the_machine() {
 }
 
 #[test]
+fn a_setup_starts_from_what_an_earlier_one_leaves_also_turned_over() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    run(&mut s, "cam.setup.create", json!({"name": "Front", "origin": top}));
+    // The window cut right through: a 30 × 20 hole in the 60 × 40 plate.
+    run(&mut s, "cam.op.pocket", json!({"setup": "Front", "sketch": "Window", "tool": 1, "bottom": -10, "stepdown": 5}));
+    let left = run(&mut s, "cam.simulate", json!({"setup": "Front", "columns": 120, "field": true}));
+    let removed = left["removed_volume"].as_f64().unwrap();
+    assert!((removed - 6000.0).abs() < 300.0, "{removed}");
+    run(&mut s, "cam.setup.create", json!({"name": "Again", "origin": top, "stock_from": "Front"}));
+    run(&mut s, "cam.setup.create", json!({"name": "Back", "axis": "-z", "origin": top, "stock_from": "Front"}));
+    for name in ["Again", "Back"] {
+        run(&mut s, "cam.op.face", json!({"setup": name, "tool": 1, "bottom": -0.5}));
+        let play = crate::cam_playback(&s, &json!({"setup": name, "columns": 120})).unwrap();
+        // It starts with the hole already there, seen from its own side.
+        let volume = play.stock.volume();
+        assert!((volume - (24000.0 - removed)).abs() < 400.0, "{name}: {volume} vs {}", 24000.0 - removed);
+    }
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["setups"][1]["stock_from"], listed["setups"][0]["id"]);
+    // Turned over, its program says how to turn the part.
+    assert!(run(&mut s, "cam.post", json!({"setup": "Back"}))["gcode"].as_str().unwrap().contains("part flipped about the X axis"));
+    // Only an earlier setup, facing the same way or turned over; removing it leaves the later ones on their own stock.
+    for bad in
+        [json!({"setup": "Front", "stock_from": "Back"}), json!({"setup": "Again", "stock_from": "Nowhere"}), json!({"setup": "Again", "axis": "+x"})]
+    {
+        assert!(s.execute("cam.setup.edit", &bad).is_err(), "{bad}");
+    }
+    run(&mut s, "cam.setup.remove", json!({"setup": "Front"}));
+    assert!(s.doc.manufacture.setups.iter().all(|x| x.stock_from.is_none()));
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

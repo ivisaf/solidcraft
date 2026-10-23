@@ -1467,6 +1467,33 @@ fn a_setup_form_sets_the_work_offset_and_its_menu_offers_the_sheet() {
     assert!(sheet.enabled);
 }
 
+/// A setup's menu makes the setup for the part turned over, its stock what the first leaves;
+/// a setup's form chooses where its stock comes from.
+#[test]
+fn a_setup_turned_over_takes_its_stock_from_the_first() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.work_offset = 1;
+    });
+    let first = h.app.session.doc.manufacture.setups[0].id;
+    menu_action(&mut h.app, &json!({"do": "turn", "setup": first}));
+    let setups = &h.app.session.doc.manufacture.setups;
+    assert_eq!(setups.len(), 2, "{:?}", h.app.manufacture.error);
+    let turned = &setups[1];
+    assert_eq!((turned.axis.z, turned.stock_from, turned.work_offset), (-1.0, Some(first), 55));
+    // Its form shows where the stock comes from; set back to its own box, it is.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][1]) else { panic!("no form") };
+    assert_eq!(form.stock_from, first.to_string());
+    form.stock_from.clear();
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    assert_eq!(h.app.session.doc.manufacture.setups[1].stock_from, None);
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {
