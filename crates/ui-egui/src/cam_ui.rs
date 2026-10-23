@@ -513,6 +513,11 @@ pub struct CamUi {
     pub path_colour: usize,
     /// How fast the machine's rapids move (mm/min), for playing a program; kept with the preferences.
     pub rapid_rate: f64,
+    /// How the next program is written: an optional stop before each operation after the
+    /// first, and an air cut (every Z raised by `air_height` mm).
+    pub optional_stops: bool,
+    pub air_cut: bool,
+    pub air_height: f64,
     /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
     pub look: PanelLook,
     pub tools_look: PanelLook,
@@ -582,6 +587,9 @@ impl Default for CamUi {
     fn default() -> Self {
         CamUi {
             rapid_rate: solidcraft_engine::cam::DEFAULT_RAPID_RATE,
+            optional_stops: false,
+            air_cut: false,
+            air_height: 20.0,
             play: None,
             open: false,
             tools_open: false,
@@ -3630,6 +3638,18 @@ fn manufacture_window(
                 if to_check > 0 {
                     ui.label(RichText::new(tf("manufacture.ops_to_check", &[("count", &to_check.to_string())])).color(t.warning));
                 }
+                // How the program is written this time.
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    crate::ui_kit::checkbox(ui, tm("Stop before each operation (M1)"), &mut cam.optional_stops).on_hover_text(tm(
+                        "An optional stop before every operation after the first: the machine pauses there when its optional stop switch is on",
+                    ));
+                    crate::ui_kit::checkbox(ui, tm("Air cut"), &mut cam.air_cut)
+                        .on_hover_text(tm("Writes the program with every Z raised, to run it above the stock first and watch where the tool goes"));
+                    if cam.air_cut {
+                        crate::ui_kit::number_field(ui, &mut cam.air_height, 1.0..=1000.0, 1.0, " mm");
+                    }
+                });
                 // The setup's whole program: the one thing everything here leads to.
                 ui.add_space(4.0);
                 let label = RichText::new(format!("{}  ({})", tm("Post Process"), text(setup, "post"))).strong().size(t.font_heading).color(t.text);
@@ -4110,6 +4130,8 @@ pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
         choice(ui, "pref_cam_detail", "Simulation detail", &mut prefs.cam_sim_detail, &SIM_DETAIL.map(|d| d.0));
         crate::ui_kit::row(ui, tm("Rapid rate"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_rapid_rate, 100.0..=100_000.0, 50.0, " mm/min"))
             .on_hover_text(help("Rapid rate").map(tm).unwrap_or_default());
+        crate::ui_kit::row(ui, tm("Spindle spin-up"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_spindle_delay, 0.0..=60.0, 0.5, " s"))
+            .on_hover_text(tm("How long programs wait after the spindle starts or changes speed, so that it is up to speed before it cuts (a G4 after M3). 0: no wait"));
     });
 }
 
@@ -4191,7 +4213,15 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
 /// Writes a setup's program, or one operation of it, to `path`.
 pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
     let _language = crate::i18n::scope(&app.preferences.language);
-    let mut p = json!({ "setup": setup, "path": path });
+    let cam = &app.manufacture;
+    let air = if cam.air_cut { cam.air_height } else { 0.0 };
+    let mut p = json!({
+        "setup": setup,
+        "path": path,
+        "spindle_delay": app.preferences.cam_spindle_delay,
+        "optional_stops": cam.optional_stops,
+        "air_cut": air,
+    });
     if let Some(op) = op {
         p["op"] = json!(op);
     }

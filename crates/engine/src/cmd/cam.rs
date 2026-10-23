@@ -123,7 +123,9 @@ pub static COMMANDS: &[CommandSpec] = &[
          deviation: [per column: below 0 cut into the part, above 0 left on it]} in work coordinates, with the frame that places them. Top-down: undercuts are not seen",
     ),
     CommandSpec::new("cam.post", "Post Process", post).at("MANUFACTURE", "ACTIONS").icon("cam_post").noundo().params(
-        "setup?: id or name; op?: id or name, to write that operation alone (default: every operation, in order); post?: rs274|grbl|grblhal|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write → lines, extension, \
+        "setup?: id or name; op?: id or name, to write that operation alone (default: every operation, in order); post?: rs274|grbl|grblhal|lnc|lnc_atc or a post definition object (default: the setup's); path?: file to write; spindle_delay?: seconds to wait \
+         after the spindle starts (0 to 60); optional_stops?: bool, an M1 before each operation after the first; air_cut?: mm every Z is raised (0 to 1000), \
+         to run the program above the stock first → lines, extension, \
          cut_minutes, and gcode (the program text) when no path is given",
     ),
 ];
@@ -2433,6 +2435,53 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// The comment lines at the top of a program, for checking it at the machine: the stock and
+/// where its top and bottom are, where the work zero is, the tools and the cutting time.
+fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: f64) -> Vec<String> {
+    let mm = |v: f64| {
+        let t = format!("{:.3}", v + 0.0);
+        let t = t.trim_end_matches('0').trim_end_matches('.').to_string();
+        if t == "-0" { "0".to_string() } else { t }
+    };
+    let mut notes = Vec::new();
+    if let Some((lo, hi)) = at.stock {
+        notes.push(format!(
+            "Stock {} x {} x {} mm, top at Z{}, bottom at Z{}",
+            mm(hi.x - lo.x),
+            mm(hi.y - lo.y),
+            mm(hi.z - lo.z),
+            mm(hi.z),
+            mm(lo.z)
+        ));
+    }
+    let side = |a: Anchor, low: &str, high: &str| match a {
+        Anchor::Min => low.to_string(),
+        Anchor::Center => "centre".to_string(),
+        Anchor::Max => high.to_string(),
+    };
+    notes.push(match &setup.origin {
+        SetupOrigin::Box { of, x, y, z } => {
+            let of = if *of == BoxOf::Stock { "stock" } else { "part" };
+            format!("Work zero G54: {of} box, X {}, Y {}, Z {}", side(*x, "left", "right"), side(*y, "front", "back"), side(*z, "bottom", "top"))
+        }
+        SetupOrigin::Point { at } => format!("Work zero G54: the world point {}, {}, {}", mm(at.x), mm(at.y), mm(at.z)),
+    });
+    if let Some(material) = &setup.material {
+        notes.push(format!("Material: {material}"));
+    }
+    let mut seen = Vec::new();
+    for op in ops {
+        if !seen.contains(&op.tool.number) {
+            seen.push(op.tool.number);
+            let t = &op.tool;
+            let about = if t.description.trim().is_empty() { String::new() } else { format!(" {}", t.description.trim()) };
+            notes.push(format!("T{}: D{} {}{about}", t.number, mm(t.diameter), t.kind.label()));
+        }
+    }
+    notes.push(format!("Cutting time about {} min", mm((minutes * 10.0).round() / 10.0)));
+    notes
+}
+
 fn post(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.post";
     let setup = setup(s, p, cmd)?;
@@ -2454,7 +2503,16 @@ fn post(s: &mut Session, p: &Value) -> Result<Value> {
         Some(op) => format!("{} {} {}", s.doc.name, setup.name, op.name),
         None => format!("{} {}", s.doc.name, setup.name),
     };
-    let mut program = cam::Program { name, operations: Vec::new() };
+    let seconds = |k: &str, most: f64| match p.get(k) {
+        None | Some(Value::Null) => Ok(0.0),
+        Some(_) => num(p, k).filter(|v| (0.0..=most).contains(v)).ok_or_else(|| bad(cmd, format!("`{k}` must be 0 to {most}"))),
+    };
+    let safety = cam::Safety {
+        spindle_delay: seconds("spindle_delay", 60.0)?,
+        optional_stops: bool_(p, "optional_stops").unwrap_or(false),
+        air_cut: seconds("air_cut", 1000.0)?,
+    };
+    let mut program = cam::Program { name, operations: Vec::new(), notes: Vec::new(), safety };
     let mut minutes = 0.0;
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     for (_, op) in setup.operations.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {
@@ -2463,6 +2521,7 @@ fn post(s: &mut Session, p: &Value) -> Result<Value> {
         let tool = s.doc.manufacture.tool(op.tool).cloned().ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         program.operations.push(cam::Operation { name: op.name.clone(), tool, spindle_rpm: op.spindle_rpm, coolant: op.coolant, path });
     }
+    program.notes = program_notes(setup, &at, &program.operations, minutes);
     let text = cam::emit(&program, &post).map_err(cam_error)?;
     let mut out = json!({"lines": text.lines().count(), "extension": post.extension, "post": post.name, "cut_minutes": minutes});
     match str_(p, "path") {

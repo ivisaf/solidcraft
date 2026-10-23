@@ -26,7 +26,7 @@ mod tool;
 
 pub use adaptive::{AdaptiveParams, adaptive};
 pub use check::verify;
-pub use gcode::{Operation, Program, emit, parse};
+pub use gcode::{Operation, Program, Safety, emit, parse};
 pub use offset::offset_regions;
 pub use ops::{
     BoreParams, ChamferParams, ContourParams, Cut, DrillParams, FaceParams, Feeds, Heights, MAX_TABS, PocketParams, Side, Tabs, bore, chamfer,

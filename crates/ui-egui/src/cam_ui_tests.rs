@@ -353,6 +353,14 @@ fn facing_boundary_and_posting_one_operation_or_the_setup() {
     assert_eq!(h.app.manufacture.error, None);
     let (one, all) = (std::fs::read_to_string(one).unwrap(), std::fs::read_to_string(all).unwrap());
     assert!(one.contains("(Contour1:") && !one.contains("(Face1:") && all.contains("(Face1:") && all.contains("(Contour1:"));
+    // The spindle's spin-up from the preferences; the panel's stops and air cut when chosen.
+    assert!(all.contains("G4 P3") && !all.lines().any(|l| l == "M1") && !all.contains("AIR CUT"), "{all}");
+    h.app.preferences.cam_spindle_delay = 0.0;
+    (h.app.manufacture.optional_stops, h.app.manufacture.air_cut, h.app.manufacture.air_height) = (true, true, 15.0);
+    let safe = dir.join("safe.ngc");
+    post_to(&mut h.app, setup, None, &safe.to_string_lossy());
+    let safe = std::fs::read_to_string(safe).unwrap();
+    assert!(!safe.contains("G4 P3") && safe.lines().any(|l| l == "M1") && safe.contains("raised by 15 mm"), "{safe}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

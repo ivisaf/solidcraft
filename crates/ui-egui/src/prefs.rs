@@ -469,6 +469,8 @@ preference_settings! {
     cam_panel_fade: usize = 1;
     /// How fast this machine's rapids move (mm/min), for the time a played program takes.
     cam_rapid_rate: f32 = 5000.0;
+    /// How long programs wait after the spindle starts (s): a dwell after `M3`, so that it is up to speed before it cuts.
+    cam_spindle_delay: f32 = 3.0;
     /// The wheel zooms toward the point under the cursor (else toward the view's centre).
     zoom_to_cursor: bool = true, 1 => check("Zoom to the cursor", "The wheel zooms toward the point under the cursor (off: toward the view's centre)");
     /// Spread discrete wheel input across frames (off: apply each event immediately).

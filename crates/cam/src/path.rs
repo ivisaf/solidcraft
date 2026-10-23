@@ -32,6 +32,16 @@ impl Move {
             Move::Dwell { .. } => None,
         }
     }
+
+    /// The same move shifted by `by` (an arc's centre stays in XY, so `by` should only lift it).
+    pub fn lifted(&self, by: Vec3) -> Move {
+        match *self {
+            Move::Rapid { to } => Move::Rapid { to: to + by },
+            Move::Feed { to, feed } => Move::Feed { to: to + by, feed },
+            Move::Arc { to, center, ccw, feed } => Move::Arc { to: to + by, center, ccw, feed },
+            Move::Dwell { seconds } => Move::Dwell { seconds },
+        }
+    }
 }
 
 /// Signed angle (positive = counter-clockwise) of an arc move from `from` to `to`; zero when

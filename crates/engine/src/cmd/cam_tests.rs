@@ -51,7 +51,8 @@ fn pocket_from_a_sketch_to_gcode() {
     let posted = run(&mut s, "cam.post", json!({}));
     let gcode = posted["gcode"].as_str().unwrap();
     assert!(
-        gcode.starts_with("(Untitled Setup1)\nG17 G21 G40 G49 G54 G80 G90 G94\n(Pocket1: T1 D6 flat end mill)\nM5\nT1 M6\nG43 H1\nS12000 M3\n"),
+        gcode.starts_with("(Untitled Setup1)\n(Work zero G54: the world point 0, 0, 0)\n(T1: D6 flat end mill)\n")
+            && gcode.contains("G17 G21 G40 G49 G54 G80 G90 G94\n(Pocket1: T1 D6 flat end mill)\nM5\nT1 M6\nG43 H1\nS12000 M3\n"),
         "{gcode}"
     );
     assert!(gcode.ends_with("M5\nM30\n"));
@@ -1403,6 +1404,30 @@ fn one_operation_simulates_and_plays_on_the_stock_the_ones_before_it_left() {
     for bad in [json!({"ops": "Pocket1"}), json!({"ops": ["Drill9"]}), json!({"ops": []}), json!({"first": [true]}), json!({"ops": [1, 2, 3]})] {
         assert!(s.execute("cam.simulate", &bad).is_err(), "{bad}");
         assert!(crate::cam_playback(&s, &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn a_program_says_at_its_top_what_to_check_and_waits_stops_or_cuts_air_when_asked() {
+    let mut s = pocket_job(0.0, json!({"post": "grbl"}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    run(&mut s, "cam.op.pocket", pocket_op());
+    run(&mut s, "cam.op.contour", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -8, "side": "outside"}));
+    let plain = run(&mut s, "cam.post", json!({}));
+    let text = plain["gcode"].as_str().unwrap();
+    // The stock and where it is against the work zero, the tool and the time, as comments at the top.
+    let head: Vec<&str> = text.lines().take_while(|l| l.starts_with('(')).collect();
+    assert!(head.iter().any(|l| l.starts_with("(Stock 40 x 30 x 8 mm, top at Z0, bottom at Z-8")), "{head:?}");
+    assert!(head.contains(&"(Work zero G54: the world point 0, 0, 0)"), "{head:?}");
+    assert!(head.iter().any(|l| l.starts_with("(T1: D6 flat")) && head.iter().any(|l| l.starts_with("(Cutting time about")), "{head:?}");
+    assert!(!text.contains("G4 P") && !text.lines().any(|l| l == "M1"), "nothing asked for, nothing added");
+    let safe = run(&mut s, "cam.post", json!({"spindle_delay": 3, "optional_stops": true, "air_cut": 25}));
+    let text = safe["gcode"].as_str().unwrap();
+    assert!(text.contains("G4 P3") && text.lines().any(|l| l == "M1") && text.contains("AIR CUT"), "{text}");
+    let lowest = |t: &str| solidcraft_cam::parse(t).unwrap().iter().filter_map(|m| m.target()).map(|p| p.z).fold(f64::INFINITY, f64::min);
+    assert!((lowest(text) - lowest(plain["gcode"].as_str().unwrap()) - 25.0).abs() < 1e-6);
+    for bad in [json!({"spindle_delay": -1}), json!({"spindle_delay": "x"}), json!({"air_cut": 1e6})] {
+        assert!(s.execute("cam.post", &bad).is_err(), "{bad}");
     }
 }
 

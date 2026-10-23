@@ -31,7 +31,32 @@ pub struct Operation {
 pub struct Program {
     pub name: String,
     pub operations: Vec<Operation>,
+    /// Comment lines written at the top, for checking the program before it runs (the stock,
+    /// where the work zero is, the tools).
+    #[serde(default)]
+    pub notes: Vec<String>,
+    #[serde(default)]
+    pub safety: Safety,
 }
+
+/// What a program does for the machine and the person at it besides the toolpaths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Safety {
+    /// Seconds to wait after the spindle starts or changes speed, for it to get up to speed.
+    #[serde(default)]
+    pub spindle_delay: f64,
+    /// An optional stop (`M1`) before every operation after the first.
+    #[serde(default)]
+    pub optional_stops: bool,
+    /// An air cut: every Z raised by this much (mm), to run the program above the stock first.
+    #[serde(default)]
+    pub air_cut: f64,
+}
+
+/// Longest wait after the spindle starts (s).
+const MAX_SPINDLE_DELAY: f64 = 60.0;
+/// Highest an air cut lifts the program (mm).
+const MAX_AIR_CUT: f64 = 1000.0;
 
 /// `v` with at most `decimals` decimals and no trailing zeros.
 fn number(v: f64, decimals: u8) -> String {
@@ -209,14 +234,28 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
     if program.operations.len() > MAX_OPERATIONS {
         return Err(CamError::TooLarge(format!("more than {MAX_OPERATIONS} operations")));
     }
+    let safety = program.safety;
+    if !(0.0..=MAX_SPINDLE_DELAY).contains(&safety.spindle_delay) {
+        return invalid(format!("the spindle's delay must be 0 to {MAX_SPINDLE_DELAY} seconds"));
+    }
+    if !(0.0..=MAX_AIR_CUT).contains(&safety.air_cut) {
+        return invalid(format!("an air cut raises the program 0 to {MAX_AIR_CUT} mm"));
+    }
     let mut w = Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, feed: None };
     let mut values = Values { program: plain(&program.name), units: post.units.code().into(), ..Values::default() };
     w.comment(&program.name);
+    if safety.air_cut > 0.0 {
+        w.comment(&format!("AIR CUT: every Z raised by {} mm, not a real cut", number(safety.air_cut, 3)));
+    }
+    for note in program.notes.iter().take(MAX_OPERATIONS) {
+        w.comment(note);
+    }
     w.template(&post.header, &values)?;
+    let lift = Vec3::new(0.0, 0.0, safety.air_cut);
     let mut tool: Option<u32> = None;
     let mut rpm: Option<String> = None;
     let mut coolant = false;
-    for op in &program.operations {
+    for (k, op) in program.operations.iter().enumerate() {
         op.tool.validate()?;
         if !(op.spindle_rpm > 0.0) || !(op.spindle_rpm <= 1.0e6) {
             return invalid(format!("operation `{}`: the spindle speed must be above 0", plain(&op.name)));
@@ -225,6 +264,9 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         values.tool = op.tool.number.to_string();
         values.diameter = number(op.tool.diameter / post.units.mm(), post.decimals);
         values.rpm = speed.clone();
+        if safety.optional_stops && k > 0 {
+            w.block("M1");
+        }
         w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind.label()));
         if tool != Some(op.tool.number) {
             if tool.is_some() || post.tool_change_first {
@@ -237,6 +279,13 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         if rpm.as_ref() != Some(&speed) {
             w.template(&post.spindle_on, &values)?;
             rpm = Some(speed);
+            // Up to speed before it cuts.
+            if safety.spindle_delay > 0.0 {
+                values.seconds = w.value(safety.spindle_delay, 3);
+                values.milliseconds = number(safety.spindle_delay * 1000.0, 0);
+                let dwell = fill(&post.dwell, &values)?;
+                w.block(&dwell);
+            }
         }
         if op.coolant != coolant {
             w.template(if op.coolant { &post.coolant_on } else { &post.coolant_off }, &values)?;
@@ -247,7 +296,7 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
             if m.target().is_some_and(|to| !to.is_finite()) {
                 return Err(CamError::Unsafe(format!("operation `{}` has a coordinate that is not a finite number", plain(&op.name))));
             }
-            match *m {
+            match m.lifted(lift) {
                 Move::Rapid { to } => w.rapid(to),
                 Move::Feed { to, feed } | Move::Arc { to, feed, .. } if !(feed > 0.0) || !feed.is_finite() => {
                     let _ = to;

@@ -593,6 +593,7 @@ fn drill_program() -> Program {
     Program {
         name: "Bracket (rev 2)".into(),
         operations: vec![Operation { name: "Drill".into(), tool: t, spindle_rpm: 3000.0, coolant: true, path }],
+        ..Default::default()
     }
 }
 
@@ -624,6 +625,49 @@ M5
 M30
 ";
     assert_eq!(text, expected);
+}
+
+#[test]
+fn a_program_waits_for_the_spindle_stops_between_operations_and_cuts_air_when_asked() {
+    let mut program = drill_program();
+    let mut second = program.operations[0].clone();
+    second.name = "Again".into();
+    program.operations.push(second);
+    program.notes = vec!["Stock 60 x 40 x 10 mm".into()];
+    program.safety = Safety { spindle_delay: 2.5, optional_stops: true, air_cut: 0.0 };
+    let text = emit(&program, &Post::grbl()).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    // The notes come first; the spindle starts once and is waited for; the second operation is preceded by M1.
+    assert_eq!(&lines[..2], ["(Bracket rev 2)", "(Stock 60 x 40 x 10 mm)"]);
+    let on = lines.iter().position(|l| l.ends_with("M3")).unwrap();
+    assert_eq!(lines[on + 1], "G4 P2.5");
+    assert_eq!(lines.iter().filter(|l| l.starts_with("G4 P2.5")).count(), 1, "the speed did not change");
+    let stop = lines.iter().position(|l| *l == "M1").unwrap();
+    assert_eq!(lines[stop + 1], "(Again: T3 D5 drill)");
+    assert_eq!(lines.iter().filter(|l| **l == "M1").count(), 1);
+    // An air cut: the same moves, every Z 30 mm higher, and the program says so.
+    let real = parse(&emit(&drill_program(), &Post::grbl()).unwrap()).unwrap();
+    let mut air = drill_program();
+    air.safety.air_cut = 30.0;
+    let text = emit(&air, &Post::grbl()).unwrap();
+    assert!(text.lines().nth(1).is_some_and(|l| l.contains("AIR CUT")), "{text}");
+    let lifted = parse(&text).unwrap();
+    assert_eq!(lifted.len(), real.len());
+    for (a, b) in real.iter().zip(&lifted) {
+        if let (Some(a), Some(b)) = (a.target(), b.target()) {
+            assert!((b.z - a.z - 30.0).abs() < 1e-9 && (b.x - a.x).abs() < 1e-9 && (b.y - a.y).abs() < 1e-9, "{a:?} {b:?}");
+        }
+    }
+    // Waits and lifts that are no such thing are refused.
+    for safety in [
+        Safety { spindle_delay: -1.0, ..Default::default() },
+        Safety { spindle_delay: f64::NAN, ..Default::default() },
+        Safety { air_cut: 5000.0, ..Default::default() },
+    ] {
+        let mut p = drill_program();
+        p.safety = safety;
+        assert!(emit(&p, &Post::grbl()).is_err(), "{safety:?}");
+    }
 }
 
 #[test]
@@ -682,6 +726,7 @@ M30
     let program = Program {
         name: "p".into(),
         operations: vec![Operation { name: "Pocket".into(), tool: tool(6.0), spindle_rpm: 12000.0, coolant: false, path: path.clone() }],
+        ..Default::default()
     };
     let text = emit(&program, &Post::lnc()).unwrap();
     let mut z = String::new();
@@ -755,6 +800,7 @@ fn written_program_reads_back_as_the_same_path() {
     let program = Program {
         name: "p".into(),
         operations: vec![Operation { name: "Pocket".into(), tool: tool(6.0), spindle_rpm: 12000.0, coolant: false, path: path.clone() }],
+        ..Default::default()
     };
     for arcs in [true, false] {
         let mut post = Post::rs274();
@@ -788,6 +834,7 @@ fn arc_too_short_to_write_is_never_a_full_circle() {
     let program = Program {
         name: "p".into(),
         operations: vec![Operation { name: "o".into(), tool: tool(6.0), spindle_rpm: 1000.0, coolant: false, path: Toolpath { moves } }],
+        ..Default::default()
     };
     let text = emit(&program, &Post::rs274()).unwrap();
     assert!(!text.contains("G2 ") && !text.contains("G3 "), "{text}");
@@ -884,8 +931,11 @@ fn hostile_values_are_errors_never_panics() {
         let _ = path.stats();
         let _ = path.points(b);
         let _ = verify(&path, &good_cut.heights);
-        let program =
-            Program { name: "x".into(), operations: vec![Operation { name: "o".into(), tool: tool(6.0), spindle_rpm: b, coolant: false, path }] };
+        let program = Program {
+            name: "x".into(),
+            operations: vec![Operation { name: "o".into(), tool: tool(6.0), spindle_rpm: b, coolant: false, path }],
+            ..Default::default()
+        };
         let _ = emit(&program, &Post::rs274());
     }
     // Things that must be refused outright.
