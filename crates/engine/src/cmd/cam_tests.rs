@@ -1449,6 +1449,48 @@ fn a_contour_through_the_stock_without_tabs_is_warned_about() {
 }
 
 #[test]
+fn a_setup_runs_in_its_work_offset_and_has_a_sheet_for_the_machine() {
+    let mut s = pocket_job(0.0, json!({"post": "grbl", "work_offset": "G55"}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    run(&mut s, "cam.op.pocket", pocket_op());
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["setups"][0]["work_offset"], 55);
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("G17 G21 G55 G90 G94") && !gcode.contains("G54") && gcode.contains("(Work zero G55:"), "{gcode}");
+    // A post without the offset in its header gets it on a line of its own; G54 is the controller's usual and is not added.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "post": "lnc", "work_offset": 57}));
+    let lnc = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(lnc.lines().any(|l| l == "G57"), "{lnc}");
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "work_offset": 54}));
+    assert!(!run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().lines().any(|l| l == "G54"));
+    // Saved only when it is not G54, and read back.
+    let setup = s.doc.manufacture.setups[0].clone();
+    assert!(json!(setup).get("work_offset").is_none());
+    let mut moved = setup.clone();
+    moved.work_offset = 59;
+    let back: solidcraft_doc::manufacture::Setup = serde_json::from_value(json!(moved)).unwrap();
+    assert_eq!(back.work_offset, 59);
+    for bad in [json!({"work_offset": 53}), json!({"work_offset": "G60"}), json!({"work_offset": "x"}), json!({"work_offset": true})] {
+        let mut p = bad.clone();
+        p["setup"] = json!("Setup1");
+        assert!(s.execute("cam.setup.edit", &p).is_err(), "{bad}");
+    }
+    // The sheet: the stock and the zero, the tools, the operations in order.
+    let sheet = run(&mut s, "cam.sheet", json!({}))["text"].as_str().unwrap().to_string();
+    for part in [
+        "# Untitled – Setup1",
+        "- Stock 40 x 30 x 8 mm",
+        "Work zero G54",
+        "## Tools",
+        "| T1 | flat end mill | 6 mm |",
+        "## Operations",
+        "| 1 | Pocket1 | pocket | T1 | 12000 rev/min | 600 mm/min |",
+    ] {
+        assert!(sheet.contains(part), "{part} in\n{sheet}");
+    }
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

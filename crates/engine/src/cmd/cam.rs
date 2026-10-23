@@ -47,7 +47,8 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0); origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
-     rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none) → setup: id, name";
+     rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
+     (or 54 to 59; default G54), the work offset its programs run in → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
@@ -88,7 +89,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
+        "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
+         the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
+    ),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).icon("delete").params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Facing", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
@@ -611,6 +616,18 @@ fn tool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "removed": number }))
 }
 
+/// `work_offset`: 54 to 59, or `G54` to `G59`.
+fn work_offset_param(p: &Value, cmd: &str) -> Result<Option<u8>> {
+    let refused = || bad(cmd, "`work_offset` must be G54 to G59 (or 54 to 59)");
+    let n = match p.get("work_offset") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(refused)?,
+        Some(Value::String(t)) => t.trim().trim_start_matches(['G', 'g']).parse::<u64>().map_err(|_| refused())?,
+        Some(_) => return Err(refused()),
+    };
+    (54..=59).contains(&n).then_some(Some(n as u8)).ok_or_else(refused)
+}
+
 fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.setup.create";
     let setups = &s.doc.manufacture.setups;
@@ -637,7 +654,8 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let post = str_(p, "post").unwrap_or("rs274");
     let post = Post::builtin(post).ok_or_else(|| bad(cmd, format!("unknown post `{post}` (known: {})", Post::BUILTIN.join(", "))))?.name;
     let material = material_param(p, cmd)?.flatten();
-    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, operations: Vec::new() };
+    let work_offset = work_offset_param(p, cmd)?.unwrap_or(54);
+    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, operations: Vec::new() };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -668,6 +686,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = p.get("stock") {
         setup.stock = stock_param(s, v, &setup.stock, cmd)?;
+    }
+    if let Some(offset) = work_offset_param(p, cmd)? {
+        setup.work_offset = offset;
     }
     if let Some(material) = material_param(p, cmd)? {
         setup.material = material;
@@ -2212,7 +2233,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -2477,9 +2498,10 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
     notes.push(match &setup.origin {
         SetupOrigin::Box { of, x, y, z } => {
             let of = if *of == BoxOf::Stock { "stock" } else { "part" };
-            format!("Work zero G54: {of} box, X {}, Y {}, Z {}", side(*x, "left", "right"), side(*y, "front", "back"), side(*z, "bottom", "top"))
+            let (x, y, z) = (side(*x, "left", "right"), side(*y, "front", "back"), side(*z, "bottom", "top"));
+            format!("Work zero G{}: {of} box, X {x}, Y {y}, Z {z}", setup.work_offset)
         }
-        SetupOrigin::Point { at } => format!("Work zero G54: the world point {}, {}, {}", mm(at.x), mm(at.y), mm(at.z)),
+        SetupOrigin::Point { at } => format!("Work zero G{}: the world point {}, {}, {}", setup.work_offset, mm(at.x), mm(at.y), mm(at.z)),
     });
     if let Some(material) = &setup.material {
         notes.push(format!("Material: {material}"));
@@ -2495,6 +2517,116 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
     }
     notes.push(format!("Cutting time about {} min", mm((minutes * 10.0).round() / 10.0)));
     notes
+}
+
+/// A setup's sheet for the machine, in Markdown: what to clamp and where the zero is, the
+/// tools to load, and the operations in the order they run.
+fn sheet(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.sheet";
+    let setup = setup(s, p, cmd)?.clone();
+    let at = resolve(s, &setup).map_err(|e| bad(cmd, e))?;
+    let listed = list_now(s);
+    let ops: Vec<Value> = listed["setups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|x| x["id"] == json!(setup.id))
+        .and_then(|x| x["operations"].as_array().cloned())
+        .unwrap_or_default();
+    // Text that cannot break a table row.
+    let cell = |t: &str| t.replace('|', "/").replace(['\n', '\r'], " ");
+    let mm = |v: f64| {
+        let t = format!("{:.3}", v + 0.0);
+        let t = t.trim_end_matches('0').trim_end_matches('.').to_string();
+        if t == "-0" { "0".to_string() } else { t }
+    };
+    let mut out = vec![format!("# {} – {}", cell(&s.doc.name), cell(&setup.name)), String::new()];
+    let programs: Vec<cam::Operation> = setup
+        .operations
+        .iter()
+        .filter_map(|op| {
+            Some(cam::Operation {
+                name: op.name.clone(),
+                tool: s.doc.manufacture.tool(op.tool)?.clone(),
+                spindle_rpm: op.spindle_rpm,
+                coolant: op.coolant,
+                path: cam::Toolpath::default(),
+            })
+        })
+        .collect();
+    let minutes: f64 = ops.iter().filter_map(|o| o["toolpath"]["cut_minutes"].as_f64()).sum();
+    for note in program_notes(&setup, &at, &programs, minutes) {
+        out.push(format!("- {}", cell(&note)));
+    }
+    out.push(format!("- Post: {}", cell(&setup.post)));
+    out.push(String::new());
+    out.push("## Tools".into());
+    out.push(String::new());
+    out.push("| T | Kind | Diameter | Flutes | Flute length | Out of the holder | Description |".into());
+    out.push("|---|---|---|---|---|---|---|".into());
+    let mut seen = Vec::new();
+    for op in &setup.operations {
+        if seen.contains(&op.tool) {
+            continue;
+        }
+        seen.push(op.tool);
+        if let Some(t) = s.doc.manufacture.tool(op.tool) {
+            let length = t.length.map_or_else(|| "–".to_string(), |l| format!("{} mm", mm(l)));
+            out.push(format!(
+                "| T{} | {} | {} mm | {} | {} mm | {length} | {} |",
+                t.number,
+                t.kind.label(),
+                mm(t.diameter),
+                t.flutes,
+                mm(t.flute_length),
+                cell(&t.description)
+            ));
+        }
+    }
+    out.push(String::new());
+    out.push("## Operations".into());
+    out.push(String::new());
+    out.push("| # | Operation | Kind | Tool | Spindle | Feed | Plunge | Stepdown | Lowest Z | Time |".into());
+    out.push("|---|---|---|---|---|---|---|---|---|---|".into());
+    let mut warnings = Vec::new();
+    for (k, o) in ops.iter().enumerate() {
+        let text = |key: &str| o[key].as_str().map(str::to_string).unwrap_or_else(|| o[key].to_string());
+        let number = |v: &Value| v.as_f64().map_or_else(|| "–".to_string(), mm);
+        out.push(format!(
+            "| {} | {} | {} | T{} | {} rev/min | {} mm/min | {} mm/min | {} | {} | {} min |",
+            k + 1,
+            cell(&text("name")),
+            cell(&text("kind")),
+            o["tool"],
+            number(&o["spindle_rpm"]),
+            number(&o["cut_feed"]),
+            number(&o["plunge_feed"]),
+            cell(&text("stepdown")),
+            number(&o["toolpath"]["lowest_z"]),
+            number(&o["toolpath"]["cut_minutes"].as_f64().map(|m| (m * 10.0).round() / 10.0).map_or(Value::Null, |m| json!(m))),
+        ));
+        for key in ["error", "warning"] {
+            if let Some(w) = o[key].as_str() {
+                warnings.push(format!("- {}: {}", cell(&text("name")), cell(w)));
+            }
+        }
+    }
+    if !warnings.is_empty() {
+        out.push(String::new());
+        out.push("## Warnings".into());
+        out.push(String::new());
+        out.extend(warnings);
+    }
+    let text = out.join("\n") + "\n";
+    let mut result = json!({ "lines": out.len() });
+    match str_(p, "path") {
+        Some(path) => {
+            solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            result["path"] = json!(path);
+        }
+        None => result["text"] = json!(text),
+    }
+    Ok(result)
 }
 
 fn post(s: &mut Session, p: &Value) -> Result<Value> {
@@ -2527,7 +2659,7 @@ fn post(s: &mut Session, p: &Value) -> Result<Value> {
         optional_stops: bool_(p, "optional_stops").unwrap_or(false),
         air_cut: seconds("air_cut", 1000.0)?,
     };
-    let mut program = cam::Program { name, operations: Vec::new(), notes: Vec::new(), safety };
+    let mut program = cam::Program { name, operations: Vec::new(), notes: Vec::new(), safety, work_offset: Some(setup.work_offset) };
     let mut minutes = 0.0;
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     for (_, op) in setup.operations.iter().enumerate().filter(|(i, _)| only.is_none_or(|o| o == *i)) {

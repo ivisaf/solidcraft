@@ -2,7 +2,8 @@
 //! can be read from JSON), not code: line templates around the motion blocks, and a few
 //! switches for how the motion itself is written.
 //!
-//! Templates may use `{program}` (program name), `{units}` (`G21` or `G20`), `{tool}` (tool
+//! Templates may use `{program}` (program name), `{units}` (`G21` or `G20`), `{wcs}` (the work
+//! offset, `G54` to `G59`), `{tool}` (tool
 //! number), `{diameter}` (tool diameter in output units) and `{rpm}` (spindle speed); the dwell
 //! template uses `{seconds}` or `{milliseconds}`.
 
@@ -123,7 +124,7 @@ impl Post {
             feed_decimals: 1,
             line_numbers: None,
             comments: CommentStyle::Parentheses,
-            header: lines(&["G17 {units} G40 G49 G54 G80 G90 G94"]),
+            header: lines(&["G17 {units} G40 G49 {wcs} G80 G90 G94"]),
             tool_change: lines(&["M5", "T{tool} M6", "G43 H{tool}"]),
             tool_change_first: true,
             spindle_on: lines(&["S{rpm} M3"]),
@@ -150,7 +151,7 @@ impl Post {
             feed_decimals: 0,
             line_numbers: None,
             comments: CommentStyle::Parentheses,
-            header: lines(&["G17 {units} G54 G90 G94"]),
+            header: lines(&["G17 {units} {wcs} G90 G94"]),
             tool_change: lines(&["M5", "M0"]),
             tool_change_first: false,
             spindle_on: lines(&["S{rpm} M3"]),
@@ -175,7 +176,7 @@ impl Post {
     pub fn grblhal() -> Post {
         Post {
             name: "grblhal".into(),
-            header: lines(&["G17 {units} G40 G49 G54 G80 G90 G94"]),
+            header: lines(&["G17 {units} G40 G49 {wcs} G80 G90 G94"]),
             tool_change: lines(&["M5", "T{tool} M6"]),
             ..Post::grbl()
         }
@@ -219,7 +220,7 @@ impl Post {
     pub fn lnc_atc() -> Post {
         Post {
             name: "lnc_atc".into(),
-            header: lines(&["G17 G40 G49 G80 G90 G94 G54"]),
+            header: lines(&["G17 G40 G49 G80 G90 G94 {wcs}"]),
             tool_change: lines(&["M05", "T{tool} M06", "G43 H{tool}"]),
             tool_change_first: true,
             ..Post::lnc()
@@ -278,6 +279,7 @@ impl Post {
 pub(crate) struct Values {
     pub program: String,
     pub units: String,
+    pub wcs: String,
     pub tool: String,
     pub diameter: String,
     pub rpm: String,
@@ -297,6 +299,7 @@ pub(crate) fn fill(line: &str, v: &Values) -> Result<String> {
         out.push_str(match name.strip_prefix('{').unwrap_or(name) {
             "program" => &v.program,
             "units" => &v.units,
+            "wcs" => &v.wcs,
             "tool" => &v.tool,
             "diameter" => &v.diameter,
             "rpm" => &v.rpm,

@@ -37,6 +37,9 @@ pub struct Program {
     pub notes: Vec<String>,
     #[serde(default)]
     pub safety: Safety,
+    /// The work offset the program runs in (54 to 59: `G54` to `G59`; none: `G54`).
+    #[serde(default)]
+    pub work_offset: Option<u8>,
 }
 
 /// What a program does for the machine and the person at it besides the toolpaths.
@@ -242,7 +245,12 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         return invalid(format!("an air cut raises the program 0 to {MAX_AIR_CUT} mm"));
     }
     let mut w = Writer { post, out: String::new(), line: post.line_numbers.map(|n| n.start), x: None, y: None, z: None, pos: None, feed: None };
-    let mut values = Values { program: plain(&program.name), units: post.units.code().into(), ..Values::default() };
+    let offset = program.work_offset.unwrap_or(54);
+    if !(54..=59).contains(&offset) {
+        return invalid("the work offset must be G54 to G59");
+    }
+    let wcs = format!("G{offset}");
+    let mut values = Values { program: plain(&program.name), units: post.units.code().into(), wcs: wcs.clone(), ..Values::default() };
     w.comment(&program.name);
     if safety.air_cut > 0.0 {
         w.comment(&format!("AIR CUT: every Z raised by {} mm, not a real cut", number(safety.air_cut, 3)));
@@ -251,6 +259,10 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         w.comment(note);
     }
     w.template(&post.header, &values)?;
+    // A post that does not write the work offset still gets one that is not the controller's usual.
+    if offset != 54 && !post.header.iter().any(|l| l.contains("{wcs}")) {
+        w.block(&wcs);
+    }
     let lift = Vec3::new(0.0, 0.0, safety.air_cut);
     let mut tool: Option<u32> = None;
     let mut rpm: Option<String> = None;

@@ -1448,6 +1448,25 @@ fn rapids_into_material_are_confirmed_before_a_program_is_written() {
     assert!(h.app.manufacture.confirm_post.is_none());
 }
 
+/// A setup's form sets the work offset its programs run in; its menu writes its setup sheet.
+#[test]
+fn a_setup_form_sets_the_work_offset_and_its_menu_offers_the_sheet() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.work_offset = 2;
+    });
+    assert_eq!(h.app.session.doc.manufacture.setups[0].work_offset, 56);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(again)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!(again.work_offset, 2, "opened again it shows G56");
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    let sheet = menu_items(&h.app, setup, None).into_iter().find(|i| i.label == "Setup Sheet…").expect("the sheet in the menu");
+    assert!(sheet.enabled);
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

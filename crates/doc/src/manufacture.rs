@@ -43,8 +43,19 @@ pub struct Setup {
     pub material: Option<String>,
     /// The built-in post processor programs are written with.
     pub post: String,
+    /// The work offset its programs run in: 54 to 59 (`G54` to `G59`).
+    #[serde(default = "g54", skip_serializing_if = "is_g54")]
+    pub work_offset: u8,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<CamOperation>,
+}
+
+fn g54() -> u8 {
+    54
+}
+
+fn is_g54(offset: &u8) -> bool {
+    *offset == 54
 }
 
 fn world_up() -> Vec3 {
