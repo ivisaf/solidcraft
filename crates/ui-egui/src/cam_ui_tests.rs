@@ -497,7 +497,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 14, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 15, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1628,6 +1628,33 @@ fn a_v_carve_form_carves_with_a_v_bit() {
     assert!(op["kind"] == "vcarve" && (op["toolpath"]["lowest_z"].as_f64().unwrap() + 2.0).abs() < 1e-6, "{op}");
     let Some(Form::Op(again)) = edit_form(&h.app, &listed["setups"][0], op) else { panic!("no form") };
     assert_eq!((again.kind, again.max_depth.as_str()), (OpKind::VCarve, "2 mm"));
+}
+
+/// A thread form needs a pitch, mills round a sketch's circles, and opens again as it was.
+#[test]
+fn a_thread_form_mills_a_thread_in_a_hole() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 40, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Holes"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center": [20, 20], "radius": 3.3234375})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("cam.tool.define", json!({"number": 4, "kind": "flat", "diameter": 5, "spindle_rpm": 10000, "feed": 300})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.thread");
+    h.frames(2);
+    assert!(h.widget("THREAD").is_some() && h.widget("Pitch").is_some());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.tool, f.bottom) = ("4".into(), "-8".into());
+    let wanted = missing(h.app.manufacture.form.as_ref().unwrap(), &choices(&h.app, &json!({}), &json!({})));
+    assert!(wanted.iter().any(|n| n.field == "Pitch"), "a pitch is needed");
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.pitch, f.thread_passes) = ("1.25 mm".into(), "2".into());
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let op = &listed["setups"][0]["operations"][0];
+    let Some(Form::Op(again)) = edit_form(&h.app, &listed["setups"][0], op) else { panic!("no form") };
+    assert_eq!((again.kind, again.pitch.as_str(), again.thread_passes.as_str(), again.thread_outside), (OpKind::Thread, "1.25 mm", "2", false));
 }
 
 /// Every text one frame paints, whole and in the parts a composed one is made of.

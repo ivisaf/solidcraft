@@ -1210,6 +1210,97 @@ pub fn bore(holes: &[(Vec2, f64)], tool: &Tool, params: &BoreParams, cut: &Cut) 
     b.finish()
 }
 
+/// How a thread is milled round a hole or a boss with a single-profile thread mill.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ThreadParams {
+    /// The thread's pitch (mm): how far the helix rises in one turn.
+    pub pitch: f64,
+    /// The thread's major (nominal) diameter (mm).
+    pub diameter: f64,
+    /// Inside a hole (a nut's thread); otherwise round a boss (a bolt's).
+    pub internal: bool,
+    /// Climb milling; otherwise conventional.
+    pub climb: bool,
+    /// Passes out to the full thread depth, evenly apart.
+    pub passes: u32,
+}
+
+/// Most radial passes of a thread.
+const MAX_THREAD_PASSES: u32 = 20;
+
+/// Mills a thread at each centre: in passes out to the thread's full depth (ISO metric: the
+/// minor diameter 1.0825 pitches less than the major inside a hole, 1.2269 round a boss), each
+/// from the bottom up on a helix rising one pitch a turn, in from the middle (inside) or from
+/// outside the boss and away again before it goes up.
+pub fn thread_mill(centres: &[Vec2], tool: &Tool, params: &ThreadParams, cut: &Cut) -> Result<Toolpath> {
+    tool.validate()?;
+    cut.heights.validate()?;
+    cut.feeds.validate()?;
+    if centres.is_empty() {
+        return invalid("there is no hole or boss to thread");
+    }
+    if centres.len() > MAX_HOLES {
+        return Err(CamError::TooLarge(format!("more than {MAX_HOLES} threads")));
+    }
+    if !(params.pitch > 0.0 && params.pitch <= tool.diameter) {
+        return invalid("the thread's pitch must be above 0 and at most the tool diameter");
+    }
+    if !(params.diameter > 0.0 && params.diameter <= MAX_COORD) {
+        return invalid("the thread's diameter must be above 0");
+    }
+    if !(1..=MAX_THREAD_PASSES).contains(&params.passes) {
+        return invalid(format!("a thread is milled in 1 to {MAX_THREAD_PASSES} passes"));
+    }
+    let h = cut.heights;
+    if !(h.top > h.bottom) {
+        return invalid("the thread has no length");
+    }
+    let turns = ((h.top - h.bottom) / params.pitch).ceil();
+    if !(turns <= MAX_LEVELS as f64) {
+        return Err(CamError::TooLarge(format!("more than {MAX_LEVELS} turns")));
+    }
+    let r = tool.radius();
+    let major = params.diameter * 0.5;
+    // The tool's axis: where each pass runs, out to the full depth.
+    let (first, last) = if params.internal {
+        let minor = major - 1.0825 * params.pitch * 0.5;
+        (minor - r, major - r)
+    } else {
+        let minor = major - 1.2269 * params.pitch * 0.5;
+        (major + r, minor + r)
+    };
+    if params.internal && !(first > 1e-3) {
+        return invalid(format!("a {} mm thread mill does not fit a {} mm thread", tool.diameter, params.diameter));
+    }
+    // Going up, a right-hand thread turns counter-clockwise seen from above; climb inside a hole is counter-clockwise too.
+    let ccw = params.climb == params.internal;
+    let half_turns = (turns as usize) * 2;
+    let mut b = Builder::new(cut);
+    for &c in centres {
+        check_point(c)?;
+        for pass in 1..=params.passes {
+            let at = first + (last - first) * f64::from(pass) / f64::from(params.passes);
+            // In and out where the tool is free: the hole's middle, or beyond the boss.
+            let free = if params.internal { c } else { c + Vec2::new(at + r + 1.0, 0.0) };
+            let start = c + Vec2::new(at, 0.0);
+            b.travel_to(free)?;
+            b.plunge_to(h.bottom)?;
+            b.cut_to(start, h.bottom)?;
+            for k in 1..=half_turns {
+                let z = (h.bottom + params.pitch * 0.5 * k as f64).min(h.top);
+                let to = if k % 2 == 0 { start } else { c - Vec2::new(at, 0.0) };
+                b.push(Move::Arc { to: to.extend(z), center: c, ccw, feed: cut.feeds.cut })?;
+            }
+            let end = b.pos.map_or(start, |p| Vec2::new(p.x, p.y));
+            let away = if params.internal { c } else { c + (end - c) * ((at + r + 1.0) / at.max(1e-9)) };
+            let top = b.pos.map_or(h.top, |p| p.z);
+            b.cut_to(away, top)?;
+            b.retract()?;
+        }
+    }
+    b.finish()
+}
+
 pub fn drill(points: &[Vec2], tool: &Tool, params: &DrillParams, cut: &Cut) -> Result<Toolpath> {
     tool.validate()?;
     cut.heights.validate()?;

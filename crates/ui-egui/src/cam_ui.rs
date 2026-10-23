@@ -73,6 +73,7 @@ pub enum OpKind {
     Chamfer,
     VCarve,
     Bore,
+    Thread,
     Drill,
 }
 
@@ -85,6 +86,7 @@ impl OpKind {
             OpKind::Adaptive => "cam.op.adaptive",
             OpKind::Chamfer => "cam.op.chamfer",
             OpKind::VCarve => "cam.op.vcarve",
+            OpKind::Thread => "cam.op.thread",
             OpKind::Bore => "cam.op.bore",
             OpKind::Drill => "cam.op.drill",
         }
@@ -97,6 +99,7 @@ impl OpKind {
             OpKind::Adaptive => "ADAPTIVE",
             OpKind::Chamfer => "CHAMFER",
             OpKind::VCarve => "V-CARVE",
+            OpKind::Thread => "THREAD",
             OpKind::Bore => "BORE",
             OpKind::Drill => "DRILL",
         }
@@ -307,6 +310,11 @@ pub struct OpForm {
     pub pitch: String,
     /// The deepest a V-carve goes (empty: as deep as its shape asks).
     pub max_depth: String,
+    /// A thread's major diameter (empty: from the drawn circle), whether it is round a boss
+    /// rather than in a hole, and its passes out to the full depth (empty: one).
+    pub thread_diameter: String,
+    pub thread_outside: bool,
+    pub thread_passes: String,
     /// A pocket's rest machining: the larger tool (its number) that cleared it before (empty: the whole pocket).
     pub rest_from: String,
     /// Adaptive clearing: the heaviest cut (percent of the tool's diameter), the entry helix's
@@ -738,6 +746,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             tab_height: String::new(),
             finish: String::new(),
             max_depth: String::new(),
+            thread_diameter: String::new(),
+            thread_outside: false,
+            thread_passes: String::new(),
             lead: String::new(),
             skin: String::new(),
             skin_last: false,
@@ -807,6 +818,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         "cam.op.adaptive" => Some(op(OpKind::Adaptive)),
         "cam.op.chamfer" => Some(op(OpKind::Chamfer)),
         "cam.op.vcarve" => Some(op(OpKind::VCarve)),
+        "cam.op.thread" => Some(op(OpKind::Thread)),
         "cam.op.bore" => Some(op(OpKind::Bore)),
         "cam.op.drill" => Some(op(OpKind::Drill)),
         _ => None,
@@ -1071,6 +1083,20 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                         Err(_) => {}
                     }
                 }
+                OpKind::Thread => {
+                    optional(&mut p, "pitch", &f.pitch);
+                    if !f.thread_diameter.trim().is_empty() {
+                        p.insert("diameter".into(), json!(f.thread_diameter.trim()));
+                    } else if f.editing.is_some() {
+                        p.insert("diameter".into(), Value::Null);
+                    }
+                    p.insert("side".into(), json!(if f.thread_outside { "outside" } else { "inside" }));
+                    if let Ok(n) = f.thread_passes.trim().parse::<u64>() {
+                        p.insert("thread_passes".into(), json!(n));
+                    } else if !f.thread_passes.trim().is_empty() {
+                        return Err(tm("The number of thread passes must be a whole number").into());
+                    }
+                }
                 OpKind::VCarve => {
                     optional(&mut p, "stepover", &f.stepover);
                     if !f.max_depth.trim().is_empty() {
@@ -1095,7 +1121,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("faces".into(), json!(faces));
             }
             // A number of passes instead of the stepdown; on an edit an emptied one goes back to the stepdown.
-            if !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve) {
+            if !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve | OpKind::Thread) {
                 match f.passes.trim().parse::<u64>() {
                     Ok(n) => {
                         p.insert("passes".into(), json!(n));
@@ -1169,7 +1195,10 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             if f.kind == OpKind::Chamfer {
                 p.insert("side".into(), json!(if f.side == 1 { "inside" } else { "outside" }));
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve) {
+            if matches!(
+                f.kind,
+                OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve | OpKind::Thread
+            ) {
                 p.insert("climb".into(), json!(f.climb));
             }
             p.insert("coolant".into(), json!(f.coolant));
@@ -1288,6 +1317,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         "adaptive" => OpKind::Adaptive,
         "chamfer" => OpKind::Chamfer,
         "vcarve" => OpKind::VCarve,
+        "thread" => OpKind::Thread,
         "bore" => OpKind::Bore,
         "drill" => OpKind::Drill,
         _ => return None,
@@ -1340,6 +1370,9 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         tab_height: text(&inputs["tabs"], "height"),
         finish: text(inputs, "finish"),
         max_depth: text(inputs, "max_depth"),
+        thread_diameter: text(inputs, "diameter"),
+        thread_outside: inputs["internal"].as_bool() == Some(false),
+        thread_passes: inputs["passes"].as_u64().map(|n| n.to_string()).unwrap_or_default(),
         lead: text(inputs, "lead"),
         skin: text(inputs, "skin"),
         skin_last: inputs["skin_last"].as_bool().unwrap_or(false),
@@ -2204,6 +2237,12 @@ fn help(label: &str) -> Option<&'static str> {
         "Plunge feed" => "How fast the tool moves down into the material.",
         "Stepdown" => "How deep the tool goes per pass. Deep cuts are made in several passes.",
         "Passes" => "How many depth passes, instead of a stepdown: the depth is divided evenly. Empty: by the stepdown.",
+        "Pitch" => "How far the thread rises in one turn: 1.25 mm for M8, 1.5 mm for M10, say.",
+        "Thread diameter" => {
+            "The thread's major (nominal) diameter: 8 mm for M8. Empty: a hole drawn at its core diameter plus its depth, a boss as drawn."
+        }
+        "Thread side" => "Inside a hole (a nut's thread) or round a boss (a bolt's).",
+        "Thread passes" => "How many passes out to the full thread depth: more are gentler on a small thread mill. Empty: one.",
         "Deepest" => {
             "The deepest the V-bit's point goes below the top: wider parts of the shape are carved flat at this depth. Empty: as deep as the shape asks."
         }
@@ -3101,7 +3140,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             let unused =
                 (!f.passes.trim().is_empty()).then_some("Not used: the passes divide the depth evenly. Empty Passes to cut by the stepdown.");
             // A bore goes down on its helix (its depth per turn is further down).
-            let levels = !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve);
+            let levels = !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve | OpKind::Thread);
             if levels && field_unless(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter", unused).0 {
                 lit = Some(HeightLine::Passes);
             }
@@ -3187,6 +3226,14 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Chamfer width", &mut f.width, "1 mm");
                     field(ui, need, "Tip offset", &mut f.tip_offset, "0.5 mm");
                 }
+                OpKind::Thread => {
+                    field(ui, need, "Pitch", &mut f.pitch, "1.25 mm for M8");
+                    field(ui, need, "Thread diameter", &mut f.thread_diameter, "from the drawn circle");
+                    let mut side = usize::from(f.thread_outside);
+                    choice(ui, need, "sc_cam_thread_side", "Thread side", &mut side, &["inside a hole", "round a boss"]);
+                    f.thread_outside = side == 1;
+                    field(ui, need, "Thread passes", &mut f.thread_passes, "1");
+                }
                 OpKind::VCarve => {
                     field(ui, need, "Stepover", &mut f.stepover, "2% of the tool's diameter");
                     field(ui, need, "Deepest", &mut f.max_depth, "as deep as the shape asks");
@@ -3204,7 +3251,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Chamfer) {
                 field(ui, need, "Ramp angle", &mut f.ramp_angle, "3 deg (0: plunge)");
             }
-            if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve) {
+            if matches!(
+                f.kind,
+                OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve | OpKind::Thread
+            ) {
                 row_label(ui, "Direction", None);
                 crate::ui_kit::checkbox(ui, tm("Climb"), &mut f.climb);
                 ui.end_row();
@@ -3269,6 +3319,9 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
                 if empty(&f.feed) && !from_chip && tool.feed.is_none() {
                     want("Feed", "the feed: this tool has none of its own");
                 }
+            }
+            if f.kind == OpKind::Thread && empty(&f.pitch) {
+                want("Pitch", "the thread's pitch");
             }
             match &lists.heights {
                 Some(Ok((top, bottom))) => {
@@ -3617,8 +3670,17 @@ fn kind_name(group: &str, kind: &str) -> String {
 }
 
 /// The operations the toolbar offers, by their command.
-const OPERATIONS: [&str; 8] =
-    ["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.vcarve", "cam.op.bore", "cam.op.drill"];
+const OPERATIONS: [&str; 9] = [
+    "cam.op.face",
+    "cam.op.contour",
+    "cam.op.pocket",
+    "cam.op.adaptive",
+    "cam.op.chamfer",
+    "cam.op.vcarve",
+    "cam.op.bore",
+    "cam.op.thread",
+    "cam.op.drill",
+];
 
 /// How far along the way to a program the job is: a setup, an operation, a simulation, a
 /// program written (until the design changes). Each step is a button that does it; the line
@@ -3656,7 +3718,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
             let tip = [
                 "The raw block and the work zero. Click to make one, or to change it.",
-                "Facing, 2D Contour, 2D Pocket, Adaptive, Chamfer, V-Carve, Bore or Drill: click to choose one.",
+                "Facing, 2D Contour, 2D Pocket, Adaptive, Chamfer, V-Carve, Bore, Thread or Drill: click to choose one.",
                 "Cut the raw block with every operation and see what is left, or cut into the part.",
                 "Write the setup's program for the machine.",
             ];
@@ -4325,6 +4387,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             let icon = match text(op, "kind").as_str() {
                 "bore" => "cam_drill".to_string(),
                 "chamfer" | "vcarve" => "cam_contour".to_string(),
+                "thread" => "cam_drill".to_string(),
                 "adaptive" => "cam_pocket".to_string(),
                 kind => format!("cam_{kind}"),
             };

@@ -121,6 +121,12 @@ pub static COMMANDS: &[CommandSpec] = &[
          below the top (default: as deep as the shape asks); climb?: bool (default true); V-carves the closed profiles (letters, a logo) with a \
          V-bit: rings inside the outlines, each where the cone just touches the walls; the depth comes from the shape (bottom is not used)"
     )),
+    CommandSpec::new("cam.op.thread", "Thread", op_thread).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!(
+        "pitch: expr, the thread's pitch; diameter?: expr, its major diameter (default: a hole drawn at its core diameter plus 1.0825 pitches, a \
+         boss as drawn); side?: inside|outside (default inside: a hole's thread; outside: a boss's); thread_passes?: 1 to 20 out to the full thread \
+         depth (default 1); climb?: bool (default true); mills a right-hand thread round each round profile or picked hole with a single-profile \
+         thread mill, from the bottom up"
+    )),
     CommandSpec::new("cam.op.chamfer", "Chamfer", op_chamfer).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("width?: expr across the top (default 1 mm); tip_offset?: expr, how much deeper than the chamfer the tool's point goes (default 0.5 mm); side?: outside|inside (default outside: the profiles are the part); climb?: bool (default true); ramp_angle?: angle expr (default 3 deg); chamfers the top edges of the profiles or picked faces in one pass with a V-bit or a drill, at the tool's angle; the depth comes from the width (bottom is not used)")),
     CommandSpec::new("cam.op.bore", "Bore", op_bore).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("pitch?: expr, how far down one turn of the helix goes (default: the tool's stepdown, else a quarter of its diameter); climb?: bool (default true); stock_to_leave?: expr; mills each round profile (or a picked face's round holes, a picked hole's wall) larger than the tool on a helix down its wall, then once round at the bottom; a hole more than twice the tool's diameter keeps a core")),
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
@@ -1441,7 +1447,7 @@ impl OpShape {
             CamOperationKind::Chamfer { .. } | CamOperationKind::VCarve { .. } => OpShape::Chamfer,
             CamOperationKind::Pocket { .. } | CamOperationKind::Adaptive { .. } => OpShape::Pocket,
             // Holes, as drilled: their heights are the same.
-            CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } => OpShape::Drill,
+            CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } | CamOperationKind::Thread { .. } => OpShape::Drill,
         }
     }
 }
@@ -1734,6 +1740,29 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             }
             let holes: Vec<(Vec2, f64)> = holes.into_iter().map(|(c, r)| (c, 2.0 * r)).collect();
             cam::bore(&holes, tool, &params, &cut)
+        }
+        CamOperationKind::Thread { pitch, diameter, internal, climb, passes } => {
+            let pitch = len("pitch", pitch)?;
+            // Round profiles of a sketch; a picked face's round holes and picked hole walls.
+            let holes: Vec<(Vec2, f64)> = if picked {
+                regions.iter().flat_map(|r| r.holes.iter().filter_map(round_hole)).chain(g.bores.iter().copied()).collect()
+            } else {
+                let round: Vec<_> = regions.iter().filter_map(|r| round_hole(&r.outer)).collect();
+                if round.len() < regions.len() {
+                    return Err(fail("only round profiles can be threaded".into()));
+                }
+                round
+            };
+            let Some(&(_, drawn)) = holes.first() else { return Err(fail("there is no round hole or boss to thread".into())) };
+            // A hole is drawn at its core diameter, a boss at its major one (ISO metric).
+            let major = match diameter {
+                Some(e) => len("diameter", e)?,
+                None if *internal => 2.0 * drawn + 1.0825 * pitch,
+                None => 2.0 * drawn,
+            };
+            let params = cam::ThreadParams { pitch, diameter: major, internal: *internal, climb: *climb, passes: *passes };
+            let centres: Vec<Vec2> = holes.iter().map(|(c, _)| *c).collect();
+            cam::thread_mill(&centres, tool, &params, &cut)
         }
         CamOperationKind::Drill { peck, dwell } => {
             let peck = peck.as_ref().map(|e| len("peck", e)).transpose()?;
@@ -2236,6 +2265,19 @@ fn op_vcarve(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn op_thread(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.thread";
+    let pitch = expr(p, "pitch").ok_or_else(|| bad(cmd, "`pitch` is required: the thread's pitch (1.25 mm for M8, say)"))?;
+    let diameter = optional_length(s, p, "diameter", cmd)?;
+    let internal = !matches!(str_(p, "side"), Some("outside"));
+    let passes = match p.get("thread_passes") {
+        None => 1,
+        Some(v) => v.as_u64().filter(|n| (1..=20).contains(n)).ok_or_else(|| bad(cmd, "`thread_passes` must be 1 to 20"))? as u32,
+    };
+    let climb = bool_(p, "climb").unwrap_or(true);
+    add_op(s, p, cmd, "Thread", |_| CamOperationKind::Thread { pitch, diameter, internal, climb, passes })
+}
+
 fn op_bore(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.bore";
     let (pitch, climb, leave) = (expr(p, "pitch"), bool_(p, "climb").unwrap_or(true), stock_to_leave(p));
@@ -2370,6 +2412,8 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "tabs",
         "finish",
         "max_depth",
+        "diameter",
+        "thread_passes",
         "lead",
         "dogbones",
         "skin",
@@ -2393,6 +2437,14 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
         match (&mut kind, k) {
             (CamOperationKind::VCarve { max_depth, .. }, "max_depth") => *max_depth = optional_length(s, p, k, cmd)?,
+            (CamOperationKind::Thread { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
+            (CamOperationKind::Thread { diameter, .. }, "diameter") => *diameter = optional_length(s, p, k, cmd)?,
+            (CamOperationKind::Thread { internal, .. }, "side") => *internal = !matches!(str_(p, k), Some("outside")),
+            (CamOperationKind::Thread { passes, .. }, "thread_passes") => {
+                *passes =
+                    p.get(k).and_then(Value::as_u64).filter(|n| (1..=20).contains(n)).ok_or_else(|| bad(cmd, "`thread_passes` must be 1 to 20"))?
+                        as u32
+            }
             (
                 CamOperationKind::Face { stepover, .. } | CamOperationKind::Pocket { stepover, .. } | CamOperationKind::VCarve { stepover, .. },
                 "stepover",
@@ -2422,6 +2474,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 | CamOperationKind::Bore { climb, .. }
                 | CamOperationKind::Chamfer { climb, .. }
                 | CamOperationKind::VCarve { climb, .. }
+                | CamOperationKind::Thread { climb, .. }
                 | CamOperationKind::Adaptive { climb, .. },
                 "climb",
             ) => *climb = bool_(p, k).ok_or_else(|| bad(cmd, "`climb` must be true or false"))?,

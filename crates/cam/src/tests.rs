@@ -402,6 +402,46 @@ fn a_v_carve_goes_deeper_away_from_the_walls_down_to_its_limit() {
     assert!(vcarve(&strip, &vbit, &VCarveParams { stepover: 0.0, ..params }, &c).is_err());
 }
 
+#[test]
+fn a_thread_rises_one_pitch_a_turn_out_to_its_full_depth() {
+    // M8 × 1.25 in a 6.8 mm hole, with a 6 mm thread mill: from the bottom up, in two passes.
+    let mill = tool(6.0);
+    let params = ThreadParams { pitch: 1.25, diameter: 8.0, internal: true, climb: true, passes: 2 };
+    let c = cut(0.0, -10.0, 10.0);
+    let path = thread_mill(&[v(20.0, 20.0)], &mill, &params, &c).unwrap();
+    let arcs: Vec<(Vec3, bool)> = path
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Arc { to, ccw, .. } => Some((*to, *ccw)),
+            _ => None,
+        })
+        .collect();
+    assert!(!arcs.is_empty() && arcs.iter().all(|(_, ccw)| *ccw), "climb inside: counter-clockwise going up");
+    // Each half turn rises half a pitch; the last pass runs at the major diameter less the tool's radius.
+    for w in arcs.windows(2).filter(|w| w[1].0.z > w[0].0.z + 1e-9) {
+        assert!((w[1].0.z - w[0].0.z - 0.625).abs() < 1e-6 || (w[1].0.z + 0.0).abs() < 1e-9, "{w:?}");
+    }
+    let farthest = arcs.iter().map(|(p, _)| (p.x - 20.0).hypot(p.y - 20.0)).fold(0.0, f64::max);
+    assert!((farthest - (4.0 - 3.0)).abs() < 1e-6, "{farthest}");
+    assert!((path.stats().lowest_z.unwrap() + 10.0).abs() < 1e-9);
+    // Round a boss: outside it, and conventional turns clockwise going up.
+    let bolt = thread_mill(&[v(0.0, 0.0)], &mill, &ThreadParams { internal: false, climb: false, ..params }, &c).unwrap();
+    let nearest = bolt
+        .moves
+        .iter()
+        .filter_map(|m| match m {
+            Move::Arc { to, .. } => Some(to.x.hypot(to.y)),
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(nearest >= 4.0 - 1.2269 * 0.625 + 3.0 - 1e-6, "{nearest}");
+    // A tool too large, a pitch past the tool, no passes: refused.
+    assert!(thread_mill(&[v(0.0, 0.0)], &tool(7.0), &params, &c).is_err());
+    assert!(thread_mill(&[v(0.0, 0.0)], &mill, &ThreadParams { pitch: 7.0, ..params }, &c).is_err());
+    assert!(thread_mill(&[v(0.0, 0.0)], &mill, &ThreadParams { passes: 0, ..params }, &c).is_err());
+}
+
 /// The steepest descent of a cutting move (radians), and whether any goes straight down below `top`.
 fn steepest(path: &Toolpath, top: f64) -> (f64, bool) {
     let pts = path.points(0.002);

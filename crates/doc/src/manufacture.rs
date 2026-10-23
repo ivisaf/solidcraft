@@ -270,6 +270,19 @@ pub enum CamOperationKind {
         max_depth: Option<Expr>,
         climb: bool,
     },
+    /// A thread milled with a single-profile thread mill round each round profile: inside a
+    /// hole (drawn at its core diameter) or round a boss (drawn at its major diameter).
+    Thread {
+        /// How far the helix rises in one turn (a length expression).
+        pitch: Expr,
+        /// The thread's major diameter (a length expression; none: from the drawn circle and the pitch).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diameter: Option<Expr>,
+        internal: bool,
+        climb: bool,
+        /// Passes out to the full thread depth.
+        passes: u32,
+    },
     /// Mills round holes larger than the tool on a helix, `pitch` (a length expression) down a turn.
     Bore { climb: bool, stock_to_leave: Expr, pitch: Expr },
     /// Drills at the centre of each profile.
@@ -303,6 +316,7 @@ impl CamOperationKind {
             CamOperationKind::Adaptive { .. } => "adaptive",
             CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::VCarve { .. } => "vcarve",
+            CamOperationKind::Thread { .. } => "thread",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",
         }

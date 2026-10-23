@@ -1680,6 +1680,33 @@ fn a_v_carve_carves_letters_with_a_v_bit_to_the_depth_the_shape_asks() {
 }
 
 #[test]
+fn a_thread_is_milled_in_a_hole_drawn_at_its_core_diameter() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Holes"}));
+    // M8 × 1.25: drawn at its core, 8 − 1.0825 × 1.25 = 6.647 mm.
+    run(&mut s, "sketch.circle.center", json!({"center": [20, 20], "radius": 3.3234375}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 4, "kind": "flat", "diameter": 5, "spindle_rpm": 10000, "feed": 300}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"of": "stock", "x": "min", "y": "min", "z": "max"}}));
+    run(&mut s, "cam.op.thread", json!({"sketch": "Holes", "tool": 4, "pitch": 1.25, "bottom": -8, "thread_passes": 2}));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let op = &listed["setups"][0]["operations"][0];
+    assert!(op["kind"] == "thread" && op.get("error").is_none(), "{op}");
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    // The last pass runs 1.5 mm from the centre: the 8 mm major diameter less the tool's radius.
+    let moves = solidcraft_cam::parse(&gcode).unwrap();
+    let farthest = moves.iter().filter_map(|m| m.target()).map(|p| (p.x - 20.0).hypot(p.y - 20.0)).filter(|r| *r < 10.0).fold(0.0, f64::max);
+    assert!((farthest - 1.5).abs() < 0.01, "{farthest}");
+    run(&mut s, "cam.op.edit", json!({"op": "Thread1", "diameter": 7.5, "thread_passes": 1}));
+    assert!(matches!(
+        &s.doc.manufacture.setups[0].operations[0].kind,
+        solidcraft_doc::manufacture::CamOperationKind::Thread { passes: 1, diameter: Some(_), .. }
+    ));
+    assert!(s.execute("cam.op.thread", &json!({"sketch": "Holes", "tool": 4, "bottom": -8})).is_err(), "a pitch is needed");
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

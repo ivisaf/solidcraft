@@ -267,7 +267,7 @@ pub const SECTIONS: &[Section] = &[
         promoted: 4,
         ids: &["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.vcarve"],
     },
-    Section { tab: "MANUFACTURE", panel: "DRILLING", promoted: 2, ids: &["cam.op.drill", "cam.op.bore"] },
+    Section { tab: "MANUFACTURE", panel: "DRILLING", promoted: 3, ids: &["cam.op.drill", "cam.op.bore", "cam.op.thread"] },
     Section { tab: "MANUFACTURE", panel: "ACTIONS", promoted: 3, ids: &["cam.list", "cam.simulate", "cam.post", "cam.toolpath"] },
     Section { tab: "RENDER", panel: "SCENE", promoted: 2, ids: &["render.scene"] },
     Section { tab: "RENDER", panel: "IMAGE", promoted: 1, ids: &["render.start"] },
