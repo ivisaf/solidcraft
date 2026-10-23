@@ -518,6 +518,8 @@ pub struct CamUi {
     pub optional_stops: bool,
     pub air_cut: bool,
     pub air_height: f64,
+    /// A program waiting to be written once its rapids into material are confirmed.
+    pub confirm_post: Option<PendingPost>,
     /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
     pub look: PanelLook,
     pub tools_look: PanelLook,
@@ -590,6 +592,7 @@ impl Default for CamUi {
             optional_stops: false,
             air_cut: false,
             air_height: 20.0,
+            confirm_post: None,
             play: None,
             open: false,
             tools_open: false,
@@ -3332,6 +3335,10 @@ const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar 
 /// The engine's warnings about a toolpath in this window's language: how deep a program or an
 /// operation cuts into the part; other messages as the engine words them.
 fn engine_text(w: &str) -> String {
+    // Several warnings of one operation, one after the other.
+    if w.contains("; ") {
+        return w.split("; ").map(engine_text).collect::<Vec<_>>().join("; ");
+    }
     let between = |s: &str, a: &str, b: &str| s.strip_prefix(a).and_then(|r| r.strip_suffix(b)).map(str::to_string);
     if let Some(depth) = between(w, "cuts up to ", " mm into the part") {
         return tf("manufacture.op_cuts_into_part", &[("depth", &depth)]);
@@ -3705,6 +3712,7 @@ fn simulation_block(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
 
 /// Draw the windows that are open, and keep what the viewport shows up to date. Called once per frame.
 pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
+    confirm::post_confirmation(app, ctx);
     if !app.manufacture.open && !app.manufacture.tools_open {
         return;
     }
@@ -3872,6 +3880,44 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
         });
     }
     if let Some((setup, op, post)) = asked.post {
+        // Rapids that run into material drive the tool through the stock at full speed: confirmed first.
+        let collisions = rapid_collisions(app, setup, op.as_ref().map(|o| o.0));
+        if collisions > 0 {
+            app.manufacture.confirm_post = Some(PendingPost { setup, op, post, collisions });
+        } else {
+            pick_post(app, setup, op, post);
+        }
+    }
+}
+
+/// A program to write: its setup, one operation of it or all, the setup's post, and how many
+/// of its rapid moves run into material.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingPost {
+    pub setup: u64,
+    pub op: Option<(u64, String)>,
+    pub post: String,
+    pub collisions: u64,
+}
+
+/// How many rapid moves of a setup's program (or of one operation of it, on what the ones
+/// before it leave) run into material, as a quick simulation finds; none when it cannot tell.
+fn rapid_collisions(app: &mut SolveApp, setup: u64, op: Option<u64>) -> u64 {
+    let Some(s) = app.session.doc.manufacture.setups.iter().find(|s| s.id == setup) else { return 0 };
+    let mut p = json!({ "setup": setup, "columns": 150 });
+    if let Some(op) = op {
+        let first: Vec<u64> = s.operations.iter().take_while(|o| o.id != op).map(|o| o.id).collect();
+        (p["ops"], p["first"]) = (json!([op]), json!(first));
+    }
+    app.session
+        .execute("cam.simulate", &p)
+        .ok()
+        .map_or(0, |v| v["operations"].as_array().into_iter().flatten().filter_map(|o| o["rapid_collisions"].as_u64()).sum())
+}
+
+/// Asks where to write a program, then writes it.
+fn pick_post(app: &mut SolveApp, setup: u64, op: Option<(u64, String)>, post: String) {
+    {
         let extension = solidcraft_engine::cam::Post::builtin(&post).map(|p| p.extension).unwrap_or_else(|| "nc".into());
         // A file named after what is in it.
         let stem: String =
@@ -4237,6 +4283,9 @@ pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
         Err(e) => app.manufacture.error = Some(e),
     }
 }
+
+#[path = "cam_ui_confirm.rs"]
+mod confirm;
 
 #[cfg(test)]
 #[path = "cam_ui_tests.rs"]

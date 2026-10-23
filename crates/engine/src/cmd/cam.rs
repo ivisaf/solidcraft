@@ -2163,14 +2163,20 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(listed)
 }
 
+/// The warning of a contour that cuts through the stock with no tabs.
+const THROUGH_WITHOUT_TABS: &str = "cuts through the stock without tabs, so the part comes loose on the last pass";
+
 fn list_now(s: &Session) -> Value {
     let m = &s.doc.manufacture;
     let setups: Vec<Value> = m
         .setups
         .iter()
         .map(|setup| {
-            // The part seen from above, to tell an operation that cuts into it.
-            let part = resolve(s, setup).ok().and_then(|at| setup_part(s, &at));
+            // The part seen from above, to tell an operation that cuts into it; the stock's bottom,
+            // to tell one that cuts through it.
+            let resolved = resolve(s, setup).ok();
+            let part = resolved.as_ref().and_then(|at| setup_part(s, at));
+            let stock_bottom = resolved.as_ref().and_then(|at| at.stock).map(|(lo, _)| lo.z);
             let ops: Vec<Value> = setup
                 .operations
                 .iter()
@@ -2186,9 +2192,18 @@ fn list_now(s: &Session) -> Value {
                                 (Some(part), Some(tool)) => cam::gouge(&path, tool, part),
                                 _ => 0.0,
                             };
+                            let mut warnings = Vec::new();
                             // A chamfer cuts the part's edge on purpose: the model has no chamfer to compare with.
                             if depth > GOUGE_REPORTED && !matches!(op.kind, CamOperationKind::Chamfer { .. }) {
-                                v["warning"] = json!(format!("cuts up to {depth:.2} mm into the part"));
+                                warnings.push(format!("cuts up to {depth:.2} mm into the part"));
+                            }
+                            // A contour through the whole stock with nothing holding the part: it comes loose on the last pass.
+                            let through = matches!((path.stats().lowest_z, stock_bottom), (Some(z), Some(bottom)) if z <= bottom + 1e-6);
+                            if through && matches!(op.kind, CamOperationKind::Contour { tabs: None, .. }) {
+                                warnings.push(THROUGH_WITHOUT_TABS.to_string());
+                            }
+                            if !warnings.is_empty() {
+                                v["warning"] = json!(warnings.join("; "));
                             }
                         }
                         Err(e) => v["error"] = json!(e.to_string()),

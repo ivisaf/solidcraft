@@ -1419,6 +1419,35 @@ fn an_operation_simulates_on_what_the_ones_before_it_leave() {
     assert_eq!(title(&h), "Simulated: Setup1, 1 of 2 operations (hidden ones are left out)");
 }
 
+/// A program whose rapids run into material is written only once that is confirmed; a clean
+/// one goes straight to its file.
+#[test]
+fn rapids_into_material_are_confirmed_before_a_program_is_written() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Pocket"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [40, 30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    let setup = h.app.session.doc.manufacture.setups[0].id;
+    menu_action(&mut h.app, &json!({"do": "post", "setup": setup}));
+    assert!(h.app.manufacture.confirm_post.is_none() && h.app.file_picker.is_some(), "clean: no question, straight to where to write it");
+    h.app.file_picker = None;
+    // Started 6 mm down without the cut above it: its rapids at the retract height are in the material.
+    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "top": -6, "bottom": -8})).unwrap();
+    let late = h.app.session.doc.manufacture.setups[0].operations[1].id;
+    menu_action(&mut h.app, &json!({"do": "post", "setup": setup, "op": late}));
+    let asked = h.app.manufacture.confirm_post.clone().expect("the question");
+    assert!(asked.collisions > 0 && asked.op.as_ref().map(|o| o.0) == Some(late));
+    h.frames(2);
+    assert!(h.widget("Write anyway").is_some());
+    h.step(&json!({"widget": "Cancel"})).unwrap();
+    h.frames(1);
+    assert!(h.app.manufacture.confirm_post.is_none());
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

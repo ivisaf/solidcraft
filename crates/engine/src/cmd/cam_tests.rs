@@ -1432,6 +1432,23 @@ fn a_program_says_at_its_top_what_to_check_and_waits_stops_or_cuts_air_when_aske
 }
 
 #[test]
+fn a_contour_through_the_stock_without_tabs_is_warned_about() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Pocket", "distance": 8, "direction": "negative"}));
+    let contour = |bottom: f64| json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": bottom, "side": "outside"});
+    run(&mut s, "cam.op.contour", contour(-8.0));
+    run(&mut s, "cam.op.contour", contour(-6.0));
+    let mut held = contour(-8.0);
+    held["tabs"] = json!({"count": 4});
+    run(&mut s, "cam.op.contour", held);
+    let listed = run(&mut s, "cam.list", json!({}));
+    let warning = |k: usize| listed["setups"][0]["operations"][k]["warning"].as_str().unwrap_or("").to_string();
+    // Through the bottom with nothing holding it: warned; not as deep, or with tabs: not.
+    assert!(warning(0).contains("without tabs"), "{}", warning(0));
+    assert!(!warning(1).contains("without tabs") && !warning(2).contains("without tabs"), "{} / {}", warning(1), warning(2));
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));
