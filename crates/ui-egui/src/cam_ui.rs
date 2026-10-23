@@ -241,6 +241,8 @@ pub struct SetupForm {
     pub stock_from: String,
     /// Clamps no tool may enter, each as typed: X from, Y from, X to, Y to, top (work coordinates).
     pub clamps: Vec<[String; 5]>,
+    /// Copies of the part as typed: how many along X and Y, and how far apart (empty: one part).
+    pub copies: [String; 4],
 }
 
 /// The work offsets a setup's programs can run in.
@@ -811,6 +813,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             work_offset: 0,
             stock_from: String::new(),
             clamps: Vec::new(),
+            copies: Default::default(),
         }))),
         "cam.op.face" => Some(op(OpKind::Face)),
         "cam.op.contour" => Some(op(OpKind::Contour)),
@@ -977,6 +980,21 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 clamps.push(json!({ "min": [v[0].min(v[2]), v[1].min(v[3])], "max": [v[0].max(v[2]), v[1].max(v[3])], "top": v[4] }));
             }
             p.insert("clamps".into(), json!(clamps));
+            // Copies: counts as whole numbers, an empty count is one.
+            let copies = if f.copies.iter().all(|t| t.trim().is_empty()) {
+                Value::Null
+            } else {
+                let count = |t: &str| -> Result<u64, String> {
+                    if t.trim().is_empty() {
+                        Ok(1)
+                    } else {
+                        t.trim().parse::<u64>().map_err(|_| tm("The number of copies must be a whole number").to_string())
+                    }
+                };
+                let gap = |t: &str| if t.trim().is_empty() { Ok(0.0) } else { number("The copies' spacing", t) };
+                json!({ "nx": count(&f.copies[0])?, "ny": count(&f.copies[1])?, "dx": gap(&f.copies[2])?, "dy": gap(&f.copies[3])? })
+            };
+            p.insert("copies".into(), copies);
             match f.editing {
                 Some(id) => {
                     p.insert("setup".into(), json!(id));
@@ -1305,6 +1323,11 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
                 [n(&c["min"][0]), n(&c["min"][1]), n(&c["max"][0]), n(&c["max"][1]), n(&c["top"])]
             })
             .collect(),
+        copies: {
+            let c = &setup["copies"];
+            let n = |v: &Value| v.as_f64().map(|x| x.to_string()).unwrap_or_default();
+            if c.is_object() { [n(&c["nx"]), n(&c["ny"]), n(&c["dx"]), n(&c["dy"])] } else { Default::default() }
+        },
     })))
 }
 
@@ -2266,6 +2289,10 @@ fn help(label: &str) -> Option<&'static str> {
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
+        "Copies" => {
+            "Copies of the part side by side on the stock, in rows along X and columns along Y: each operation cuts every copy before the next operation. Empty: one part."
+        }
+        "Spacing" => "How far apart the copies are along X and Y, from one part's place to the next's (mm).",
         "Clamps" => {
             "What holds the stock and no tool may touch: a box from-to across, in the setup's work coordinates, up to its top. Operations whose tool comes into one are warned about."
         }
@@ -3036,6 +3063,21 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             if let Some(k) = gone {
                 f.clamps.remove(k);
+            }
+            // Copies of the part: how many along X and Y, then how far apart.
+            for (label, range, hints) in [("Copies", 0..2, ["along X", "along Y"]), ("Spacing", 2..4, ["X apart", "Y apart"])] {
+                explained(ui.label(tm(label)), label, None);
+                ui.horizontal(|ui| {
+                    for (i, hint) in range.zip(hints) {
+                        ui.scope(|ui| {
+                            ui.set_max_width(68.0);
+                            if let Some(text) = f.copies.get_mut(i) {
+                                crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_copies", i)), text, tm(hint), false);
+                            }
+                        });
+                    }
+                });
+                ui.end_row();
             }
             ui.label("");
             if button(ui, tm("Add Clamp"), Button::Small).on_hover_text(tm(help("Clamps").unwrap_or_default())).clicked() && f.clamps.len() < 64 {

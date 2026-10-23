@@ -52,8 +52,28 @@ pub struct Setup {
     /// What holds the stock that no tool may touch (clamps, vices), in the setup's work coordinates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clamps: Vec<Clamp>,
+    /// Copies of the part side by side on the stock, each cut by every operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<Copies>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<CamOperation>,
+}
+
+/// Copies of the part in rows and columns along the setup's X and Y, `dx` and `dy` apart (mm):
+/// `nx` × `ny` in all, the first where the part is.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Copies {
+    pub nx: u32,
+    pub ny: u32,
+    pub dx: f64,
+    pub dy: f64,
+}
+
+impl Copies {
+    /// Where each copy is, from the first, in rows along X.
+    pub fn offsets(&self) -> Vec<(f64, f64)> {
+        (0..self.ny).flat_map(|j| (0..self.nx).map(move |i| (f64::from(i) * self.dx, f64::from(j) * self.dy))).collect()
+    }
 }
 
 /// A box no tool may enter: from `min` to `max` across, in the setup's work coordinates, up to

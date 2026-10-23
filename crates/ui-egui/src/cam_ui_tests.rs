@@ -1657,6 +1657,26 @@ fn a_thread_form_mills_a_thread_in_a_hole() {
     assert_eq!((again.kind, again.pitch.as_str(), again.thread_passes.as_str(), again.thread_outside), (OpKind::Thread, "1.25 mm", "2", false));
 }
 
+/// A setup form sets copies of the part; opened again it shows them, and emptied there is one.
+#[test]
+fn a_setup_form_sets_copies_of_the_part() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    fill(&mut h, "cam.setup.create", |f| {
+        let Form::Setup(setup) = f else { panic!("not a setup form") };
+        setup.copies = ["3".into(), String::new(), "70".into(), String::new()];
+    });
+    let copies = h.app.session.doc.manufacture.setups[0].copies.expect("copies");
+    assert_eq!((copies.nx, copies.ny, copies.dx), (3, 1, 70.0));
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut again)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!(again.copies[0], "3");
+    again.copies = Default::default();
+    h.app.manufacture.form = Some(Form::Setup(again));
+    apply(&mut h.app);
+    assert!(h.app.session.doc.manufacture.setups[0].copies.is_none());
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

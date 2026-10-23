@@ -10,7 +10,7 @@ use solidcraft_cam::{
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{
-    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, FaceRef, Setup, SetupOrigin, StockDef, TabsDef,
+    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, FaceRef, Setup, SetupOrigin, StockDef, TabsDef,
 };
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
@@ -52,7 +52,8 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
      (or 54 to 59; default G54), the work offset its programs run in; stock_from?: an earlier setup (id or name; null: none) whose result \
      is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z); clamps?: \
-     [{name?, min: [x, y], max: [x, y], top}] boxes in work coordinates no tool may enter (operations that do are warned about) → setup: id, name";
+     [{name?, min: [x, y], max: [x, y], top}] boxes in work coordinates no tool may enter (operations that do are warned about); copies?: \
+     {nx, ny, dx, dy}: copies of the part in rows along X and columns along Y, dx and dy apart, each cut by every operation (null: one) → setup: id, name";
 
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
@@ -93,7 +94,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, clamps as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, clamps, copies as in cam.setup.create (stock offsets left out stay as they are)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -671,6 +672,32 @@ fn stock_from_param(s: &Session, p: &Value, at: Option<usize>, axis: Vec3, cmd: 
     }
 }
 
+/// Most copies of the part on one setup.
+const MAX_COPIES: u32 = 1000;
+
+/// `copies`: `{nx, ny, dx, dy}` (`null`: one part).
+fn copies_param(p: &Value, cmd: &str) -> Result<Option<Option<Copies>>> {
+    let refused = || {
+        bad(
+            cmd,
+            format!("`copies` must be {{nx, ny: 1 or more, {MAX_COPIES} in all; dx, dy: how far apart (mm), above 0 where there is more than one}}"),
+        )
+    };
+    let c = match p.get("copies") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(None)),
+        Some(c) => c,
+    };
+    let count = |k: &str| c.get(k).map_or(Some(1), Value::as_u64).filter(|n| (1..=u64::from(MAX_COPIES)).contains(n)).map(|n| n as u32);
+    let gap = |k: &str| c.get(k).map_or(Some(0.0), Value::as_f64).filter(|v| v.is_finite() && (0.0..=1e5).contains(v));
+    let (nx, ny) = (count("nx").ok_or_else(refused)?, count("ny").ok_or_else(refused)?);
+    let (dx, dy) = (gap("dx").ok_or_else(refused)?, gap("dy").ok_or_else(refused)?);
+    if nx * ny > MAX_COPIES || (nx > 1 && !(dx > 0.0)) || (ny > 1 && !(dy > 0.0)) {
+        return Err(refused());
+    }
+    Ok(Some((nx * ny > 1).then_some(Copies { nx, ny, dx, dy })))
+}
+
 /// Most clamps on one setup.
 const MAX_CLAMPS: usize = 64;
 
@@ -784,7 +811,9 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let work_offset = work_offset_param(p, cmd)?.unwrap_or(54);
     let stock_from = stock_from_param(s, p, None, axis, cmd)?.flatten();
     let clamps = clamps_param(p, cmd)?.unwrap_or_default();
-    let mut setup = Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, clamps, operations: Vec::new() };
+    let copies = copies_param(p, cmd)?.flatten();
+    let mut setup =
+        Setup { id: 0, name: name.clone(), axis, origin, stock, material, post, work_offset, stock_from, clamps, copies, operations: Vec::new() };
     resolve(s, &setup).map_err(|e| bad(cmd, e))?;
     setup.id = next_id(s);
     let id = setup.id;
@@ -824,6 +853,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(clamps) = clamps_param(p, cmd)? {
         setup.clamps = clamps;
+    }
+    if let Some(copies) = copies_param(p, cmd)? {
+        setup.copies = copies;
     }
     // A turned axis can leave a setup it takes its stock from facing neither way.
     if let Some(from) = setup.stock_from
@@ -950,6 +982,8 @@ pub(crate) struct Resolved {
     frame: Frame,
     part: Option<Box3>,
     stock: Option<Box3>,
+    /// Where each copy of the part is, from the first (one at 0, 0 without copies).
+    copies: Vec<(f64, f64)>,
 }
 
 fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> {
@@ -984,7 +1018,11 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     };
     let shift = Vec3::new(o.dot(x), o.dot(y), o.dot(z));
     let moved = |b: Box3| (b.0 - shift, b.1 - shift);
-    Ok(Resolved { frame: Frame { o, x, y, z }, part: part.map(moved), stock: stock.map(moved) })
+    // The stock reaches over every copy.
+    let copies = setup.copies.map_or_else(|| vec![(0.0, 0.0)], |c| c.offsets());
+    let (far_x, far_y) = copies.iter().fold((0.0f64, 0.0f64), |m, c| (m.0.max(c.0), m.1.max(c.1)));
+    let stock = stock.map(moved).map(|(lo, hi)| (lo, hi + Vec3::new(far_x, far_y, 0.0)));
+    Ok(Resolved { frame: Frame { o, x, y, z }, part: part.map(moved), stock, copies })
 }
 
 /// How many tools a setup's program loads: one for its first operation, and one each time the
@@ -1782,7 +1820,25 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             cam::drill(&points, tool, &DrillParams { peck, dwell: *dwell }, &cut)
         }
     };
-    path.map_err(|e| fail(e.to_string()))
+    // Facing the stock covers every copy already: the stock reaches over them.
+    let copies: &[(f64, f64)] = if matches!(op.geometry, CamGeometry::Stock) { &[(0.0, 0.0)] } else { &at.copies };
+    path.map(|p| copied(p, copies)).map_err(|e| fail(e.to_string()))
+}
+
+/// A toolpath cut on every copy, one after the other, the tool up at its highest between them.
+fn copied(path: Toolpath, copies: &[(f64, f64)]) -> Toolpath {
+    if copies.len() <= 1 {
+        return path;
+    }
+    let up = path.moves.iter().filter_map(|m| m.target()).map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+    let mut moves = Vec::with_capacity(path.moves.len() * copies.len() + copies.len());
+    for &(dx, dy) in copies {
+        if let Some(last) = moves.iter().rev().find_map(|m: &cam::Move| m.target()) {
+            moves.push(cam::Move::Rapid { to: Vec3::new(last.x, last.y, up) });
+        }
+        moves.extend(path.moves.iter().map(|m| m.shifted(dx, dy)));
+    }
+    Toolpath { moves }
 }
 
 /// The faces an operation is to cut, from `faces: [{body?, point}]`: each the face holding the point.
@@ -2630,7 +2686,7 @@ fn list_now(s: &Session) -> Value {
                 })
                 .collect();
             let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
-                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "tool_changes": tool_changes(setup), "operations": ops});
+                "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "stock_from": setup.stock_from, "clamps": setup.clamps, "copies": setup.copies, "tool_changes": tool_changes(setup), "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
                 Ok(at) => {
@@ -2945,6 +3001,9 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
     // Seen from below: how the part is turned over for it.
     if setup.axis.z < -1.0 + 1e-9 {
         notes.push("Turned over: part flipped about the X axis, the tool comes from below".to_string());
+    }
+    if let Some(c) = setup.copies {
+        notes.push(format!("Copies: {} x {}, {} x {} mm apart", c.nx, c.ny, mm(c.dx), mm(c.dy)));
     }
     if let Some(material) = &setup.material {
         notes.push(format!("Material: {material}"));

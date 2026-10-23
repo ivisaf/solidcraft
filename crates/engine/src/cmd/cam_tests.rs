@@ -1707,6 +1707,51 @@ fn a_thread_is_milled_in_a_hole_drawn_at_its_core_diameter() {
 }
 
 #[test]
+fn copies_of_the_part_are_each_cut_by_every_operation() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"of": "stock", "x": "min", "y": "min", "z": "max"}}));
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Window", "tool": 1, "bottom": -3}));
+    run(&mut s, "cam.op.face", json!({"tool": 1, "top": 0, "bottom": -0.5}));
+    let face_x = |s: &mut Session| {
+        let gcode = run(s, "cam.post", json!({"op": "Face1"}))["gcode"].as_str().unwrap().to_string();
+        solidcraft_cam::parse(&gcode).unwrap().iter().filter_map(|m| m.target()).map(|p| p.x).fold(0.0, f64::max)
+    };
+    let alone = face_x(&mut s);
+    run(&mut s, "cam.op.remove", json!({"op": "Face1"}));
+    let one = run(&mut s, "cam.simulate", json!({"columns": 150}))["removed_volume"].as_f64().unwrap();
+    let length = |s: &mut Session| run(s, "cam.list", json!({}))["setups"][0]["operations"][0]["toolpath"]["cut_length"].as_f64().unwrap();
+    let single = length(&mut s);
+    // Three side by side, 70 mm apart: three times the cut, the stock reaching over all of them.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "copies": {"nx": 3, "ny": 1, "dx": 70}}));
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert!((listed["setups"][0]["stock_box"]["max"][0].as_f64().unwrap() - 200.0).abs() < 1e-6, "{}", listed["setups"][0]["stock_box"]);
+    assert!((length(&mut s) - 3.0 * single).abs() < 1e-6);
+    let three = run(&mut s, "cam.simulate", json!({"columns": 300}))["removed_volume"].as_f64().unwrap();
+    assert!((three - 3.0 * one).abs() < 0.05 * one, "{three} vs 3 × {one}");
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("(Copies: 3 x 1, 70 x 0 mm apart)"));
+    let xs = solidcraft_cam::parse(&gcode).unwrap().iter().filter_map(|m| m.target()).map(|p| p.x).fold(0.0, f64::max);
+    assert!(xs > 140.0 + 15.0, "the last copy's window: {xs}");
+    // Facing the stock is not repeated: the stock already reaches over every copy.
+    run(&mut s, "cam.op.face", json!({"tool": 1, "top": 0, "bottom": -0.5}));
+    let wide = face_x(&mut s);
+    assert!(wide > alone + 130.0 && wide < 200.0 + 10.0, "{alone} → {wide}");
+    let lengths = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"].clone();
+    let face_moves = lengths[1]["toolpath"]["moves"].as_u64().unwrap();
+    assert!(face_moves < 400, "{face_moves}");
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "copies": null}));
+    assert!(s.doc.manufacture.setups[0].copies.is_none());
+    for bad in [json!({"nx": 2}), json!({"nx": 0}), json!({"nx": 2000, "dx": 1}), json!({"nx": 2, "dx": -5})] {
+        assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "copies": bad})).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

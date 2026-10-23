@@ -33,6 +33,15 @@ impl Move {
         }
     }
 
+    /// The same move moved `dx`, `dy` across (an arc's centre with it).
+    pub fn shifted(&self, dx: f64, dy: f64) -> Move {
+        let by = Vec3::new(dx, dy, 0.0);
+        match *self {
+            Move::Arc { to, center, ccw, feed } => Move::Arc { to: to + by, center: center + Vec2::new(dx, dy), ccw, feed },
+            other => other.lifted(by),
+        }
+    }
+
     /// The same move shifted by `by` (an arc's centre stays in XY, so `by` should only lift it).
     pub fn lifted(&self, by: Vec3) -> Move {
         match *self {
