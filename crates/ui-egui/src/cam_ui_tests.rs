@@ -1693,6 +1693,27 @@ fn a_setup_form_sets_copies_of_the_part() {
     assert!(h.app.session.doc.manufacture.setups[0].copies.is_none());
 }
 
+/// The tool assistant's shape step sets the holder; opened again it shows it.
+#[test]
+fn a_tool_s_holder_is_set_in_its_shape() {
+    let mut h = lab();
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        (tool.number, tool.diameter, tool.length, tool.holder_diameter, tool.holder_length) =
+            ("7".into(), "6".into(), "25".into(), "32".into(), "45".into());
+    });
+    // A new tool goes into the machine's library.
+    let listed = library_listing(&mut h.app, true);
+    let tool = listed["tools"].as_array().into_iter().flatten().find(|t| t["number"] == 7).cloned().expect("the tool");
+    assert_eq!((tool["holder_diameter"].as_f64(), tool["holder_length"].as_f64()), (Some(32.0), Some(45.0)), "{tool}");
+    h.app.start("cam.tool.define");
+    if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+        f.step = 1;
+    }
+    h.frames(2);
+    assert!(h.widget("Holder diameter").is_some() && h.widget("Holder length").is_some());
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

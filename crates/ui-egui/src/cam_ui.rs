@@ -140,6 +140,9 @@ pub struct ToolForm {
     pub tip_diameter: String,
     pub shank_diameter: String,
     pub length: String,
+    /// The holder above the tool (mm): its diameter and length. Empty: not known.
+    pub holder_diameter: String,
+    pub holder_length: String,
     /// The assistant's step: 0 the kind, 1 the shape, 2 the cutting data.
     pub step: usize,
     /// The material whose cutting data the rows show ("": the tool's own, for every other material).
@@ -800,6 +803,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 tip_diameter: String::new(),
                 shank_diameter: String::new(),
                 length: String::new(),
+                holder_diameter: String::new(),
+                holder_length: String::new(),
                 step: 0,
                 material: String::new(),
                 others: Vec::new(),
@@ -903,6 +908,8 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 ("tip_diameter", "The tip diameter", &f.tip_diameter),
                 ("shank_diameter", "The shank diameter", &f.shank_diameter),
                 ("length", "The length", &f.length),
+                ("holder_diameter", "The holder's diameter", &f.holder_diameter),
+                ("holder_length", "The holder's length", &f.holder_length),
             ] {
                 let plain = text.trim().trim_end_matches("mm").trim_end_matches("deg").trim_end_matches('°').trim();
                 if !plain.is_empty() {
@@ -1264,6 +1271,8 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         tip_diameter: number("tip_diameter"),
         shank_diameter: number("shank_diameter"),
         length: number("length"),
+        holder_diameter: number("holder_diameter"),
+        holder_length: number("holder_length"),
         // A tool that exists opens on its shape.
         step: 1,
         material: String::new(),
@@ -2317,6 +2326,10 @@ fn help(label: &str) -> Option<&'static str> {
         "X direction" => {
             "Which way the setup's X runs, across the tool axis. Automatic: worked out from the axis. From below (-z), +x means the part is turned over about X, -x about Y."
         }
+        "Holder diameter" => {
+            "How wide the holder (collet nut, chuck) the tool sits in is. With its length, and the tool's length out of it, operations check that the holder stays clear of the clamps. Empty: not checked."
+        }
+        "Holder length" => "How long the holder is, from where the tool comes out of it up. Empty: not checked.",
         "Copies" => {
             "Copies of the part side by side on the stock, in rows along X and columns along Y: each operation cuts every copy before the next operation. Empty: one part."
         }
@@ -2969,6 +2982,9 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         row(ui, "Tip diameter (d)", &mut f.tip_diameter, "0 mm (a sharp point)", Dim::Tip);
                     }
                     field(ui, need, "Flutes", &mut f.flutes, "2");
+                    // The holder: checked against clamps, from where the tool comes out of it.
+                    field(ui, need, "Holder diameter", &mut f.holder_diameter, "not known");
+                    field(ui, need, "Holder length", &mut f.holder_length, "not known");
                 });
                 ui.add_space(12.0);
                 tool_picture(ui, &ToolShape::of(f), lit, egui::vec2(170.0, 250.0), true);
@@ -3712,6 +3728,9 @@ fn engine_text(w: &str) -> String {
         return w.split("; ").map(engine_text).collect::<Vec<_>>().join("; ");
     }
     let between = |s: &str, a: &str, b: &str| s.strip_prefix(a).and_then(|r| r.strip_suffix(b)).map(str::to_string);
+    if let Some(clamp) = w.strip_prefix("the holder runs into clamp ") {
+        return tf("manufacture.the_holder_runs_into_clamp", &[("clamp", clamp)]);
+    }
     if let Some(clamp) = w.strip_prefix("runs into clamp ") {
         return tf("manufacture.runs_into_named_clamp", &[("clamp", clamp)]);
     }

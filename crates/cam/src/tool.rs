@@ -71,6 +71,12 @@ pub struct Tool {
     pub shank_diameter: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub length: Option<f64>,
+    /// The holder the tool sits in (mm): how wide it is and how long, from where the tool comes
+    /// out of it up; what must stay clear of clamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_diameter: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_length: Option<f64>,
     /// Cutting data for particular materials; the data above is for every other one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cutting: Vec<CuttingData>,
@@ -135,6 +141,8 @@ impl Tool {
             tip_angle: None,
             tip_diameter: None,
             shank_diameter: None,
+            holder_diameter: None,
+            holder_length: None,
             length: None,
             cutting: Vec::new(),
         }
@@ -197,6 +205,12 @@ impl Tool {
         }
         if self.shank_diameter.is_some_and(|d| !(d > 0.0 && d <= MAX_TOOL_DIAMETER)) {
             return invalid("the shank diameter must be above 0 and at most 1000 mm");
+        }
+        if self.holder_diameter.is_some_and(|d| !(d > 0.0 && d <= MAX_TOOL_DIAMETER)) {
+            return invalid("the holder's diameter must be above 0 and at most 1000 mm");
+        }
+        if self.holder_length.is_some_and(|l| !(l > 0.0 && l <= 10.0 * MAX_TOOL_DIAMETER)) {
+            return invalid("the holder's length must be above 0");
         }
         if self.length.is_some_and(|l| !(l >= self.flute_length && l <= 10.0 * MAX_TOOL_DIAMETER)) {
             return invalid("a tool's length must be at least its flute length");

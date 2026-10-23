@@ -1622,6 +1622,16 @@ fn clamps_in_the_way_and_a_tool_too_short_are_warned_about() {
     run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": [{"name": "Vice", "min": [20, 0], "max": [25, 40], "top": 5}]}));
     assert!(warning(&mut s).contains("runs into clamp Vice"), "{}", warning(&mut s));
     assert_eq!(run(&mut s, "cam.list", json!({}))["setups"][0]["clamps"][0]["name"], "Vice");
+    // A tall clamp beside the window: the tool keeps clear of it, its wide holder does not.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": [{"name": "Tall", "min": [52, 0], "max": [60, 40], "top": 30}]}));
+    assert!(!warning(&mut s).contains("clamp"), "{}", warning(&mut s));
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "length": 20, "holder_diameter": 30, "holder_length": 40}),
+    );
+    assert!(warning(&mut s).contains("the holder runs into clamp Tall"), "{}", warning(&mut s));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "length": 20}));
     run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": null}));
     assert!(s.doc.manufacture.setups[0].clamps.is_empty());
     // A tool that reaches 2 mm out of its holder cannot go 3 mm deep.

@@ -59,7 +59,7 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
-            "number: 1–9999; kind: flat|ball|drill|vbit; diameter: expr; tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
+            "number: 1–9999; kind: flat|ball|drill|vbit; diameter: expr; tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it); cutting?: [{material, spindle_rpm?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
@@ -309,6 +309,8 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         },
         shank_diameter: data("shank_diameter", was.and_then(|t| t.shank_diameter))?,
         length: data("length", was.and_then(|t| t.length))?,
+        holder_diameter: data("holder_diameter", was.and_then(|t| t.holder_diameter))?,
+        holder_length: data("holder_length", was.and_then(|t| t.holder_length))?,
         cutting,
     };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
@@ -2720,6 +2722,12 @@ fn list_now(s: &Session) -> Value {
                             if let Some(tool) = m.tool(op.tool) {
                                 if let Some(clamp) = clamp_hit(&path, tool.radius(), &setup.clamps) {
                                     warnings.push(format!("runs into clamp {clamp}"));
+                                } else if let (Some(d), Some(reach)) = (tool.holder_diameter, tool.length) {
+                                    // The holder, from where the tool comes out of it up: as a tool that wide, that much higher.
+                                    let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, reach))).collect() };
+                                    if let Some(clamp) = clamp_hit(&lifted, d * 0.5, &setup.clamps) {
+                                        warnings.push(format!("the holder runs into clamp {clamp}"));
+                                    }
                                 }
                                 // Deeper below the stock's top than the tool reaches out of its holder: the holder hits the stock.
                                 if let (Some(reach), Some(lowest), Some(top)) = (tool.length, path.stats().lowest_z, stock_top) {
