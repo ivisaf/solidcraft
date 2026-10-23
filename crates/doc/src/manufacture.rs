@@ -260,6 +260,16 @@ pub enum CamOperationKind {
         #[serde(default = "default_ramp")]
         ramp_angle: Expr,
     },
+    /// Letters and shapes V-carved with a V-bit: rings inside the outlines, each where the tool's
+    /// cone just touches the walls, deeper the farther from them.
+    VCarve {
+        /// Distance between the rings (a length expression).
+        stepover: Expr,
+        /// Deepest the point goes below the top (a length expression; none: as deep as the shape asks).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_depth: Option<Expr>,
+        climb: bool,
+    },
     /// Mills round holes larger than the tool on a helix, `pitch` (a length expression) down a turn.
     Bore { climb: bool, stock_to_leave: Expr, pitch: Expr },
     /// Drills at the centre of each profile.
@@ -292,6 +302,7 @@ impl CamOperationKind {
             CamOperationKind::Pocket { .. } => "pocket",
             CamOperationKind::Adaptive { .. } => "adaptive",
             CamOperationKind::Chamfer { .. } => "chamfer",
+            CamOperationKind::VCarve { .. } => "vcarve",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",
         }

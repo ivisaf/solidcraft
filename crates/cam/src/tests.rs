@@ -378,6 +378,30 @@ fn dogbones_reach_the_corners_lead_arcs_start_off_the_part_and_an_onion_skin_hol
     }
 }
 
+#[test]
+fn a_v_carve_goes_deeper_away_from_the_walls_down_to_its_limit() {
+    let mut vbit = Tool::new(5, ToolKind::VBit, 10.0, 6.0);
+    vbit.tip_angle = Some(90.0);
+    // A 10 mm wide strip: at 90° the middle is 5 mm from the walls, so 5 mm deep.
+    let strip = [rect(0.0, 0.0, 40.0, 10.0)];
+    let params = VCarveParams { stepover: 0.25, max_depth: None, climb: true, tolerance: 0.01 };
+    let c = cut(0.0, -20.0, 10.0);
+    let path = vcarve(&strip, &vbit, &params, &c).unwrap();
+    let lowest = path.stats().lowest_z.unwrap();
+    assert!((lowest + 5.0).abs() < 0.3, "{lowest}");
+    // Each cutting point is as deep as it is far from the nearer long wall (45°): never past it.
+    for q in cutting_points(&path, -0.01) {
+        let wall = q.y.min(10.0 - q.y).min(q.x).min(40.0 - q.x);
+        assert!(-q.z <= wall + 1e-6, "{q:?} deeper than the wall allows");
+    }
+    // Held to 2 mm deep, and in passes no deeper than the stepdown.
+    let held = vcarve(&strip, &vbit, &VCarveParams { max_depth: Some(2.0), ..params }, &cut(0.0, -20.0, 0.75)).unwrap();
+    assert!((held.stats().lowest_z.unwrap() + 2.0).abs() < 1e-9);
+    // A flat end mill is no V-bit.
+    assert!(vcarve(&strip, &tool(6.0), &params, &c).is_err());
+    assert!(vcarve(&strip, &vbit, &VCarveParams { stepover: 0.0, ..params }, &c).is_err());
+}
+
 /// The steepest descent of a cutting move (radians), and whether any goes straight down below `top`.
 fn steepest(path: &Toolpath, top: f64) -> (f64, bool) {
     let pts = path.points(0.002);

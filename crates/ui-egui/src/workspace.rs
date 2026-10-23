@@ -265,7 +265,7 @@ pub const SECTIONS: &[Section] = &[
         tab: "MANUFACTURE",
         panel: "MILLING",
         promoted: 4,
-        ids: &["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer"],
+        ids: &["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.vcarve"],
     },
     Section { tab: "MANUFACTURE", panel: "DRILLING", promoted: 2, ids: &["cam.op.drill", "cam.op.bore"] },
     Section { tab: "MANUFACTURE", panel: "ACTIONS", promoted: 3, ids: &["cam.list", "cam.simulate", "cam.post", "cam.toolpath"] },

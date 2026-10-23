@@ -185,6 +185,79 @@ pub struct DrillParams {
     pub dwell: f64,
 }
 
+/// How shapes are V-carved with a V-bit: the walls come out at the tool's angle.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VCarveParams {
+    /// Distance between the rings (mm): smaller carves the walls smoother.
+    pub stepover: f64,
+    /// Deepest the point goes below the top (mm); none: as deep as the shape asks.
+    pub max_depth: Option<f64>,
+    pub climb: bool,
+    /// Chord error allowed on spline boundaries (mm).
+    pub tolerance: f64,
+}
+
+/// Most rings a V-carve cuts.
+const MAX_VCARVE_RINGS: usize = 5000;
+
+/// V-carves `regions` (letters, a logo) with a V-bit: rings inside the outlines, each where the
+/// tool's cone just touches the walls, so that it goes deeper the farther the ring is from them
+/// and the walls come out at the tool's angle; down to `max_depth`, below which the rings stay
+/// at that depth. Each ring is cut in depth passes no deeper than the stepdown.
+pub fn vcarve(regions: &[Region2], tool: &Tool, params: &VCarveParams, cut: &Cut) -> Result<Toolpath> {
+    tool.validate()?;
+    cut.heights.validate()?;
+    cut.feeds.validate()?;
+    if tool.kind != crate::tool::ToolKind::VBit {
+        return invalid("a V-carve is cut with a V-bit");
+    }
+    if !(params.stepover > 0.0 && params.stepover <= tool.diameter) {
+        return invalid("the stepover must be above 0 and at most the tool diameter");
+    }
+    if params.max_depth.is_some_and(|d| !(d > 0.0 && d <= MAX_COORD)) {
+        return invalid("the deepest a V-carve goes must be above 0");
+    }
+    if !(cut.stepdown > 0.0) || !cut.stepdown.is_finite() {
+        return invalid("the stepdown must be above 0");
+    }
+    let slope = (tool.point_angle() * 0.5).to_radians().tan();
+    let tip = tool.tip() * 0.5;
+    let top = cut.heights.top;
+    let shape = Shape::from_regions(regions, params.tolerance)?;
+    // Down as far as the limit (or the shape) asks: the cut's own bottom is its top edge.
+    let heights = Heights { bottom: top - params.max_depth.unwrap_or(MAX_COORD), ..cut.heights };
+    let cut = Cut { heights, ..*cut };
+    let mut b = Builder::new(&cut);
+    for k in 1.. {
+        if k > MAX_VCARVE_RINGS {
+            return Err(CamError::TooLarge(format!("the V-carve needs more than {MAX_VCARVE_RINGS} rings; use a larger stepover")));
+        }
+        let away = tip + params.stepover * k as f64;
+        let rings = shape.offset(away)?;
+        if rings.is_empty() {
+            break;
+        }
+        // Where the cone, its axis `away` from the walls, touches them at the top.
+        let depth = ((away - tip) / slope).min(params.max_depth.unwrap_or(f64::INFINITY));
+        let passes = ((depth / cut.stepdown) - 1e-9).ceil().max(1.0) as usize;
+        for lp in rings {
+            // Offset loops keep the inside on their left: the wall is on the right, as climb wants.
+            let lp = if params.climb { lp } else { reversed(&lp) };
+            let Some(first) = lp.first() else { continue };
+            b.travel_to(first.start())?;
+            b.plunge_to(top)?;
+            for pass in 1..=passes {
+                let level = top - depth * pass as f64 / passes as f64;
+                b.plunge_to(level)?;
+                b.cut_loop(&lp, level)?;
+                b.cut_to(first.start(), level)?;
+            }
+            b.retract()?;
+        }
+    }
+    b.finish()
+}
+
 /// How a top edge is chamfered with a pointed tool (a V-bit, a drill): the chamfer's angle is the tool's.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChamferParams {

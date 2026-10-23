@@ -1656,6 +1656,30 @@ fn ordering_by_tool_loads_each_tool_once() {
 }
 
 #[test]
+fn a_v_carve_carves_letters_with_a_v_bit_to_the_depth_the_shape_asks() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Logo"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [50, 18]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "vbit", "diameter": 12, "tip_angle": 90, "spindle_rpm": 18000, "feed": 800}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"of": "stock", "x": "min", "y": "min", "z": "max"}}));
+    run(&mut s, "cam.op.vcarve", json!({"sketch": "Logo", "tool": 3, "stepover": 0.2}));
+    // An 8 mm wide strip at 90°: 4 mm deep in the middle; no warning for cutting into the model.
+    let listed = run(&mut s, "cam.list", json!({}));
+    let op = &listed["setups"][0]["operations"][0];
+    assert_eq!(op["kind"], "vcarve");
+    let lowest = op["toolpath"]["lowest_z"].as_f64().unwrap();
+    assert!((lowest + 4.0).abs() < 0.25 && op.get("warning").is_none(), "{op}");
+    run(&mut s, "cam.op.edit", json!({"op": "VCarve1", "max_depth": 1.5}));
+    let lowest = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0]["toolpath"]["lowest_z"].as_f64().unwrap();
+    assert!((lowest + 1.5).abs() < 1e-6, "{lowest}");
+    // Only with a V-bit.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    assert!(s.execute("cam.op.vcarve", &json!({"sketch": "Logo", "tool": 1})).is_err());
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

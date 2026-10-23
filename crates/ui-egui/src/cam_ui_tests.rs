@@ -497,7 +497,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 13, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 14, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1606,6 +1606,30 @@ fn a_setup_s_menu_orders_its_operations_by_tool() {
     assert!(h.app.status.as_ref().is_some_and(|s| s.0.contains("3 → 2")), "{:?}", h.app.status);
 }
 
+/// A V-carve form carves a sketch's shapes with a V-bit, down to an optional deepest.
+#[test]
+fn a_v_carve_form_carves_with_a_v_bit() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Logo"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [50, 18]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.app.run("cam.tool.define", json!({"number": 3, "kind": "vbit", "diameter": 12, "tip_angle": 90, "spindle_rpm": 18000, "feed": 800})).unwrap();
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.vcarve");
+    h.frames(2);
+    assert!(h.widget("V-CARVE").is_some() && h.widget("Deepest").is_some() && h.widget("Bottom").is_none());
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.tool, f.stepover, f.max_depth) = ("3".into(), "0.25 mm".into(), "2 mm".into());
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let op = &listed["setups"][0]["operations"][0];
+    assert!(op["kind"] == "vcarve" && (op["toolpath"]["lowest_z"].as_f64().unwrap() + 2.0).abs() < 1e-6, "{op}");
+    let Some(Form::Op(again)) = edit_form(&h.app, &listed["setups"][0], op) else { panic!("no form") };
+    assert_eq!((again.kind, again.max_depth.as_str()), (OpKind::VCarve, "2 mm"));
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {
@@ -1654,9 +1678,17 @@ fn cam_surfaces(language: &str) -> Vec<(String, std::collections::BTreeSet<Strin
         seen.push(("playback".into(), painted_texts(&mut h)));
         h.app.manufacture.play = None;
     }
-    for id in
-        ["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.bore", "cam.op.drill", "cam.setup.create"]
-    {
+    for id in [
+        "cam.op.face",
+        "cam.op.contour",
+        "cam.op.pocket",
+        "cam.op.adaptive",
+        "cam.op.chamfer",
+        "cam.op.vcarve",
+        "cam.op.bore",
+        "cam.op.drill",
+        "cam.setup.create",
+    ] {
         h.app.start(id);
         h.frames(2);
         seen.push((id.to_string(), painted_texts(&mut h)));
