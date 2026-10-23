@@ -96,6 +96,9 @@ pub fn is_supported(id: &str) -> bool {
     LOCALES.iter().any(|catalog| catalog.id == id)
 }
 
+/// The id prefix of the Manufacture (CAM) windows' own messages.
+const MANUFACTURE: &str = "manufacture.";
+
 /// Immutable locale reference. Catalogs parse once; lookups are logarithmic.
 #[derive(Clone, Copy)]
 pub struct Locale(&'static Catalog);
@@ -119,9 +122,30 @@ impl Locale {
     pub fn label(self, label: &str) -> &str {
         static LABEL_IDS: OnceLock<BTreeMap<&'static str, &'static str>> = OnceLock::new();
         let ids = LABEL_IDS.get_or_init(|| {
-            ENGLISH.messages().iter().filter(|(_, text)| !text.contains('{')).map(|(id, text)| (text.as_str(), id.as_str())).collect()
+            ENGLISH
+                .messages()
+                .iter()
+                .filter(|(id, text)| !text.contains('{') && !id.starts_with(MANUFACTURE))
+                .map(|(text_id, text)| (text.as_str(), text_id.as_str()))
+                .collect()
         });
         ids.get(label).map_or_else(|| self.text(label), |id| self.text(id))
+    }
+
+    /// A label of the Manufacture (CAM) windows: their own entry for the English text where
+    /// they have one (a CAM "Clearance" is a height, not the Inspect command's gap), otherwise
+    /// as [`Locale::label`]. Their entries are left out of the shared lookup for that reason.
+    pub fn manufacture_label(self, label: &str) -> &str {
+        static CAM_IDS: OnceLock<BTreeMap<&'static str, &'static str>> = OnceLock::new();
+        let ids = CAM_IDS.get_or_init(|| {
+            ENGLISH
+                .messages()
+                .iter()
+                .filter(|(id, text)| !text.contains('{') && id.starts_with(MANUFACTURE))
+                .map(|(id, text)| (text.as_str(), id.as_str()))
+                .collect()
+        });
+        ids.get(label).map_or_else(|| self.label(label), |id| self.text(id))
     }
 
     pub fn format(self, id: &str, args: &[(&str, &str)]) -> String {
@@ -233,6 +257,10 @@ pub fn tr(id: &str) -> &str {
 }
 pub fn tr_label(label: &str) -> &str {
     CURRENT.with(|current| current.get().label(label))
+}
+/// [`Locale::manufacture_label`] in this thread's language.
+pub fn tr_manufacture(label: &str) -> &str {
+    CURRENT.with(|current| current.get().manufacture_label(label))
 }
 pub fn format(id: &str, args: &[(&str, &str)]) -> String {
     CURRENT.with(|current| current.get().format(id, args))

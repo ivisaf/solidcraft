@@ -1259,3 +1259,94 @@ fn an_adaptive_form_clears_a_pocket_at_a_steady_load() {
     h.frames(2);
     assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Adaptive1"));
 }
+
+/// Every text one frame paints, whole and in the parts a composed one is made of.
+fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
+    fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {
+        match shape {
+            egui::Shape::Text(t) => {
+                let text = t.galley.job.text.trim();
+                out.insert(text.to_string());
+                for part in text.split(['›', '·', '•', '→']).flat_map(|p| p.split("  ")) {
+                    out.insert(part.trim().to_string());
+                }
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut texts = std::collections::BTreeSet::new();
+    h.painted_frame().iter().for_each(|s| walk(&s.shape, &mut texts));
+    texts
+}
+
+/// The CAM surfaces in `language`: the Manufacture panel with a setup, operations and a
+/// simulation, the program playing, every operation's form, the setup form, the tool library
+/// and the tool assistant's three steps; each surface's painted texts.
+fn cam_surfaces(language: &str) -> Vec<(String, std::collections::BTreeSet<String>)> {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.run("sketch.create", json!({"plane": "XY", "offset": 10, "name": "Pocket"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0": [10, 10], "p1": [40, 30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    fill(&mut h, "cam.op.pocket", |f| {
+        let Form::Op(op) = f else { panic!("not an operation form") };
+        op.bottom = "-3 mm".into();
+    });
+    h.app.preferences.language = language.into();
+    h.app.start("cam.list");
+    h.frames(2);
+    let mut seen = vec![("panel".to_string(), painted_texts(&mut h))];
+    h.app.start("cam.simulate");
+    h.frames(3);
+    seen.push(("simulation".into(), painted_texts(&mut h)));
+    if let Some(at) = h.widget(crate::i18n::Locale::for_language(language).label("Play the program")) {
+        h.step(&json!({"click": at})).unwrap();
+        h.frames(2);
+        seen.push(("playback".into(), painted_texts(&mut h)));
+        h.app.manufacture.play = None;
+    }
+    for id in
+        ["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.bore", "cam.op.drill", "cam.setup.create"]
+    {
+        h.app.start(id);
+        h.frames(2);
+        seen.push((id.to_string(), painted_texts(&mut h)));
+        h.app.manufacture.form = None;
+    }
+    h.app.start("cam.library.list");
+    h.frames(2);
+    seen.push(("tool library".into(), painted_texts(&mut h)));
+    h.app.start("cam.tool.define");
+    for step in 0..3 {
+        if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+            f.step = step;
+        }
+        h.frames(2);
+        seen.push((format!("tool step {step}"), painted_texts(&mut h)));
+    }
+    seen
+}
+
+/// The CAM surfaces paint no English text that their language has no translation of.
+#[test]
+fn cam_surfaces_speak_the_chosen_language() {
+    type Messages = std::collections::BTreeMap<String, String>;
+    let english: Messages = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/en.json"))).unwrap();
+    for (language, catalog) in [
+        ("de", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/de.json"))),
+        ("ja", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json"))),
+        ("zh", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json"))),
+    ] {
+        let messages: Messages = serde_json::from_str(catalog).unwrap();
+        // English where the catalog has nothing, or something else, for one of the text's ids.
+        let english_left = |text: &str| english.iter().any(|(id, en)| en == text && !en.contains('{') && messages.get(id) != Some(en));
+        let leaks: Vec<String> = cam_surfaces(language)
+            .into_iter()
+            .flat_map(|(surface, texts)| texts.into_iter().filter(|t| english_left(t)).map(move |t| format!("{surface}: {t:?}")))
+            .collect();
+        assert!(leaks.is_empty(), "English left on the CAM surfaces in {language}:\n{}", leaks.join("\n"));
+    }
+}

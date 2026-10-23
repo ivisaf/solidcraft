@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use solidcraft_engine::geom::Vec3;
 
 use crate::SolveApp;
+use crate::i18n::{format as tf, tr_manufacture as tm};
 use crate::theme::Tokens;
 use crate::viewport::Proj;
 
@@ -45,10 +46,11 @@ fn path_colour(index: usize) -> egui::Color32 {
 /// A small drop-down of `options` after a label; `true` when the choice changed.
 fn small_choice(ui: &mut egui::Ui, id: &str, label: &str, help_label: &str, index: &mut usize, options: &[&str]) -> bool {
     let before = *index;
-    explained(ui.label(label), help_label, None);
+    explained(ui.label(tm(label)), help_label, None);
+    let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
     // Only as wide as its longest option: the kit's drop-down otherwise fills the row.
-    let width = ui_kit::ContentWidth::dropdown(ui, options) + ui_kit::ContentWidth::label(ui, " ");
-    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| crate::ui_kit::dropdown(ui, id, index, options));
+    let width = ui_kit::ContentWidth::dropdown(ui, &options) + ui_kit::ContentWidth::label(ui, " ");
+    ui.allocate_ui(egui::vec2(width, ui_kit::row_height()), |ui| crate::ui_kit::dropdown(ui, id, index, &options));
     *index != before
 }
 
@@ -82,7 +84,7 @@ impl OpKind {
     }
     fn title(self) -> &'static str {
         match self {
-            OpKind::Face => "FACE",
+            OpKind::Face => "FACING",
             OpKind::Contour => "2D CONTOUR",
             OpKind::Pocket => "2D POCKET",
             OpKind::Adaptive => "ADAPTIVE",
@@ -779,7 +781,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
 
 /// The command a form stands for. Fields left empty are left to the command's defaults.
 pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
-    let number = |what: &str, s: &str| s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| format!("{what} must be a number"));
+    let number = |what: &str, s: &str| {
+        s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| tf("manufacture.must_be_a_number", &[("what", tm(what))]))
+    };
     let mut p = serde_json::Map::new();
     fn optional(p: &mut serde_json::Map<String, Value>, k: &str, s: &str) {
         if !s.trim().is_empty() {
@@ -843,11 +847,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     ("stepover", "The stepover", &c.stepover),
                 ] {
                     if !text.trim().is_empty() {
-                        e.insert(k.into(), json!(number(&format!("{what} in {material}"), text)?));
+                        e.insert(k.into(), json!(number(&tf("manufacture.in_material", &[("what", tm(what)), ("material", &material)]), text)?));
                     }
                 }
                 if c.feed.trim().is_empty() && !c.chip_load.trim().is_empty() {
-                    e.insert("chip_load".into(), json!(number(&format!("The chip load in {material}"), &c.chip_load)?));
+                    e.insert(
+                        "chip_load".into(),
+                        json!(number(&tf("manufacture.in_material", &[("what", tm("The chip load")), ("material", &material)]), &c.chip_load)?),
+                    );
                 }
                 if !e.is_empty() {
                     e.insert("material".into(), json!(material));
@@ -1016,7 +1023,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     Ok(n) => {
                         p.insert("passes".into(), json!(n));
                     }
-                    Err(_) if !f.passes.trim().is_empty() => return Err("The number of passes must be a whole number".into()),
+                    Err(_) if !f.passes.trim().is_empty() => return Err(tm("The number of passes must be a whole number").into()),
                     Err(_) if f.editing.is_some() => {
                         p.insert("passes".into(), Value::Null);
                     }
@@ -1027,7 +1034,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 if f.tabs {
                     let mut tabs = serde_json::Map::new();
                     if !f.tab_count.trim().is_empty() {
-                        let n = f.tab_count.trim().parse::<u64>().map_err(|_| "The number of tabs must be a whole number".to_string())?;
+                        let n = f.tab_count.trim().parse::<u64>().map_err(|_| tm("The number of tabs must be a whole number").to_string())?;
                         tabs.insert("count".into(), json!(n));
                     }
                     optional(&mut tabs, "width", &f.tab_width);
@@ -1243,18 +1250,21 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
 
 /// Says in the Tool Library window what an import took and what it left out.
 pub fn imported(app: &mut SolveApp, result: Result<Value, String>) {
+    let _language = crate::i18n::scope(&app.preferences.language);
     match result {
         Ok(v) => {
             let count = |k: &str| v[k].as_array().map_or(0, Vec::len);
-            let mut lines = vec![format!("Imported {} tool(s)", count("added") + count("replaced"))];
-            if count("materials") > 0 {
-                lines[0].push_str(&format!(" and {} material(s)", count("materials")));
-            }
+            let tools = (count("added") + count("replaced")).to_string();
+            let mut lines = vec![if count("materials") > 0 {
+                tf("manufacture.imported_tools_and_materials", &[("tools", &tools), ("materials", &count("materials").to_string())])
+            } else {
+                tf("manufacture.imported_tools", &[("tools", &tools)])
+            }];
             if count("skipped") > 0 {
                 let numbers: Vec<String> = v["skipped"].as_array().into_iter().flatten().map(|n| format!("T{n}")).collect();
-                lines.push(format!("Skipped {}: the library has these numbers already", numbers.join(", ")));
+                lines.push(tf("manufacture.skipped_numbers", &[("numbers", &numbers.join(", "))]));
             }
-            lines.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|n| format!("Left out {n}")));
+            lines.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|n| tf("manufacture.left_out", &[("what", n)])));
             app.manufacture.error = None;
             app.manufacture.import_notes = lines;
         }
@@ -1416,14 +1426,16 @@ fn previewed_op(cam: &CamUi) -> Option<u64> {
 
 /// Simulates the first setup (what the toolbar's Simulate does).
 pub fn simulate(app: &mut SolveApp) {
+    let _language = crate::i18n::scope(&app.preferences.language);
     match app.session.doc.manufacture.setups.first().map(|s| s.id) {
         Some(setup) => simulate_setup(app, setup),
-        None => app.manufacture.error = Some("There is no setup to simulate".into()),
+        None => app.manufacture.error = Some(tm("There is no setup to simulate").into()),
     }
 }
 
 /// Runs `cam.simulate` on a setup and keeps what it found for the window.
 pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
+    let _language = crate::i18n::scope(&app.preferences.language);
     app.manufacture.play = None;
     app.manufacture.stock_stamp += 1;
     app.manufacture.simulated = Some(setup);
@@ -1431,12 +1443,18 @@ pub fn simulate_setup(app: &mut SolveApp, setup: u64) {
     match app.session.execute("cam.simulate", &json!({ "setup": setup, "field": true, "columns": columns })) {
         Ok(v) => {
             let number = |k: &str| v[k].as_f64();
-            let mut found = vec![format!("Removed {:.2} cm³", number("removed_volume").unwrap_or(0.0) / 1000.0)];
+            let removed = format!("{:.2}", number("removed_volume").unwrap_or(0.0) / 1000.0);
+            let mut found = vec![tf("manufacture.removed", &[("volume", &removed)])];
             if let (Some(gouge), Some(left), Some(volume)) = (number("max_gouge"), number("max_leftover"), number("leftover_volume")) {
-                found.push(if gouge > 1e-3 { format!("Cuts up to {gouge:.3} mm into the part") } else { "Does not cut into the part".into() });
-                found.push(format!("Leaves up to {left:.2} mm on the part ({:.2} cm³)", volume / 1000.0));
+                found.push(if gouge > 1e-3 {
+                    tf("manufacture.cuts_into_part", &[("depth", &format!("{gouge:.3}"))])
+                } else {
+                    tm("Does not cut into the part").into()
+                });
+                let (left, volume) = (format!("{left:.2}"), format!("{:.2}", volume / 1000.0));
+                found.push(tf("manufacture.leaves_on_part", &[("thickness", &left), ("volume", &volume)]));
             }
-            found.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+            found.extend(v["notes"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|n| tm(n).to_string()));
             let warnings = v["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
             app.manufacture.simulation = Some((found, warnings));
             app.manufacture.stock = StockField::from_json(&v["field"]);
@@ -1541,7 +1559,10 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
     let Some(setup) = cam.simulated else { return };
     ui.add_space(4.0);
     let Some(play) = cam.play.as_mut() else {
-        if button(ui, "Play the program", Button::Normal).on_hover_text("Show the tool moving along the toolpaths and cutting the stock").clicked() {
+        if button(ui, tm("Play the program"), Button::Normal)
+            .on_hover_text(tm("Show the tool moving along the toolpaths and cutting the stock"))
+            .clicked()
+        {
             asked.play = Some(setup);
         }
         return;
@@ -1551,10 +1572,10 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
     let k = play.data.playback.step_at(play.t).unwrap_or(0);
     let mut stop = false;
     ui.horizontal_wrapped(|ui| {
-        if button(ui, "|<", Button::Small).on_hover_text("To the start").clicked() {
+        if button(ui, "|<", Button::Small).on_hover_text(tm("To the start")).clicked() {
             play.seek = Some(0.0);
         }
-        if button(ui, "<", Button::Small).on_hover_text("Back one move").clicked() {
+        if button(ui, "<", Button::Small).on_hover_text(tm("Back one move")).clicked() {
             let back = match steps.get(k) {
                 Some(s) if play.t > s.start + 1e-9 => s.start,
                 _ => k.checked_sub(1).and_then(|k| steps.get(k)).map_or(0.0, |s| s.start),
@@ -1568,29 +1589,29 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
         } else {
             "Play"
         };
-        if button(ui, label, Button::Small).clicked() {
+        if button(ui, tm(label), Button::Small).clicked() {
             if play.t >= total {
                 (play.seek, play.playing) = (Some(0.0), true);
             } else {
                 play.playing = !play.playing;
             }
         }
-        if button(ui, ">", Button::Small).on_hover_text("On one move").clicked() {
+        if button(ui, ">", Button::Small).on_hover_text(tm("On one move")).clicked() {
             let on = steps.get(k).map_or(total, |s| s.start + s.minutes);
             (play.seek, play.playing) = (Some(on), false);
         }
-        if button(ui, ">|", Button::Small).on_hover_text("To the end").clicked() {
+        if button(ui, ">|", Button::Small).on_hover_text(tm("To the end")).clicked() {
             (play.seek, play.playing) = (Some(total), false);
         }
         let speeds = PLAY_SPEEDS.map(|s| s.0);
         small_choice(ui, "sc_cam_play_speed", "Speed", "Playback speed", &mut play.speed, &speeds);
-        if button(ui, "Stop", Button::Small).on_hover_text("Stop playing and show the simulation's result").clicked() {
+        if button(ui, tm("Stop"), Button::Small).on_hover_text(tm("Stop playing and show the simulation's result")).clicked() {
             stop = true;
         }
     });
     // The machine's own rapid rate: the times follow it, the tool stays where it is.
     ui.horizontal(|ui| {
-        explained(ui.label("Rapids"), "Rapid rate", None);
+        explained(ui.label(tm("Rapids")), "Rapid rate", None);
         let mut rate = cam.rapid_rate;
         let r = ui_kit::number_field(ui, &mut rate, 100.0..=100_000.0, 50.0, " mm/min");
         if r.changed() && rate != cam.rapid_rate {
@@ -1615,16 +1636,16 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
         let op = play.data.ops.get(step.op).map_or("", String::as_str);
         let tool = play.data.tools.get(step.op).map_or(0, |t| t.number);
         let feed = match step.feed {
-            _ if step.dwell => format!("dwell {} s", shown(step.minutes * 60.0, 1)),
-            Some(f) => format!("feed {} mm/min", shown(f, 0)),
-            None => "rapid".to_string(),
+            _ if step.dwell => tf("manufacture.dwell_seconds", &[("seconds", &shown(step.minutes * 60.0, 1))]),
+            Some(f) => tf("manufacture.feed_rate", &[("feed", &shown(f, 0))]),
+            None => tm("rapid").to_string(),
         };
         let mm = |v: f64| shown((v * 1e3).round() / 1e3 + 0.0, 3);
         ui.label(RichText::new(format!("{op}  T{tool}   X {}  Y {}  Z {}   {feed}", mm(p.x), mm(p.y), mm(p.z))).color(t.text));
-        ui.label(RichText::new(format!("{} of {}", clock(play.t), clock(total))).color(t.text_dim));
+        ui.label(RichText::new(tf("manufacture.time_of_total", &[("time", &clock(play.t)), ("total", &clock(total))])).color(t.text_dim));
     }
     if play.collisions > 0 {
-        ui.label(RichText::new(format!("{} rapid move(s) ran into material: marked red where it happened", play.collisions)).color(t.error));
+        ui.label(RichText::new(tf("manufacture.rapids_into_material", &[("count", &play.collisions.to_string())])).color(t.error));
     }
     if stop && let Some(play) = cam.play.take() {
         cam.stock = play.finished;
@@ -1958,19 +1979,19 @@ fn needed<'a>(need: &'a [Need], label: &str) -> Option<&'a Need> {
 /// is for (and what it needs) on hover.
 fn row_label(ui: &mut egui::Ui, label: &str, need: Option<&Need>) {
     let t = Tokens::get();
-    let text = if need.is_some() { RichText::new(label).color(t.error) } else { RichText::new(label) };
+    let text = if need.is_some() { RichText::new(tm(label)).color(t.error) } else { RichText::new(tm(label)) };
     let r = ui.label(text);
     explained(r, label, need);
 }
 
 /// `r` with what its row is for, and what it needs, on hover.
 fn explained(r: egui::Response, label: &str, need: Option<&Need>) -> egui::Response {
-    let mut tip = help(label).unwrap_or_default().to_string();
+    let mut tip = help(label).map(tm).unwrap_or_default().to_string();
     if let Some(n) = need {
         if !tip.is_empty() {
             tip.push_str("\n\n");
         }
-        tip.push_str(&format!("Needed: {}", n.why));
+        tip.push_str(&tf("manufacture.needed", &[("why", tm(&n.why))]));
     }
     if tip.is_empty() {
         return r;
@@ -1993,7 +2014,7 @@ fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
 fn text_box(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, invalid: bool) -> egui::Response {
     ui.scope(|ui| {
         ui.set_max_width(140.0);
-        crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, hint, invalid)
+        crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, tm(hint), invalid)
     })
     .inner
 }
@@ -2028,7 +2049,7 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
         let r = explained(r, label, need);
         crate::params_dialog::complete(ui, &r, value);
         let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
-        let name = format!("{label} from the selection");
+        let name = tf("manufacture.from_the_selection", &[("label", tm(label))]);
         let side = crate::ui_kit::row_height();
         let b = ui
             .add_enabled_ui(picked.is_some(), |ui| {
@@ -2037,12 +2058,12 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
             })
             .inner;
         let tip = match picked {
-            Some(z) => format!("Take the height from the selection: {}", mm(z)),
+            Some(z) => tf("manufacture.take_the_height", &[("height", &mm(z))]),
             None => String::new(),
         };
-        let b = b
-            .on_hover_text(tip)
-            .on_disabled_hover_text("Click an edge, a point or a face of the model first (the bottom circle of a hole, say); this takes its height.");
+        let b = b.on_hover_text(tip).on_disabled_hover_text(tm(
+            "Click an edge, a point or a face of the model first (the bottom circle of a hole, say); this takes its height.",
+        ));
         lit |= b.hovered();
         if let (true, Some(z)) = (b.clicked(), picked) {
             *value = mm(z);
@@ -2062,7 +2083,7 @@ fn field_unless(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
     let need = needed(need, label);
     row_label(ui, label, need);
     let r = ui.add_enabled_ui(unused.is_none(), |ui| text_box(ui, label, value, hint, need.is_some())).inner;
-    let r = r.on_disabled_hover_text(unused.unwrap_or_default());
+    let r = r.on_disabled_hover_text(tm(unused.unwrap_or_default()));
     let lit = r.hovered() || r.has_focus();
     let r = explained(r, label, need);
     let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
@@ -2125,7 +2146,7 @@ fn heights_picture(ui: &mut egui::Ui, h: &solidcraft_engine::PreviewHeights, lit
         // Bottom first, upwards: each label at least a line above the last.
         let place = if label_y.is_finite() { ly.min(label_y - 13.0) } else { ly };
         label_y = place;
-        labels.push((place, format!("{name} {}", shown(*z, 2)), if on { t.text } else { *colour }, on));
+        labels.push((place, format!("{} {}", tm(name), shown(*z, 2)), if on { t.text } else { *colour }, on));
     }
     for (ly, text, colour, on) in labels {
         let font = egui::FontId::proportional(if on { t.font_caption } else { t.font_small });
@@ -2173,7 +2194,8 @@ fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut 
 
 fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut usize, options: &[&str]) {
     row_label(ui, label, needed(need, label));
-    let r = crate::ui_kit::dropdown(ui, id, index, options);
+    let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
+    let r = crate::ui_kit::dropdown(ui, id, index, &options);
     explained(r, label, None);
     ui.end_row();
 }
@@ -2183,7 +2205,7 @@ fn pick(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, value: &mut Str
     let need = needed(need, label);
     row_label(ui, label, need);
     // Indexed for the kit's drop-down; a value not in the list shows as it is, chosen by none.
-    let mut labels: Vec<&str> = options.iter().map(|(_, l)| l.as_str()).collect();
+    let mut labels: Vec<&str> = options.iter().map(|(_, l)| tm(l)).collect();
     let mut index = options.iter().position(|(v, _)| v == value).unwrap_or_else(|| {
         labels.push(value.as_str());
         labels.len() - 1
@@ -2275,7 +2297,7 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             continue;
         }
         let name = text(t, "description");
-        let what = if name.is_empty() { text(t, "kind").replace('_', " ") } else { name };
+        let what = if name.is_empty() { kind_name("tool_kind", &text(t, "kind")) } else { name };
         tools.push((n.clone(), format!("T{n}  D{diameter} {what}")));
         // Its data in the setup's material, where it has some, else its own.
         let cut = material
@@ -2497,11 +2519,12 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
     let t = Tokens::get();
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     // Where it is: three steps, each a button back to it.
-    crate::ui_kit::segmented(ui, &mut f.step, &["1  Kind", "2  Shape", "3  Cutting data"], crate::ui_kit::Segments::default());
+    let steps = [tm("1  Kind"), tm("2  Shape"), tm("3  Cutting data")];
+    crate::ui_kit::segmented(ui, &mut f.step, &steps, crate::ui_kit::Segments::default());
     ui.add_space(6.0);
     match f.step {
         0 => {
-            ui.label(RichText::new("What kind of tool is it?").color(t.text_dim));
+            ui.label(RichText::new(tm("What kind of tool is it?")).color(t.text_dim));
             ui.horizontal_wrapped(|ui| {
                 for (k, name) in TOOL_KIND_NAMES.iter().enumerate() {
                     // Stubby, so that each kind's end shows: (diameter, cutting length, shank, length).
@@ -2520,8 +2543,8 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink(6.0)).layout(egui::Layout::top_down(egui::Align::Center)));
                     tool_picture(&mut inside, &shape, None, egui::vec2(96.0, 96.0), false);
                     // Not selectable: a click on the name is a click on the tile.
-                    inside.add(egui::Label::new(*name).selectable(false));
-                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, *name));
+                    inside.add(egui::Label::new(tm(name)).selectable(false));
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, tm(name)));
                     if r.clicked() {
                         f.kind = k;
                         f.step = 1;
@@ -2541,7 +2564,7 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         field(ui, need, "Number", &mut f.number, "1");
                     }
                     row_label(ui, "Kind", None);
-                    ui.label(TOOL_KIND_NAMES.get(f.kind).copied().unwrap_or_default());
+                    ui.label(tm(TOOL_KIND_NAMES.get(f.kind).copied().unwrap_or_default()));
                     ui.end_row();
                     field(ui, need, "Description", &mut f.description, "");
                     let mut row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, d: Dim| {
@@ -2567,24 +2590,24 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
         }
         _ => {
             // Which material's data the rows show: the library's materials, and any the tool has data for.
-            let mut options: Vec<(String, String)> = vec![(String::new(), "Every material".into())];
+            let mut options: Vec<(String, String)> = vec![(String::new(), tm("Every material").into())];
             for m in materials.iter().map(String::as_str).chain(f.others.iter().map(|(m, _)| m.as_str())).chain([f.material.as_str()]) {
                 if !m.is_empty() && !options.iter().any(|(n, _)| same_material(n, m)) {
                     let has = !f.kept(m).is_empty_text();
-                    options.push((m.to_string(), if has { format!("{m}  (has data)") } else { m.to_string() }));
+                    options.push((m.to_string(), if has { tf("manufacture.has_data", &[("material", m)]) } else { m.to_string() }));
                 }
             }
             if options.len() > 1 {
-                options[0].1 = "Any other material".into();
+                options[0].1 = tm("Any other material").into();
             }
             let own = f.kept("");
             let in_material = !f.material.is_empty();
             // In a material, an empty row is the tool's own value: its hint says what that is.
             let hint = |own: &str, usual: &'static str| -> String {
                 match (in_material, own.trim()) {
-                    (false, _) => usual.to_string(),
-                    (true, "") => "the tool's: none".to_string(),
-                    (true, v) => format!("the tool's: {v}"),
+                    (false, _) => tm(usual).to_string(),
+                    (true, "") => tm("the tool's: none").to_string(),
+                    (true, v) => tf("manufacture.the_tools_value", &[("value", v)]),
                 }
             };
             egui::Grid::new("sc_cam_tool_cutting").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2610,15 +2633,15 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
             } else {
                 "Materials are added in the Tool Library; a tool can then have data for each."
             };
-            ui.add(egui::Label::new(RichText::new(note).color(Tokens::get().text_dim)).wrap());
+            ui.add(egui::Label::new(RichText::new(tm(note)).color(Tokens::get().text_dim)).wrap());
         }
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if button(ui, "< Back", ui_kit::Button::Enabled(f.step > 0)).clicked() {
+        if button(ui, tm("< Back"), ui_kit::Button::Enabled(f.step > 0)).clicked() {
             f.step -= 1;
         }
-        if button(ui, "Next >", ui_kit::Button::Enabled(f.step < 2)).clicked() {
+        if button(ui, tm("Next >"), ui_kit::Button::Enabled(f.step < 2)).clicked() {
             f.step += 1;
         }
     });
@@ -2630,7 +2653,9 @@ fn heights_or_note(ui: &mut egui::Ui, seen: Option<&solidcraft_engine::PreviewHe
         Some(h) => heights_picture(ui, h, lit, height),
         None => {
             ui.set_max_width(PICTURE_W);
-            ui.add(egui::Label::new(RichText::new("A picture of the heights shows once nothing is missing").color(Tokens::get().text_dim)).wrap());
+            ui.add(
+                egui::Label::new(RichText::new(tm("A picture of the heights shows once nothing is missing")).color(Tokens::get().text_dim)).wrap(),
+            );
         }
     }
 }
@@ -2658,12 +2683,12 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             } else {
                 // Where on the box, along each of the setup's own axes.
                 let [x, y, z] = &mut f.anchors;
-                choice(ui, need, "sc_cam_setup_x", "Origin X", x, &["min", "center", "max"]);
-                choice(ui, need, "sc_cam_setup_y", "Origin Y", y, &["min", "center", "max"]);
+                choice(ui, need, "sc_cam_setup_x", "Origin X", x, &["min", "centre", "max"]);
+                choice(ui, need, "sc_cam_setup_y", "Origin Y", y, &["min", "centre", "max"]);
                 choice(ui, need, "sc_cam_setup_z", "Origin Z", z, &["bottom", "middle", "top"]);
             }
             choice(ui, need, "sc_cam_setup_post", "Post", &mut f.post, solidcraft_engine::cam::Post::BUILTIN);
-            let mut materials: Vec<(String, String)> = vec![(String::new(), "not said".into())];
+            let mut materials: Vec<(String, String)> = vec![(String::new(), tm("not said").into())];
             materials.extend(choices.materials.iter().map(|m| (m.clone(), m.clone())));
             pick(ui, need, "sc_cam_setup_material", "Material", &mut f.material, &materials);
         }
@@ -2672,7 +2697,14 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             if f.faces.is_empty() {
                 // Facing covers a box: the stock's, the part's, or the one round a sketch's profiles.
                 if f.kind == OpKind::Face {
-                    choice(ui, need, "sc_cam_face_boundary", "Boundary", &mut f.boundary, &FACE_BOUNDS);
+                    choice(
+                        ui,
+                        need,
+                        "sc_cam_face_boundary",
+                        "Boundary",
+                        &mut f.boundary,
+                        &["the raw block", "the part's outline", "a sketch's outline"],
+                    );
                 }
                 if f.kind != OpKind::Face || f.boundary == 2 {
                     pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
@@ -2680,8 +2712,8 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             } else {
                 row_label(ui, "Faces", None);
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} picked", f.faces.len()));
-                    if button(ui, "Use a sketch", Button::Small).clicked() {
+                    ui.label(tf("manufacture.faces_picked", &[("count", &f.faces.len().to_string())]));
+                    if button(ui, tm("Use a sketch"), Button::Small).clicked() {
                         f.faces.clear();
                     }
                 });
@@ -2689,7 +2721,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             if !selected.is_empty() && selected != f.faces.as_slice() {
                 ui.label("");
-                if button(ui, format!("Cut the {} selected face(s)", selected.len()), Button::Small).clicked() {
+                if button(ui, tf("manufacture.cut_the_selected_faces", &[("count", &selected.len().to_string())]), Button::Small).clicked() {
                     f.faces = selected.to_vec();
                 }
                 ui.end_row();
@@ -2700,8 +2732,8 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             prefill(f, choices);
             // Filled from the tool's data in the setup's material, when the setup says one.
             let tools = match &choices.material {
-                Some(m) => format!("the tool's for {m}"),
-                None => "the tool's".to_string(),
+                Some(m) => tf("manufacture.the_tools_for", &[("material", m)]),
+                None => tm("the tool's").to_string(),
             };
             let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, &tools);
             let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, "feed ÷ (speed × flutes)");
@@ -2718,9 +2750,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             };
             // Heights the geometry gives are shown as they are; one it does not give is asked for.
             let auto = |what: &str, z: Option<Option<f64>>| match z {
-                Some(Some(z)) => format!("{} mm: {what}", shown(z, 3)),
-                Some(None) => "required: type it in".to_string(),
-                None => what.to_string(),
+                Some(Some(z)) => tf("manufacture.height_given", &[("height", &shown(z, 3)), ("what", tm(what))]),
+                Some(None) => tm("required: type it in").to_string(),
+                None => tm(what).to_string(),
             };
             let given = lists_heights(choices);
             // Beside each, a button that takes the height from what is selected in the model.
@@ -2728,7 +2760,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             // The heights the preview cuts at fill the automatic ones in.
             let seen = choices.cut_heights.as_ref();
             // Known from the preview: the value; else how it is found.
-            let automatic = |z: Option<f64>, what: &str| z.map_or_else(|| what.to_string(), |z| format!("{} mm (automatic)", shown(z, 3)));
+            let automatic = |z: Option<f64>, what: &str| {
+                z.map_or_else(|| tm(what).to_string(), |z| tf("manufacture.height_automatic", &[("height", &shown(z, 3))]))
+            };
             let mut lit = None;
             // Where the height rows are: the picture beside them stands as tall as they are.
             let first_row = ui.cursor().top();
@@ -2781,7 +2815,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                         field(ui, need, "Finish allowance", &mut f.finish, "none");
                     }
                     row_label(ui, "Tabs", None);
-                    let r = crate::ui_kit::checkbox(ui, "Hold the part", &mut f.tabs);
+                    let r = crate::ui_kit::checkbox(ui, tm("Hold the part"), &mut f.tabs);
                     explained(r, "Tabs", None);
                     ui.end_row();
                     if f.tabs {
@@ -2795,7 +2829,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
                     field(ui, need, "Finish allowance", &mut f.finish, "none");
                     // Rest machining: what a larger tool left, in the corners and narrow places.
-                    let mut options: Vec<(String, String)> = vec![(String::new(), "none: the whole pocket".into())];
+                    let mut options: Vec<(String, String)> = vec![(String::new(), tm("none: the whole pocket").into())];
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_rest_from", "Rest of tool", &mut f.rest_from, &options);
                 }
@@ -2807,7 +2841,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Helix largest (%)", &mut f.helix_max, "100");
                     field(ui, need, "Helix smallest (%)", &mut f.helix_min, "10");
                     field(ui, need, "Light-cut feed (%)", &mut f.feed_up, "100: the feed");
-                    let mut options: Vec<(String, String)> = vec![(String::new(), "none: the whole pocket".into())];
+                    let mut options: Vec<(String, String)> = vec![(String::new(), tm("none: the whole pocket").into())];
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_adaptive_rest", "Rest of tool", &mut f.rest_from, &options);
                 }
@@ -2831,11 +2865,11 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             if matches!(f.kind, OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive) {
                 row_label(ui, "Direction", None);
-                crate::ui_kit::checkbox(ui, "Climb", &mut f.climb);
+                crate::ui_kit::checkbox(ui, tm("Climb"), &mut f.climb);
                 ui.end_row();
             }
             row_label(ui, "Coolant", None);
-            crate::ui_kit::checkbox(ui, "On", &mut f.coolant);
+            crate::ui_kit::checkbox(ui, tm("On"), &mut f.coolant);
             ui.end_row();
         }
     });
@@ -2917,9 +2951,10 @@ fn need_text(need: &[Need]) -> String {
     let rows: Vec<&str> = need.iter().filter(|n| !n.field.is_empty()).map(|n| n.field).collect();
     let mut lines = Vec::new();
     if !rows.is_empty() {
-        lines.push(format!("Still needed: {} (marked red; point at a row for more)", rows.join(", ")));
+        let rows: Vec<&str> = rows.into_iter().map(tm).collect();
+        lines.push(tf("manufacture.still_needed", &[("rows", &rows.join(", "))]));
     }
-    lines.extend(need.iter().filter(|n| n.field.is_empty()).map(|n| n.why.clone()));
+    lines.extend(need.iter().filter(|n| n.field.is_empty()).map(|n| tm(&n.why).to_string()));
     lines.join("\n")
 }
 
@@ -2940,15 +2975,15 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
     let mut ok = false;
     let mut cancel = false;
     let shown = egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-        ui.label(RichText::new(title).strong());
+        ui.label(RichText::new(tm(title)).strong());
         ui.add_space(4.0);
         form_ui(ui, form, selected, lists, &need);
         ui.add_space(6.0);
         // OK stays off until nothing is missing; what is missing is said under it.
         let wanted = need_text(&need);
         ui.horizontal(|ui| {
-            ok = button(ui, "OK", ui_kit::Button::Enabled(need.is_empty())).on_disabled_hover_text(&wanted).clicked();
-            cancel = button(ui, "Cancel", Button::Normal).clicked();
+            ok = button(ui, tm("OK"), ui_kit::Button::Enabled(need.is_empty())).on_disabled_hover_text(&wanted).clicked();
+            cancel = button(ui, tm("Cancel"), Button::Normal).clicked();
         });
         if !need.is_empty() {
             ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
@@ -2956,10 +2991,10 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
         // What stops the toolpath, said before OK.
         match (&*form, &cam.preview) {
             (Form::Op(_), Some((_, _, Err(e)))) => {
-                ui.add(egui::Label::new(RichText::new(format!("Cannot be cut: {e}")).color(t.error)).wrap());
+                ui.add(egui::Label::new(RichText::new(tf("manufacture.cannot_be_cut", &[("why", e)])).color(t.error)).wrap());
             }
             (Form::Op(_), Some((_, _, Ok(solidcraft_engine::CamPreview { warning: Some(w), .. })))) => {
-                ui.add(egui::Label::new(RichText::new(format!("This toolpath {w}: check Top, Bottom and the geometry")).color(t.warning)).wrap());
+                ui.add(egui::Label::new(RichText::new(tf("manufacture.toolpath_warning", &[("warning", &engine_text(w))])).color(t.warning)).wrap());
             }
             _ => {}
         }
@@ -3069,16 +3104,17 @@ fn docked_panel(
         let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
         drag_header(ui, id, band, offset, anchor - dock.anchor);
         ui.horizontal(|ui| {
-            if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, if *folded { "Expand" } else { "Collapse" }, true, false).clicked()
+            if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, tm(if *folded { "Expand" } else { "Collapse" }), true, false)
+                .clicked()
             {
                 *folded = !*folded;
             }
             // Not selectable: a drag on the title moves the panel.
-            ui.add(egui::Label::new(RichText::new(title).strong().size(t.font_label)).selectable(false))
-                .on_hover_text("Drag to move, double-click to dock again");
+            ui.add(egui::Label::new(RichText::new(tm(title)).strong().size(t.font_label)).selectable(false))
+                .on_hover_text(tm("Drag to move, double-click to dock again"));
             let width = ui.spacing().interact_size.x;
             right_aligned(ui, total, width, |ui| {
-                if crate::ui_kit::compact_button(ui, "×", "Close", true, false).clicked() {
+                if crate::ui_kit::compact_button(ui, "×", tm("Close"), true, false).clicked() {
                     keep = false;
                 }
             });
@@ -3109,7 +3145,7 @@ fn docked_panel(
             if r.double_clicked() {
                 look.width = 0.0;
             }
-            r.on_hover_text("Drag to make the panel wider or narrower; double-click for its usual width");
+            r.on_hover_text(tm("Drag to make the panel wider or narrower; double-click for its usual width"));
         });
     }
     (keep, rect)
@@ -3172,18 +3208,35 @@ struct Asked {
 }
 
 /// Why Simulate and Post Process are off on a setup without operations.
-const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Face, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill)";
+const NO_OPS: &str = "This setup has no operation yet: add one from the toolbar (Facing, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill)";
 
-/// The operations the toolbar offers, by their command and label.
-const OPERATIONS: [(&str, &str); 7] = [
-    ("cam.op.face", "Face"),
-    ("cam.op.contour", "2D Contour"),
-    ("cam.op.pocket", "2D Pocket"),
-    ("cam.op.adaptive", "Adaptive"),
-    ("cam.op.chamfer", "Chamfer"),
-    ("cam.op.bore", "Bore"),
-    ("cam.op.drill", "Drill"),
-];
+/// The engine's warnings about a toolpath in this window's language: how deep a program or an
+/// operation cuts into the part; other messages as the engine words them.
+fn engine_text(w: &str) -> String {
+    let between = |s: &str, a: &str, b: &str| s.strip_prefix(a).and_then(|r| r.strip_suffix(b)).map(str::to_string);
+    if let Some(depth) = between(w, "cuts up to ", " mm into the part") {
+        return tf("manufacture.op_cuts_into_part", &[("depth", &depth)]);
+    }
+    if let Some((depth, area)) = between(w, "the program cuts up to ", " mm²")
+        .and_then(|r| r.split_once(" mm into the part, over ").map(|(d, a)| (d.to_string(), a.to_string())))
+    {
+        return tf("manufacture.program_cuts_into_part", &[("depth", &depth), ("area", &area)]);
+    }
+    tm(w).to_string()
+}
+
+/// A kind the engine names (`pocket`, `ball_endmill`) as people read it: `group` is
+/// `op_kind` or `tool_kind`, since a drill is a tool as well as an operation.
+fn kind_name(group: &str, kind: &str) -> String {
+    let id = format!("manufacture.{group}_{kind}");
+    match crate::i18n::tr(&id) {
+        known if known != id => known.to_string(),
+        _ => kind.replace('_', " "),
+    }
+}
+
+/// The operations the toolbar offers, by their command.
+const OPERATIONS: [&str; 7] = ["cam.op.face", "cam.op.contour", "cam.op.pocket", "cam.op.adaptive", "cam.op.chamfer", "cam.op.bore", "cam.op.drill"];
 
 /// How far along the way to a program the job is: a setup, an operation, a simulation, a
 /// program written (until the design changes). Each step is a button that does it; the line
@@ -3212,7 +3265,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             let is_next = next == Some(k);
             // Each step needs the ones before it.
             let open = done.iter().take(k).all(|d| *d);
-            let caption = RichText::new(format!("{}  {name}", k + 1));
+            let caption = RichText::new(format!("{}  {}", k + 1, tm(name)));
             let (caption, fill, stroke) = match (is_done, is_next) {
                 (true, _) => (caption.color(t.text), Some(t.accent_soft), None),
                 (_, true) => (caption.strong().color(t.text), None, Some(Stroke::new(1.5, t.accent))),
@@ -3221,20 +3274,21 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
             let why = ["", "Make a setup first", "Add an operation first", "Add an operation first"];
             let tip = [
                 "The raw block and the work zero. Click to make one, or to change it.",
-                "Face, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill: click to choose one.",
+                "Facing, 2D Contour, 2D Pocket, Adaptive, Chamfer, Bore or Drill: click to choose one.",
                 "Cut the raw block with every operation and see what is left, or cut into the part.",
                 "Write the setup's program for the machine.",
             ];
             let r = ui
                 .add_enabled_ui(open, |ui| tinted(ui, fill, stroke, |ui| button(ui, caption, Button::Normal)))
                 .inner
-                .on_hover_text(tip.get(k).copied().unwrap_or_default())
-                .on_disabled_hover_text(why.get(k).copied().unwrap_or_default());
+                .on_hover_text(tm(tip.get(k).copied().unwrap_or_default()))
+                .on_disabled_hover_text(tm(why.get(k).copied().unwrap_or_default()));
             if k == 1 {
                 // The operations to choose from, under the step.
                 egui::Popup::menu(&r).show(|ui| {
-                    for (cmd, label) in OPERATIONS {
-                        if button(ui, label, Button::Normal).clicked() {
+                    for cmd in OPERATIONS {
+                        // The toolbar's own name for it.
+                        if button(ui, crate::i18n::tr(&format!("cmd.{}", cmd.replace('.', "_"))), Button::Normal).clicked() {
                             asked.start = Some(cmd);
                         }
                     }
@@ -3261,7 +3315,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
         Some(k) => NEXT.get(k).copied().unwrap_or_default(),
         None => "Done: the G-code is written. A change to the design or the operations starts the checks again.",
     };
-    ui.label(RichText::new(line).color(if next.is_some() { t.text } else { t.text_dim }));
+    ui.label(RichText::new(tm(line)).color(if next.is_some() { t.text } else { t.text_dim }));
 }
 
 /// The tool table's columns.
@@ -3275,7 +3329,7 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         egui::Grid::new(id).num_columns(TOOL_HEADS.len()).spacing([18.0, 6.0]).striped(true).show(ui, |ui| {
             for head in TOOL_HEADS {
-                ui.label(RichText::new(head).color(t.text_dim));
+                ui.label(RichText::new(tm(head)).color(t.text_dim));
             }
             ui.end_row();
             for tool in tools {
@@ -3284,14 +3338,14 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 // Cutting data a tool has none of: each operation is given it instead.
                 let cell = |ui: &mut egui::Ui, v: Option<String>| match v {
                     Some(v) => ui.label(v),
-                    None => ui.label(RichText::new("—").color(t.text_dim)).on_hover_text("Not set: operations with this tool ask for it"),
+                    None => ui.label(RichText::new("—").color(t.text_dim)).on_hover_text(tm("Not set: operations with this tool ask for it")),
                 };
                 let name = text(tool, "description");
                 let label = if name.is_empty() { format!("T{number}") } else { format!("T{number}  {name}") };
                 if crate::ui_kit::list_picker(ui, &format!("cam_tool_{library}_{number}"), &label, *picked == Some((library, number))).clicked() {
                     *picked = if *picked == Some((library, number)) { None } else { Some((library, number)) };
                 }
-                ui.label(text(tool, "kind").replace('_', " "));
+                ui.label(kind_name("tool_kind", &text(tool, "kind")));
                 cell(ui, data("diameter", 3).map(|d| format!("{d} mm")));
                 cell(ui, data("flutes", 0));
                 cell(ui, data("spindle_rpm", 0));
@@ -3299,10 +3353,12 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 cell(ui, data("feed", 1));
                 // How this design's copy of a library tool stands.
                 match tool["design"].as_str() {
-                    Some("same") => ui.label(RichText::new("in use").color(t.text_dim)).on_hover_text("This design uses it as the library has it"),
-                    Some("differs") => {
-                        ui.label(RichText::new("changed").color(t.warning)).on_hover_text("Changed in the library since this design copied it")
+                    Some("same") => {
+                        ui.label(RichText::new(tm("in use")).color(t.text_dim)).on_hover_text(tm("This design uses it as the library has it"))
                     }
+                    Some("differs") => ui
+                        .label(RichText::new(tm("changed")).color(t.warning))
+                        .on_hover_text(tm("Changed in the library since this design copied it")),
                     _ => ui.label(""),
                 };
                 ui.end_row();
@@ -3339,12 +3395,12 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             }
             egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("This machine's tools").strong());
-                    ui.label(RichText::new("shared by every design").color(t.text_dim)).on_hover_text(text(library, "path"));
+                    ui.label(RichText::new(tm("This machine's tools")).strong());
+                    ui.label(RichText::new(tm("shared by every design")).color(t.text_dim)).on_hover_text(text(library, "path"));
                 });
                 ui.add_space(4.0);
                 if tools.is_empty() {
-                    ui.label(RichText::new("No tools yet. New Tool adds the first.").color(t.text_dim));
+                    ui.label(RichText::new(tm("No tools yet. New Tool adds the first.")).color(t.text_dim));
                 } else {
                     tool_table(ui, "sc_cam_tool_table", &tools, true, &mut cam.selected_tool);
                 }
@@ -3353,8 +3409,8 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                 ui.add_space(6.0);
                 egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Only in this design").strong());
-                        ui.label(RichText::new("not in the machine's library").color(t.text_dim));
+                        ui.label(RichText::new(tm("Only in this design")).strong());
+                        ui.label(RichText::new(tm("not in the machine's library")).color(t.text_dim));
                     });
                     ui.add_space(4.0);
                     tool_table(ui, "sc_cam_design_tools", &own, false, &mut cam.selected_tool);
@@ -3363,7 +3419,7 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             ui.add_space(6.0);
             // What can be done: always New Tool and the library file; with a tool picked, to that tool.
             ui.horizontal_wrapped(|ui| {
-                if button(ui, "New Tool", Button::Normal).clicked() {
+                if button(ui, tm("New Tool"), Button::Normal).clicked() {
                     asked.new_tool = true;
                 }
                 if let Some((in_library, number)) = cam.selected_tool
@@ -3371,31 +3427,31 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                 {
                     ui.separator();
                     ui.label(RichText::new(format!("T{number}")).strong());
-                    if button(ui, "Edit", Button::Normal).clicked() {
+                    if button(ui, tm("Edit"), Button::Normal).clicked() {
                         asked.form = tool_form(tool, in_library);
                     }
-                    if button(ui, "Remove", Button::Normal).clicked() {
+                    if button(ui, tm("Remove"), Button::Normal).clicked() {
                         let id = if in_library { "cam.library.remove" } else { "cam.tool.remove" };
                         asked.run.push((id, json!({ "number": number })));
                     }
-                    if !in_library && button(ui, "Add to library", Button::Normal).clicked() {
+                    if !in_library && button(ui, tm("Add to library"), Button::Normal).clicked() {
                         asked.run.push(("cam.library.add", json!({ "number": number })));
                     }
                     if tool["design"].as_str() == Some("differs")
-                        && button(ui, "Update this design", Button::Normal)
-                            .on_hover_text("Replace this design's older copy of the tool with the library's")
+                        && button(ui, tm("Update this design"), Button::Normal)
+                            .on_hover_text(tm("Replace this design's older copy of the tool with the library's"))
                             .clicked()
                     {
                         asked.run.push(("cam.tool.update", json!({ "number": number })));
                     }
                 } else {
-                    ui.label(RichText::new("Pick a tool to change or remove it").color(t.text_dim));
+                    ui.label(RichText::new(tm("Pick a tool to change or remove it")).color(t.text_dim));
                 }
                 ui.separator();
-                asked.import = button(ui, "Import…", Button::Normal)
-                    .on_hover_text("Add the tools of a library file to this machine's library: SolidCraft's own, or an RP23CNC toollibrary.json")
+                asked.import = button(ui, tm("Import…"), Button::Normal)
+                    .on_hover_text(tm("Add the tools of a library file to this machine's library: SolidCraft's own, or an RP23CNC toollibrary.json"))
                     .clicked();
-                asked.export = button(ui, "Export…", Button::Normal).on_hover_text("Write this machine's library to a file").clicked();
+                asked.export = button(ui, tm("Export…"), Button::Normal).on_hover_text(tm("Write this machine's library to a file")).clicked();
             });
             for (k, line) in cam.import_notes.iter().enumerate() {
                 let colour = if k == 0 { t.text_dim } else { t.warning };
@@ -3434,18 +3490,18 @@ fn manufacture_window(
                 ui.label(RichText::new(e).color(t.error));
             }
             ui.horizontal_wrapped(|ui| {
-                if button(ui, "Tool Library…", Button::Normal).clicked() {
+                if button(ui, tm("Tool Library…"), Button::Normal).clicked() {
                     cam.tools_open = true;
                 }
-                crate::ui_kit::checkbox(ui, "Toolpaths", &mut cam.show_paths);
+                crate::ui_kit::checkbox(ui, tm("Toolpaths"), &mut cam.show_paths);
                 let widths = PATH_WIDTHS.map(|w| w.0);
                 small_choice(ui, "sc_cam_path_colour", "Colour", "Toolpath colour", &mut cam.path_colour, &PATH_COLOURS);
                 small_choice(ui, "sc_cam_path_width", "Width", "Toolpath width", &mut cam.path_width, &widths);
                 let fades = PANEL_FADES.map(|f| f.0);
                 small_choice(ui, "sc_cam_panel_fade", "Fade", "Panel fade", &mut cam.look.fade, &fades);
-                crate::ui_kit::checkbox(ui, "Stock and origin", &mut cam.show_setups);
+                crate::ui_kit::checkbox(ui, tm("Stock and origin"), &mut cam.show_setups);
                 if cam.stock.is_some() {
-                    crate::ui_kit::checkbox(ui, "Simulated stock", &mut cam.show_stock);
+                    crate::ui_kit::checkbox(ui, tm("Simulated stock"), &mut cam.show_stock);
                     // Finer shows the cut stock closer to the toolpaths, and takes longer.
                     let detail = SIM_DETAIL.map(|d| d.0);
                     if small_choice(ui, "sc_cam_sim_detail", "Detail", "Simulation detail", &mut cam.sim_detail, &detail) {
@@ -3458,7 +3514,7 @@ fn manufacture_window(
             steps(ui, cam, &setups, asked);
             ui.add_space(4.0);
             if setups.is_empty() {
-                ui.label(RichText::new("No setup yet: New Setup on the toolbar makes the first").color(t.text_dim));
+                ui.label(RichText::new(tm("No setup yet: New Setup on the toolbar makes the first")).color(t.text_dim));
             }
             for setup in &setups {
                 let id = setup["id"].as_u64().unwrap_or(0);
@@ -3466,21 +3522,21 @@ fn manufacture_window(
                 egui::Frame::group(ui.style()).inner_margin(8.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(text(setup, "name")).strong());
-                        ui.label(RichText::new(format!("post: {}", text(setup, "post"))).color(t.text_dim));
-                        if button(ui, "Edit", Button::Small).clicked() {
+                        ui.label(RichText::new(tf("manufacture.post_name", &[("post", &text(setup, "post"))])).color(t.text_dim));
+                        if button(ui, tm("Edit"), Button::Small).clicked() {
                             asked.form = setup_form(setup);
                         }
                         let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
                         if ui
-                            .add_enabled_ui(has_ops, |ui| button(ui, "Simulate", Button::Small))
+                            .add_enabled_ui(has_ops, |ui| button(ui, tm("Simulate"), Button::Small))
                             .inner
-                            .on_hover_text("Cut the raw block with every operation and show what is left")
-                            .on_disabled_hover_text(NO_OPS)
+                            .on_hover_text(tm("Cut the raw block with every operation and show what is left"))
+                            .on_disabled_hover_text(tm(NO_OPS))
                             .clicked()
                         {
                             asked.simulate = Some(id);
                         }
-                        if button(ui, "Remove", Button::Small).clicked() {
+                        if button(ui, tm("Remove"), Button::Small).clicked() {
                             asked.run.push(("cam.setup.remove", json!({ "setup": id })));
                         }
                     });
@@ -3490,10 +3546,15 @@ fn manufacture_window(
                     for op in setup["operations"].as_array().into_iter().flatten() {
                         ui.horizontal(|ui| {
                             ui.add_space(12.0);
-                            ui.label(format!("{}  ({}, T{})", text(op, "name"), text(op, "kind"), op["tool"].as_u64().unwrap_or(0)));
+                            ui.label(format!(
+                                "{}  ({}, T{})",
+                                text(op, "name"),
+                                kind_name("op_kind", &text(op, "kind")),
+                                op["tool"].as_u64().unwrap_or(0)
+                            ));
                             match op.get("error").and_then(Value::as_str) {
                                 Some(e) => {
-                                    ui.label(RichText::new(e).color(t.error));
+                                    ui.label(RichText::new(engine_text(e)).color(t.error));
                                 }
                                 None => {
                                     ui.label(
@@ -3502,24 +3563,24 @@ fn manufacture_window(
                                 }
                             }
                             for (label, by) in [("Up", -1), ("Down", 1)] {
-                                if button(ui, label, Button::Small).clicked() {
+                                if button(ui, tm(label), Button::Small).clicked() {
                                     asked.run.push(("cam.op.move", json!({ "setup": id, "op": op["id"], "by": by })));
                                 }
                             }
-                            if button(ui, "Edit", Button::Small).clicked() {
+                            if button(ui, tm("Edit"), Button::Small).clicked() {
                                 asked.edit_op = Some((setup.clone(), op.clone()));
                             }
                             if ui
-                                .add_enabled_ui(op.get("error").is_none(), |ui| button(ui, "Post", Button::Small))
+                                .add_enabled_ui(op.get("error").is_none(), |ui| button(ui, tm("Post"), Button::Small))
                                 .inner
-                                .on_hover_text("Write this operation alone as G-code")
-                                .on_disabled_hover_text("This operation cannot be cut: fix what it says first (Edit)")
+                                .on_hover_text(tm("Write this operation alone as G-code"))
+                                .on_disabled_hover_text(tm("This operation cannot be cut: fix what it says first (Edit)"))
                                 .clicked()
                                 && let Some(op_id) = op["id"].as_u64()
                             {
                                 asked.post = Some((id, Some((op_id, text(op, "name"))), text(setup, "post")));
                             }
-                            if button(ui, "Remove", Button::Small).clicked() {
+                            if button(ui, tm("Remove"), Button::Small).clicked() {
                                 asked.run.push(("cam.op.remove", json!({ "setup": id, "op": op["id"] })));
                             }
                         });
@@ -3527,16 +3588,17 @@ fn manufacture_window(
                         if let Some(w) = op.get("warning").and_then(Value::as_str) {
                             ui.horizontal(|ui| {
                                 ui.add_space(24.0);
-                                ui.label(RichText::new(w).color(t.warning)).on_hover_text(
+                                ui.label(RichText::new(engine_text(w)).color(t.warning)).on_hover_text(tm(
                                     "The toolpath runs into the part. Simulate shows where; change the operation's heights or geometry.",
-                                );
+                                ));
                             });
                         }
                     }
                     // The setup's whole program: the one thing everything here leads to.
                     ui.add_space(6.0);
                     let has_ops = setup["operations"].as_array().is_some_and(|o| !o.is_empty());
-                    let label = RichText::new(format!("Post Process  ({})", text(setup, "post"))).strong().size(t.font_heading).color(t.text);
+                    let label =
+                        RichText::new(format!("{}  ({})", tm("Post Process"), text(setup, "post"))).strong().size(t.font_heading).color(t.text);
                     let post = ui.add_enabled_ui(has_ops, |ui| {
                         ui.vertical_centered_justified(|ui| {
                             ui.spacing_mut().button_padding.y = t.space_8;
@@ -3546,8 +3608,8 @@ fn manufacture_window(
                     });
                     if post
                         .inner
-                        .on_hover_text("Write every operation of this setup, in order, as one G-code program")
-                        .on_disabled_hover_text(NO_OPS)
+                        .on_hover_text(tm("Write every operation of this setup, in order, as one G-code program"))
+                        .on_disabled_hover_text(tm(NO_OPS))
                         .clicked()
                     {
                         asked.post = Some((id, None, text(setup, "post")));
@@ -3561,7 +3623,7 @@ fn manufacture_window(
                     ui.label(RichText::new(line).color(t.text_dim));
                 }
                 for line in warnings {
-                    ui.label(RichText::new(line).color(t.warning));
+                    ui.label(RichText::new(engine_text(line)).color(t.warning));
                 }
                 play_controls(ui, cam, asked);
             }
@@ -3642,18 +3704,18 @@ fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &
     let materials: Vec<&str> = library["materials"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Materials").strong());
-            ui.label(RichText::new("what stock is made of: a tool can have cutting data for each").color(t.text_dim));
+            ui.label(RichText::new(tm("Materials")).strong());
+            ui.label(RichText::new(tm("what stock is made of: a tool can have cutting data for each")).color(t.text_dim));
         });
         ui.add_space(4.0);
         if materials.is_empty() {
-            ui.label(RichText::new("None yet. Add one, then give tools their data for it (Edit, Cutting data).").color(t.text_dim));
+            ui.label(RichText::new(tm("None yet. Add one, then give tools their data for it (Edit, Cutting data).")).color(t.text_dim));
         }
         ui.horizontal_wrapped(|ui| {
             for m in &materials {
                 ui.label(*m);
-                if ui_kit::compact_button(ui, "×", &format!("Remove {m}"), true, false)
-                    .on_hover_text("Tools in the library lose their data for it; designs keep theirs")
+                if ui_kit::compact_button(ui, "×", &tf("manufacture.remove_material", &[("material", m)]), true, false)
+                    .on_hover_text(tm("Tools in the library lose their data for it; designs keep theirs"))
                     .clicked()
                 {
                     asked.run.push(("cam.material.remove", json!({ "name": m })));
@@ -3665,11 +3727,11 @@ fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &
             let (enter, _) = ui
                 .scope(|ui| {
                     ui.set_max_width(180.0);
-                    ui_kit::text_field(ui, &mut cam.new_material, "Plywood, MDF, Aluminium…")
+                    ui_kit::text_field(ui, &mut cam.new_material, tm("Plywood, MDF, Aluminium…"))
                 })
                 .inner;
             let named = !cam.new_material.trim().is_empty();
-            if (button(ui, "Add material", ui_kit::Button::Enabled(named)).clicked() || enter) && named {
+            if (button(ui, tm("Add material"), ui_kit::Button::Enabled(named)).clicked() || enter) && named {
                 asked.run.push(("cam.material.define", json!({ "name": cam.new_material.trim() })));
                 cam.new_material.clear();
             }
@@ -3800,7 +3862,10 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
         );
 
         if let Some(resp) = &r.resp {
-            let hover = setup.get("error").and_then(Value::as_str).map_or_else(|| format!("post: {}", text(setup, "post")), str::to_string);
+            let hover = setup
+                .get("error")
+                .and_then(Value::as_str)
+                .map_or_else(|| tf("manufacture.post_name", &[("post", &text(setup, "post"))]), str::to_string);
             resp.clone().on_hover_text(hover);
         }
         if r.eye {
@@ -3851,12 +3916,9 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             if let Some(resp) = &r.resp {
                 let hover = error.map_or_else(
                     || {
-                        format!(
-                            "{}, T{}, {:.1} min",
-                            text(op, "kind"),
-                            op["tool"].as_u64().unwrap_or(0),
-                            op["toolpath"]["cut_minutes"].as_f64().unwrap_or(0.0)
-                        )
+                        let tool = op["tool"].as_u64().unwrap_or(0).to_string();
+                        let minutes = format!("{:.1}", op["toolpath"]["cut_minutes"].as_f64().unwrap_or(0.0));
+                        tf("manufacture.op_summary", &[("kind", &kind_name("op_kind", &text(op, "kind"))), ("tool", &tool), ("minutes", &minutes)])
                     },
                     str::to_string,
                 );
@@ -3890,7 +3952,7 @@ fn toggle_hidden(app: &mut SolveApp, id: u64) {
 
 /// A menu entry that `menu_action` does: `what` to the setup, or to one operation of it.
 fn menu_item(label: &str, icon: &str, what: &str, setup: u64, op: Option<u64>) -> crate::context_menu::Item {
-    let mut item = crate::context_menu::Item::action("ui.cam", label, icon);
+    let mut item = crate::context_menu::Item::action("ui.cam", tm(label), icon);
     item.params = Some(json!({ "do": what, "setup": setup, "op": op }));
     item
 }
@@ -3955,6 +4017,7 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
 
 /// Writes a setup's program, or one operation of it, to `path`.
 pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
+    let _language = crate::i18n::scope(&app.preferences.language);
     let mut p = json!({ "setup": setup, "path": path });
     if let Some(op) = op {
         p["op"] = json!(op);
@@ -3966,7 +4029,7 @@ pub fn post_to(app: &mut SolveApp, setup: u64, op: Option<u64>, path: &str) {
             if op.is_none() {
                 app.manufacture.posted_at = Some(app.session.revision);
             }
-            app.set_status(format!("Wrote {} lines of G-code", v["lines"].as_u64().unwrap_or(0)), false);
+            app.set_status(tf("manufacture.wrote_lines", &[("lines", &v["lines"].as_u64().unwrap_or(0).to_string())]), false);
         }
         Err(e) => app.manufacture.error = Some(e),
     }

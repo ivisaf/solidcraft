@@ -212,6 +212,11 @@ impl Harness {
 
     /// Lay out and draw one frame (feeding queued pointer and key events).
     pub fn frame(&mut self) {
+        self.painted_frame();
+    }
+
+    /// One frame, as [`Harness::frame`]: what it painted.
+    pub fn painted_frame(&mut self) -> Vec<egui::epaint::ClippedShape> {
         self.time += 1.0 / 60.0;
         let mut raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
@@ -228,6 +233,7 @@ impl Harness {
         // Nothing is painted: drop the frame's texture changes.
         out.textures_delta.clear();
         self.output = out.platform_output;
+        out.shapes
     }
 
     pub fn frames(&mut self, n: usize) {
