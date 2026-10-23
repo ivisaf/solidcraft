@@ -523,6 +523,9 @@ pub struct CamUi {
     posted_now: bool,
     /// The title of the form last shown (one that opens is scrolled into view).
     form_seen: Option<&'static str>,
+    /// The open form as it opened: when it differs, the form has changes a click in the
+    /// browser does not throw away.
+    form_opened: Option<Form>,
     /// What the last tool import took and left out, shown in the Tool Library window.
     pub import_notes: Vec<String>,
     /// Setups and operations whose toolpaths are not drawn (the browser's eyes).
@@ -610,6 +613,7 @@ impl Default for CamUi {
             posted_at: None,
             posted_now: false,
             form_seen: None,
+            form_opened: None,
             import_notes: Vec::new(),
             hidden: Default::default(),
             path_ids: Vec::new(),
@@ -779,6 +783,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     if let Some(Form::Op(f)) = &mut form {
         prefill(f, &lists);
     }
+    app.manufacture.form_opened = form.clone();
     app.manufacture.form = form;
     app.manufacture.error = None;
     true
@@ -3220,6 +3225,8 @@ struct Asked {
     form: Option<Form>,
     /// An operation to open for editing: its setup and itself, as listed.
     edit_op: Option<(Value, Value)>,
+    /// The form was picked in the browser: it does not replace an open form with changes.
+    from_browser: bool,
     apply: bool,
     simulate: Option<u64>,
     /// A setup whose simulated program to play.
@@ -3642,6 +3649,12 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     (app.preferences.cam_panel_width, app.preferences.cam_tools_width, app.preferences.cam_panel_fade) =
         (cam.look.width, cam.tools_look.width, cam.look.fade);
     app.preferences.cam_rapid_rate = cam.rapid_rate as f32;
+    // A form opened some other way (an automation setting it) counts as opened as first drawn.
+    if cam.form.is_none() {
+        cam.form_opened = None;
+    } else if cam.form_opened.is_none() {
+        cam.form_opened = cam.form.clone();
+    }
     app.manufacture = cam;
     answer(app, asked);
 }
@@ -3702,8 +3715,15 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
         asked.form = edit_form(app, &setup, &op);
     }
     if let Some(form) = asked.form {
-        app.manufacture.form = Some(form);
-        app.manufacture.error = None;
+        let cam = &app.manufacture;
+        let changed = cam.form.is_some() && cam.form_opened.is_some() && cam.form != cam.form_opened;
+        if asked.from_browser && changed && cam.form.as_ref() != Some(&form) {
+            app.set_status(tm("The open form has changes: OK keeps them, Cancel drops them"), false);
+        } else {
+            app.manufacture.form_opened = Some(form.clone());
+            app.manufacture.form = Some(form);
+            app.manufacture.error = None;
+        }
     }
     if asked.apply {
         apply(app);
@@ -3826,11 +3846,10 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             toggle_hidden(app, id);
         } else if r.fold {
             toggle(app, &skey, true);
-        } else if r.clicked {
+        } else if r.clicked || r.double {
+            // The setup picked is the one the panel shows.
             app.manufacture.picked = Some((id, None));
-        }
-        if r.double {
-            asked.form = setup_form(setup);
+            (asked.form, asked.from_browser) = (setup_form(setup), true);
             app.manufacture.open = true;
         }
         if let Some(at) = r.secondary {
@@ -3900,11 +3919,10 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
             }
             if r.eye {
                 toggle_hidden(app, op_id);
-            } else if r.clicked {
+            } else if r.clicked || r.double {
+                // The operation picked is the one the panel shows.
                 app.manufacture.picked = Some((id, Some(op_id)));
-            }
-            if r.double {
-                asked.edit_op = Some((setup.clone(), op.clone()));
+                (asked.edit_op, asked.from_browser) = (Some((setup.clone(), op.clone())), true);
                 app.manufacture.open = true;
             }
             if let Some(at) = r.secondary {

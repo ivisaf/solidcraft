@@ -1216,6 +1216,7 @@
   "manufacture.the_number_of_flutes": "刃数",
   "manufacture.the_number_of_passes_must_be": "走刀次数必须是整数",
   "manufacture.the_number_of_tabs_must_be": "连接桥数量必须是整数",
+  "manufacture.the_open_form_has_changes": "打开的表单有更改：确定保存，取消放弃",
   "manufacture.the_origin_s_x": "原点 X",
   "manufacture.the_origin_s_y": "原点 Y",
   "manufacture.the_origin_s_z": "原点 Z",

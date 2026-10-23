@@ -1216,6 +1216,7 @@
   "manufacture.the_number_of_flutes": "The number of flutes",
   "manufacture.the_number_of_passes_must_be": "The number of passes must be a whole number",
   "manufacture.the_number_of_tabs_must_be": "The number of tabs must be a whole number",
+  "manufacture.the_open_form_has_changes": "The open form has changes: OK keeps them, Cancel drops them",
   "manufacture.the_origin_s_x": "The origin's X",
   "manufacture.the_origin_s_y": "The origin's Y",
   "manufacture.the_origin_s_z": "The origin's Z",

@@ -1317,6 +1317,44 @@ fn the_manufacture_folder_menu_and_preferences_set_the_display() {
     }
 }
 
+/// One click on an operation (or a setup) in the browser shows its form in the panel; a form
+/// with changes stays until OK or Cancel, and the status line says so.
+#[test]
+fn a_click_in_the_browser_shows_that_operation_s_form() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    for bottom in [-3, -4] {
+        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
+    }
+    h.frames(2);
+    let click = |h: &mut Harness, name: &str| {
+        let at = crate::browser::drawn_rows().into_iter().find(|r| r.0 == name).map(|r| r.1.center()).unwrap();
+        h.step(&json!({"click": [at.x, at.y]})).unwrap();
+        h.frames(2);
+    };
+    let editing = |h: &Harness| match &h.app.manufacture.form {
+        Some(Form::Op(f)) => f.name.clone(),
+        Some(Form::Setup(f)) => f.name.clone(),
+        _ => String::new(),
+    };
+    click(&mut h, "Pocket1");
+    assert_eq!(editing(&h), "Pocket1");
+    click(&mut h, "Pocket2");
+    assert_eq!(editing(&h), "Pocket2", "the panel follows the click");
+    if let Some(Form::Op(f)) = &mut h.app.manufacture.form {
+        f.bottom = "-5 mm".into();
+    }
+    h.frames(1);
+    click(&mut h, "Pocket1");
+    assert_eq!(editing(&h), "Pocket2", "a form with changes stays");
+    assert!(h.app.status.as_ref().is_some_and(|s| s.0.contains("OK keeps them")), "{:?}", h.app.status);
+    h.app.manufacture.form = None;
+    h.frames(1);
+    click(&mut h, "Setup1");
+    assert_eq!(editing(&h), "Setup1", "a setup shows its own form");
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

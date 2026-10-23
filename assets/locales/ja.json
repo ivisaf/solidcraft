@@ -1216,6 +1216,7 @@
   "manufacture.the_number_of_flutes": "刃数",
   "manufacture.the_number_of_passes_must_be": "パス数は整数で入力してください",
   "manufacture.the_number_of_tabs_must_be": "タブ数は整数で入力してください",
+  "manufacture.the_open_form_has_changes": "開いているフォームに変更があります: OK で保存、キャンセルで破棄します",
   "manufacture.the_origin_s_x": "原点の X",
   "manufacture.the_origin_s_y": "原点の Y",
   "manufacture.the_origin_s_z": "原点の Z",

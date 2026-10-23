@@ -1210,6 +1210,7 @@
   "manufacture.the_number_of_flutes": "Die Schneidenzahl",
   "manufacture.the_number_of_passes_must_be": "Die Anzahl der Durchgänge muss eine ganze Zahl sein",
   "manufacture.the_number_of_tabs_must_be": "Die Anzahl der Haltestege muss eine ganze Zahl sein",
+  "manufacture.the_open_form_has_changes": "Das offene Formular hat Änderungen: OK übernimmt sie, Abbrechen verwirft sie",
   "manufacture.the_origin_s_x": "Das X des Nullpunkts",
   "manufacture.the_origin_s_y": "Das Y des Nullpunkts",
   "manufacture.the_origin_s_z": "Das Z des Nullpunkts",
