@@ -95,6 +95,15 @@ pub static COMMANDS: &[CommandSpec] = &[
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
     ),
+    CommandSpec::new("cam.template.save", "Save Template", template_save).icon("cam_setup").noundo().params(
+        "setup?: id or name; path?: file to write → operations, and template (the JSON) when no path is given: the setup's operations and \
+         their tools, sketches by name, to add to a setup of this design or another (cam.template.apply)",
+    ),
+    CommandSpec::new("cam.template.apply", "Apply Template", template_apply).icon("cam_setup").params(
+        "setup?: id or name; path?: a template file, or template?: its JSON (what cam.template.save gives) → added: the new operations' \
+         names. Sketches are found by name; a tool the design does not have is added from the template; an operation whose sketch \
+         or faces this design does not have is added all the same, and says so until it is edited",
+    ),
     CommandSpec::new("cam.setup.remove", "Remove Setup", setup_remove).icon("delete").params("setup: id or name"),
     CommandSpec::new("cam.op.face", "Facing", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
@@ -894,6 +903,101 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     let shift = Vec3::new(o.dot(x), o.dot(y), o.dot(z));
     let moved = |b: Box3| (b.0 - shift, b.1 - shift);
     Ok(Resolved { frame: Frame { o, x, y, z }, part: part.map(moved), stock: stock.map(moved) })
+}
+
+/// What a template file says it is.
+const TEMPLATE_FORMAT: &str = "solidcraft-cam-template";
+
+/// A setup's operations as a template: each without its id, its sketch by name, and the tools
+/// they cut with.
+fn template_save(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.template.save";
+    let setup = setup(s, p, cmd)?;
+    let sketch_name = |id: u64| s.doc.features.iter().find(|f| f.id == id).map(|f| f.name.clone());
+    let mut ops = Vec::new();
+    let mut tools: Vec<Tool> = Vec::new();
+    for op in &setup.operations {
+        let mut v = json!(op);
+        if let Some(o) = v.as_object_mut() {
+            o.remove("id");
+        }
+        if let CamGeometry::Sketch { sketch, .. } = &op.geometry {
+            v["sketch_name"] = json!(sketch_name(*sketch));
+        }
+        ops.push(v);
+        if let Some(t) = s.doc.manufacture.tool(op.tool)
+            && !tools.iter().any(|x| x.number == t.number)
+        {
+            tools.push(t.clone());
+        }
+    }
+    let template = json!({ "format": TEMPLATE_FORMAT, "version": 1, "operations": ops, "tools": tools });
+    let mut out = json!({ "operations": setup.operations.len() });
+    match str_(p, "path") {
+        Some(path) => {
+            let text = serde_json::to_string_pretty(&template).map_err(|e| bad(cmd, e.to_string()))?;
+            solidcraft_io::vfs::write(path, text.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            out["path"] = json!(path);
+        }
+        None => out["template"] = template,
+    }
+    Ok(out)
+}
+
+/// Adds a template's operations to a setup, after those it has.
+fn template_apply(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.template.apply";
+    let si = setup_index(s, p, cmd)?;
+    let template = match (str_(p, "path"), p.get("template")) {
+        (Some(path), _) => {
+            let bytes = solidcraft_io::vfs::read(path, 16 << 20).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+            serde_json::from_slice::<Value>(&bytes).map_err(|e| bad(cmd, format!("{path}: not a template ({e})")))?
+        }
+        (None, Some(t)) => t.clone(),
+        (None, None) => return Err(bad(cmd, "give `path` or `template`")),
+    };
+    if template["format"] != TEMPLATE_FORMAT {
+        return Err(bad(cmd, "not a SolidCraft operation template"));
+    }
+    let items = template["operations"].as_array().cloned().unwrap_or_default();
+    let have = s.doc.manufacture.setups.get(si).map_or(0, |x| x.operations.len());
+    if items.is_empty() || have + items.len() > MAX_OPERATIONS {
+        return Err(bad(cmd, format!("a template adds 1 to {} operations to this setup", MAX_OPERATIONS.saturating_sub(have))));
+    }
+    // Tools the design does not have yet, from the template.
+    for t in template["tools"].as_array().into_iter().flatten().take(MAX_TOOLS) {
+        let tool: Tool = serde_json::from_value(t.clone()).map_err(|e| bad(cmd, format!("a tool of the template: {e}")))?;
+        tool.validate().map_err(|e| bad(cmd, format!("a tool of the template: {e}")))?;
+        let m = &mut s.doc_mut().manufacture;
+        if m.tool(tool.number).is_none() && m.tools.len() < MAX_TOOLS {
+            m.tools.push(tool);
+        }
+    }
+    let mut added = Vec::new();
+    for item in items {
+        let mut v = item.clone();
+        let sketch = v.get("sketch_name").and_then(Value::as_str).map(str::to_string);
+        if let Some(o) = v.as_object_mut() {
+            o.remove("sketch_name");
+            o.insert("id".into(), json!(0));
+        }
+        let mut op: CamOperation = serde_json::from_value(v).map_err(|e| bad(cmd, format!("an operation of the template: {e}")))?;
+        // This design's sketch of that name (none: an id no feature has, which the operation reports).
+        if let (CamGeometry::Sketch { sketch: id, .. }, Some(name)) = (&mut op.geometry, sketch) {
+            *id = s.doc.features.iter().find(|f| matches!(f.kind, solidcraft_doc::FeatureKind::Sketch { .. }) && f.name == name).map_or(0, |f| f.id);
+        }
+        let names: Vec<String> = s.doc.manufacture.setups.get(si).map(|x| x.operations.iter().map(|o| o.name.clone()).collect()).unwrap_or_default();
+        let base: String = op.name.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+        if names.iter().any(|n| n.eq_ignore_ascii_case(&op.name)) {
+            op.name = (1..).map(|k| format!("{base}{k}")).find(|n| !names.iter().any(|x| x.eq_ignore_ascii_case(n))).unwrap_or_default();
+        }
+        op.id = next_id(s);
+        added.push(op.name.clone());
+        if let Some(setup) = s.doc_mut().manufacture.setups.get_mut(si) {
+            setup.operations.push(op);
+        }
+    }
+    Ok(json!({ "added": added }))
 }
 
 fn setup_remove(s: &mut Session, p: &Value) -> Result<Value> {

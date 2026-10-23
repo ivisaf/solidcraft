@@ -1529,6 +1529,46 @@ fn a_setup_starts_from_what_an_earlier_one_leaves_also_turned_over() {
 }
 
 #[test]
+fn a_template_carries_a_setup_s_operations_to_another_design() {
+    let mut s = pocket_job(0.0, json!({}));
+    run(&mut s, "cam.op.pocket", pocket_op());
+    run(&mut s, "cam.op.contour", json!({"sketch": "Pocket", "tool": 1, "spindle_rpm": 12000, "feed": 600, "bottom": -5, "side": "outside"}));
+    let template = run(&mut s, "cam.template.save", json!({}))["template"].clone();
+    assert_eq!(template["operations"][0]["sketch_name"], "Pocket");
+    // Another design: its sketch of that name has another id, and it has no tool yet.
+    let mut other = Session::default();
+    run(&mut other, "sketch.create", json!({"plane": "XY", "name": "Other"}));
+    run(&mut other, "sketch.circle.center", json!({"center": [5, 5], "radius": 2}));
+    run(&mut other, "sketch.finish", json!({}));
+    run(&mut other, "sketch.create", json!({"plane": "XY", "name": "Pocket"}));
+    run(&mut other, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [50, 20]}));
+    run(&mut other, "sketch.finish", json!({}));
+    run(&mut other, "cam.setup.create", json!({}));
+    let added = run(&mut other, "cam.template.apply", json!({"template": template}));
+    assert_eq!(added["added"], json!(["Pocket1", "Contour1"]));
+    assert!(other.doc.manufacture.tool(1).is_some(), "the tool came with it");
+    let listed = run(&mut other, "cam.list", json!({}));
+    let ops = listed["setups"][0]["operations"].as_array().unwrap().clone();
+    assert!(ops.iter().all(|o| o.get("error").is_none() && o["toolpath"]["cut_length"].as_f64().unwrap() > 0.0), "{ops:?}");
+    // Again: its names are made unique.
+    let again = run(&mut other, "cam.template.apply", json!({"template": template}));
+    assert_eq!(again["added"], json!(["Pocket2", "Contour2"]));
+    // A sketch the design does not have: added all the same, saying so.
+    let mut lone = Session::default();
+    run(&mut lone, "cam.setup.create", json!({}));
+    run(&mut lone, "cam.template.apply", json!({"template": template}));
+    let listed = run(&mut lone, "cam.list", json!({}));
+    assert!(listed["setups"][0]["operations"][0]["error"].as_str().is_some());
+    for bad in [
+        json!({"template": {"format": "x", "operations": []}}),
+        json!({"template": {"format": "solidcraft-cam-template", "operations": "no"}}),
+        json!({}),
+    ] {
+        assert!(other.execute("cam.template.apply", &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
 fn operations_take_the_cutting_data_for_their_setups_material() {
     let lib = library_file("materials");
     let mut s = pocket_job(0.0, json!({"material": "MDF"}));

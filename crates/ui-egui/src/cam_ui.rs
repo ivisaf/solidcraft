@@ -803,6 +803,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     }
     let mut form = form;
     if let Some(Form::Op(f)) = &mut form {
+        if let Some(saved) = app.preferences.cam_op_defaults.get(id) {
+            recall(f, saved, &lists);
+        }
         prefill(f, &lists);
     }
     app.manufacture.form_opened = form.clone();
@@ -1367,6 +1370,49 @@ fn prefill(f: &mut OpForm, lists: &Choices) {
     f.stepdown = length(data.stepdown);
     f.stepover = length(data.stepover);
 }
+
+/// The rows of an operation form a default keeps: how it cuts, not what or how deep.
+macro_rules! default_rows {
+    ($m:ident) => {
+        $m!(text: tool, spindle_rpm, feed, plunge_feed, stepdown, stepover, stock_to_leave, ramp_angle, passes, tab_count, tab_width,
+            tab_height, finish, pitch, stepover_percent, helix_angle, helix_max, helix_min, feed_up, width, tip_offset, peck, dwell, margin);
+        $m!(flag: climb, tabs, coolant);
+        $m!(index: side, boundary, limit);
+    };
+}
+
+/// An operation form's rows a default keeps, by name.
+fn remembered(f: &OpForm) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    macro_rules! keep {
+        (text: $($n:ident),*) => { $(out.insert(stringify!($n).to_string(), f.$n.clone());)* };
+        (flag: $($n:ident),*) => { $(out.insert(stringify!($n).to_string(), f.$n.to_string());)* };
+        (index: $($n:ident),*) => { $(out.insert(stringify!($n).to_string(), f.$n.to_string());)* };
+    }
+    default_rows!(keep);
+    out
+}
+
+/// A new operation form filled from a kept default: a tool the library no longer has, and its
+/// speeds, are left to the form's own.
+fn recall(f: &mut OpForm, saved: &std::collections::BTreeMap<String, String>, lists: &Choices) {
+    let get = |k: &str| saved.get(k).filter(|v| v.len() <= MAX_NAME_TEXT);
+    let tool_known = get("tool").is_some_and(|t| lists.tools.iter().any(|(n, _)| n == t));
+    let speeds = ["tool", "spindle_rpm", "feed", "plunge_feed"];
+    macro_rules! take {
+        (text: $($n:ident),*) => { $(if let Some(v) = get(stringify!($n)).filter(|_| tool_known || !speeds.contains(&stringify!($n))) { f.$n = v.clone(); })* };
+        (flag: $($n:ident),*) => { $(if let Some(v) = get(stringify!($n)).and_then(|v| v.parse::<bool>().ok()) { f.$n = v; })* };
+        (index: $($n:ident),*) => { $(if let Some(v) = get(stringify!($n)).and_then(|v| v.parse::<usize>().ok()).filter(|v| *v < 8) { f.$n = v; })* };
+    }
+    default_rows!(take);
+    // The kept speeds stand: the tool's own do not fill them over.
+    if tool_known {
+        f.filled_for = f.tool.clone();
+    }
+}
+
+/// Longest text a kept default row may have.
+const MAX_NAME_TEXT: usize = 200;
 
 /// Runs the open form's command; the form closes when the command succeeds.
 pub fn apply(app: &mut SolveApp) {
@@ -3121,6 +3167,14 @@ fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], l
             cancel = button(ui, tm("Cancel"), Button::Normal).clicked();
             // An operation is simulated as the form has it, before OK.
             if matches!(form, Form::Op(_)) {
+                asked.save_default = button(ui, tm("Save as Default"), Button::Small)
+                    .on_hover_text(tm(
+                        "New operations of this kind start with this form's tool, speeds, stepdown and the like (not its geometry or heights)",
+                    ))
+                    .clicked();
+                asked.forget_default = button(ui, tm("Built-in Defaults"), Button::Small)
+                    .on_hover_text(tm("New operations of this kind start with SolidCraft's own defaults again"))
+                    .clicked();
                 asked.simulate_form = button(ui, tm("Simulate"), ui_kit::Button::Enabled(need.is_empty()))
                     .on_hover_text(tm("Cut this operation, with the values in the form, on what the operations before it leave; OK still applies it"))
                     .on_disabled_hover_text(&wanted)
@@ -3351,6 +3405,9 @@ struct Asked {
     simulate_op: Option<(u64, u64)>,
     /// Simulate the open operation form as it stands.
     simulate_form: bool,
+    /// Keep the open operation form's rows as the default of its kind, or forget that default.
+    save_default: bool,
+    forget_default: bool,
     /// A setup whose simulated program to play.
     play: Option<u64>,
     /// Write a program: the setup, one operation of it or all (`None`), and the setup's post.
@@ -3890,6 +3947,19 @@ fn answer(app: &mut SolveApp, mut asked: Asked) {
     if asked.simulate_form {
         simulate_form(app);
     }
+    if let Some(Form::Op(f)) = &app.manufacture.form
+        && (asked.save_default || asked.forget_default)
+    {
+        let kind = f.kind.command();
+        let title = crate::i18n::tr(&format!("cmd.{}", kind.replace('.', "_"))).to_string();
+        if asked.save_default {
+            app.preferences.cam_op_defaults.insert(kind.to_string(), remembered(f));
+            app.set_status(tf("manufacture.default_saved", &[("kind", &title)]), false);
+        } else {
+            app.preferences.cam_op_defaults.remove(kind);
+            app.set_status(tf("manufacture.default_forgotten", &[("kind", &title)]), false);
+        }
+    }
     if let Some(setup) = asked.play {
         start_play(app, setup);
     }
@@ -4227,6 +4297,8 @@ pub fn menu_items(app: &SolveApp, setup: u64, op: Option<u64>) -> Vec<crate::con
             disable(menu_item("Post Process", "cam_post", "post", setup, None), !ops.is_empty()),
             disable(menu_item("Setup Sheet…", "cam_post", "sheet", setup, None), !ops.is_empty()),
             menu_item("New Setup, Turned Over", "cam_setup", "turn", setup, None),
+            disable(menu_item("Save as Template…", "", "template_save", setup, None), !ops.is_empty()),
+            menu_item("Apply Template…", "", "template_apply", setup, None),
             Item::sep(),
             menu_item("Remove Setup", "delete", "remove", setup, None),
         ],
@@ -4289,6 +4361,19 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
             }
             asked.run.push(("cam.setup.create", p));
         }
+        ("template_save", None) => {
+            let name: String = text(&s, "name").chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
+            app.pick_save(&format!("{name} template.json"), &["json"], move |app, path| {
+                if let Some(path) = path {
+                    app.manufacture.error = run(app, "cam.template.save", json!({ "setup": setup, "path": path })).err();
+                }
+            });
+        }
+        ("template_apply", None) => app.pick_open_for(&["json"], move |app, path| {
+            if let Some(path) = path {
+                app.manufacture.error = run(app, "cam.template.apply", json!({ "setup": setup, "path": path })).err();
+            }
+        }),
         ("sheet", None) => {
             let name: String = format!("{} sheet", text(&s, "name")).chars().filter(|c| c.is_ascii_alphanumeric() || "-_ ".contains(*c)).collect();
             app.pick_save(&format!("{name}.md"), &["md"], move |app, path| {

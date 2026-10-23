@@ -1494,6 +1494,38 @@ fn a_setup_turned_over_takes_its_stock_from_the_first() {
     assert_eq!(h.app.session.doc.manufacture.setups[1].stock_from, None);
 }
 
+/// An operation form's rows kept as the default of its kind start the next form of that kind,
+/// its geometry and heights not; forgotten, the built-in ones start it again.
+#[test]
+fn an_operation_form_kept_as_default_starts_the_next_one() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.pocket");
+    let built_in = match &h.app.manufacture.form {
+        Some(Form::Op(f)) => (f.stepdown.clone(), f.climb, f.spindle_rpm.clone()),
+        _ => panic!("no operation form"),
+    };
+    if let Some(Form::Op(f)) = &mut h.app.manufacture.form {
+        (f.stepdown, f.climb, f.spindle_rpm, f.bottom, f.ramp_angle) = ("1.5 mm".into(), false, "9000".into(), "-7".into(), "2 deg".into());
+    }
+    answer(&mut h.app, Asked { save_default: true, ..Default::default() });
+    assert!(h.app.status.as_ref().is_some_and(|s| s.0.contains("2D Pocket")), "{:?}", h.app.status);
+    h.app.manufacture.form = None;
+    h.app.start("cam.op.pocket");
+    let Some(Form::Op(f)) = h.app.manufacture.form.clone() else { panic!("no operation form") };
+    assert_eq!((f.stepdown.as_str(), f.climb, f.spindle_rpm.as_str(), f.ramp_angle.as_str()), ("1.5 mm", false, "9000", "2 deg"));
+    assert_ne!(f.bottom, "-7", "the depth is not kept");
+    // Another kind keeps its own; forgotten, the built-in defaults are back.
+    h.app.start("cam.op.contour");
+    assert!(matches!(&h.app.manufacture.form, Some(Form::Op(c)) if c.climb));
+    h.app.start("cam.op.pocket");
+    answer(&mut h.app, Asked { forget_default: true, ..Default::default() });
+    h.app.start("cam.op.pocket");
+    let Some(Form::Op(f)) = h.app.manufacture.form.clone() else { panic!("no operation form") };
+    assert_eq!((f.stepdown, f.climb, f.spindle_rpm), built_in);
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

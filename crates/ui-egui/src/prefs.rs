@@ -471,6 +471,8 @@ preference_settings! {
     cam_rapid_rate: f32 = 5000.0;
     /// How long programs wait after the spindle starts (s): a dwell after `M3`, so that it is up to speed before it cuts.
     cam_spindle_delay: f32 = 3.0;
+    /// What new operations of each kind start with (by its command, `cam.op.pocket`…): form rows and their text.
+    cam_op_defaults: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> = Default::default();
     /// The wheel zooms toward the point under the cursor (else toward the view's centre).
     zoom_to_cursor: bool = true, 1 => check("Zoom to the cursor", "The wheel zooms toward the point under the cursor (off: toward the view's centre)");
     /// Spread discrete wheel input across frames (off: apply each event immediately).
