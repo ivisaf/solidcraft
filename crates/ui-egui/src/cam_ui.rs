@@ -356,6 +356,8 @@ pub struct StockField {
     pub ny: usize,
     pub floor: f64,
     pub z: Vec<f64>,
+    /// Where each column's material starts (empty: on the floor everywhere).
+    pub bottom: Vec<f64>,
     /// Per column: below 0 cut into the part, above 0 left on it. Empty when there was no part to compare with.
     pub deviation: Vec<f64>,
 }
@@ -366,8 +368,10 @@ impl StockField {
         let (nx, ny) = (v["nx"].as_u64()? as usize, v["ny"].as_u64()? as usize);
         let z = numbers("z")?;
         let deviation = numbers("deviation").unwrap_or_default();
+        let bottom = numbers("bottom").unwrap_or_default();
         let f = &v["frame"];
-        (nx.checked_mul(ny) == Some(z.len()) && (deviation.is_empty() || deviation.len() == z.len())).then_some(StockField {
+        let fits = |v: &Vec<f64>| v.is_empty() || v.len() == z.len();
+        (nx.checked_mul(ny) == Some(z.len()) && fits(&deviation) && fits(&bottom)).then_some(StockField {
             frame: [point(&f["origin"])?, point(&f["x"])?, point(&f["y"])?, point(&f["z"])?],
             origin: [v["origin"][0].as_f64()?, v["origin"][1].as_f64()?],
             cell: v["cell"].as_f64()?,
@@ -375,6 +379,7 @@ impl StockField {
             ny,
             floor: v["floor"].as_f64()?,
             z,
+            bottom,
             deviation,
         })
     }
@@ -389,6 +394,7 @@ impl StockField {
             ny: field.ny,
             floor: field.floor,
             z: field.z.clone(),
+            bottom: field.bottom.clone(),
             deviation: Vec::new(),
         }
     }
@@ -399,13 +405,15 @@ impl StockField {
         o + x * q.x + y * q.y + z * q.z
     }
 
-    /// Column `(i, j)` in the world: the top of it at its centre, the point on the floor
-    /// under that, and its deviation from the part.
-    fn column(&self, i: usize, j: usize) -> Option<(Vec3, Vec3, f64)> {
+    /// Column `(i, j)` in the world: the top of it at its centre, the bottom of its material
+    /// under that, its deviation from the part, and whether it holds material.
+    fn column(&self, i: usize, j: usize) -> Option<(Vec3, Vec3, f64, bool)> {
         let k = j.checked_mul(self.nx)?.checked_add(i)?;
         let z = *self.z.get(k).filter(|_| i < self.nx && j < self.ny)?;
+        let base = self.bottom.get(k).map_or(self.floor, |b| b.max(self.floor));
         let (cx, cy) = (self.origin[0] + (i as f64 + 0.5) * self.cell, self.origin[1] + (j as f64 + 0.5) * self.cell);
-        Some((self.world(Vec3::new(cx, cy, z)), self.world(Vec3::new(cx, cy, self.floor)), self.deviation.get(k).copied().unwrap_or(0.0)))
+        let (top, under) = (self.world(Vec3::new(cx, cy, z)), self.world(Vec3::new(cx, cy, base)));
+        Some((top, under, self.deviation.get(k).copied().unwrap_or(0.0), z > base + 1e-9))
     }
 }
 
@@ -432,8 +440,9 @@ pub fn stock_key(app: &SolveApp) -> (bool, u64) {
     (stock_shown(app), app.manufacture.stock_stamp)
 }
 
-/// The simulated stock as triangles: its top through the column centres and walls down to
-/// its floor round the edge, each with what it is.
+/// The simulated stock as triangles: its top through the column centres, its underside where
+/// it was cut from below, and walls down round the edge, each with what it is. Where all of a
+/// triangle's columns are cut through there is none: a hole.
 pub fn stock_triangles(field: &StockField) -> Vec<([Vec3; 3], StockMark)> {
     let mut out = Vec::new();
     let mark = |d: [f64; 3]| {
@@ -452,13 +461,17 @@ pub fn stock_triangles(field: &StockField) -> Vec<([Vec3; 3], StockMark)> {
             else {
                 continue;
             };
-            out.push(([a.0, b.0, c.0], mark([a.2, b.2, c.2])));
-            out.push(([a.0, c.0, d.0], mark([a.2, c.2, d.2])));
+            for [p, q, r] in [[a, b, c], [a, c, d]].into_iter().filter(|t| t.iter().any(|x| x.3)) {
+                out.push(([p.0, q.0, r.0], mark([p.2, q.2, r.2])));
+                if !field.bottom.is_empty() {
+                    out.push(([p.1, r.1, q.1], StockMark::Fine));
+                }
+            }
         }
     }
-    // Walls round the edge, outward-facing: along each side, from the top's rim down to the floor.
-    let mut wall = |a: Option<(Vec3, Vec3, f64)>, b: Option<(Vec3, Vec3, f64)>| {
-        if let (Some((a, a_floor, _)), Some((b, b_floor, _))) = (a, b) {
+    // Walls round the edge, outward-facing: along each side, from the top's rim down to the bottom.
+    let mut wall = |a: Option<(Vec3, Vec3, f64, bool)>, b: Option<(Vec3, Vec3, f64, bool)>| {
+        if let (Some((a, a_floor, _, _)), Some((b, b_floor, _, _))) = (a, b) {
             out.push(([a, a_floor, b_floor], StockMark::Fine));
             out.push(([a, b_floor, b], StockMark::Fine));
         }

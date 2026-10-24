@@ -2815,8 +2815,8 @@ fn toolpath(s: &mut Session, p: &Value) -> Result<Value> {
 /// `cell` wide or `columns` across its longer side (default 300); and its corners.
 /// A setup's stock before its operations: its block, or (`stock_from`, without a `stock` of
 /// `p`'s) what the earlier setup leaves of its own, seen along this setup's axis. Turned over,
-/// a column is whole where the earlier setup left material in it and empty where it cut through:
-/// how deep it cut from the other side is under the material this setup sees.
+/// what the earlier setup cut from its side is the bottom of this setup's columns, and a column
+/// it cut through is empty.
 fn start_stock(s: &Session, setup: &Setup, at: &Resolved, p: &Value, cmd: &str) -> Result<(cam::HeightField, Box3)> {
     let (mut field, block) = sim_block(p, cmd, at)?;
     let earlier = setup.stock_from.filter(|_| p.get("stock").is_none()).and_then(|id| {
@@ -2826,31 +2826,36 @@ fn start_stock(s: &Session, setup: &Setup, at: &Resolved, p: &Value, cmd: &str) 
         setups.iter().take(here).find(|x| x.id == id)
     });
     let Some(earlier) = earlier else { return Ok((field, block)) };
-    let Some(same) = facing(earlier.axis, setup.axis) else { return Ok((field, block)) };
+    if facing(earlier.axis, setup.axis).is_none() {
+        return Ok((field, block));
+    }
     let before = resolve(s, earlier).map_err(|e| bad(cmd, e))?;
     let (mut left, _) = start_stock(s, earlier, &before, &json!({ "cell": field.cell }), cmd)?;
     for op in &earlier.operations {
         let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| bad(cmd, format!("no tool {}", op.tool)))?;
         cam::simulate(&mut left, &build_in(s, &before, op)?, tool).map_err(cam_error)?;
     }
-    let top = block.1.z;
+    let (floor, top) = (field.floor, block.1.z);
+    let mut bottom = vec![floor; field.z.len()];
     for j in 0..field.ny {
         for i in 0..field.nx {
             let c = field.centre(i, j);
             // The column's line in the earlier setup's work coordinates.
             let there = before.frame.local(at.frame.world(Vec3::new(c.x, c.y, 0.0)));
-            let z = left.at(Vec2::new(there.x, there.y));
-            let height = if same {
-                at.frame.local(before.frame.world(Vec3::new(there.x, there.y, z))).z
-            } else if z > left.floor + 1e-9 {
-                top
-            } else {
-                field.floor
-            };
-            if let Some(cell) = field.z.get_mut(j * field.nx + i) {
-                *cell = height.clamp(field.floor, top);
+            let q = Vec2::new(there.x, there.y);
+            let (z, base) = (left.at(q), left.base_at(q));
+            // Both ends of its material here; turned over, the earlier top is this bottom.
+            let here = |z: f64| at.frame.local(before.frame.world(Vec3::new(there.x, there.y, z))).z.clamp(floor, top);
+            let (a, b) = (here(z), here(base));
+            let (lo, hi) = if z > base + 1e-9 && (a - b).abs() > 1e-9 { (a.min(b), a.max(b)) } else { (floor, floor) };
+            let k = j * field.nx + i;
+            if let (Some(cell), Some(under)) = (field.z.get_mut(k), bottom.get_mut(k)) {
+                (*cell, *under) = (hi, lo);
             }
         }
+    }
+    if bottom.iter().any(|b| *b > floor + 1e-9) {
+        field.bottom = bottom;
     }
     Ok((field, block))
 }
@@ -3020,6 +3025,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
             "ny": stock.ny,
             "floor": stock.floor,
             "z": stock.z,
+            "bottom": stock.bottom,
             "deviation": deviation,
         });
     }

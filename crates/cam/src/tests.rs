@@ -1410,6 +1410,18 @@ fn simulation_knows_tool_shapes_and_rapids_through_material() {
         let _ = HeightField::block(Vec3::new(0.0, 0.0, 0.0), Vec3::new(bad, bad, bad), 1.0);
     }
     assert!(compare(&block(), &HeightField::block(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 0.5).unwrap()).is_err());
+    // Stock cut from below up to -12: only 12 mm is left to cut, and a cut deeper goes through,
+    // leaving the columns empty for a rapid to pass.
+    let mut stock = block();
+    stock.bottom = vec![-12.0; stock.z.len()];
+    close(stock.volume(), 20.0 * 20.0 * 12.0, 1e-6);
+    let through = simulate(&mut stock, &down(-15.0), &tool(6.0)).unwrap();
+    close(through.max_engagement, 12.0, 1e-9);
+    close(through.removed_volume, PI * 9.0 * 12.0, PI * 9.0 * 12.0 * 0.01);
+    let (i, j) = stock.column(Vec2::ZERO).unwrap();
+    assert_eq!((stock.get(i, j), stock.base(j * stock.nx + i)), (Some(-20.0), -20.0));
+    let down_the_hole = Toolpath { moves: vec![Move::Rapid { to: Vec3::new(0.0, 0.0, 5.0) }, Move::Rapid { to: Vec3::new(0.0, 0.0, -16.0) }] };
+    assert_eq!(simulate(&mut stock, &down_the_hole, &tool(2.0)).unwrap().rapid_collisions, 0);
 }
 
 #[test]

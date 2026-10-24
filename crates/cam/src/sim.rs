@@ -3,8 +3,9 @@
 //! material, how deep the tool is buried, and, against a height field of the part, where the
 //! program cuts into the part or leaves material on it.
 //!
-//! A height field only knows the top of each column, so undercuts do not exist in it. Along a
-//! sloped move a column takes the tool's height at the nearest point of the move.
+//! A height field knows the top of each column and, for stock already cut from the other side,
+//! its bottom; undercuts do not exist in it. A column cut through is empty: top and bottom on the
+//! floor. Along a sloped move a column takes the tool's height at the nearest point of the move.
 
 use serde::{Deserialize, Serialize};
 use solidcraft_geom::{Vec2, Vec3};
@@ -31,6 +32,10 @@ pub struct HeightField {
     pub z: Vec<f64>,
     /// Columns are never cut below this.
     pub floor: f64,
+    /// Where each column's material starts, as `z` (empty: on the floor everywhere): above the
+    /// floor where the stock was cut from below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bottom: Vec<f64>,
 }
 
 impl HeightField {
@@ -47,7 +52,7 @@ impl HeightField {
             return Err(CamError::TooLarge(format!("the simulation would need more than {MAX_CELLS} columns; use a larger cell")));
         }
         let (nx, ny) = (nx.max(1.0) as usize, ny.max(1.0) as usize);
-        Ok(HeightField { origin: Vec2::new(min.x, min.y), cell, nx, ny, z: vec![max.z; nx * ny], floor: min.z })
+        Ok(HeightField { origin: Vec2::new(min.x, min.y), cell, nx, ny, z: vec![max.z; nx * ny], floor: min.z, bottom: Vec::new() })
     }
 
     pub fn centre(&self, i: usize, j: usize) -> Vec2 {
@@ -58,6 +63,16 @@ impl HeightField {
         if i < self.nx && j < self.ny { self.z.get(j * self.nx + i).copied() } else { None }
     }
 
+    /// Where column `k`'s material starts (`j × nx + i`).
+    pub fn base(&self, k: usize) -> f64 {
+        self.bottom.get(k).map_or(self.floor, |b| b.max(self.floor))
+    }
+
+    /// Where the material of the column under `p` starts; the floor off the field.
+    pub fn base_at(&self, p: Vec2) -> f64 {
+        self.column(p).map_or(self.floor, |(i, j)| self.base(j * self.nx + i))
+    }
+
     /// Columns whose centres lie in `lo`–`hi`: index ranges, clipped to the field.
     pub(crate) fn range(&self, lo: Vec2, hi: Vec2) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
         let index = |v: f64, n: usize| ((v / self.cell).floor().clamp(0.0, n as f64)) as usize;
@@ -66,9 +81,9 @@ impl HeightField {
         (i0..i1, j0..j1)
     }
 
-    /// Volume between the columns and the floor.
+    /// Volume of the columns' material.
     pub fn volume(&self) -> f64 {
-        self.z.iter().map(|z| (z - self.floor).max(0.0)).sum::<f64>() * self.cell * self.cell
+        self.z.iter().enumerate().map(|(k, z)| (z - self.base(k)).max(0.0)).sum::<f64>() * self.cell * self.cell
     }
 
     /// The top of `triangles` seen from above, on columns `cell` wide over `min`–`max`; `floor`
@@ -291,12 +306,23 @@ fn sweep(field: &mut HeightField, a: Vec3, to: Vec3, cutting: bool, tool: &Tool,
             // Straight down or up, the lowest point of the move is what cuts.
             let tip = if len2 > 0.0 { a.z + (to.z - a.z) * t } else { a.z.min(to.z) };
             let z = (tip + profile(tool, off)).max(field.floor);
-            let Some(h) = field.z.get_mut(j * field.nx + i) else { continue };
+            let k = j * field.nx + i;
+            let base = field.base(k);
+            let Some(h) = field.z.get_mut(k) else { continue };
             if z < *h - 1e-9 {
                 if cutting {
-                    report.max_engagement = report.max_engagement.max(*h - z);
-                    report.removed_volume += (*h - z) * field.cell * field.cell;
-                    *h = z;
+                    let to = z.max(base);
+                    report.max_engagement = report.max_engagement.max(*h - to);
+                    report.removed_volume += (*h - to) * field.cell * field.cell;
+                    // Down to where the material starts: the column is cut through.
+                    if z <= base + 1e-9 {
+                        *h = field.floor;
+                        if let Some(b) = field.bottom.get_mut(k) {
+                            *b = field.floor;
+                        }
+                    } else {
+                        *h = z;
+                    }
                 } else {
                     collided = true;
                 }

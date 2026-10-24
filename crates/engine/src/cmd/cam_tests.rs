@@ -1536,6 +1536,36 @@ fn a_setup_starts_from_what_an_earlier_one_leaves_also_turned_over() {
 }
 
 #[test]
+fn a_turned_over_setup_sees_what_was_cut_from_the_other_side() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    // A pocket 4 deep from the top, then the same window 7 deep from below: only the 6 mm left
+    // between them is cut, and the window goes through.
+    run(&mut s, "cam.setup.create", json!({"name": "Front", "origin": top}));
+    run(&mut s, "cam.op.pocket", json!({"setup": "Front", "sketch": "Window", "tool": 1, "bottom": -4, "stepdown": 4}));
+    let front = run(&mut s, "cam.simulate", json!({"setup": "Front", "columns": 120}))["removed_volume"].as_f64().unwrap();
+    run(&mut s, "cam.setup.create", json!({"name": "Back", "axis": "-z", "origin": top, "stock_from": "Front"}));
+    run(&mut s, "cam.op.pocket", json!({"setup": "Back", "sketch": "Window", "tool": 1, "bottom": -7, "stepdown": 7}));
+    let play = crate::cam_playback(&s, &json!({"setup": "Back", "columns": 120})).unwrap();
+    assert!(!play.stock.bottom.is_empty(), "the pocket is the bottom of the columns seen from below");
+    close(play.stock.volume(), 24000.0 - front, 1.0);
+    let back = run(&mut s, "cam.simulate", json!({"setup": "Back", "columns": 120, "field": true}));
+    let removed = back["removed_volume"].as_f64().unwrap();
+    close(removed, front / 4.0 * 6.0, front / 4.0 * 0.3);
+    // Along the middle row, the window's columns (half the width) are empty.
+    let field = &back["field"];
+    let (nx, j) = (field["nx"].as_u64().unwrap() as usize, field["ny"].as_u64().unwrap() as usize / 2);
+    let floor = field["floor"].as_f64().unwrap();
+    let middle = field["z"].as_array().unwrap().iter().zip(field["bottom"].as_array().unwrap()).skip(j * nx).take(nx);
+    assert!(middle.filter(|(z, b)| z.as_f64() == Some(floor) && b.as_f64() == Some(floor)).count() > nx / 3);
+}
+
+#[test]
 fn a_template_carries_a_setup_s_operations_to_another_design() {
     let mut s = pocket_job(0.0, json!({}));
     run(&mut s, "cam.op.pocket", pocket_op());
