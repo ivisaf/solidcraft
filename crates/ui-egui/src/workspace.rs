@@ -272,6 +272,7 @@ pub const SECTIONS: &[Section] = &[
             "cam.op.adaptive",
             "cam.op.adaptive3d",
             "cam.op.parallel3d",
+            "cam.op.zlevel3d",
             "cam.op.chamfer",
             "cam.op.vcarve",
         ],

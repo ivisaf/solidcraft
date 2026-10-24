@@ -16,6 +16,7 @@
 mod adaptive;
 mod adaptive3d;
 mod check;
+mod drop;
 mod finish3d;
 mod gcode;
 mod offset;
@@ -29,7 +30,7 @@ mod tool;
 pub use adaptive::{AdaptiveParams, adaptive};
 pub use adaptive3d::{Rough3d, adaptive_3d};
 pub use check::verify;
-pub use finish3d::{Finish3d, parallel_3d};
+pub use finish3d::{Finish3d, ZLevel3d, parallel_3d, zlevel_3d};
 pub use gcode::{Operation, Program, Safety, emit, parse};
 pub use offset::offset_regions;
 pub use ops::{

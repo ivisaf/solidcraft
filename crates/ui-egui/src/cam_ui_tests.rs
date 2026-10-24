@@ -193,7 +193,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     assert!(warnings.is_empty(), "{warnings:?}");
     // Nothing was cut: the whole stock is drawn as the part, its top at the box's top.
     let field = h.app.manufacture.stock.clone().expect("the cut stock");
-    let tris = stock_triangles(&field);
+    let tris = stock_triangles(&field, 0.05);
     assert!(!tris.is_empty() && tris.iter().all(|t| t.1 == StockMark::Fine));
     let (low, high) = tris.iter().flat_map(|t| t.0).fold((f64::INFINITY, f64::NEG_INFINITY), |m, p| (m.0.min(p.z), m.1.max(p.z)));
     assert!((low - 0.0).abs() < 1e-9 && (high - 10.0).abs() < 1e-9, "{low} {high}");
@@ -207,15 +207,34 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     simulate(&mut h.app);
     // The stock is drawn with the cut-into columns marked, and goes when it is hidden.
     let field = h.app.manufacture.stock.clone().expect("the cut stock");
-    let marks: Vec<StockMark> = stock_triangles(&field).into_iter().map(|t| t.1).collect();
+    let marks: Vec<StockMark> = stock_triangles(&field, 0.05).into_iter().map(|t| t.1).collect();
     assert!(marks.contains(&StockMark::Gouge) && marks.contains(&StockMark::Fine), "{}", marks.len());
     let mut scene = crate::gpu::GpuScene::default();
     stock_scene(&h.app, &mut scene);
     // 28 bytes a vertex, three a triangle.
     assert_eq!(scene.tris.len(), marks.len() * 3 * 28);
-    let (shown, stamp) = stock_key(&h.app);
+    // Material left on the part shows from the thickness the preference says: a coarser
+    // threshold marks less, and drawing again is asked for when it changes.
+    // Four columns: a finishing pass's cusp (0.02 mm) on the left, a roughing allowance (0.3 mm) on the right.
+    let small = StockField {
+        frame: [Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 0.0, 1.0)],
+        origin: [0.0, 0.0],
+        cell: 1.0,
+        nx: 3,
+        ny: 2,
+        floor: -1.0,
+        z: vec![0.0; 6],
+        bottom: Vec::new(),
+        deviation: vec![0.02, 0.02, 0.3, 0.02, 0.02, 0.3],
+    };
+    let left = |threshold: f64| stock_triangles(&small, threshold).into_iter().filter(|t| t.1 == StockMark::Leftover).count();
+    assert_eq!((left(0.001), left(0.05), left(0.5)), (4, 2, 0), "the cusps only at the finest");
+    let (shown, stamp, leftover) = stock_key(&h.app);
+    h.app.preferences.cam_leftover_shown = 0;
+    assert_ne!(stock_key(&h.app).2, leftover);
+    h.app.preferences.cam_leftover_shown = leftover;
     h.app.manufacture.show_stock = false;
-    assert_eq!((shown, stock_key(&h.app)), (true, (false, stamp)));
+    assert_eq!((shown, stock_key(&h.app)), (true, (false, stamp, leftover)));
     let mut scene = crate::gpu::GpuScene::default();
     stock_scene(&h.app, &mut scene);
     assert!(scene.tris.is_empty());
@@ -497,7 +516,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 17, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 18, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1364,7 +1383,7 @@ fn a_3d_parallel_form_finishes_the_part_s_box_or_inside_a_sketch() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.parallel3d");
     h.frames(2);
-    for row in ["3D PARALLEL", "Sketch", "Stepover", "Pass angle", "Stock to leave", "Both ways (zigzag)"] {
+    for row in ["3D PARALLEL", "Sketch", "Stepover", "Pass angle", "Stock to leave", "Both ways (zigzag)", "Only what earlier operations left"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     assert!(h.widget("Stepdown").is_none(), "one layer, following the surface");
@@ -1393,6 +1412,46 @@ fn a_3d_parallel_form_finishes_the_part_s_box_or_inside_a_sketch() {
     assert!(matches!(h.app.session.doc.manufacture.setups[0].operations[0].geometry, CamGeometry::Sketch { .. }));
     edit(&mut h, "");
     assert_eq!(h.app.session.doc.manufacture.setups[0].operations[0].geometry, CamGeometry::Part);
+}
+
+/// 3D Z-level finishing: the model's box without a sketch, no stepdown of its own, its level
+/// step, steepness and direction kept and shown again.
+#[test]
+fn a_3d_z_level_form_finishes_the_walls() {
+    use solidcraft_engine::doc::manufacture::{CamGeometry, CamOperationKind};
+    let mut h = sketched();
+    h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.zlevel3d");
+    h.frames(2);
+    for row in ["3D Z-LEVEL", "Sketch", "Level step", "Walls from", "Stock to leave", "Climb", "Only what earlier operations left"] {
+        assert!(h.widget(row).is_some(), "{row}");
+    }
+    assert!(h.widget("Stepdown").is_none(), "its level step instead");
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.level_step, f.steep, f.climb) = ("0.5 mm".into(), "45".into(), false);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert!(matches!(&op.kind, CamOperationKind::ZLevel3d { step, steep, climb: false, .. } if step == "0.5 mm" && *steep == 45.0), "{:?}", op.kind);
+    assert_eq!(op.geometry, CamGeometry::Part);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+    assert_eq!((again.kind, again.level_step.as_str(), again.steep.as_str(), again.climb), (OpKind::ZLevel3d, "0.5 mm", "45", false));
+    // Rest finishing after it: only where it left material.
+    h.app.start("cam.op.zlevel3d");
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    f.rest3d = true;
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[1].clone();
+    assert!(matches!(op.kind, CamOperationKind::ZLevel3d { rest: true, .. }), "{:?}", op.kind);
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let setup = listed["setups"][0].clone();
+    let Some(Form::Op(again)) = edit_form(&h.app, &setup, &setup["operations"][1]) else { panic!("no form") };
+    assert!(again.rest3d);
 }
 
 /// In the browser an operation shows its time, and is dragged before another of its setup

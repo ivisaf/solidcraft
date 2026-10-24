@@ -304,8 +304,28 @@ pub enum CamOperationKind {
     },
     /// Finishes the model's shape in 3D with passes side by side `stepover` apart (a length
     /// expression), running `angle` degrees from X, following the model with `stock_to_leave`
-    /// left on it, back and forth when `zigzag`.
-    Parallel3d { stepover: Expr, angle: f64, stock_to_leave: Expr, zigzag: bool },
+    /// left on it, back and forth when `zigzag`; with `rest`, only where earlier operations
+    /// left material on the model.
+    Parallel3d {
+        stepover: Expr,
+        angle: f64,
+        stock_to_leave: Expr,
+        zigzag: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rest: bool,
+    },
+    /// Finishes the model's steep walls in 3D level by level, `step` apart (a length
+    /// expression), the tool running round the model where it touches it, where the model is
+    /// at least `steep` degrees steep, with `stock_to_leave` left on it; with `rest`, only where
+    /// earlier operations left material on the model.
+    ZLevel3d {
+        step: Expr,
+        stock_to_leave: Expr,
+        steep: f64,
+        climb: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rest: bool,
+    },
     /// A thread milled with a single-profile thread mill round each round profile: inside a
     /// hole (drawn at its core diameter) or round a boss (drawn at its major diameter).
     Thread {
@@ -357,6 +377,7 @@ impl CamOperationKind {
             CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::VCarve { .. } => "vcarve",
             CamOperationKind::Parallel3d { .. } => "parallel_3d",
+            CamOperationKind::ZLevel3d { .. } => "zlevel_3d",
             CamOperationKind::Thread { .. } => "thread",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",

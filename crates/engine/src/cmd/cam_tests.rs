@@ -2046,3 +2046,74 @@ fn parallel_finishing_follows_the_model_after_roughing() {
         assert!(s.execute("cam.op.parallel3d", &bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn z_level_finishing_goes_round_the_walls() {
+    use solidcraft_doc::manufacture::{CamGeometry, CamOperationKind};
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 8], "p1": [30, 22]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -4, "operation": "cut"}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 4, "spindle_rpm": 15000, "feed": 800}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    run(&mut s, "cam.setup.create", json!({"name": "Walls", "origin": top, "stock": {"top": 1}}));
+    let made = run(&mut s, "cam.op.zlevel3d", json!({"tool": 2, "stock_to_leave": 0.1}));
+    let op = s.doc.manufacture.setups[0].operations[0].clone();
+    assert_eq!(op.geometry, CamGeometry::Part, "the model's box by itself");
+    assert!(
+        matches!(&op.kind, CamOperationKind::ZLevel3d { step, steep, climb: true, .. } if step == "0.333333 mm" && *steep == 30.0),
+        "{:?}",
+        op.kind
+    );
+    // Round the pocket's walls, down to its floor (5 below the zero).
+    assert!(made["lowest_z"].as_f64().unwrap() <= -4.0, "{made}");
+    let listed = run(&mut s, "cam.list", json!({}));
+    let first = &listed["setups"][0]["operations"][0];
+    assert_eq!(first["kind"], "zlevel_3d");
+    assert!(first.get("warning").is_none_or(Value::is_null), "{first}");
+    let sim = run(&mut s, "cam.simulate", json!({"setup": "Walls", "columns": 300}));
+    assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
+    // Edited: coarser levels, steeper walls only, the other way round.
+    run(&mut s, "cam.op.edit", json!({"op": made["operation"], "step": 1, "steep": 60, "climb": false}));
+    assert!(
+        matches!(&s.doc.manufacture.setups[0].operations[0].kind, CamOperationKind::ZLevel3d { step, steep, climb: false, .. } if step == "1" && *steep == 60.0)
+    );
+    for bad in [json!({"tool": 2, "step": 0}), json!({"tool": 2, "steep": 90})] {
+        assert!(s.execute("cam.op.zlevel3d", &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn rest_finishing_goes_only_where_the_larger_ball_left_material() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 8], "p1": [30, 22]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -4, "operation": "cut"}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 4, "spindle_rpm": 15000, "feed": 800}));
+    run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "ball", "diameter": 1.5, "spindle_rpm": 20000, "feed": 500}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    run(&mut s, "cam.setup.create", json!({"name": "Job", "origin": top, "stock": {"top": 1}}));
+    // Nothing before it: nothing to go by.
+    assert!(s.execute("cam.op.parallel3d", &json!({"tool": 3, "rest": true})).is_err());
+    run(&mut s, "cam.op.adaptive3d", json!({"tool": 1, "stepdown": 3, "stock_to_leave": 0.3}));
+    run(&mut s, "cam.op.parallel3d", json!({"tool": 2}));
+    let left = |s: &mut Session| run(s, "cam.simulate", json!({"setup": "Job", "columns": 400}))["leftover_volume"].as_f64().unwrap();
+    let before = left(&mut s);
+    let rest = run(&mut s, "cam.op.parallel3d", json!({"tool": 3, "rest": true, "stepover": 0.2}));
+    let all = run(&mut s, "cam.op.parallel3d", json!({"tool": 3, "stepover": 0.2}));
+    // Round the pocket's walls only, where the 4 mm ball left its round: a fraction of it all.
+    assert!(rest["cut_length"].as_f64().unwrap() < all["cut_length"].as_f64().unwrap() * 0.5, "{rest} {all}");
+    run(&mut s, "cam.op.remove", json!({"setup": "Job", "op": all["operation"]}));
+    let after = left(&mut s);
+    assert!(after < before * 0.8, "{before} -> {after}");
+    let sim = run(&mut s, "cam.simulate", json!({"setup": "Job", "columns": 400}));
+    assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
+    // Switched off again it finishes it all.
+    run(&mut s, "cam.op.edit", json!({"op": rest["operation"], "rest": false}));
+    assert!(matches!(&s.doc.manufacture.setups[0].operations[2].kind, solidcraft_doc::manufacture::CamOperationKind::Parallel3d { rest: false, .. }));
+}

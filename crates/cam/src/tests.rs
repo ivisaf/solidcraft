@@ -1821,7 +1821,8 @@ fn adaptive_3d_roughs_down_to_the_part_level_by_level() {
         assert!(points.iter().any(|p| (p.z + 4.5).abs() < 1e-9), "{kind:?}: a level on the block's top");
         // Never into the part; never deeper than a stepdown.
         let (into, left, bite) = rough_check(&part, stock, &path, &t, 0.5);
-        assert!(into <= 1e-6, "{kind:?}: cuts {into} into the part");
+        // Within the rounding of the measuring columns.
+        assert!(into <= 2e-3, "{kind:?}: cuts {into} into the part");
         assert!(bite <= deepest_bite + 1e-6, "{kind:?}: {bite}");
         // What stands above the allowance: the round of the tool along the block's corners (a
         // ball: and its cusps).
@@ -1889,7 +1890,7 @@ fn the_holder_keeps_the_tool_up_beside_a_tall_block() {
 }
 
 fn finish<'a>(part: &'a [[Vec3; 3]], boundary: &'a [Region2]) -> Finish3d<'a> {
-    Finish3d { boundary, part, stepover: 0.5, angle: 0.0, stock_to_leave: 0.0, tolerance: 0.01, zigzag: true }
+    Finish3d { boundary, part, stepover: 0.5, angle: 0.0, stock_to_leave: 0.0, tolerance: 0.01, zigzag: true, left: None, rest: false }
 }
 
 /// The finished stock against the part on fine columns, over the columns `inside` keeps: the
@@ -1917,14 +1918,15 @@ fn parallel_finishing_follows_a_slope_to_its_cusps() {
     let (part, _) = slope();
     let area = [rect(0.0, 0.0, 60.0, 40.0)];
     let c = cut(0.0, -15.0, 4.0);
-    // A ball's cusps between passes 0.5 mm apart: 0.5² / (8 × 3) ≈ 0.01 mm, the tolerance of the
-    // straight runs, and what keeping clear between column centres leaves on the slope; a flat
-    // end more (its rim rides the slope). Nothing is cut into the part.
-    for (kind, most) in [(ToolKind::BallEndmill, 0.08), (ToolKind::BullNose, 0.08), (ToolKind::FlatEndmill, 0.15)] {
+    // A ball's cusps between passes 0.5 mm apart: 0.5² / (8 × 3) ≈ 0.01 mm (a ball is dropped
+    // exactly onto the triangles); a bull nose and a flat end also what keeping clear between
+    // column centres leaves on the slope (its rim rides the slope). Nothing is cut into the part.
+    for (kind, most) in [(ToolKind::BallEndmill, 0.025), (ToolKind::BullNose, 0.08), (ToolKind::FlatEndmill, 0.15)] {
         let t = Tool { corner_radius: (kind == ToolKind::BullNose).then_some(1.0), ..Tool::new(1, kind, 6.0, 20.0) };
         let path = parallel_3d(&finish(&part, &area), &t, &c).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
         let (into, left) = finish_check(&part, &path, &t, 0.0, |p| p.x > 4.0 && p.x < 56.0 && p.y > 4.0 && p.y < 36.0);
-        assert!(into <= 1e-6, "{kind:?}: cuts {into} into the part");
+        // Within the rounding of the measuring columns.
+        assert!(into <= 2e-3, "{kind:?}: cuts {into} into the part");
         assert!(left <= most, "{kind:?}: leaves {left}");
         eprintln!("{kind:?}: into {into:.4}, left {left:.4}, {} moves", path.moves.len());
     }
@@ -1933,7 +1935,7 @@ fn parallel_finishing_follows_a_slope_to_its_cusps() {
     let path = parallel_3d(&Finish3d { stock_to_leave: 0.3, ..finish(&part, &area) }, &ball, &c).unwrap();
     let (into, left) = finish_check(&part, &path, &ball, 0.3, |p| p.x > 4.0 && p.x < 56.0 && p.y > 4.0 && p.y < 36.0);
     assert!(into <= -0.28, "the allowance: {into}");
-    assert!(left <= 0.08, "{left}");
+    assert!(left <= 0.025, "{left}");
     for bad in [
         Finish3d { stepover: 0.0, ..finish(&part, &area) },
         Finish3d { stepover: 7.0, ..finish(&part, &area) },
@@ -1959,9 +1961,124 @@ fn parallel_finishing_goes_over_a_block_without_cutting_into_it() {
             p.x > 3.5 && p.x < 56.5 && p.y > 3.5 && p.y < 36.5 && (off_block || on_top)
         };
         let (into, left) = finish_check(&part, &path, &ball, 0.0, away);
-        assert!(into <= 1e-6, "{angle}: cuts {into} into the part");
+        // Within the rounding of the measuring columns.
+        assert!(into <= 2e-3, "{angle}: cuts {into} into the part");
         assert!(left <= 0.04, "{angle}: leaves {left}");
         let lowest = path.stats().lowest_z.unwrap();
         close(lowest, -15.0, 1e-6);
     }
+}
+
+/// A slab at -15 with a frustum on it: its top 20 to 40 by 12 to 28 at -5, its foot 10 to 50 by
+/// 2 to 38 at -15, so its flanks rise at 45°.
+fn frustum() -> Vec<[Vec3; 3]> {
+    let p = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    let (t0, t1, t2, t3) = (p(20.0, 12.0, -5.0), p(40.0, 12.0, -5.0), p(40.0, 28.0, -5.0), p(20.0, 28.0, -5.0));
+    let (f0, f1, f2, f3) = (p(10.0, 2.0, -15.0), p(50.0, 2.0, -15.0), p(50.0, 38.0, -15.0), p(10.0, 38.0, -15.0));
+    let mut part = box_triangles(Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, -15.0));
+    part.extend([
+        [t0, t1, t2],
+        [t0, t2, t3],
+        [f0, f1, t1],
+        [f0, t1, t0],
+        [f1, f2, t2],
+        [f1, t2, t1],
+        [f2, f3, t3],
+        [f2, t3, t2],
+        [f3, f0, t0],
+        [f3, t0, t3],
+    ]);
+    part
+}
+
+fn zlevel<'a>(part: &'a [[Vec3; 3]], boundary: &'a [Region2]) -> ZLevel3d<'a> {
+    ZLevel3d { boundary, part, step: 0.5, stock_to_leave: 0.0, tolerance: 0.01, steep: 30.0, climb: true, left: None, rest: false }
+}
+
+#[test]
+fn z_level_finishing_goes_round_the_steep_flanks() {
+    let part = frustum();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let c = cut(0.0, -15.0, 4.0);
+    let ball = Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0);
+    let path = zlevel_3d(&zlevel(&part, &area), &ball, &c).unwrap();
+    // On the flanks, away from their foot and the top's edge: the cusp between levels 0.5 mm
+    // apart on a 45° flank (a ball is put exactly where it touches), as fine columns measure it;
+    // nothing cut into the part.
+    let flank = |p: Vec2| {
+        let (dx, dy) = ((p.x - 30.0).abs(), (p.y - 20.0).abs());
+        let off = (dx - 10.0).max(dy - 8.0);
+        off > 1.5 && off < 8.5
+    };
+    let (into, left) = finish_check(&part, &path, &ball, 0.0, flank);
+    assert!(into <= 2e-3, "cuts {into} into the part");
+    assert!(left <= 0.04, "leaves {left} on the flanks");
+    // Climbing, the part is on the right: each level's loop round the frustum runs clockwise.
+    let level = |path: &Toolpath, z: f64| -> Vec<Vec2> {
+        path.moves.iter().filter_map(|m| m.target()).filter(|p| (p.z - z).abs() < 1e-9).map(|p| v(p.x, p.y)).collect()
+    };
+    let turn = |pts: &[Vec2]| pts.windows(2).map(|w| w[0].x * w[1].y - w[1].x * w[0].y).sum::<f64>();
+    assert!(turn(&level(&path, -10.0)) < 0.0, "clockwise when climbing");
+    let conventional = zlevel_3d(&ZLevel3d { climb: false, ..zlevel(&part, &area) }, &ball, &c).unwrap();
+    assert!(turn(&level(&conventional, -10.0)) > 0.0, "anticlockwise otherwise");
+    // Steeper than its flanks only: nothing on them.
+    let steep = zlevel_3d(&ZLevel3d { steep: 60.0, ..zlevel(&part, &area) }, &ball, &c).unwrap();
+    assert!(level(&steep, -10.0).is_empty(), "45° flanks are left to parallel finishing");
+    for bad in [ZLevel3d { step: 0.0, ..zlevel(&part, &area) }, ZLevel3d { steep: 90.0, ..zlevel(&part, &area) }] {
+        assert!(zlevel_3d(&bad, &ball, &c).is_err());
+    }
+}
+
+#[test]
+fn rest_finishing_cleans_only_where_a_larger_ball_could_not_reach() {
+    let (part, stock) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let c = cut(0.0, -15.0, 4.0);
+    let (big, small) = (Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0), Tool::new(2, ToolKind::BallEndmill, 2.0, 20.0));
+    // Finished with the 6 mm ball: its round stays in the corners at the block's foot.
+    let mut field = HeightField::block(stock.0, stock.1, 0.1).unwrap();
+    simulate(&mut field, &parallel_3d(&finish(&part, &area), &big, &c).unwrap(), &big).unwrap();
+    let seen = HeightField::of_triangles(v(0.0, 0.0), v(60.0, 40.0), 0.1, -20.0, &part, false).unwrap();
+    // On the slab within 2 mm of the block's walls: the corner.
+    let corner = |p: Vec2| {
+        let off = (p.x - 30.0).abs().max((p.y - 20.0).abs() * 10.0 / 8.0) - 10.0;
+        off > 0.2 && off < 2.0 && (p.x - 30.0).abs() < 9.0 && (p.y - 20.0).abs() < 7.0 || {
+            let (dx, dy) = ((p.x - 30.0).abs() - 10.0, (p.y - 20.0).abs() - 8.0);
+            (dx > 0.2 && dx < 2.0 && (p.y - 20.0).abs() < 7.0) || (dy > 0.2 && dy < 2.0 && (p.x - 30.0).abs() < 9.0)
+        }
+    };
+    let worst = |f: &HeightField| {
+        let mut most = 0.0f64;
+        for j in 0..f.ny {
+            for i in 0..f.nx {
+                if corner(f.centre(i, j)) {
+                    most = most.max(f.get(i, j).unwrap() - seen.get(i, j).unwrap());
+                }
+            }
+        }
+        most
+    };
+    let before = worst(&field);
+    // The 2 mm ball only where that is left (its own round, a third of the 6 mm one's, stays):
+    // far less cut than finishing it all.
+    let rest = parallel_3d(&Finish3d { left: Some(&field), rest: true, ..finish(&part, &area) }, &small, &c).unwrap();
+    let all = parallel_3d(&finish(&part, &area), &small, &c).unwrap();
+    assert!(rest.stats().cut_length < all.stats().cut_length * 0.5, "{} vs {}", rest.stats().cut_length, all.stats().cut_length);
+    let mut after = field.clone();
+    simulate(&mut after, &rest, &small).unwrap();
+    let left = worst(&after);
+    assert!(before > 1.0 && left < before * 0.5, "{before} -> {left}");
+    let (into, _) = finish_check(&part, &rest, &small, 0.0, |_| false);
+    assert!(into <= 2e-3, "cuts {into} into the part");
+    // Z-level does the same round the walls.
+    let walls = zlevel_3d(&ZLevel3d { left: Some(&field), rest: true, steep: 0.0, ..zlevel(&part, &area) }, &small, &c).unwrap();
+    let every = zlevel_3d(&ZLevel3d { steep: 0.0, ..zlevel(&part, &area) }, &small, &c).unwrap();
+    assert!(walls.stats().cut_length < every.stats().cut_length * 0.7, "{} vs {}", walls.stats().cut_length, every.stats().cut_length);
+    eprintln!(
+        "rest: corner {before:.2} -> {left:.2}; parallel {:.0} of {:.0} mm, z-level {:.0} of {:.0} mm",
+        rest.stats().cut_length,
+        all.stats().cut_length,
+        walls.stats().cut_length,
+        every.stats().cut_length
+    );
 }

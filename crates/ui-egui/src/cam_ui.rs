@@ -30,6 +30,9 @@ const ANCHORS: [&str; 3] = ["min", "center", "max"];
 const ORIGINS: [&str; 3] = ["stock box", "part box", "world point"];
 /// Toolpath line widths: a name and the cutting moves' width in points (rapids are thinner).
 const PATH_WIDTHS: [(&str, f32); 3] = [("thin", 1.0), ("normal", 1.5), ("thick", 2.5)];
+/// From how thick material left on the part is shown in the simulated stock (mm): finer than a
+/// finishing pass's cusps, it is drawn as the part.
+const LEFTOVER_SHOWN: [(&str, f64); 5] = [("0.001 mm", 0.001), ("0.01 mm", 0.01), ("0.05 mm", 0.05), ("0.1 mm", 0.1), ("0.2 mm", 0.2)];
 /// Toolpath colours, from the theme (rapids keep the warning colour, so it is not offered).
 const PATH_COLOURS: [&str; 3] = ["blue", "green", "white"];
 
@@ -74,6 +77,8 @@ pub enum OpKind {
     Adaptive3d,
     /// Finishing the model in 3D with passes side by side.
     Parallel3d,
+    /// Finishing the model's steep walls in 3D level by level.
+    ZLevel3d,
     Chamfer,
     VCarve,
     Bore,
@@ -90,6 +95,7 @@ impl OpKind {
             OpKind::Adaptive => "cam.op.adaptive",
             OpKind::Adaptive3d => "cam.op.adaptive3d",
             OpKind::Parallel3d => "cam.op.parallel3d",
+            OpKind::ZLevel3d => "cam.op.zlevel3d",
             OpKind::Chamfer => "cam.op.chamfer",
             OpKind::VCarve => "cam.op.vcarve",
             OpKind::Thread => "cam.op.thread",
@@ -105,6 +111,7 @@ impl OpKind {
             OpKind::Adaptive => "ADAPTIVE",
             OpKind::Adaptive3d => "3D ADAPTIVE",
             OpKind::Parallel3d => "3D PARALLEL",
+            OpKind::ZLevel3d => "3D Z-LEVEL",
             OpKind::Chamfer => "CHAMFER",
             OpKind::VCarve => "V-CARVE",
             OpKind::Thread => "THREAD",
@@ -353,6 +360,12 @@ pub struct OpForm {
     /// 3D finishing: which way its passes run (degrees from X; empty: 0), and back and forth.
     pub pass_angle: String,
     pub zigzag: bool,
+    /// 3D Z-level finishing: how far apart its levels are (empty: a twelfth of the tool's
+    /// diameter), and from how steep a wall it takes (degrees; empty: 30).
+    pub level_step: String,
+    pub steep: String,
+    /// 3D finishing: only where earlier operations left material on the model.
+    pub rest3d: bool,
     /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
     pub width: String,
     pub tip_offset: String,
@@ -433,7 +446,7 @@ impl StockField {
     }
 }
 
-/// Deviations smaller than this are drawn as the part (mm).
+/// Cuts into the part smaller than this are drawn as the part (mm).
 const SHOWN_DEVIATION: f64 = 1e-3;
 
 /// What a triangle of the drawn stock is.
@@ -452,19 +465,20 @@ pub fn stock_shown(app: &SolveApp) -> bool {
 }
 
 /// Changes when what the viewport draws of the stock changes.
-pub fn stock_key(app: &SolveApp) -> (bool, u64) {
-    (stock_shown(app), app.manufacture.stock_stamp)
+pub fn stock_key(app: &SolveApp) -> (bool, u64, usize) {
+    (stock_shown(app), app.manufacture.stock_stamp, app.preferences.cam_leftover_shown)
 }
 
 /// The simulated stock as triangles: its top through the column centres, its underside where
 /// it was cut from below, and walls down round the edge, each with what it is. Where all of a
-/// triangle's columns are cut through there is none: a hole.
-pub fn stock_triangles(field: &StockField) -> Vec<([Vec3; 3], StockMark)> {
+/// triangle's columns are cut through there is none: a hole. Material left on the part is
+/// marked from `leftover` thick (mm), a cut into it from the smallest.
+pub fn stock_triangles(field: &StockField, leftover: f64) -> Vec<([Vec3; 3], StockMark)> {
     let mut out = Vec::new();
     let mark = |d: [f64; 3]| {
         if d.iter().any(|d| *d < -SHOWN_DEVIATION) {
             StockMark::Gouge
-        } else if d.iter().any(|d| *d > SHOWN_DEVIATION) {
+        } else if d.iter().any(|d| *d > leftover.max(SHOWN_DEVIATION)) {
             StockMark::Leftover
         } else {
             StockMark::Fine
@@ -510,7 +524,8 @@ pub fn stock_scene(app: &SolveApp, sc: &mut crate::gpu::GpuScene) {
     let Some(field) = app.manufacture.stock.as_ref().filter(|_| stock_shown(app)) else { return };
     let t = Tokens::get();
     let rgba = |c: egui::Color32| [c.r(), c.g(), c.b(), 255];
-    for (tri, mark) in stock_triangles(field) {
+    let leftover = LEFTOVER_SHOWN.get(app.preferences.cam_leftover_shown).map_or(0.05, |l| l.1);
+    for (tri, mark) in stock_triangles(field, leftover) {
         let [a, b, c] = tri;
         let n = (b - a).cross(c - a).normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0)).to_f32();
         let colour = rgba(match mark {
@@ -759,7 +774,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     let first_tool = lists.tools.first().map(|t| t.0.clone()).unwrap_or_default();
     let op = |kind: OpKind| {
         // The newest sketch, except for 3D roughing, which roughs the whole stock unless told otherwise.
-        let sketch = if matches!(kind, OpKind::Adaptive3d | OpKind::Parallel3d) {
+        let sketch = if matches!(kind, OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d) {
             String::new()
         } else {
             app.session
@@ -827,6 +842,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             step_up: String::new(),
             pass_angle: String::new(),
             zigzag: true,
+            level_step: String::new(),
+            steep: String::new(),
+            rest3d: false,
             width: String::new(),
             tip_offset: String::new(),
             peck: String::new(),
@@ -890,6 +908,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         "cam.op.adaptive" => Some(op(OpKind::Adaptive)),
         "cam.op.adaptive3d" => Some(op(OpKind::Adaptive3d)),
         "cam.op.parallel3d" => Some(op(OpKind::Parallel3d)),
+        "cam.op.zlevel3d" => Some(op(OpKind::ZLevel3d)),
         "cam.op.chamfer" => Some(op(OpKind::Chamfer)),
         "cam.op.vcarve" => Some(op(OpKind::VCarve)),
         "cam.op.thread" => Some(op(OpKind::Thread)),
@@ -1109,12 +1128,12 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     // Facing chooses its boundary; 3D roughing without a sketch roughs the stock.
                     let on_sketch = match f.kind {
                         OpKind::Face => f.boundary == 2,
-                        OpKind::Adaptive3d | OpKind::Parallel3d => !f.sketch.trim().is_empty(),
+                        OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d => !f.sketch.trim().is_empty(),
                         _ => true,
                     };
                     let was_on_sketch = match f.kind {
                         OpKind::Face => e.boundary == 2,
-                        OpKind::Adaptive3d | OpKind::Parallel3d => !e.sketch.is_empty(),
+                        OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d => !e.sketch.is_empty(),
                         _ => true,
                     };
                     if f.faces.is_empty() && on_sketch && (f.sketch.trim() != e.sketch || !e.faces.is_empty() || !was_on_sketch) {
@@ -1123,7 +1142,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                         // Facing chooses; 3D finishing covers the model's box, 3D roughing the stock.
                         let boundary = match f.kind {
                             OpKind::Face => FACE_BOUNDS.get(f.boundary).copied(),
-                            OpKind::Parallel3d => Some("part"),
+                            OpKind::Parallel3d | OpKind::ZLevel3d => Some("part"),
                             _ => None,
                         };
                         p.insert("boundary".into(), json!(boundary.unwrap_or("stock")));
@@ -1199,6 +1218,19 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                         None => {}
                     }
                 }
+                OpKind::ZLevel3d => {
+                    p.insert("rest".into(), json!(f.rest3d));
+                    optional(&mut p, "stock_to_leave", &f.stock_to_leave);
+                    if !f.level_step.trim().is_empty() {
+                        p.insert("step".into(), json!(f.level_step.trim()));
+                    }
+                    let steep = f.steep.trim().trim_end_matches("deg").trim_end_matches('°').trim();
+                    if !steep.is_empty() {
+                        p.insert("steep".into(), json!(number("The steepness", steep)?));
+                    } else if f.editing.is_some() {
+                        p.insert("steep".into(), json!(30.0));
+                    }
+                }
                 OpKind::Parallel3d => {
                     optional(&mut p, "stepover", &f.stepover);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
@@ -1209,6 +1241,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                         p.insert("angle".into(), json!(0.0));
                     }
                     p.insert("zigzag".into(), json!(f.zigzag));
+                    p.insert("rest".into(), json!(f.rest3d));
                 }
                 OpKind::Thread => {
                     optional(&mut p, "pitch", &f.pitch);
@@ -1331,6 +1364,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     | OpKind::Chamfer
                     | OpKind::Adaptive
                     | OpKind::Adaptive3d
+                    | OpKind::ZLevel3d
                     | OpKind::VCarve
                     | OpKind::Thread
             ) {
@@ -1462,6 +1496,14 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
     })))
 }
 
+/// 3D finishing's rest row: only where earlier operations of the setup left material.
+fn rest_row(ui: &mut egui::Ui, rest: &mut bool) {
+    row_label(ui, "Rest", None);
+    let r = crate::ui_kit::checkbox(ui, tm("Only what earlier operations left"), rest);
+    explained(r, "Rest", None);
+    ui.end_row();
+}
+
 /// A form filled in from an operation as `cam.list` reports it.
 pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
     let kind = match op["kind"].as_str()? {
@@ -1471,6 +1513,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         "adaptive" => OpKind::Adaptive,
         "adaptive_3d" => OpKind::Adaptive3d,
         "parallel_3d" => OpKind::Parallel3d,
+        "zlevel_3d" => OpKind::ZLevel3d,
         "chamfer" => OpKind::Chamfer,
         "vcarve" => OpKind::VCarve,
         "thread" => OpKind::Thread,
@@ -1544,6 +1587,9 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         step_up: text(inputs, "step_up"),
         pass_angle: inputs["angle"].as_f64().filter(|a| *a != 0.0).map(|a| a.to_string()).unwrap_or_default(),
         zigzag: inputs["zigzag"].as_bool().unwrap_or(true),
+        level_step: text(inputs, "step"),
+        rest3d: inputs["rest"].as_bool().unwrap_or(false),
+        steep: inputs["steep"].as_f64().filter(|a| *a != 30.0).map(|a| a.to_string()).unwrap_or_default(),
         width: text(inputs, "width"),
         tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
@@ -1702,7 +1748,7 @@ fn heights_query(f: &OpForm) -> Option<Value> {
         p.insert("boundary".into(), json!(FACE_BOUNDS.get(f.boundary).copied().unwrap_or("stock")));
     } else if f.kind == OpKind::Adaptive3d && f.sketch.trim().is_empty() {
         p.insert("boundary".into(), json!("stock"));
-    } else if f.kind == OpKind::Parallel3d && f.sketch.trim().is_empty() {
+    } else if matches!(f.kind, OpKind::Parallel3d | OpKind::ZLevel3d) && f.sketch.trim().is_empty() {
         p.insert("boundary".into(), json!("part"));
     } else if f.sketch.trim().is_empty() {
         return None;
@@ -2553,6 +2599,16 @@ fn help(label: &str) -> Option<&'static str> {
         "Helix largest (%)" | "Helix smallest (%)" => {
             "The entry helix's diameter, as a percentage of the tool's: as large as there is room for, at most the largest; with less room than the smallest, a ramp instead."
         }
+        "Leftover shown from" => {
+            "From how thick material left on the part shows in the simulated stock (the warning colour). Finer than a finishing pass's cusps, it is drawn as the part. Cuts into the part show however small."
+        }
+        "Rest" => {
+            "Only where the setup's earlier operations left material on the model: with a smaller tool after a larger one, it cleans the corners and steps the larger could not reach, and goes nowhere else."
+        }
+        "Level step" => "How far apart the levels are that the tool goes round the walls at: smaller is cleaner but slower.",
+        "Walls from" => {
+            "How steep, in degrees, a wall has to be to be finished level by level; flatter areas are left to 3D Parallel. 0: wherever the tool touches."
+        }
         "Pass angle" => "Which way the finishing passes run, in degrees from X: across the slopes that matter most, they finish them best.",
         "Zigzag" => "Back and forth, the tool going on to the next pass along the part; otherwise every pass the same way, the tool up between them.",
         "Step-up height" => {
@@ -3384,9 +3440,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                         &["the raw block", "the part's outline", "a sketch's outline"],
                     );
                 }
-                if matches!(f.kind, OpKind::Adaptive3d | OpKind::Parallel3d) {
+                if matches!(f.kind, OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d) {
                     // Without a sketch, the whole stock (finishing: the model's box); with one, only inside its profiles.
-                    let none = if f.kind == OpKind::Parallel3d { "none: the part's box" } else { "none: the whole stock" };
+                    let none = if f.kind == OpKind::Adaptive3d { "none: the whole stock" } else { "none: the part's box" };
                     let mut options: Vec<(String, String)> = vec![(String::new(), tm(none).into())];
                     options.extend(choices.sketches.iter().cloned());
                     pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &options);
@@ -3471,7 +3527,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 (!f.passes.trim().is_empty()).then_some("Not used: the passes divide the depth evenly. Empty Passes to cut by the stepdown.");
             // A bore goes down on its helix (its depth per turn is further down).
             // 3D finishing follows the surface: one layer.
-            let levels = !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve | OpKind::Thread | OpKind::Parallel3d);
+            let levels = !matches!(
+                f.kind,
+                OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve | OpKind::Thread | OpKind::Parallel3d | OpKind::ZLevel3d
+            );
             if levels && field_unless(ui, need, "Stepdown", &mut f.stepdown, "half the tool diameter", unused).0 {
                 lit = Some(HeightLine::Passes);
             }
@@ -3537,6 +3596,12 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     explained(r, "Dogbones", None);
                     ui.end_row();
                 }
+                OpKind::ZLevel3d => {
+                    field(ui, need, "Level step", &mut f.level_step, "a twelfth of the tool's diameter");
+                    field(ui, need, "Walls from", &mut f.steep, "30° (0: everywhere)");
+                    field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
+                    rest_row(ui, &mut f.rest3d);
+                }
                 OpKind::Parallel3d => {
                     field(ui, need, "Stepover", &mut f.stepover, "a tenth of the tool's diameter");
                     field(ui, need, "Pass angle", &mut f.pass_angle, "0° (along X)");
@@ -3545,6 +3610,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     let r = crate::ui_kit::checkbox(ui, tm("Both ways (zigzag)"), &mut f.zigzag);
                     explained(r, "Zigzag", None);
                     ui.end_row();
+                    rest_row(ui, &mut f.rest3d);
                 }
                 OpKind::Adaptive3d => {
                     field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");
@@ -3609,6 +3675,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     | OpKind::Chamfer
                     | OpKind::Adaptive
                     | OpKind::Adaptive3d
+                    | OpKind::ZLevel3d
                     | OpKind::VCarve
                     | OpKind::Thread
             ) {
@@ -3660,7 +3727,7 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
             // Facing chooses a box instead, and 3D roughing roughs the whole stock without one.
             if f.faces.is_empty()
                 && (f.kind != OpKind::Face || f.boundary == 2)
-                && !matches!(f.kind, OpKind::Adaptive3d | OpKind::Parallel3d)
+                && !matches!(f.kind, OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d)
                 && empty(&f.sketch)
             {
                 if lists.sketches.is_empty() {
@@ -4046,13 +4113,14 @@ fn kind_name(group: &str, kind: &str) -> String {
 }
 
 /// The operations the toolbar offers, by their command.
-const OPERATIONS: [&str; 11] = [
+const OPERATIONS: [&str; 12] = [
     "cam.op.face",
     "cam.op.contour",
     "cam.op.pocket",
     "cam.op.adaptive",
     "cam.op.adaptive3d",
     "cam.op.parallel3d",
+    "cam.op.zlevel3d",
     "cam.op.chamfer",
     "cam.op.vcarve",
     "cam.op.bore",
@@ -4780,7 +4848,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 "chamfer" | "vcarve" => "cam_contour".to_string(),
                 "thread" => "cam_drill".to_string(),
                 "adaptive" | "adaptive_3d" => "cam_pocket".to_string(),
-                "parallel_3d" => "cam_contour".to_string(),
+                "parallel_3d" | "zlevel_3d" => "cam_contour".to_string(),
                 kind => format!("cam_{kind}"),
             };
             let r = draw_row(
@@ -4899,6 +4967,7 @@ pub fn folder_menu_items(app: &SolveApp) -> Vec<crate::context_menu::Item> {
         Item::sep(),
         choices("Toolpath colour", "colour", &PATH_COLOURS, prefs.cam_path_colour),
         choices("Toolpath width", "width", &PATH_WIDTHS.map(|w| w.0), prefs.cam_path_width),
+        choices("Leftover shown from", "leftover", &LEFTOVER_SHOWN.map(|l| l.0), prefs.cam_leftover_shown),
         choices("Panel fade", "fade", &PANEL_FADES.map(|f| f.0), prefs.cam_panel_fade),
     ]);
     items
@@ -4918,6 +4987,7 @@ pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
         choice(ui, "pref_cam_width", "Toolpath width", &mut prefs.cam_path_width, &PATH_WIDTHS.map(|w| w.0));
         choice(ui, "pref_cam_fade", "Panel fade", &mut prefs.cam_panel_fade, &PANEL_FADES.map(|f| f.0));
         choice(ui, "pref_cam_detail", "Simulation detail", &mut prefs.cam_sim_detail, &SIM_DETAIL.map(|d| d.0));
+        choice(ui, "pref_cam_leftover", "Leftover shown from", &mut prefs.cam_leftover_shown, &LEFTOVER_SHOWN.map(|l| l.0));
         crate::ui_kit::row(ui, tm("Rapid rate"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_rapid_rate, 100.0..=100_000.0, 50.0, " mm/min"))
             .on_hover_text(help("Rapid rate").map(tm).unwrap_or_default());
         crate::ui_kit::row(ui, tm("Spindle spin-up"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_spindle_delay, 0.0..=60.0, 0.5, " s"))
@@ -4978,6 +5048,7 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         "stock" => return cam.show_stock = !cam.show_stock,
         "colour" => return prefs.cam_path_colour = index.min(PATH_COLOURS.len() - 1),
         "width" => return prefs.cam_path_width = index.min(PATH_WIDTHS.len() - 1),
+        "leftover" => return prefs.cam_leftover_shown = index.min(LEFTOVER_SHOWN.len() - 1),
         "fade" => return prefs.cam_panel_fade = index.min(PANEL_FADES.len() - 1),
         _ => {}
     }

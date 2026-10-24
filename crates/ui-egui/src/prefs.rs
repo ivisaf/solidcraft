@@ -521,6 +521,9 @@ preference_settings! {
     cam_sim_detail: usize = 1;
     cam_path_width: usize = 1;
     cam_path_colour: usize = 0;
+    /// From how thick material left on the part the simulated stock shows it (index into the
+    /// Manufacture panel's choices).
+    cam_leftover_shown: usize = 2;
     /// The Manufacture and Tool Library panels' widths as dragged (0: their docked width), and
     /// how far their background fades while the pointer is elsewhere (index into the panel's choices).
     cam_panel_width: f32 = 0.0;
