@@ -33,7 +33,9 @@ applies what you typed, and **Up/Down** picks one of them first. A unit right af
 
 Expressions are unit-aware: `2 * width + 5 mm`, `angle / 2`, `sqrt(area)`, `1 in + 3 mm`, using
 `+ - * / ^`, parentheses, `sin cos tan asin acos atan atan2 sqrt abs min max floor ceil round mod
-trunc` and unit conversion. A decimal comma works too, outside parentheses: `2,5 mm` is
+trunc` and unit conversion. A number and the unit after it are one value: `10 mm / 2 mm` is 5
+and `90 deg / 1 rad` is π/2, and a fraction of numbers before a unit is one value too (`1/2 in`
+is half an inch). A decimal comma works too, outside parentheses: `2,5 mm` is
 `2.5 mm` (inside a function's parentheses the comma separates its arguments, so write
 `max(2.5, 3)` there). A mixed number is one value, as imperial sizes are written: `2 1/8"` and
 `3 7/16 in` are 2.125 in and 3.4375 in (a whole number, a space, then a proper fraction of whole
