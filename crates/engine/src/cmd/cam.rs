@@ -118,6 +118,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("lead?: expr, the radius of a quarter-circle lead-in and lead-out onto the wall (default none: it ramps along the loop; not with tabs); dogbones?: bool, into the sharp inside corners; skin?: expr, an onion skin left on the bottom, taken off in a last pass with skin_last?: bool; side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("dogbones?: bool, into the pocket's sharp corners; stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
     CommandSpec::new("cam.op.adaptive3d", "3D Adaptive", op_adaptive3d).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("roughs the stock down to the model level by level with a flat or ball end mill, at the steady load of cam.op.adaptive: the tool follows the model's shape seen from the tool's side (no undercuts), levels a stepdown apart at most and one on each flat floor of the model, so floors come out level; without a sketch or faces it roughs the whole stock (boundary?: stock|part, the box it stays in), with them only inside their profiles (where the tool's axis stays); the top defaults to the stock's top and the bottom to the model's deepest floor seen from the tool (not beside the part down to the stock's bottom); stepover_percent?, helix_angle?, helix_max?, helix_min?, climb?, feed_up?: as cam.op.adaptive; stock_to_leave?: expr, left on the model all round (sides and floors); step_up?: expr, levels in between on slopes this far apart at most, taking the steps the levels leave (default a quarter of the stepdown; 0: none; null: the default); it starts from what earlier operations of the setup (and the setup it takes its stock from) left, and a tool with a length and a holder diameter keeps its holder clear of the model and the stock")),
+    CommandSpec::new("cam.op.parallel3d", "3D Parallel", op_parallel3d).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("finishes the model's shape in 3D with a flat, ball or bull-nose end mill: passes side by side across the area, each following the model seen from the tool's side (no undercuts) as low as the tool may go without coming nearer than stock_to_leave; without a sketch or faces the area is the model's box (boundary?: part|stock), with them inside their profiles (where the tool's axis stays); the top defaults to the stock's top and the bottom to the model's deepest floor seen from the tool; stepover?: expr, how far apart the passes are (default a tenth of the tool's diameter); angle?: degrees from X the passes run (default 0); stock_to_leave?: expr (default 0); zigzag?: bool, back and forth (default true; false: every pass the same way, up between them)")),
     CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); feed_up?: percent of the feed (100 to 500; null or 100: never faster): a step lighter than the stepover makes thinner chips and goes as much faster, up to this; cuts go as arcs where their steps lie on one; inner profiles are islands")),
     CommandSpec::new("cam.op.vcarve", "V-Carve", op_vcarve).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!(
         "stepover?: expr, the distance between the rings (default: 2% of the tool's diameter); max_depth?: expr, the deepest the point goes \
@@ -1531,7 +1532,7 @@ impl OpShape {
             CamOperationKind::Contour { .. } => OpShape::Contour,
             // Both start at the top edge and find their depth themselves.
             CamOperationKind::Chamfer { .. } | CamOperationKind::VCarve { .. } => OpShape::Chamfer,
-            CamOperationKind::Adaptive { model: true, .. } => OpShape::Rough3d,
+            CamOperationKind::Adaptive { model: true, .. } | CamOperationKind::Parallel3d { .. } => OpShape::Rough3d,
             CamOperationKind::Pocket { .. } | CamOperationKind::Adaptive { .. } => OpShape::Pocket,
             // Holes, as drilled: their heights are the same.
             CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } | CamOperationKind::Thread { .. } => OpShape::Drill,
@@ -1870,6 +1871,35 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::chamfer(regions, tool, &params, &cut)
         }
+        CamOperationKind::Parallel3d { stepover, angle, stock_to_leave, zigzag } => {
+            let one = part_triangles(s, at);
+            if one.is_empty() {
+                return Err(fail("there is no model to finish".into()));
+            }
+            // Over the whole box every copy of the part is in the way, as for roughing.
+            let all_copies = matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part);
+            let shifts: &[(f64, f64)] = if all_copies { &at.copies } else { &[(0.0, 0.0)] };
+            let part: Vec<[Vec3; 3]> = shifts.iter().flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0)))).collect();
+            let key = rough_key(s, op);
+            if let Some(path) = key.and_then(|k| s.cam_path_cache.lock().ok()?.get(&k).cloned()) {
+                Ok(path)
+            } else {
+                let job = cam::Finish3d {
+                    boundary: regions,
+                    part: &part,
+                    stepover: len("stepover", stepover)?,
+                    angle: *angle,
+                    stock_to_leave: len("stock_to_leave", stock_to_leave)?,
+                    tolerance: TOLERANCE,
+                    zigzag: *zigzag,
+                };
+                let made = cam::parallel_3d(&job, tool, &cut);
+                if let (Some(k), Ok(path), Ok(mut cache)) = (key, &made, s.cam_path_cache.lock()) {
+                    cache.insert(k, path.clone());
+                }
+                made
+            }
+        }
         CamOperationKind::VCarve { stepover, max_depth, climb } => {
             let params = VCarveParams {
                 stepover: len("stepover", stepover)?,
@@ -2058,6 +2088,11 @@ fn geometry_param(s: &Session, p: &Value, cmd: &str) -> Result<CamGeometry> {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
         (None, None) if matches!(cmd, "cam.op.face" | "cam.op.adaptive3d") => boundary_param(p, cmd)?,
+        // Finishing covers the model's box unless told the stock's.
+        (None, None) if cmd == "cam.op.parallel3d" => match p.get("boundary") {
+            None => CamGeometry::Part,
+            Some(_) => boundary_param(p, cmd)?,
+        },
         _ => CamGeometry::Sketch {
             sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
             profiles: super::features::profiles(p, cmd)?,
@@ -2074,7 +2109,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
         "cam.op.contour" => OpShape::Contour,
         "cam.op.chamfer" | "cam.op.vcarve" => OpShape::Chamfer,
         "cam.op.pocket" | "cam.op.adaptive" => OpShape::Pocket,
-        "cam.op.adaptive3d" => OpShape::Rough3d,
+        "cam.op.adaptive3d" | "cam.op.parallel3d" => OpShape::Rough3d,
         "cam.op.drill" | "cam.op.bore" => OpShape::Drill,
         _ => return Err(bad(cmd, "not an operation")),
     };
@@ -2536,6 +2571,28 @@ fn op_vcarve(s: &mut Session, p: &Value) -> Result<Value> {
     })
 }
 
+fn op_parallel3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.parallel3d";
+    let stepover = expr(p, "stepover");
+    if let Some(e) = &stepover
+        && !(length(s, cmd, "stepover", e)? > 0.0)
+    {
+        return Err(bad(cmd, "`stepover` must be above 0"));
+    }
+    let angle = match p.get("angle") {
+        None => 0.0,
+        Some(_) => num(p, "angle").filter(|a| a.is_finite() && a.abs() <= 360.0).ok_or_else(|| bad(cmd, "`angle` must be -360 to 360 degrees"))?,
+    };
+    let zigzag = bool_(p, "zigzag").unwrap_or(true);
+    let stock_to_leave = stock_to_leave(p);
+    add_op(s, p, cmd, "Parallel3D", |tool| CamOperationKind::Parallel3d {
+        stepover: stepover.unwrap_or_else(|| mm(tool.diameter * 0.1)),
+        angle,
+        stock_to_leave,
+        zigzag,
+    })
+}
+
 fn op_thread(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.op.thread";
     let pitch = expr(p, "pitch").ok_or_else(|| bad(cmd, "`pitch` is required: the thread's pitch (1.25 mm for M8, say)"))?;
@@ -2676,7 +2733,10 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => {
             if p.get("boundary").is_some() {
-                if !matches!(op.kind, CamOperationKind::Face { .. } | CamOperationKind::Adaptive { model: true, .. }) {
+                if !matches!(
+                    op.kind,
+                    CamOperationKind::Face { .. } | CamOperationKind::Adaptive { model: true, .. } | CamOperationKind::Parallel3d { .. }
+                ) {
                     return Err(bad(cmd, format!("a {} operation has no `boundary`", op.kind.label())));
                 }
                 op.geometry = boundary_param(p, cmd)?;
@@ -2708,6 +2768,8 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "helix_min",
         "feed_up",
         "step_up",
+        "angle",
+        "zigzag",
         "pitch",
         "width",
         "tip_offset",
@@ -2731,9 +2793,18 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                         as u32
             }
             (
-                CamOperationKind::Face { stepover, .. } | CamOperationKind::Pocket { stepover, .. } | CamOperationKind::VCarve { stepover, .. },
+                CamOperationKind::Face { stepover, .. }
+                | CamOperationKind::Pocket { stepover, .. }
+                | CamOperationKind::VCarve { stepover, .. }
+                | CamOperationKind::Parallel3d { stepover, .. },
                 "stepover",
             ) => *stepover = checked(k, Kind::Length)?,
+            (CamOperationKind::Parallel3d { angle, .. }, "angle") => {
+                *angle = num(p, k).filter(|a| a.is_finite() && a.abs() <= 360.0).ok_or_else(|| bad(cmd, "`angle` must be -360 to 360 degrees"))?
+            }
+            (CamOperationKind::Parallel3d { zigzag, .. }, "zigzag") => {
+                *zigzag = bool_(p, k).ok_or_else(|| bad(cmd, "`zigzag` must be true or false"))?
+            }
             (CamOperationKind::Face { inside, .. }, "limit") => *inside = limit_param(p, cmd)?,
             (CamOperationKind::Face { margin, .. }, "margin") => {
                 *margin = if p.get(k).is_some_and(Value::is_null) { None } else { Some(margin_param(s, p, cmd)?) }
@@ -2768,7 +2839,8 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
                 CamOperationKind::Contour { stock_to_leave, .. }
                 | CamOperationKind::Pocket { stock_to_leave, .. }
                 | CamOperationKind::Bore { stock_to_leave, .. }
-                | CamOperationKind::Adaptive { stock_to_leave, .. },
+                | CamOperationKind::Adaptive { stock_to_leave, .. }
+                | CamOperationKind::Parallel3d { stock_to_leave, .. },
                 "stock_to_leave",
             ) => *stock_to_leave = checked(k, Kind::Length)?,
             (
@@ -2850,24 +2922,23 @@ pub fn cam_list_ready(s: &Session) -> bool {
     {
         return true;
     }
-    let rough =
-        s.doc.manufacture.setups.iter().flat_map(|x| &x.operations).filter(|o| matches!(o.kind, CamOperationKind::Adaptive { model: true, .. }));
+    let rough = s.doc.manufacture.setups.iter().flat_map(|x| &x.operations).filter(|o| slow_kind(&o.kind));
     let Ok(cache) = s.cam_path_cache.lock() else { return true };
     rough.into_iter().all(|op| rough_key(s, op).is_none_or(|k| cache.get(&k).is_some()))
+}
+
+/// Operations following the model in 3D: their toolpaths take seconds.
+fn slow_kind(kind: &CamOperationKind) -> bool {
+    matches!(kind, CamOperationKind::Adaptive { model: true, .. } | CamOperationKind::Parallel3d { .. })
 }
 
 /// Whether `cmd` with `p` (as [`cam_preview`] takes them) makes or changes a 3D roughing
 /// operation, whose toolpath takes seconds.
 pub fn cam_slow(s: &Session, cmd: &str, p: &Value) -> bool {
     match cmd {
-        "cam.op.adaptive3d" => true,
+        "cam.op.adaptive3d" | "cam.op.parallel3d" => true,
         "cam.op.edit" => key(p, "op").is_some_and(|k| {
-            s.doc
-                .manufacture
-                .setups
-                .iter()
-                .flat_map(|x| &x.operations)
-                .any(|o| matches!(o.kind, CamOperationKind::Adaptive { model: true, .. }) && (k == o.id.to_string() || k == o.name))
+            s.doc.manufacture.setups.iter().flat_map(|x| &x.operations).any(|o| slow_kind(&o.kind) && (k == o.id.to_string() || k == o.name))
         }),
         _ => false,
     }

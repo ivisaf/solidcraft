@@ -5,7 +5,8 @@
 //!
 //! A height field knows the top of each column and, for stock already cut from the other side,
 //! its bottom; undercuts do not exist in it. A column cut through is empty: top and bottom on the
-//! floor. Along a sloped move a column takes the tool's height at the nearest point of the move.
+//! floor. Along a sloped move a column takes the lowest the tool reaches over it near where the
+//! move passes nearest (a few positions within the tool's radius either way).
 
 use serde::{Deserialize, Serialize};
 use solidcraft_geom::{Vec2, Vec3};
@@ -18,6 +19,9 @@ use crate::{CamError, Result, invalid};
 pub const MAX_CELLS: usize = 4_000_000;
 /// Most column updates of one simulated toolpath.
 const MAX_WORK: u64 = 4_000_000_000;
+/// How many positions either way along a sloped move a column looks at for the lowest the tool
+/// reaches over it.
+const SLOPE_LOOKS: u32 = 8;
 /// Most columns a dilation keeps maxima of (one field per width).
 const MAX_DILATION: usize = 16_000_000;
 
@@ -215,12 +219,24 @@ impl HeightField {
 }
 
 /// How deep `path` cuts into the part `part` holds (mm; 0 when it never does): the deepest a
-/// cutting move's tool end goes below the part's top within its radius, less a few columns'
-/// width (the field's own rounding of a wall, either way) so that a tool running along a wall
-/// is not counted.
+/// cutting move's tool end goes below the part's top within its radius (a rounded end: below
+/// the part seen through its shape), less a few columns' width (the field's own rounding of a
+/// wall, either way) so that a tool running along a wall is not counted.
 pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
     let r = (tool.radius() - part.cell * 2.5).max(0.0);
-    let Ok(reach) = part.dilated(r) else { return 0.0 };
+    // A rounded end clears a wall its tip goes below: the part seen through the tool's shape.
+    let reach = if tool.corner() > 0.0 && r > 0.0 {
+        let corner = (tool.corner() - part.cell * 2.5).max(0.0);
+        let slim = match tool.kind {
+            ToolKind::BullNose if corner > 0.0 => Tool { diameter: r * 2.0, corner_radius: Some(corner.min(r)), ..tool.clone() },
+            ToolKind::BullNose => Tool { diameter: r * 2.0, ..Tool::new(tool.number, ToolKind::FlatEndmill, r * 2.0, tool.flute_length) },
+            _ => Tool { diameter: r * 2.0, ..tool.clone() },
+        };
+        tool_floor(part, &slim, 0.0)
+    } else {
+        part.dilated(r)
+    };
+    let Ok(reach) = reach else { return 0.0 };
     let step = (part.cell * 0.5).max(1e-3);
     let mut deepest: f64 = 0.0;
     let mut samples: u64 = 0;
@@ -313,7 +329,7 @@ pub struct CutReport {
 
 /// How far above its tip a rounded end `corner` round, on a tool `r` in radius, is at distance
 /// `d` from its axis: flat out to `r - corner`, then round (a ball: `corner` = `r`).
-fn rounded(r: f64, corner: f64, d: f64) -> f64 {
+pub(crate) fn rounded(r: f64, corner: f64, d: f64) -> f64 {
     let flat = r - corner;
     if d <= flat { 0.0 } else { corner - (corner * corner - (d - flat).powi(2)).max(0.0).sqrt() }
 }
@@ -370,8 +386,22 @@ fn sweep(field: &mut HeightField, a: Vec3, to: Vec3, cutting: bool, tool: &Tool,
                 continue;
             }
             // Straight down or up, the lowest point of the move is what cuts.
-            let tip = if len2 > 0.0 { a.z + (to.z - a.z) * t } else { a.z.min(to.z) };
-            let z = (tip + profile(tool, off)).max(field.floor);
+            let tip_at = |t: f64| if len2 > 0.0 { a.z + (to.z - a.z) * t } else { a.z.min(to.z) };
+            let mut z = (tip_at(t) + profile(tool, off)).max(field.floor);
+            // Along a slope the tool reaches lowest over the column a little down the move from
+            // where it passes nearest: positions within its radius either way are looked at too.
+            if len2 > 0.0 && (to.z - a.z).abs() > 1e-9 {
+                let window = r / len2.sqrt();
+                for k in 1..=SLOPE_LOOKS {
+                    for side in [-1.0, 1.0] {
+                        let tt = (t + side * window * f64::from(k) / f64::from(SLOPE_LOOKS)).clamp(0.0, 1.0);
+                        let off = c.dist(a2 + d * tt);
+                        if off <= r {
+                            z = z.min((tip_at(tt) + profile(tool, off)).max(field.floor));
+                        }
+                    }
+                }
+            }
             let k = j * field.nx + i;
             let base = field.base(k);
             let Some(h) = field.z.get_mut(k) else { continue };

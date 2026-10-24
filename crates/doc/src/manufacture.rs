@@ -302,6 +302,10 @@ pub enum CamOperationKind {
         max_depth: Option<Expr>,
         climb: bool,
     },
+    /// Finishes the model's shape in 3D with passes side by side `stepover` apart (a length
+    /// expression), running `angle` degrees from X, following the model with `stock_to_leave`
+    /// left on it, back and forth when `zigzag`.
+    Parallel3d { stepover: Expr, angle: f64, stock_to_leave: Expr, zigzag: bool },
     /// A thread milled with a single-profile thread mill round each round profile: inside a
     /// hole (drawn at its core diameter) or round a boss (drawn at its major diameter).
     Thread {
@@ -352,6 +356,7 @@ impl CamOperationKind {
             CamOperationKind::Adaptive { .. } => "adaptive",
             CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::VCarve { .. } => "vcarve",
+            CamOperationKind::Parallel3d { .. } => "parallel_3d",
             CamOperationKind::Thread { .. } => "thread",
             CamOperationKind::Bore { .. } => "bore",
             CamOperationKind::Drill { .. } => "drill",

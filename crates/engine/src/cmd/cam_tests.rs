@@ -2009,3 +2009,40 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     let sim = run(&mut s, "cam.simulate", json!({"setup": "Two", "columns": 300}));
     assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
 }
+
+#[test]
+fn parallel_finishing_follows_the_model_after_roughing() {
+    use solidcraft_doc::manufacture::{CamGeometry, CamOperationKind};
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 8], "p1": [30, 22]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -4, "operation": "cut"}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 4, "spindle_rpm": 15000, "feed": 800}));
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    run(&mut s, "cam.setup.create", json!({"name": "Both", "origin": top, "stock": {"top": 1}}));
+    run(&mut s, "cam.op.adaptive3d", json!({"tool": 1, "stepdown": 3, "stock_to_leave": 0.3}));
+    let made = run(&mut s, "cam.op.parallel3d", json!({"tool": 2}));
+    // The pocket's floor, 5 below the zero, is as deep as it goes.
+    close(made["lowest_z"].as_f64().unwrap(), -5.0, 1e-6);
+    let op = s.doc.manufacture.setups[0].operations[1].clone();
+    assert_eq!(op.geometry, CamGeometry::Part, "the model's box by itself");
+    assert!(
+        matches!(&op.kind, CamOperationKind::Parallel3d { stepover, angle, zigzag: true, .. } if stepover == "0.4 mm" && *angle == 0.0),
+        "{:?}",
+        op.kind
+    );
+    let listed = run(&mut s, "cam.list", json!({}));
+    assert_eq!(listed["setups"][0]["operations"][1]["kind"], "parallel_3d");
+    assert!(listed["setups"][0]["operations"][1].get("warning").is_none_or(Value::is_null), "{listed}");
+    let sim = run(&mut s, "cam.simulate", json!({"setup": "Both", "columns": 300}));
+    assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
+    // Edited: across the other way, one way only.
+    run(&mut s, "cam.op.edit", json!({"op": made["operation"], "angle": 90, "zigzag": false}));
+    assert!(matches!(&s.doc.manufacture.setups[0].operations[1].kind, CamOperationKind::Parallel3d { angle, zigzag: false, .. } if *angle == 90.0));
+    for bad in [json!({"tool": 2, "stepover": 0}), json!({"tool": 2, "angle": 1000})] {
+        assert!(s.execute("cam.op.parallel3d", &bad).is_err(), "{bad}");
+    }
+}

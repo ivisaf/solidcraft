@@ -1887,3 +1887,81 @@ fn the_holder_keeps_the_tool_up_beside_a_tall_block() {
     assert!(points.iter().any(|q| (q.z + 14.5).abs() < 1e-9), "the slab is reached away from the block");
     assert!(adaptive_3d(&Rough3d { holder: Some((5.0, 6.0)), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).is_err());
 }
+
+fn finish<'a>(part: &'a [[Vec3; 3]], boundary: &'a [Region2]) -> Finish3d<'a> {
+    Finish3d { boundary, part, stepover: 0.5, angle: 0.0, stock_to_leave: 0.0, tolerance: 0.01, zigzag: true }
+}
+
+/// The finished stock against the part on fine columns, over the columns `inside` keeps: the
+/// deepest cut into the part and the thickest left on it (over `allowance`).
+fn finish_check(part: &[[Vec3; 3]], path: &Toolpath, t: &Tool, allowance: f64, inside: impl Fn(Vec2) -> bool) -> (f64, f64) {
+    let mut field = HeightField::block(Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, 0.0), 0.1).unwrap();
+    simulate(&mut field, path, t).unwrap();
+    let seen = HeightField::of_triangles(v(0.0, 0.0), v(60.0, 40.0), 0.1, -20.0, part, false).unwrap();
+    let (mut into, mut left) = (f64::NEG_INFINITY, 0.0f64);
+    for j in 0..field.ny {
+        for i in 0..field.nx {
+            // Only where there is part to compare with.
+            let (Some(h), Some(p)) = (field.get(i, j), seen.get(i, j).filter(|p| *p > seen.floor + 1e-9)) else { continue };
+            into = into.max(p - h);
+            if inside(field.centre(i, j)) {
+                left = left.max(h - p - allowance);
+            }
+        }
+    }
+    (into, left)
+}
+
+#[test]
+fn parallel_finishing_follows_a_slope_to_its_cusps() {
+    let (part, _) = slope();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let c = cut(0.0, -15.0, 4.0);
+    // A ball's cusps between passes 0.5 mm apart: 0.5² / (8 × 3) ≈ 0.01 mm, the tolerance of the
+    // straight runs, and what keeping clear between column centres leaves on the slope; a flat
+    // end more (its rim rides the slope). Nothing is cut into the part.
+    for (kind, most) in [(ToolKind::BallEndmill, 0.08), (ToolKind::BullNose, 0.08), (ToolKind::FlatEndmill, 0.15)] {
+        let t = Tool { corner_radius: (kind == ToolKind::BullNose).then_some(1.0), ..Tool::new(1, kind, 6.0, 20.0) };
+        let path = parallel_3d(&finish(&part, &area), &t, &c).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        let (into, left) = finish_check(&part, &path, &t, 0.0, |p| p.x > 4.0 && p.x < 56.0 && p.y > 4.0 && p.y < 36.0);
+        assert!(into <= 1e-6, "{kind:?}: cuts {into} into the part");
+        assert!(left <= most, "{kind:?}: leaves {left}");
+        eprintln!("{kind:?}: into {into:.4}, left {left:.4}, {} moves", path.moves.len());
+    }
+    // An allowance stays on the part, evenly.
+    let ball = Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0);
+    let path = parallel_3d(&Finish3d { stock_to_leave: 0.3, ..finish(&part, &area) }, &ball, &c).unwrap();
+    let (into, left) = finish_check(&part, &path, &ball, 0.3, |p| p.x > 4.0 && p.x < 56.0 && p.y > 4.0 && p.y < 36.0);
+    assert!(into <= -0.28, "the allowance: {into}");
+    assert!(left <= 0.08, "{left}");
+    for bad in [
+        Finish3d { stepover: 0.0, ..finish(&part, &area) },
+        Finish3d { stepover: 7.0, ..finish(&part, &area) },
+        Finish3d { tolerance: 0.0, ..finish(&part, &area) },
+    ] {
+        assert!(parallel_3d(&bad, &ball, &c).is_err());
+    }
+    assert!(parallel_3d(&finish(&part, &area), &Tool::new(1, ToolKind::Drill, 6.0, 20.0), &c).is_err());
+}
+
+#[test]
+fn parallel_finishing_goes_over_a_block_without_cutting_into_it() {
+    let (part, _) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let ball = Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0);
+    let c = cut(0.0, -15.0, 4.0);
+    for (angle, zigzag) in [(0.0, true), (90.0, false), (45.0, true)] {
+        let path = parallel_3d(&Finish3d { angle, zigzag, ..finish(&part, &area) }, &ball, &c).unwrap();
+        // Away from the walls (where a ball leaves its round), the floors and the top are finished.
+        let away = |p: Vec2| {
+            let off_block = p.x < 17.0 || p.x > 43.0 || p.y < 9.0 || p.y > 31.0;
+            let on_top = p.x > 21.0 && p.x < 39.0 && p.y > 13.0 && p.y < 27.0;
+            p.x > 3.5 && p.x < 56.5 && p.y > 3.5 && p.y < 36.5 && (off_block || on_top)
+        };
+        let (into, left) = finish_check(&part, &path, &ball, 0.0, away);
+        assert!(into <= 1e-6, "{angle}: cuts {into} into the part");
+        assert!(left <= 0.04, "{angle}: leaves {left}");
+        let lowest = path.stats().lowest_z.unwrap();
+        close(lowest, -15.0, 1e-6);
+    }
+}

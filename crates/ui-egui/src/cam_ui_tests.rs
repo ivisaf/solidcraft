@@ -497,7 +497,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 16, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 17, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1351,6 +1351,48 @@ fn a_3d_adaptive_form_roughs_the_stock_with_or_without_a_sketch() {
     assert_eq!(geometry(&h), CamGeometry::Stock);
     h.frames(2);
     assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Adaptive3D1"));
+}
+
+/// 3D finishing: no sketch needed (the model's box) and no stepdown; its passes' angle and
+/// direction are kept; a sketch limits it, and leaving the sketch out goes back to the box.
+#[test]
+fn a_3d_parallel_form_finishes_the_part_s_box_or_inside_a_sketch() {
+    use solidcraft_engine::doc::manufacture::{CamGeometry, CamOperationKind};
+    let mut h = sketched();
+    h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.parallel3d");
+    h.frames(2);
+    for row in ["3D PARALLEL", "Sketch", "Stepover", "Pass angle", "Stock to leave", "Both ways (zigzag)"] {
+        assert!(h.widget(row).is_some(), "{row}");
+    }
+    assert!(h.widget("Stepdown").is_none(), "one layer, following the surface");
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.stepover, f.pass_angle, f.zigzag) = ("1 mm".into(), "90".into(), false);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert!(
+        matches!(&op.kind, CamOperationKind::Parallel3d { stepover, angle, zigzag: false, .. } if stepover == "1 mm" && *angle == 90.0),
+        "{:?}",
+        op.kind
+    );
+    assert_eq!(op.geometry, CamGeometry::Part);
+    let edit = |h: &mut Harness, sketch: &str| {
+        let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+        let setup = listed["setups"][0].clone();
+        let Some(Form::Op(mut again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+        assert_eq!((again.kind, again.pass_angle.as_str(), again.zigzag), (OpKind::Parallel3d, "90", false));
+        again.sketch = sketch.into();
+        h.app.manufacture.form = Some(Form::Op(again));
+        apply(&mut h.app);
+        assert_eq!(h.app.manufacture.error, None);
+    };
+    edit(&mut h, "Pocket");
+    assert!(matches!(h.app.session.doc.manufacture.setups[0].operations[0].geometry, CamGeometry::Sketch { .. }));
+    edit(&mut h, "");
+    assert_eq!(h.app.session.doc.manufacture.setups[0].operations[0].geometry, CamGeometry::Part);
 }
 
 /// In the browser an operation shows its time, and is dragged before another of its setup
