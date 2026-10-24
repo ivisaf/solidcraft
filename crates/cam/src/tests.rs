@@ -1725,3 +1725,72 @@ fn adaptive_passes_enter_finish_and_machine_the_rest() {
     }
     assert!(adaptive(&[rect(0.0, 0.0, 5.0, 5.0)], &tool(6.0), &p, &c).is_err());
 }
+
+/// The top of a box from `lo` to `hi` and its four walls, as triangles.
+fn box_triangles(lo: Vec3, hi: Vec3) -> Vec<[Vec3; 3]> {
+    let p = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    let (a, b, c, d) = (p(lo.x, lo.y, hi.z), p(hi.x, lo.y, hi.z), p(hi.x, hi.y, hi.z), p(lo.x, hi.y, hi.z));
+    let (e, f, g, h) = (p(lo.x, lo.y, lo.z), p(hi.x, lo.y, lo.z), p(hi.x, hi.y, lo.z), p(lo.x, hi.y, lo.z));
+    vec![[a, b, c], [a, c, d], [e, f, b], [e, b, a], [f, g, c], [f, c, b], [g, h, d], [g, d, c], [h, e, a], [h, a, d]]
+}
+
+#[test]
+fn a_tool_s_floor_over_a_part_follows_its_shape() {
+    let mut part = HeightField::block(Vec3::new(0.0, 0.0, -1.0), Vec3::new(10.1, 10.1, 0.0), 0.1).unwrap();
+    part.z.iter_mut().for_each(|z| *z = part.floor);
+    let (i, j) = part.column(v(5.05, 5.05)).unwrap();
+    let k = j * part.nx + i;
+    part.z[k] = 10.0;
+    let at = |f: &HeightField, dx: usize| f.get(i + dx, j).unwrap();
+    // A 4 mm ball 0.5 off the spike: as a 5 mm ball, 0.5 lower than its surface allows.
+    let ball = tool_floor(&part, ToolKind::BallEndmill, 2.0, 0.5).unwrap();
+    close(at(&ball, 0), 10.5, 1e-9);
+    close(at(&ball, 10), 10.0 - (2.5 - (2.5f64 * 2.5 - 1.0).sqrt()) + 0.5, 1e-9);
+    // Beyond the grown ball's reach the part's floor (plus the allowance) is all it meets.
+    close(at(&ball, 30), part.floor + 0.5, 1e-9);
+    // A flat end mill stands on the spike as long as it covers it.
+    let flat = tool_floor(&part, ToolKind::FlatEndmill, 2.0, 0.0).unwrap();
+    close(at(&flat, 19), 10.0, 1e-9);
+    assert!(at(&flat, 22) < 0.0);
+    assert!(tool_floor(&part, ToolKind::Drill, 2.0, 0.0).is_err());
+}
+
+#[test]
+fn adaptive_3d_roughs_down_to_the_part_level_by_level() {
+    // A slab with its floor at -15 and a block on it whose top is at -5, in a stock from -20 to 0.
+    let mut part = box_triangles(Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, -15.0));
+    part.extend(box_triangles(Vec3::new(20.0, 12.0, -20.0), Vec3::new(40.0, 28.0, -5.0)));
+    let stock = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, 0.0));
+    let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
+    // A ball end mill is refused rather than planned as if it cut flat.
+    let ball = Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0);
+    assert!(adaptive_3d(&[rect(0.0, 0.0, 60.0, 40.0)], &part, stock, &ball, &params, &cut(0.0, -15.0, 4.0)).is_err());
+    {
+        let kind = ToolKind::FlatEndmill;
+        let t = Tool::new(1, kind, 6.0, 20.0);
+        let c = cut(0.0, -15.0, 4.0);
+        let started = std::time::Instant::now();
+        let path = adaptive_3d(&[rect(0.0, 0.0, 60.0, 40.0)], &part, stock, &t, &params, &c).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        let points = cutting_points(&path, 1.0);
+        let lowest = points.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        // Flat floors are levels of their own, the allowance above them.
+        close(lowest, -14.5, 1e-9);
+        assert!(points.iter().any(|p| (p.z + 4.5).abs() < 1e-9), "{kind:?}: a level on the block's top");
+        // Cut on a stock of finer columns: never into the part, never deeper than a stepdown.
+        let mut field = HeightField::block(stock.0, stock.1, 0.25).unwrap();
+        let report = simulate(&mut field, &path, &t).unwrap();
+        assert!(report.max_engagement <= 4.0 + 1e-6, "{kind:?}: {}", report.max_engagement);
+        let seen = HeightField::of_triangles(v(0.0, 0.0), v(60.0, 40.0), 0.25, -20.0, &part, false).unwrap();
+        let (mut into, mut left, mut total) = (0.0f64, 0.0, 0.0);
+        for (h, p) in field.z.iter().zip(&seen.z) {
+            into = into.max(p - h);
+            total += (0.0 - p - 0.5).max(0.0);
+            left += (h - p - 0.5).max(0.0);
+        }
+        assert!(into <= 1e-6, "{kind:?}: cuts {into} into the part");
+        // What stands above the allowance: the round of the tool along the block's corners.
+        let share = left / total;
+        assert!(share < 0.03, "{kind:?}: {:.1} % left", share * 100.0);
+        eprintln!("{kind:?}: {:.2} % left, engaged {:.2}, {} moves, {:?}", share * 100.0, report.max_engagement, path.moves.len(), started.elapsed());
+    }
+}

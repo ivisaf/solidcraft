@@ -497,7 +497,7 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
     assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
-    assert_eq!(on_tab.len(), 15, "cam.op.edit and the removals are reached from the window");
+    assert_eq!(on_tab.len(), 16, "cam.op.edit and the removals are reached from the window");
     for c in on_tab {
         assert!(crate::toolbar::panels("MANUFACTURE").contains(&c.panel), "{}: panel {}", c.id, c.panel);
         assert!(c.icon.starts_with("cam_"), "{}", c.id);
@@ -1279,6 +1279,50 @@ fn an_adaptive_form_clears_a_pocket_at_a_steady_load() {
     );
     h.frames(2);
     assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Adaptive1"));
+}
+
+/// 3D roughing: no sketch needed (the whole stock), no finishing lap or rest; a sketch limits
+/// it to its profiles and leaving the sketch out again goes back to the stock.
+#[test]
+fn a_3d_adaptive_form_roughs_the_stock_with_or_without_a_sketch() {
+    use solidcraft_engine::doc::manufacture::{CamGeometry, CamOperationKind};
+    let mut h = sketched();
+    h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.adaptive3d");
+    h.frames(2);
+    for row in ["3D ADAPTIVE", "Sketch", "Stepover (%)", "Stock to leave", "Helix angle", "Stepdown", "Climb"] {
+        assert!(h.widget(row).is_some(), "{row}");
+    }
+    for row in ["Rest of tool", "Finish allowance"] {
+        assert!(h.widget(row).is_none(), "{row} is not offered in 3D");
+    }
+    let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
+    (f.stepdown, f.stock_to_leave) = ("4".into(), "0.3".into());
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let geometry = |h: &Harness| h.app.session.doc.manufacture.setups[0].operations[0].geometry.clone();
+    let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
+    assert!(matches!(op.kind, CamOperationKind::Adaptive { model: true, .. }), "{:?}", op.kind);
+    assert_eq!(geometry(&h), CamGeometry::Stock);
+    // Edited: inside the sketch's rectangle, then the whole stock again.
+    let edit = |h: &mut Harness, sketch: &str| {
+        let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+        let setup = listed["setups"][0].clone();
+        let Some(Form::Op(mut again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
+        assert_eq!(again.kind, OpKind::Adaptive3d);
+        again.sketch = sketch.into();
+        h.app.manufacture.form = Some(Form::Op(again));
+        apply(&mut h.app);
+        assert_eq!(h.app.manufacture.error, None);
+    };
+    edit(&mut h, "Pocket");
+    assert!(matches!(geometry(&h), CamGeometry::Sketch { .. }));
+    edit(&mut h, "");
+    assert_eq!(geometry(&h), CamGeometry::Stock);
+    h.frames(2);
+    assert!(crate::browser::drawn_rows().into_iter().any(|r| r.0 == "Adaptive3D1"));
 }
 
 /// In the browser an operation shows its time, and is dragged before another of its setup

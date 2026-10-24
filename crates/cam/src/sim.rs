@@ -241,6 +241,62 @@ pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
     deepest
 }
 
+/// The lowest the tip of a tool `kind` (flat or ball end mill), `radius` wide, may go over each
+/// column of the `part` and stay `allowance` clear of it: the part's top seen through the tool's
+/// shape, the tool grown by the allowance all round. Columns without part get the part's floor.
+pub fn tool_floor(part: &HeightField, kind: ToolKind, radius: f64, allowance: f64) -> Result<HeightField> {
+    if !(radius > 0.0 && radius.is_finite()) || !(allowance >= 0.0 && allowance.is_finite()) {
+        return invalid("the tool's radius must be above 0 and the allowance 0 or more");
+    }
+    let r = radius + allowance;
+    // How far above its tip the grown tool's surface is at `d` from its axis.
+    let rise = |d: f64| match kind {
+        ToolKind::BallEndmill => r - (r * r - d * d).max(0.0).sqrt(),
+        _ => 0.0,
+    };
+    if !matches!(kind, ToolKind::FlatEndmill | ToolKind::BallEndmill) {
+        return Err(CamError::Unsupported("following a part in 3D takes a flat or a ball end mill".into()));
+    }
+    if kind == ToolKind::FlatEndmill {
+        let mut out = part.dilated(r)?;
+        out.z.iter_mut().for_each(|z| *z += allowance);
+        return Ok(out);
+    }
+    // The disc's columns and how far the tool's surface rises at each.
+    let reach = (r / part.cell).ceil() as i64;
+    let mut disc: Vec<(i64, i64, f64)> = Vec::new();
+    for dj in -reach..=reach {
+        for di in -reach..=reach {
+            let d = ((di * di + dj * dj) as f64).sqrt() * part.cell;
+            if d <= r {
+                disc.push((di, dj, rise(d)));
+            }
+        }
+    }
+    if !((disc.len() as f64) * (part.z.len() as f64) <= MAX_WORK as f64) {
+        return Err(CamError::TooLarge("the tool is too large for this cell size".into()));
+    }
+    let mut out = part.clone();
+    for j in 0..part.ny {
+        for i in 0..part.nx {
+            let mut low = part.floor;
+            for &(di, dj, up) in &disc {
+                let (ii, jj) = (i as i64 + di, j as i64 + dj);
+                if ii < 0 || jj < 0 {
+                    continue;
+                }
+                if let Some(h) = part.get(ii as usize, jj as usize).filter(|h| *h > part.floor) {
+                    low = low.max(h - up);
+                }
+            }
+            if let Some(c) = out.z.get_mut(j * part.nx + i) {
+                *c = low + allowance;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// What one toolpath did to the stock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CutReport {

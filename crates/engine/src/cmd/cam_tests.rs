@@ -1926,3 +1926,52 @@ fn a_v_bit_engraves_on_a_line_and_its_groove_is_a_v() {
     close(z(7.0, 2.5), -0.6, 0.05);
     close(z(7.0, 3.2), 0.0, 1e-9);
 }
+
+#[test]
+fn adaptive_3d_roughs_the_stock_down_to_the_model() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -5, "operation": "cut"}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    // 2 mm of stock over the plate; the work zero on its top.
+    let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
+    run(&mut s, "cam.setup.create", json!({"name": "Rough", "origin": top, "stock": {"top": 2}}));
+    let made = run(&mut s, "cam.op.adaptive3d", json!({"tool": 1, "stepdown": 3, "stock_to_leave": 0.2}));
+    // No sketch: the whole stock, down to the pocket's floor (7 below the zero) less the allowance.
+    close(made["lowest_z"].as_f64().unwrap(), -6.8, 1e-9);
+    let listed = run(&mut s, "cam.list", json!({}));
+    let op = &listed["setups"][0]["operations"][0];
+    assert_eq!(op["kind"], "adaptive_3d", "{op}");
+    assert!(op.get("warning").is_none_or(Value::is_null), "{op}");
+    let sim = run(&mut s, "cam.simulate", json!({"setup": "Rough", "columns": 240}));
+    // The skin over the plate and the pocket, less the allowance and the tool's round in the
+    // pocket's corners; nothing cut into the plate.
+    let removed = sim["removed_volume"].as_f64().unwrap();
+    let skin = 60.0 * 40.0 * 1.8;
+    let pocket = 30.0 * 20.0 * 4.8;
+    assert!(removed > (skin + pocket) * 0.95 && removed < skin + pocket + 100.0, "{removed}");
+    assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
+    // Only a flat end mill, and no finishing lap or rest machining in 3D yet.
+    for bad in [
+        json!({"setup": "Rough", "tool": 2}),
+        json!({"setup": "Rough", "tool": 1, "finish": 0.5}),
+        json!({"setup": "Rough", "tool": 1, "rest_from": 2}),
+    ] {
+        assert!(s.execute("cam.op.adaptive3d", &bad).is_err(), "{bad}");
+    }
+    // With room for the tool beside the part, it still goes no deeper than the deepest floor seen
+    // from above by itself: down beside the part to the stock's bottom would cut the part loose.
+    run(&mut s, "cam.setup.create", json!({"name": "Wide", "origin": top, "stock": {"top": 2, "side": 8}}));
+    let made = run(&mut s, "cam.op.adaptive3d", json!({"setup": "Wide", "tool": 1, "stepdown": 3, "stock_to_leave": 0.2}));
+    // Beside the part (no allowance to keep there) the stock goes down to that floor's height.
+    close(made["lowest_z"].as_f64().unwrap(), -7.0, 1e-9);
+    let warning = |s: &mut Session| run(s, "cam.list", json!({}))["setups"][1]["operations"][0]["warning"].clone();
+    assert!(warning(&mut s).is_null(), "{}", warning(&mut s));
+    // Told to go to the stock's bottom, it does, and says the part comes loose.
+    run(&mut s, "cam.op.edit", json!({"setup": "Wide", "op": made["operation"], "bottom": -12}));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.contains("without tabs")), "{}", warning(&mut s));
+}

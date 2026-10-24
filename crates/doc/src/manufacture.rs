@@ -273,6 +273,10 @@ pub enum CamOperationKind {
         /// never faster than the feed).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         feed_up: Option<f64>,
+        /// Roughing in 3D: level by level down to the model's shape, inside the geometry (the
+        /// stock when none), rather than a pocket of the geometry's profiles.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        model: bool,
     },
     /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
     /// deeper than the chamfer (length expressions).
@@ -340,6 +344,7 @@ impl CamOperationKind {
             CamOperationKind::Face { .. } => "face",
             CamOperationKind::Contour { .. } => "contour",
             CamOperationKind::Pocket { .. } => "pocket",
+            CamOperationKind::Adaptive { model: true, .. } => "adaptive_3d",
             CamOperationKind::Adaptive { .. } => "adaptive",
             CamOperationKind::Chamfer { .. } => "chamfer",
             CamOperationKind::VCarve { .. } => "vcarve",

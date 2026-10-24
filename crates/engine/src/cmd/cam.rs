@@ -117,6 +117,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Facing", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("lead?: expr, the radius of a quarter-circle lead-in and lead-out onto the wall (default none: it ramps along the loop; not with tabs); dogbones?: bool, into the sharp inside corners; skin?: expr, an onion skin left on the bottom, taken off in a last pass with skin_last?: bool; side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("dogbones?: bool, into the pocket's sharp corners; stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
+    CommandSpec::new("cam.op.adaptive3d", "3D Adaptive", op_adaptive3d).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("roughs the stock down to the model level by level with a flat end mill, at the steady load of cam.op.adaptive: the tool follows the model's shape seen from the tool's side (no undercuts), levels a stepdown apart at most and one on each flat floor of the model, so floors come out level; without a sketch or faces it roughs the whole stock (boundary?: stock|part, the box it stays in), with them only inside their profiles (where the tool's axis stays); the top defaults to the stock's top and the bottom to the model's deepest floor seen from the tool (not beside the part down to the stock's bottom); stepover_percent?, helix_angle?, helix_max?, helix_min?, climb?, feed_up?: as cam.op.adaptive; stock_to_leave?: expr, left on the model all round (sides and floors)")),
     CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); feed_up?: percent of the feed (100 to 500; null or 100: never faster): a step lighter than the stepover makes thinner chips and goes as much faster, up to this; cuts go as arcs where their steps lie on one; inner profiles are islands")),
     CommandSpec::new("cam.op.vcarve", "V-Carve", op_vcarve).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!(
         "stepover?: expr, the distance between the rings (default: 2% of the tool's diameter); max_depth?: expr, the deepest the point goes \
@@ -1516,6 +1517,8 @@ enum OpShape {
     Chamfer,
     Pocket,
     Drill,
+    /// Roughing down to the model in 3D.
+    Rough3d,
 }
 
 impl OpShape {
@@ -1525,11 +1528,29 @@ impl OpShape {
             CamOperationKind::Contour { .. } => OpShape::Contour,
             // Both start at the top edge and find their depth themselves.
             CamOperationKind::Chamfer { .. } | CamOperationKind::VCarve { .. } => OpShape::Chamfer,
+            CamOperationKind::Adaptive { model: true, .. } => OpShape::Rough3d,
             CamOperationKind::Pocket { .. } | CamOperationKind::Adaptive { .. } => OpShape::Pocket,
             // Holes, as drilled: their heights are the same.
             CamOperationKind::Drill { .. } | CamOperationKind::Bore { .. } | CamOperationKind::Thread { .. } => OpShape::Drill,
         }
     }
+}
+
+/// [`auto_heights`], and for roughing in 3D the deepest floor of the model seen from the tool
+/// inside the geometry's box: deep enough for every floor, never down beside the part to the
+/// stock's bottom (cutting it loose).
+fn heights_found(s: &Session, at: &Resolved, g: &Geometry, shape: OpShape, source: &CamGeometry) -> (Option<f64>, Option<f64>) {
+    let (top, bottom) = auto_heights(at, g, shape, source);
+    if !matches!(shape, OpShape::Rough3d) {
+        return (top, bottom);
+    }
+    let (mut lo, mut hi) = (Vec2::new(f64::INFINITY, f64::INFINITY), Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY));
+    for q in g.regions.iter().flat_map(|r| r.outer.polyline(TOLERANCE)) {
+        (lo, hi) = (Vec2::new(lo.x.min(q.x), lo.y.min(q.y)), Vec2::new(hi.x.max(q.x), hi.y.max(q.y)));
+    }
+    let floor = at.part.map_or(0.0, |(lo, _)| lo.z) - 1.0;
+    let deepest = part_field(s, at, lo, hi, floor).and_then(|f| f.z.iter().copied().filter(|z| *z > f.floor).reduce(f64::min));
+    (top, deepest.or(bottom))
 }
 
 /// The top and bottom an operation takes from its geometry (see [`build`]); `None` where it has none.
@@ -1561,6 +1582,10 @@ fn auto_heights_of_part(at: &Resolved, g: &Geometry, shape: OpShape, source: &Ca
     let picked = matches!(source, CamGeometry::Faces { .. });
     let on_sketch = matches!(source, CamGeometry::Sketch { .. });
     let stock_top = at.stock.map(|(_, hi)| hi.z);
+    // Roughing in 3D: all the material, from the stock's top down to the model's lowest point.
+    if matches!(shape, OpShape::Rough3d) {
+        return (Some(stock_top.unwrap_or(g.z)), at.part.map(|(lo, _)| lo.z));
+    }
     // Picked round walls: from their top down to their foot (a flat face picked with them can lower it).
     if let Some((lo, hi)) = g.walls.filter(|_| !matches!(shape, OpShape::Face)) {
         return (Some(hi.max(g.z)), Some(lo.min(g.z)));
@@ -1591,7 +1616,7 @@ fn op_cut(s: &Session, at: &Resolved, op: &CamOperation, g: &Geometry) -> Result
     let fail = |why: String| EngineError::Other(format!("operation `{}`: {why}", op.name));
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
     let stock_top = at.stock.map(|(_, hi)| hi.z);
-    let (auto_top, auto_bottom) = auto_heights(at, g, OpShape::of(&op.kind), &op.geometry);
+    let (auto_top, auto_bottom) = heights_found(s, at, g, OpShape::of(&op.kind), &op.geometry);
     let height = |what: &str, given: &Option<Expr>, auto: Option<f64>| match given {
         Some(e) => len(what, e),
         None => auto.ok_or_else(|| fail(format!("`{what}` is required"))),
@@ -1753,7 +1778,18 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             cam::pocket(regions, tool, &params, &cut)
         }
-        CamOperationKind::Adaptive { stepover_percent, climb, stock_to_leave, finish, helix_angle, helix_max, helix_min, rest_from, feed_up } => {
+        CamOperationKind::Adaptive {
+            stepover_percent,
+            climb,
+            stock_to_leave,
+            finish,
+            helix_angle,
+            helix_max,
+            helix_min,
+            rest_from,
+            feed_up,
+            model,
+        } => {
             let rest_diameter = match rest_from {
                 Some(n) => {
                     Some(s.doc.manufacture.tool(*n).map(|t| t.diameter).ok_or_else(|| fail(format!("there is no tool {n} to machine the rest of")))?)
@@ -1772,7 +1808,16 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 feed_up: feed_up.unwrap_or(100.0) / 100.0,
                 rest_diameter,
             };
-            cam::adaptive(regions, tool, &params, &cut)
+            if *model {
+                let stock = at.stock.ok_or_else(|| fail("there is no body to take the stock from".into()))?;
+                let part = part_triangles(s, at);
+                if part.is_empty() {
+                    return Err(fail("there is no model to rough down to".into()));
+                }
+                cam::adaptive_3d(regions, &part, stock, tool, &params, &cut)
+            } else {
+                cam::adaptive(regions, tool, &params, &cut)
+            }
         }
         CamOperationKind::Chamfer { side, climb, width, tip_offset, ramp_angle } => {
             let params = ChamferParams {
@@ -1909,12 +1954,13 @@ fn stats_json(path: &Toolpath) -> Value {
     json!({"cut_length": st.cut_length, "rapid_length": st.rapid_length, "cut_minutes": st.cut_minutes, "lowest_z": st.lowest_z, "moves": path.moves.len()})
 }
 
-/// Where an operation cuts, as `cmd` names it: a sketch, picked faces, or (facing) a boundary.
+/// Where an operation cuts, as `cmd` names it: a sketch, picked faces, or (facing and 3D
+/// roughing) a boundary.
 fn geometry_param(s: &Session, p: &Value, cmd: &str) -> Result<CamGeometry> {
     Ok(match (p.get("faces"), p.get("sketch")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
-        (None, None) if cmd == "cam.op.face" => boundary_param(p, cmd)?,
+        (None, None) if matches!(cmd, "cam.op.face" | "cam.op.adaptive3d") => boundary_param(p, cmd)?,
         _ => CamGeometry::Sketch {
             sketch: super::features::sketch_id(s, p.get("sketch"), cmd, "sketch")?,
             profiles: super::features::profiles(p, cmd)?,
@@ -1931,6 +1977,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
         "cam.op.contour" => OpShape::Contour,
         "cam.op.chamfer" | "cam.op.vcarve" => OpShape::Chamfer,
         "cam.op.pocket" | "cam.op.adaptive" => OpShape::Pocket,
+        "cam.op.adaptive3d" => OpShape::Rough3d,
         "cam.op.drill" | "cam.op.bore" => OpShape::Drill,
         _ => return Err(bad(cmd, "not an operation")),
     };
@@ -1938,7 +1985,7 @@ pub fn cam_heights(s: &Session, cmd: &str, p: &Value) -> Result<(Option<f64>, Op
     let at = resolve(s, setup).map_err(|e| bad(cmd, format!("setup `{}`: {e}", setup.name)))?;
     let source = geometry_param(s, p, cmd)?;
     let g = geometry(s, &at, &source).map_err(|e| bad(cmd, e))?;
-    Ok(auto_heights(&at, &g, shape, &source))
+    Ok(heights_found(s, &at, &g, shape, &source))
 }
 
 /// What an operation command would cut, with nothing in the design changed: `cmd` (a
@@ -2303,7 +2350,23 @@ fn number_in(p: &Value, k: &str, lo: f64, hi: f64, default: f64, cmd: &str) -> R
 }
 
 fn op_adaptive(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "cam.op.adaptive";
+    let kind = adaptive_kind(s, p, "cam.op.adaptive", false)?;
+    add_op(s, p, "cam.op.adaptive", "Adaptive", |_| kind)
+}
+
+fn op_adaptive3d(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.op.adaptive3d";
+    for k in ["finish", "rest_from"] {
+        if p.get(k).is_some_and(|v| !v.is_null()) {
+            return Err(bad(cmd, format!("`{k}` is not offered in 3D roughing yet")));
+        }
+    }
+    let kind = adaptive_kind(s, p, cmd, true)?;
+    add_op(s, p, cmd, "Adaptive3D", |_| kind)
+}
+
+/// An adaptive operation's kind from `p`; `model`: roughing down to the model in 3D.
+fn adaptive_kind(s: &Session, p: &Value, cmd: &str, model: bool) -> Result<CamOperationKind> {
     let helix_angle = match expr(p, "helix_angle") {
         Some(e) => {
             s.doc.eval(&e, Kind::Angle).map_err(|err| bad(cmd, format!("helix_angle: {err}")))?;
@@ -2315,7 +2378,7 @@ fn op_adaptive(s: &mut Session, p: &Value) -> Result<Value> {
     if helix_min > helix_max {
         return Err(bad(cmd, "`helix_min` must be no larger than `helix_max`"));
     }
-    let kind = CamOperationKind::Adaptive {
+    Ok(CamOperationKind::Adaptive {
         stepover_percent: number_in(p, "stepover_percent", 2.0, 50.0, 20.0, cmd)?,
         climb: bool_(p, "climb").unwrap_or(true),
         stock_to_leave: stock_to_leave(p),
@@ -2325,8 +2388,8 @@ fn op_adaptive(s: &mut Session, p: &Value) -> Result<Value> {
         helix_min,
         rest_from: rest_param(s, p, cmd)?,
         feed_up: feed_up_param(p, cmd)?,
-    };
-    add_op(s, p, cmd, "Adaptive", |_| kind)
+        model,
+    })
 }
 
 /// How much faster light adaptive steps may go: percent of the feed, none when 100 or left out.
@@ -2503,7 +2566,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         }
         (None, None) => {
             if p.get("boundary").is_some() {
-                if !matches!(op.kind, CamOperationKind::Face { .. }) {
+                if !matches!(op.kind, CamOperationKind::Face { .. } | CamOperationKind::Adaptive { model: true, .. }) {
                     return Err(bad(cmd, format!("a {} operation has no `boundary`", op.kind.label())));
                 }
                 op.geometry = boundary_param(p, cmd)?;
@@ -2716,7 +2779,7 @@ fn list_now(s: &Session) -> Value {
                             }
                             // A contour through the whole stock with nothing holding the part: it comes loose on the last pass.
                             let through = matches!((path.stats().lowest_z, stock_bottom), (Some(z), Some(bottom)) if z <= bottom + 1e-6);
-                            if through && matches!(op.kind, CamOperationKind::Contour { tabs: None, .. }) {
+                            if through && matches!(op.kind, CamOperationKind::Contour { tabs: None, .. } | CamOperationKind::Adaptive { model: true, .. }) {
                                 warnings.push(THROUGH_WITHOUT_TABS.to_string());
                             }
                             if let Some(tool) = m.tool(op.tool) {

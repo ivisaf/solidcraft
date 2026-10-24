@@ -365,6 +365,16 @@ impl Builder {
         Ok(())
     }
 
+    /// How many moves so far.
+    pub(crate) fn len(&self) -> usize {
+        self.moves.len()
+    }
+
+    /// The moves from the `k`-th on.
+    pub(crate) fn moves_from(&self, k: usize) -> &[Move] {
+        self.moves.get(k..).unwrap_or(&[])
+    }
+
     fn at(&self, p: Vec2) -> bool {
         self.pos.is_some_and(|q| Vec2::new(q.x, q.y).dist(p) <= 1e-9)
     }

@@ -70,6 +70,8 @@ pub enum OpKind {
     Contour,
     Pocket,
     Adaptive,
+    /// Adaptive roughing down to the model in 3D.
+    Adaptive3d,
     Chamfer,
     VCarve,
     Bore,
@@ -84,6 +86,7 @@ impl OpKind {
             OpKind::Contour => "cam.op.contour",
             OpKind::Pocket => "cam.op.pocket",
             OpKind::Adaptive => "cam.op.adaptive",
+            OpKind::Adaptive3d => "cam.op.adaptive3d",
             OpKind::Chamfer => "cam.op.chamfer",
             OpKind::VCarve => "cam.op.vcarve",
             OpKind::Thread => "cam.op.thread",
@@ -97,6 +100,7 @@ impl OpKind {
             OpKind::Contour => "2D CONTOUR",
             OpKind::Pocket => "2D POCKET",
             OpKind::Adaptive => "ADAPTIVE",
+            OpKind::Adaptive3d => "3D ADAPTIVE",
             OpKind::Chamfer => "CHAMFER",
             OpKind::VCarve => "V-CARVE",
             OpKind::Thread => "THREAD",
@@ -724,15 +728,19 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     };
     let first_tool = lists.tools.first().map(|t| t.0.clone()).unwrap_or_default();
     let op = |kind: OpKind| {
-        let sketch = app
-            .session
-            .doc
-            .features
-            .iter()
-            .rev()
-            .find(|f| matches!(f.kind, solidcraft_engine::doc::FeatureKind::Sketch { .. }))
-            .map(|f| f.name.clone())
-            .unwrap_or_default();
+        // The newest sketch, except for 3D roughing, which roughs the whole stock unless told otherwise.
+        let sketch = if kind == OpKind::Adaptive3d {
+            String::new()
+        } else {
+            app.session
+                .doc
+                .features
+                .iter()
+                .rev()
+                .find(|f| matches!(f.kind, solidcraft_engine::doc::FeatureKind::Sketch { .. }))
+                .map(|f| f.name.clone())
+                .unwrap_or_default()
+        };
         let faces = selected_faces(app);
         let has_bodies = !app.session.world_state().bodies.is_empty();
         Form::Op(Box::new(OpForm {
@@ -846,6 +854,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
         "cam.op.contour" => Some(op(OpKind::Contour)),
         "cam.op.pocket" => Some(op(OpKind::Pocket)),
         "cam.op.adaptive" => Some(op(OpKind::Adaptive)),
+        "cam.op.adaptive3d" => Some(op(OpKind::Adaptive3d)),
         "cam.op.chamfer" => Some(op(OpKind::Chamfer)),
         "cam.op.vcarve" => Some(op(OpKind::VCarve)),
         "cam.op.thread" => Some(op(OpKind::Thread)),
@@ -1061,12 +1070,22 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     if f.kind == OpKind::Drill && f.peck.trim().is_empty() {
                         p.insert("peck".into(), Value::Null);
                     }
-                    let on_sketch = f.kind != OpKind::Face || f.boundary == 2;
-                    let was_on_sketch = f.kind != OpKind::Face || e.boundary == 2;
+                    // Facing chooses its boundary; 3D roughing without a sketch roughs the stock.
+                    let on_sketch = match f.kind {
+                        OpKind::Face => f.boundary == 2,
+                        OpKind::Adaptive3d => !f.sketch.trim().is_empty(),
+                        _ => true,
+                    };
+                    let was_on_sketch = match f.kind {
+                        OpKind::Face => e.boundary == 2,
+                        OpKind::Adaptive3d => !e.sketch.is_empty(),
+                        _ => true,
+                    };
                     if f.faces.is_empty() && on_sketch && (f.sketch.trim() != e.sketch || !e.faces.is_empty() || !was_on_sketch) {
                         p.insert("sketch".into(), json!(f.sketch.trim()));
-                    } else if f.faces.is_empty() && !on_sketch && (f.boundary != e.boundary || !e.faces.is_empty()) {
-                        p.insert("boundary".into(), json!(FACE_BOUNDS.get(f.boundary).copied().unwrap_or("stock")));
+                    } else if f.faces.is_empty() && !on_sketch && (f.boundary != e.boundary || !e.faces.is_empty() || was_on_sketch) {
+                        let boundary = if f.kind == OpKind::Face { FACE_BOUNDS.get(f.boundary).copied() } else { None };
+                        p.insert("boundary".into(), json!(boundary.unwrap_or("stock")));
                     }
                     p.insert("op".into(), json!(e.op));
                     p.insert("setup".into(), json!(e.setup));
@@ -1102,7 +1121,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
                     optional(&mut p, "ramp_angle", &f.ramp_angle);
                 }
-                OpKind::Adaptive => {
+                OpKind::Adaptive | OpKind::Adaptive3d => {
                     for (k, what, text) in [
                         ("stepover_percent", "The stepover", &f.stepover_percent),
                         ("helix_max", "The largest helix", &f.helix_max),
@@ -1121,14 +1140,15 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     }
                     optional(&mut p, "helix_angle", &f.helix_angle);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
-                    match f.rest_from.trim().parse::<u64>() {
-                        Ok(n) => {
+                    // 3D roughing has no rest machining (yet).
+                    match f.rest_from.trim().parse::<u64>().ok().filter(|_| f.kind == OpKind::Adaptive) {
+                        Some(n) => {
                             p.insert("rest_from".into(), json!(n));
                         }
-                        Err(_) if f.editing.is_some() => {
+                        None if f.editing.is_some() && f.kind == OpKind::Adaptive => {
                             p.insert("rest_from".into(), Value::Null);
                         }
-                        Err(_) => {}
+                        None => {}
                     }
                 }
                 OpKind::Thread => {
@@ -1246,7 +1266,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             }
             if matches!(
                 f.kind,
-                OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve | OpKind::Thread
+                OpKind::Contour
+                    | OpKind::Pocket
+                    | OpKind::Bore
+                    | OpKind::Chamfer
+                    | OpKind::Adaptive
+                    | OpKind::Adaptive3d
+                    | OpKind::VCarve
+                    | OpKind::Thread
             ) {
                 p.insert("climb".into(), json!(f.climb));
             }
@@ -1381,6 +1408,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         "contour" => OpKind::Contour,
         "pocket" => OpKind::Pocket,
         "adaptive" => OpKind::Adaptive,
+        "adaptive_3d" => OpKind::Adaptive3d,
         "chamfer" => OpKind::Chamfer,
         "vcarve" => OpKind::VCarve,
         "thread" => OpKind::Thread,
@@ -1607,6 +1635,8 @@ fn heights_query(f: &OpForm) -> Option<Value> {
         p.insert("faces".into(), json!(faces));
     } else if f.kind == OpKind::Face && f.boundary < 2 {
         p.insert("boundary".into(), json!(FACE_BOUNDS.get(f.boundary).copied().unwrap_or("stock")));
+    } else if f.kind == OpKind::Adaptive3d && f.sketch.trim().is_empty() {
+        p.insert("boundary".into(), json!("stock"));
     } else if f.sketch.trim().is_empty() {
         return None;
     } else {
@@ -3160,7 +3190,12 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                         &["the raw block", "the part's outline", "a sketch's outline"],
                     );
                 }
-                if f.kind != OpKind::Face || f.boundary == 2 {
+                if f.kind == OpKind::Adaptive3d {
+                    // Without a sketch, the whole stock; with one, only inside its profiles.
+                    let mut options: Vec<(String, String)> = vec![(String::new(), tm("none: the whole stock").into())];
+                    options.extend(choices.sketches.iter().cloned());
+                    pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &options);
+                } else if f.kind != OpKind::Face || f.boundary == 2 {
                     pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
                 }
             } else {
@@ -3306,6 +3341,14 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     explained(r, "Dogbones", None);
                     ui.end_row();
                 }
+                OpKind::Adaptive3d => {
+                    field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");
+                    field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm, sides and floors");
+                    field(ui, need, "Helix angle", &mut f.helix_angle, "5 deg");
+                    field(ui, need, "Helix largest (%)", &mut f.helix_max, "100");
+                    field(ui, need, "Helix smallest (%)", &mut f.helix_min, "10");
+                    field(ui, need, "Light-cut feed (%)", &mut f.feed_up, "100: the feed");
+                }
                 OpKind::Adaptive => {
                     field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
@@ -3354,7 +3397,14 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             }
             if matches!(
                 f.kind,
-                OpKind::Contour | OpKind::Pocket | OpKind::Bore | OpKind::Chamfer | OpKind::Adaptive | OpKind::VCarve | OpKind::Thread
+                OpKind::Contour
+                    | OpKind::Pocket
+                    | OpKind::Bore
+                    | OpKind::Chamfer
+                    | OpKind::Adaptive
+                    | OpKind::Adaptive3d
+                    | OpKind::VCarve
+                    | OpKind::Thread
             ) {
                 row_label(ui, "Direction", None);
                 crate::ui_kit::checkbox(ui, tm("Climb"), &mut f.climb);
@@ -3398,7 +3448,8 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
             }
         }
         Form::Op(f) => {
-            if f.faces.is_empty() && (f.kind != OpKind::Face || f.boundary == 2) && empty(&f.sketch) {
+            // Facing chooses a box instead, and 3D roughing roughs the whole stock without one.
+            if f.faces.is_empty() && (f.kind != OpKind::Face || f.boundary == 2) && f.kind != OpKind::Adaptive3d && empty(&f.sketch) {
                 if lists.sketches.is_empty() {
                     want("Sketch", "a sketch of what to cut: draw one first");
                 } else {
@@ -3782,11 +3833,12 @@ fn kind_name(group: &str, kind: &str) -> String {
 }
 
 /// The operations the toolbar offers, by their command.
-const OPERATIONS: [&str; 9] = [
+const OPERATIONS: [&str; 10] = [
     "cam.op.face",
     "cam.op.contour",
     "cam.op.pocket",
     "cam.op.adaptive",
+    "cam.op.adaptive3d",
     "cam.op.chamfer",
     "cam.op.vcarve",
     "cam.op.bore",
@@ -4509,7 +4561,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 "bore" => "cam_drill".to_string(),
                 "chamfer" | "vcarve" => "cam_contour".to_string(),
                 "thread" => "cam_drill".to_string(),
-                "adaptive" => "cam_pocket".to_string(),
+                "adaptive" | "adaptive_3d" => "cam_pocket".to_string(),
                 kind => format!("cam_{kind}"),
             };
             let r = draw_row(

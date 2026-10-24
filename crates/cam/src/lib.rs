@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod adaptive;
+mod adaptive3d;
 mod check;
 mod gcode;
 mod offset;
@@ -25,6 +26,7 @@ mod sim;
 mod tool;
 
 pub use adaptive::{AdaptiveParams, adaptive};
+pub use adaptive3d::adaptive_3d;
 pub use check::verify;
 pub use gcode::{Operation, Program, Safety, emit, parse};
 pub use offset::offset_regions;
@@ -34,7 +36,7 @@ pub use ops::{
 };
 pub use path::{Move, PathStats, Toolpath, arc_sweep};
 pub use post::{CommentStyle, LineNumbers, Post, Units};
-pub use sim::{Comparison, CutReport, DEFAULT_RAPID_RATE, HeightField, MAX_CELLS, Playback, Step, compare, deviations, gouge, simulate};
+pub use sim::{Comparison, CutReport, DEFAULT_RAPID_RATE, HeightField, MAX_CELLS, Playback, Step, compare, deviations, gouge, simulate, tool_floor};
 pub use tool::{CuttingData, MAX_MATERIAL_NAME, MAX_MATERIALS, Tool, ToolKind, material_name, same_material};
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

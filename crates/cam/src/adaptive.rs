@@ -39,7 +39,7 @@ const ROUND: usize = 144;
 /// Points across the tool's leading edge the width of its cut is measured at.
 const ACROSS: usize = 96;
 /// How high over the floor links inside the cleared area run (mm).
-const LINK_LIFT: f64 = 0.5;
+pub(crate) const LINK_LIFT: f64 = 0.5;
 
 /// How an adaptive pocket is cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ const FEED_STEP: f64 = 0.05;
 
 /// How a depth pass enters the material at the start of the plan.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Entry {
+pub(crate) enum Entry {
     /// A helix round `c`, `r` from it.
     Helix { c: Vec2, r: f64 },
     /// Back and forth from `a` to `b`.
@@ -87,44 +87,45 @@ enum Entry {
 /// One cut of the plan, and how the tool gets to its start from where the last one ended:
 /// along `link` just above the floor, or (empty) over the retract height.
 #[derive(Clone, Debug, PartialEq)]
-struct Run {
+pub(crate) struct Run {
     /// The way through the cleared area to the cut's start (empty: the start is where the tool is).
-    link: Vec<Vec2>,
-    points: Vec<Vec2>,
+    pub(crate) link: Vec<Vec2>,
+    pub(crate) points: Vec<Vec2>,
     /// Each step's feed, as a factor of the cutting feed (the first point's is not used).
-    feeds: Vec<f64>,
+    pub(crate) feeds: Vec<f64>,
     /// An entry of its own (a part of the pocket the cleared area does not reach).
-    entry: Option<Entry>,
+    pub(crate) entry: Option<Entry>,
     /// The first cut without an entry (after a larger tool): the tool comes down to it.
-    down: bool,
+    pub(crate) down: bool,
 }
 
 /// The pocket on a grid, and what is cleared of it.
-struct Grid {
-    lo: Vec2,
-    cell: f64,
-    nx: usize,
-    ny: usize,
+pub(crate) struct Grid {
+    pub(crate) lo: Vec2,
+    pub(crate) cell: f64,
+    pub(crate) nx: usize,
+    pub(crate) ny: usize,
     /// Where the tool's axis may be, how far from the walls it has room to move, what is to
     /// be cut, and what has been.
-    allowed: Vec<bool>,
-    room: Vec<f64>,
-    material: Vec<bool>,
-    cleared: Vec<bool>,
+    pub(crate) allowed: Vec<bool>,
+    pub(crate) room: Vec<f64>,
+    pub(crate) material: Vec<bool>,
+    pub(crate) cleared: Vec<bool>,
     /// The tool's radius.
-    r: f64,
+    pub(crate) r: f64,
     /// The pocket, and how far from its boundary the tool's axis stays: positions near the
-    /// walls are checked against it exactly.
-    shape: Shape,
-    reach: f64,
+    /// walls are checked against it exactly. Without it (the walls of a part in 3D, known on
+    /// the grid only), `allowed` alone says where the axis may go.
+    pub(crate) shape: Option<Shape>,
+    pub(crate) reach: f64,
 }
 
 impl Grid {
-    fn centre(&self, i: usize, j: usize) -> Vec2 {
+    pub(crate) fn centre(&self, i: usize, j: usize) -> Vec2 {
         self.lo + Vec2::new((i as f64 + 0.5) * self.cell, (j as f64 + 0.5) * self.cell)
     }
 
-    fn index(&self, p: Vec2) -> Option<usize> {
+    pub(crate) fn index(&self, p: Vec2) -> Option<usize> {
         let (fi, fj) = ((p.x - self.lo.x) / self.cell, (p.y - self.lo.y) / self.cell);
         if !(fi >= 0.0 && fj >= 0.0) {
             return None;
@@ -134,6 +135,9 @@ impl Grid {
     }
 
     fn allowed_at(&self, p: Vec2) -> bool {
+        let Some(shape) = &self.shape else {
+            return self.index(p).and_then(|k| self.allowed.get(k).copied()).unwrap_or(false);
+        };
         let Some(room) = self.index(p).and_then(|k| self.room.get(k).copied()) else { return false };
         let inside = self.index(p).and_then(|k| self.allowed.get(k).copied()).unwrap_or(false) || room > f64::MIN;
         // A cell's centre says it for the whole cell only well away from the walls.
@@ -143,11 +147,11 @@ impl Grid {
         if room < -self.cell || !inside {
             return false;
         }
-        self.shape.clear(p, self.reach)
+        shape.clear(p, self.reach)
     }
 
     /// The cells within `r` of `p`.
-    fn disc(&self, p: Vec2, r: f64) -> impl Iterator<Item = usize> + '_ {
+    pub(crate) fn disc(&self, p: Vec2, r: f64) -> impl Iterator<Item = usize> + '_ {
         let cell = self.cell;
         let span = |c: f64, lo: f64, n: usize| {
             let a = ((c - r - lo) / cell).floor().max(0.0) as usize;
@@ -247,10 +251,16 @@ impl Grid {
 
 /// Clears `regions` (holes are islands) with `tool` at a steady engagement.
 pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: &Cut) -> Result<Toolpath> {
+    check(tool, params, cut)?;
+    let shape = Shape::from_regions(regions, params.tolerance)?;
+    adaptive_in(&shape, tool, params, cut)
+}
+
+/// Whether `p` can clear with `tool` within `cut`.
+pub(crate) fn check(tool: &Tool, p: &AdaptiveParams, cut: &Cut) -> Result<()> {
     tool.validate()?;
     cut.heights.validate()?;
     cut.feeds.validate()?;
-    let p = params;
     if !(0.02..=0.5).contains(&p.stepover) {
         return invalid("the adaptive stepover must be 2% to 50% of the tool's diameter");
     }
@@ -273,9 +283,13 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
     {
         return invalid("rest machining follows a larger tool: its diameter must be above this tool's");
     }
-    let shape = Shape::from_regions(regions, p.tolerance)?;
+    Ok(())
+}
+
+/// [`adaptive`] of a checked `shape`.
+fn adaptive_in(shape: &Shape, tool: &Tool, p: &AdaptiveParams, cut: &Cut) -> Result<Toolpath> {
     let (r, wall) = (tool.radius(), p.stock_to_leave + p.finish);
-    let mut grid = grid(&shape, r, wall)?;
+    let mut grid = grid(shape, r, wall)?;
     // After a larger tool: what it reached (as far from the walls) is cut already.
     if let Some(big) = p.rest_diameter {
         let big_r = big * 0.5;
@@ -319,44 +333,61 @@ pub fn adaptive(regions: &[Region2], tool: &Tool, params: &AdaptiveParams, cut: 
     let mut b = Builder::new(cut);
     let mut cleared = cut.heights.top;
     for z in cut.levels()? {
-        if let Some(entry) = entry {
-            enter(&mut b, entry, cleared, z, cut, p)?;
-        }
-        for run in &runs {
-            match (&run.entry, run.down) {
-                (Some(e), _) => {
-                    b.retract()?;
-                    enter(&mut b, *e, cleared, z, cut, p)?;
-                }
-                (None, false) => {
-                    // Up a little, along the cleared floor, and down again.
-                    let lift = (z + LINK_LIFT).min(cut.heights.retract);
-                    if let Some(q) = b.pos {
-                        b.push(Move::Feed { to: Vec3::new(q.x, q.y, lift), feed: cut.feeds.cut })?;
-                    }
-                    for &l in &run.link {
-                        b.push(Move::Feed { to: l.extend(lift), feed: cut.feeds.cut })?;
-                    }
-                    if let Some(first) = run.points.first() {
-                        b.push(Move::Feed { to: first.extend(lift), feed: cut.feeds.cut })?;
-                        b.push(Move::Feed { to: first.extend(z), feed: cut.feeds.plunge })?;
-                    }
-                }
-                (None, true) => {
-                    if let Some(first) = run.points.first() {
-                        b.retract()?;
-                        b.travel_to(*first)?;
-                        b.plunge_to(z)?;
-                    }
-                }
-            }
-            cut_run(&mut b, &grid, &run.points, &run.feeds, z, cut.feeds.cut)?;
-        }
+        pass(&mut b, &grid, entry, &runs, z, &|_| cleared, cut, p)?;
         lap(&mut b, &walls, z)?;
         cleared = z;
     }
     lap(&mut b, &finish, cut.heights.bottom)?;
     b.finish()
+}
+
+/// A depth pass at `z`: its entry and its cuts, each reached along its link through the cleared
+/// area or entering on its own; an entry starts `from` the height it gives for it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pass(
+    b: &mut Builder,
+    grid: &Grid,
+    entry: Option<Entry>,
+    runs: &[Run],
+    z: f64,
+    from: &dyn Fn(Entry) -> f64,
+    cut: &Cut,
+    p: &AdaptiveParams,
+) -> Result<()> {
+    if let Some(entry) = entry {
+        enter(b, entry, from(entry), z, cut, p)?;
+    }
+    for run in runs {
+        match (&run.entry, run.down) {
+            (Some(e), _) => {
+                b.retract()?;
+                enter(b, *e, from(*e), z, cut, p)?;
+            }
+            (None, false) => {
+                // Up a little, along the cleared floor, and down again.
+                let lift = (z + LINK_LIFT).min(cut.heights.retract);
+                if let Some(q) = b.pos {
+                    b.push(Move::Feed { to: Vec3::new(q.x, q.y, lift), feed: cut.feeds.cut })?;
+                }
+                for &l in &run.link {
+                    b.push(Move::Feed { to: l.extend(lift), feed: cut.feeds.cut })?;
+                }
+                if let Some(first) = run.points.first() {
+                    b.push(Move::Feed { to: first.extend(lift), feed: cut.feeds.cut })?;
+                    b.push(Move::Feed { to: first.extend(z), feed: cut.feeds.plunge })?;
+                }
+            }
+            (None, true) => {
+                if let Some(first) = run.points.first() {
+                    b.retract()?;
+                    b.travel_to(*first)?;
+                    b.plunge_to(z)?;
+                }
+            }
+        }
+        cut_run(b, grid, &run.points, &run.feeds, z, cut.feeds.cut)?;
+    }
+    Ok(())
 }
 
 /// The pocket's grid: where the tool's axis may go (`r` and `wall` off the boundary), and the
@@ -382,7 +413,7 @@ fn grid(shape: &Shape, r: f64, wall: f64) -> Result<Grid> {
         material: vec![false; nx * ny],
         cleared: vec![false; nx * ny],
         r,
-        shape: shape.clone(),
+        shape: Some(shape.clone()),
         reach: r + wall,
     };
     for j in 0..ny {
@@ -426,7 +457,7 @@ fn lap(b: &mut Builder, loops: &[Vec<Piece>], z: f64) -> Result<()> {
 }
 
 /// Gets the tool down from `from` (already cut to) to `z` at the entry.
-fn enter(b: &mut Builder, entry: Entry, from: f64, z: f64, cut: &Cut, p: &AdaptiveParams) -> Result<()> {
+pub(crate) fn enter(b: &mut Builder, entry: Entry, from: f64, z: f64, cut: &Cut, p: &AdaptiveParams) -> Result<()> {
     let slope = p.helix_angle.tan();
     match entry {
         Entry::Helix { c, r } => {
@@ -472,7 +503,14 @@ fn enter(b: &mut Builder, entry: Entry, from: f64, z: f64, cut: &Cut, p: &Adapti
 }
 
 /// The plan of a depth pass: where it enters, then the cuts, each with its link.
-fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Result<(Option<Entry>, Vec<Run>)> {
+pub(crate) fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Result<(Option<Entry>, Vec<Run>)> {
+    // Material smaller than this is left to the lap along the walls.
+    let crumbs = p.stepover * tool.diameter * g.cell * 2.0;
+    plan_to(g, reachable, tool, p, crumbs)
+}
+
+/// [`plan`], cutting until no more than `crumbs` (mm²) of the material in reach is left.
+pub(crate) fn plan_to(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams, crumbs: f64) -> Result<(Option<Entry>, Vec<Run>)> {
     let ae = p.stepover * tool.diameter;
     // The engagement angle of a straight cut `ae` wide.
     let phi = (1.0 - 2.0 * p.stepover).clamp(-1.0, 1.0).acos();
@@ -501,8 +539,6 @@ fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Re
     // Starts from which nothing could be cut: not tried again.
     let mut dead = vec![false; g.allowed.len()];
     let mut tries = 0usize;
-    // Material smaller than this is left to the lap along the walls.
-    let crumbs = ae * g.cell * 2.0;
     while runs.len() < MAX_CUTS && tries < MAX_CUTS * 4 && g.left(reachable) > crumbs {
         tries += 1;
         let (start, link, entry) = match next_start(g, at, phi, &dead) {
@@ -532,7 +568,7 @@ fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Re
 }
 
 /// Where the tool is after entering.
-fn entry_end(e: Entry) -> Vec2 {
+pub(crate) fn entry_end(e: Entry) -> Vec2 {
     match e {
         Entry::Helix { c, r } => c + Vec2::new(r, 0.0),
         Entry::Ramp { a, .. } => a,
@@ -701,8 +737,11 @@ fn feed_factor(w: f64, ae: f64, d: f64, most: f64) -> f64 {
 /// Cuts through `points` at `z` from the first (where the tool is), each step at its feed
 /// factor of `feed`; runs of points alike in feed that lie on a circle go as one arc, where the
 /// arc keeps clear of the walls as the steps do.
-fn cut_run(b: &mut Builder, g: &Grid, points: &[Vec2], feeds: &[f64], z: f64, feed: f64) -> Result<()> {
-    let clear = |q: Vec2| g.shape.clear(q, g.reach);
+pub(crate) fn cut_run(b: &mut Builder, g: &Grid, points: &[Vec2], feeds: &[f64], z: f64, feed: f64) -> Result<()> {
+    let clear = |q: Vec2| match &g.shape {
+        Some(shape) => shape.clear(q, g.reach),
+        None => g.allowed_at(q),
+    };
     let mut i = 0;
     while i + 1 < points.len() {
         let f = feeds.get(i + 1).copied().unwrap_or(1.0);
