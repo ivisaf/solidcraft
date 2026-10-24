@@ -241,21 +241,24 @@ pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
     deepest
 }
 
-/// The lowest the tip of a tool `kind` (flat or ball end mill), `radius` wide, may go over each
-/// column of the `part` and stay `allowance` clear of it: the part's top seen through the tool's
-/// shape, the tool grown by the allowance all round. Columns without part get the part's floor.
-pub fn tool_floor(part: &HeightField, kind: ToolKind, radius: f64, allowance: f64) -> Result<HeightField> {
+/// The lowest the tip of `tool` (a flat, ball or bull-nose end mill) may go over each column of
+/// the `part` and stay `allowance` clear of it: the part's top seen through the tool's shape,
+/// the tool grown by the allowance all round (its corner too). Columns without part get the
+/// part's floor.
+pub fn tool_floor(part: &HeightField, tool: &Tool, allowance: f64) -> Result<HeightField> {
+    let radius = tool.radius();
     if !(radius > 0.0 && radius.is_finite()) || !(allowance >= 0.0 && allowance.is_finite()) {
         return invalid("the tool's radius must be above 0 and the allowance 0 or more");
     }
-    let r = radius + allowance;
+    let (kind, r) = (tool.kind, radius + allowance);
+    let corner = tool.corner() + allowance;
     // How far above its tip the grown tool's surface is at `d` from its axis.
     let rise = |d: f64| match kind {
-        ToolKind::BallEndmill => r - (r * r - d * d).max(0.0).sqrt(),
+        ToolKind::BallEndmill | ToolKind::BullNose => rounded(r, corner, d),
         _ => 0.0,
     };
-    if !matches!(kind, ToolKind::FlatEndmill | ToolKind::BallEndmill) {
-        return Err(CamError::Unsupported("following a part in 3D takes a flat or a ball end mill".into()));
+    if !matches!(kind, ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose) {
+        return Err(CamError::Unsupported("following a part in 3D takes a flat, ball or bull-nose end mill".into()));
     }
     if kind == ToolKind::FlatEndmill {
         let mut out = part.dilated(r)?;
@@ -308,12 +311,19 @@ pub struct CutReport {
     pub max_engagement: f64,
 }
 
+/// How far above its tip a rounded end `corner` round, on a tool `r` in radius, is at distance
+/// `d` from its axis: flat out to `r - corner`, then round (a ball: `corner` = `r`).
+fn rounded(r: f64, corner: f64, d: f64) -> f64 {
+    let flat = r - corner;
+    if d <= flat { 0.0 } else { corner - (corner * corner - (d - flat).powi(2)).max(0.0).sqrt() }
+}
+
 /// How far above its tip the tool's surface is at distance `d` from its axis.
 fn profile(tool: &Tool, d: f64) -> f64 {
     let r = tool.radius();
     match tool.kind {
         ToolKind::FlatEndmill => 0.0,
-        ToolKind::BallEndmill => r - (r * r - d * d).max(0.0).sqrt(),
+        ToolKind::BallEndmill | ToolKind::BullNose => rounded(r, tool.corner(), d),
         ToolKind::Drill => d / (tool.point_angle() * 0.5).to_radians().tan(),
         ToolKind::VBit => (d - tool.tip() * 0.5).max(0.0) / (tool.point_angle() * 0.5).to_radians().tan(),
     }

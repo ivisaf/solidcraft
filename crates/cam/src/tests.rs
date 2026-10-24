@@ -1395,6 +1395,17 @@ fn simulation_knows_tool_shapes_and_rapids_through_material() {
     close(volume(ToolKind::BallEndmill), cylinder - PI * 27.0 / 3.0, cylinder * 0.01);
     let point = 3.0 / 59.0f64.to_radians().tan();
     close(volume(ToolKind::Drill), cylinder - PI * 9.0 * point * 2.0 / 3.0, cylinder * 0.01);
+    // A bull nose 1 mm round at its rim: a cylinder less the gap round its corner (its profile
+    // turned round the axis, summed in rings).
+    let mut stock = block();
+    let bull = Tool { corner_radius: Some(1.0), ..Tool::new(1, ToolKind::BullNose, 6.0, 20.0) };
+    let cut_bull = simulate(&mut stock, &down(-8.0), &bull).unwrap().removed_volume;
+    let n = 10_000;
+    let gap: f64 = (0..n)
+        .map(|k| 2.0 + (k as f64 + 0.5) / n as f64)
+        .map(|rho| 2.0 * PI * rho * (1.0 - (1.0 - (rho - 2.0).powi(2)).max(0.0).sqrt()) / n as f64)
+        .sum();
+    close(cut_bull, cylinder - gap, cylinder * 0.01);
     // A rapid across the top of the block is fine; one below the top is a collision and cuts nothing.
     let across = |z: f64| Toolpath { moves: vec![Move::Rapid { to: Vec3::new(-20.0, 0.0, z) }, Move::Rapid { to: Vec3::new(20.0, 0.0, z) }] };
     let mut stock = block();
@@ -1743,16 +1754,25 @@ fn a_tool_s_floor_over_a_part_follows_its_shape() {
     part.z[k] = 10.0;
     let at = |f: &HeightField, dx: usize| f.get(i + dx, j).unwrap();
     // A 4 mm ball 0.5 off the spike: as a 5 mm ball, 0.5 lower than its surface allows.
-    let ball = tool_floor(&part, ToolKind::BallEndmill, 2.0, 0.5).unwrap();
+    let ball = tool_floor(&part, &Tool::new(1, ToolKind::BallEndmill, 4.0, 10.0), 0.5).unwrap();
     close(at(&ball, 0), 10.5, 1e-9);
     close(at(&ball, 10), 10.0 - (2.5 - (2.5f64 * 2.5 - 1.0).sqrt()) + 0.5, 1e-9);
     // Beyond the grown ball's reach the part's floor (plus the allowance) is all it meets.
     close(at(&ball, 30), part.floor + 0.5, 1e-9);
     // A flat end mill stands on the spike as long as it covers it.
-    let flat = tool_floor(&part, ToolKind::FlatEndmill, 2.0, 0.0).unwrap();
+    let flat = tool_floor(&part, &Tool::new(1, ToolKind::FlatEndmill, 4.0, 10.0), 0.0).unwrap();
     close(at(&flat, 19), 10.0, 1e-9);
     assert!(at(&flat, 22) < 0.0);
-    assert!(tool_floor(&part, ToolKind::Drill, 2.0, 0.0).is_err());
+    // A bull nose 4 mm across, its corner 1 mm round: flat out to 1 mm, then its round.
+    let bull = Tool { corner_radius: Some(1.0), ..Tool::new(1, ToolKind::BullNose, 4.0, 10.0) };
+    let torus = tool_floor(&part, &bull, 0.0).unwrap();
+    close(at(&torus, 10), 10.0, 1e-9);
+    close(at(&torus, 15), 10.0 - (1.0 - (1.0f64 - 0.25).sqrt()), 1e-9);
+    assert!(tool_floor(&part, &Tool::new(1, ToolKind::Drill, 4.0, 10.0), 0.0).is_err());
+    // A bull nose needs its corner radius, at most half its diameter.
+    for corner in [None, Some(0.0), Some(2.5)] {
+        assert!(Tool { corner_radius: corner, ..Tool::new(1, ToolKind::BullNose, 4.0, 10.0) }.validate().is_err(), "{corner:?}");
+    }
 }
 
 /// The slab and block of the 3D roughing tests: a slab with its floor at -15 and on it a block
@@ -1788,8 +1808,10 @@ fn adaptive_3d_roughs_down_to_the_part_level_by_level() {
     let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
     let area = [rect(0.0, 0.0, 60.0, 40.0)];
     // A ball bites a stepdown and the cusps the level above left (up to half its radius).
-    for (kind, deepest_bite, most_left) in [(ToolKind::FlatEndmill, 4.0, 0.03), (ToolKind::BallEndmill, 4.0 + 1.5, 0.06)] {
-        let t = Tool::new(1, kind, 6.0, 20.0);
+    for (kind, deepest_bite, most_left) in
+        [(ToolKind::FlatEndmill, 4.0, 0.03), (ToolKind::BallEndmill, 4.0 + 1.5, 0.06), (ToolKind::BullNose, 4.0 + 0.5, 0.04)]
+    {
+        let t = Tool { corner_radius: (kind == ToolKind::BullNose).then_some(1.0), ..Tool::new(1, kind, 6.0, 20.0) };
         let started = std::time::Instant::now();
         let path = adaptive_3d(&rough(&part, stock, &area), &t, &params, &cut(0.0, -15.0, 4.0)).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
         let points = cutting_points(&path, 1.0);

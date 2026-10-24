@@ -1066,7 +1066,9 @@ fn an_rp23cnc_tool_library_is_imported_with_its_materials_and_cutting_data() {
         "Tools": [
             {"Number": 1, "Name": "6 mm flat end mill", "Type": "EndMill", "DiameterMm": 6, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
             {"Number": 2, "Name": "3 mm flat end mill", "Type": "EndMill", "DiameterMm": 3, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
-            {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1, "VeeAngleDeg": 60, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null}
+            {"Number": 3, "Name": "V-bit 60°", "Type": "VBit", "DiameterMm": 6, "FluteCount": 1, "VeeAngleDeg": 60, "TipDiameterMm": 0, "CornerRadiusMm": 0, "Notes": null},
+            {"Number": 4, "Name": "8 mm R1", "Type": "EndMill", "DiameterMm": 8, "FluteCount": 3, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 1, "Notes": null},
+            {"Number": 5, "Name": "4 mm R2", "Type": "EndMill", "DiameterMm": 4, "FluteCount": 2, "VeeAngleDeg": 0, "TipDiameterMm": 0, "CornerRadiusMm": 2, "Notes": null}
         ],
         "Materials": [{"Name": "Plywood", "Notes": null}, {"Name": "Aluminium", "Notes": null}],
         "Presets": [
@@ -1079,7 +1081,7 @@ fn an_rp23cnc_tool_library_is_imported_with_its_materials_and_cutting_data() {
     std::fs::write(&file, rp.to_string()).unwrap();
     let out = run(&mut s, "cam.library.import", json!({"library": library, "path": file}));
     let _ = std::fs::remove_file(&file);
-    assert_eq!(out["added"], json!([1, 2, 3]));
+    assert_eq!(out["added"], json!([1, 2, 3, 4, 5]));
     assert_eq!(out["notes"], json!(["preset `6 mm again` of tool 1 (6 mm flat end mill): its own data is `6 mm in plywood`'s"]));
     // The preset without a material is tool 1's own cutting data; its stepover, 40% of 6 mm.
     let read = crate::toollib::load(std::path::Path::new(&library)).unwrap();
@@ -1096,6 +1098,9 @@ fn an_rp23cnc_tool_library_is_imported_with_its_materials_and_cutting_data() {
     assert_eq!((tools[1].diameter, tools[1].feed, tools[1].cutting_in("MDF").and_then(|c| c.feed)), (3.0, None, Some(800.0)));
     // The V-bit with its point.
     assert_eq!((tools[2].kind, tools[2].tip_angle, tools[2].tip_diameter), (solidcraft_cam::ToolKind::VBit, Some(60.0), None));
+    // An end mill rounded at its rim is a bull nose; rounded all the way, a ball.
+    assert_eq!((tools[3].kind, tools[3].corner_radius), (solidcraft_cam::ToolKind::BullNose, Some(1.0)));
+    assert_eq!((tools[4].kind, tools[4].corner_radius), (solidcraft_cam::ToolKind::BallEndmill, None));
     let _ = std::fs::remove_file(&library);
 }
 
@@ -1938,6 +1943,11 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
     run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
     run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "drill", "diameter": 6, "spindle_rpm": 3000, "feed": 200}));
+    // A bull nose needs its corner radius; with it, it roughs too.
+    assert!(s.execute("cam.tool.define", &json!({"number": 4, "kind": "bull", "diameter": 6})).is_err());
+    let bull =
+        run(&mut s, "cam.tool.define", json!({"number": 4, "kind": "bull", "diameter": 6, "corner_radius": 1, "spindle_rpm": 12000, "feed": 600}));
+    assert_eq!((bull["tool"]["kind"].as_str(), bull["tool"]["corner_radius"].as_f64()), (Some("bull_nose"), Some(1.0)));
     // 2 mm of stock over the plate; the work zero on its top.
     let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
     run(&mut s, "cam.setup.create", json!({"name": "Rough", "origin": top, "stock": {"top": 2}}));

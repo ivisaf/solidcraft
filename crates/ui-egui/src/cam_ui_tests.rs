@@ -958,9 +958,9 @@ fn the_form_knows_every_height_it_cuts_at() {
 fn the_tool_assistant_makes_a_v_bit() {
     let mut h = lab();
     h.app.start("cam.tool.define");
-    h.frames(2);
+    h.frames(3);
     // Step one: the kinds as tiles; the V-bit's opens its shape.
-    for name in ["Flat end mill", "Ball end mill", "Drill", "V-bit"] {
+    for name in ["Flat end mill", "Ball end mill", "Drill", "V-bit", "Bull-nose end mill"] {
         assert!(h.widget(name).is_some(), "{name}");
     }
     h.step(&json!({"widget": "V-bit"})).unwrap();
@@ -985,6 +985,34 @@ fn the_tool_assistant_makes_a_v_bit() {
     );
     let Some(Form::Tool(again)) = tool_form(tool, true) else { panic!("no form") };
     assert_eq!((again.kind, again.tip_angle.as_str(), again.step), (3, "60", 1));
+}
+
+#[test]
+fn the_tool_assistant_makes_a_bull_nose() {
+    let mut h = lab();
+    h.app.start("cam.tool.define");
+    h.frames(2);
+    // The kinds in two rows: the window settles at its height in a frame more.
+    h.frames(1);
+    h.step(&json!({"widget": "Bull-nose end mill"})).unwrap();
+    h.frames(2);
+    let Some(Form::Tool(f)) = &mut h.app.manufacture.form else { panic!("no tool form") };
+    assert_eq!((f.kind, f.step), (4, 1));
+    // Its corner radius is asked for (red until given), the point's rows are not.
+    assert!(h.widget("Corner radius (r)").is_some() && h.widget("Point angle (α)").is_none());
+    let lists = choices(&h.app, &json!({}), &json!({}));
+    assert!(missing(h.app.manufacture.form.as_ref().unwrap(), &lists).iter().any(|n| n.field == "Corner radius (r)"));
+    if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+        (f.diameter, f.corner_radius) = ("8 mm".into(), "1.5 mm".into());
+    }
+    h.frames(1);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let library = library_listing(&mut h.app, true);
+    let tool = &library["tools"][0];
+    assert_eq!((tool["kind"].as_str(), tool["corner_radius"].as_f64()), (Some("bull_nose"), Some(1.5)));
+    let Some(Form::Tool(again)) = tool_form(tool, true) else { panic!("no form") };
+    assert_eq!((again.kind, again.corner_radius.as_str()), (4, "1.5"));
 }
 
 #[test]

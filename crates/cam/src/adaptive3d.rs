@@ -12,8 +12,9 @@
 //! exactly on the part's flat floors so that those come out level. On slopes a level leaves steps;
 //! levels in between, a step-up apart, take them from the top down where they stand.
 //!
-//! A ball cuts its full depth only on its axis: the planner clears discs as wide as the ball
-//! reaches within a quarter of its radius of the level, so the cusps it leaves stay that low.
+//! A ball cuts its full depth only on its axis, a bull nose on its flat: the planner clears discs
+//! as wide as the tool reaches within a quarter of its round's radius of the level, so the cusps
+//! it leaves stay that low.
 
 use solidcraft_geom::{Region2, Vec2, Vec3};
 
@@ -60,8 +61,8 @@ pub struct Rough3d<'a> {
 pub fn adaptive_3d(job: &Rough3d, tool: &Tool, params: &AdaptiveParams, cut: &Cut) -> Result<Toolpath> {
     adaptive::check(tool, params, cut)?;
     let p = params;
-    if !matches!(tool.kind, ToolKind::FlatEndmill | ToolKind::BallEndmill) {
-        return Err(CamError::Unsupported("3D adaptive roughing with anything but a flat or ball end mill".into()));
+    if !matches!(tool.kind, ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose) {
+        return Err(CamError::Unsupported("3D adaptive roughing with anything but a flat, ball or bull-nose end mill".into()));
     }
     if p.finish > 0.0 || p.rest_diameter.is_some() {
         return Err(CamError::Unsupported("a finishing lap or rest machining in 3D adaptive roughing".into()));
@@ -97,7 +98,7 @@ pub fn adaptive_3d(job: &Rough3d, tool: &Tool, params: &AdaptiveParams, cut: &Cu
     }
     let floor = bottom.min(lo_s.z) - 1.0;
     let part_top = HeightField::of_triangles(lo, hi, cell, floor, job.part, true)?;
-    let reach = sim::tool_floor(&part_top, tool.kind, r, s)?;
+    let reach = sim::tool_floor(&part_top, tool, s)?;
     // The stock over the grid: its box, nothing beside it, as far as earlier cuts left it. A column
     // partly over the box counts as stock, so that the box's edge is cleared on every level, not
     // left as a thin skin.
@@ -131,11 +132,10 @@ pub fn adaptive_3d(job: &Rough3d, tool: &Tool, params: &AdaptiveParams, cut: &Cu
             shape.inside(q, shape.dist(q).max(1e-6))
         })
         .collect();
-    // A ball clears as wide as it reaches near the level.
-    let wide = match tool.kind {
-        ToolKind::BallEndmill => (r * r - (r * (1.0 - BALL_CUSP)).powi(2)).max(0.0).sqrt(),
-        _ => r,
-    };
+    // A rounded end clears as wide as it reaches near the level: its flat, and as much of its
+    // round as comes within a quarter of the round's radius of the level.
+    let c = tool.corner();
+    let wide = r - c + (c * c - (c * (1.0 - BALL_CUSP)).powi(2)).max(0.0).sqrt();
     let mut job3 =
         Levels { tool, p, cut, top, lo, cell, nx, ny, wide, s, inside, part_top, reach, stock_top, holder: job.holder, clear: None, last: None };
     let mut b = Builder::new(cut);

@@ -18,6 +18,8 @@ pub const MAX_MATERIAL_NAME: usize = 64;
 pub enum ToolKind {
     FlatEndmill,
     BallEndmill,
+    /// A flat end rounded at its rim by a corner radius ([`Tool::corner_radius`]).
+    BullNose,
     Drill,
     /// A cone to a point (or a small flat), for engraving along a line.
     VBit,
@@ -28,6 +30,7 @@ impl ToolKind {
         match self {
             ToolKind::FlatEndmill => "flat end mill",
             ToolKind::BallEndmill => "ball end mill",
+            ToolKind::BullNose => "bull-nose end mill",
             ToolKind::Drill => "drill",
             ToolKind::VBit => "V-bit",
         }
@@ -66,6 +69,9 @@ pub struct Tool {
     /// A V-bit's flat at its point (mm; none when left out).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tip_diameter: Option<f64>,
+    /// A bull-nose end mill's corner radius, where its end rounds into its side (mm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_radius: Option<f64>,
     /// The shank's diameter and the tool's length out of the holder (mm): what its picture shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shank_diameter: Option<f64>,
@@ -140,6 +146,7 @@ impl Tool {
             stepover: None,
             tip_angle: None,
             tip_diameter: None,
+            corner_radius: None,
             shank_diameter: None,
             holder_diameter: None,
             holder_length: None,
@@ -168,7 +175,16 @@ impl Tool {
         match self.kind {
             ToolKind::VBit => self.tip_angle.unwrap_or(90.0),
             ToolKind::Drill => self.tip_angle.unwrap_or(118.0),
-            ToolKind::FlatEndmill | ToolKind::BallEndmill => 180.0,
+            ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose => 180.0,
+        }
+    }
+    /// How far the end rounds into the side (mm): a ball's radius, a bull nose's corner radius,
+    /// nothing for the rest.
+    pub fn corner(&self) -> f64 {
+        match self.kind {
+            ToolKind::BallEndmill => self.radius(),
+            ToolKind::BullNose => self.corner_radius.unwrap_or(0.0).clamp(0.0, self.radius()),
+            _ => 0.0,
         }
     }
     /// A V-bit's flat at its point (mm).
@@ -202,6 +218,9 @@ impl Tool {
         }
         if self.tip_diameter.is_some_and(|d| !(0.0..self.diameter).contains(&d)) {
             return invalid("a V-bit's tip diameter must be 0 or more and less than its diameter");
+        }
+        if self.kind == ToolKind::BullNose && !self.corner_radius.is_some_and(|c| c > 0.0 && c <= self.radius()) {
+            return invalid("a bull-nose end mill's corner radius must be above 0 and at most half its diameter");
         }
         if self.shank_diameter.is_some_and(|d| !(d > 0.0 && d <= MAX_TOOL_DIAMETER)) {
             return invalid("the shank diameter must be above 0 and at most 1000 mm");

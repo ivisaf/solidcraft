@@ -15,9 +15,9 @@ use crate::i18n::{format as tf, tr_manufacture as tm};
 use crate::theme::Tokens;
 use crate::viewport::Proj;
 
-const TOOL_KINDS: [&str; 4] = ["flat", "ball", "drill", "vbit"];
+const TOOL_KINDS: [&str; 5] = ["flat", "ball", "drill", "vbit", "bull"];
 /// What each of [`TOOL_KINDS`] is called in the tool assistant.
-const TOOL_KIND_NAMES: [&str; 4] = ["Flat end mill", "Ball end mill", "Drill", "V-bit"];
+const TOOL_KIND_NAMES: [&str; 5] = ["Flat end mill", "Ball end mill", "Drill", "V-bit", "Bull-nose end mill"];
 const SIDES: [&str; 3] = ["outside", "inside", "on"];
 /// What a facing operation's boundary is, when no faces are picked.
 const FACE_BOUNDS: [&str; 3] = ["stock", "part", "sketch"];
@@ -142,6 +142,8 @@ pub struct ToolForm {
     /// and the shank's diameter and the length out of the holder (mm). Empty: the defaults.
     pub tip_angle: String,
     pub tip_diameter: String,
+    /// A bull nose's corner radius (mm).
+    pub corner_radius: String,
     pub shank_diameter: String,
     pub length: String,
     /// The holder above the tool (mm): its diameter and length. Empty: not known.
@@ -844,6 +846,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 chip_load: String::new(),
                 tip_angle: String::new(),
                 tip_diameter: String::new(),
+                corner_radius: String::new(),
                 shank_diameter: String::new(),
                 length: String::new(),
                 holder_diameter: String::new(),
@@ -950,6 +953,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             for (k, what, text) in [
                 ("tip_angle", "The point angle", &f.tip_angle),
                 ("tip_diameter", "The tip diameter", &f.tip_diameter),
+                ("corner_radius", "The corner radius", &f.corner_radius),
                 ("shank_diameter", "The shank diameter", &f.shank_diameter),
                 ("length", "The length", &f.length),
                 ("holder_diameter", "The holder's diameter", &f.holder_diameter),
@@ -1319,6 +1323,7 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         "ball_endmill" => 1,
         "drill" => 2,
         "v_bit" => 3,
+        "bull_nose" => 4,
         _ => 0,
     };
     Some(Form::Tool(Box::new(ToolForm {
@@ -1338,6 +1343,7 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         chip_load: tool["chip_load"].as_f64().map(|c| shown(c, 4)).unwrap_or_default(),
         tip_angle: number("tip_angle"),
         tip_diameter: number("tip_diameter"),
+        corner_radius: number("corner_radius"),
         shank_diameter: number("shank_diameter"),
         length: number("length"),
         holder_diameter: number("holder_diameter"),
@@ -2350,8 +2356,14 @@ fn draw_tool(painter: &egui::Painter, proj: &Proj, frame: [Vec3; 4], tip: Vec3, 
     // Rings as (height over the tip, radius).
     let cutting: Vec<(f64, f64)> = match tool.kind {
         ToolKind::FlatEndmill => vec![(0.0, r), (flute, r)],
-        ToolKind::BallEndmill => {
-            (0..=6).map(|k| f64::from(k) / 6.0 * std::f64::consts::FRAC_PI_2).map(|a| (r - r * a.cos(), r * a.sin())).chain([(flute, r)]).collect()
+        // A rounded end: flat out to its corner, then round (a ball: round all the way).
+        ToolKind::BallEndmill | ToolKind::BullNose => {
+            let c = tool.corner();
+            (0..=6)
+                .map(|k| f64::from(k) / 6.0 * std::f64::consts::FRAC_PI_2)
+                .map(|a| (c - c * a.cos(), r - c + c * a.sin()))
+                .chain([(flute, r)])
+                .collect()
         }
         ToolKind::Drill | ToolKind::VBit => {
             let point = tool.tip() * 0.5;
@@ -2430,6 +2442,7 @@ fn help(label: &str) -> Option<&'static str> {
         "Shank diameter" => "How thick the part the holder grips is. Empty: as thick as the tool cuts.",
         "Point angle" => "The angle between the point's two flanks: a V-bit's (often 60° or 90°) or a drill's (118°).",
         "Tip diameter" => "A V-bit's small flat at its point. Empty: a sharp point.",
+        "Corner radius" => "How far a bull nose's flat end rounds into its side: at most half the diameter (all the way round is a ball).",
         "Flute length" => "How deep the cutting edges reach. Deeper cuts need a longer tool.",
         "Flutes" => "How many cutting edges the tool has. Together with the speed it sets the feed.",
         "Spindle" => "How fast the spindle turns. Empty: the tool's own speed.",
@@ -2917,6 +2930,7 @@ enum Dim {
     Shank,
     Angle,
     Tip,
+    Corner,
 }
 
 /// A tool's shape for its picture: from a form's text (what is not typed takes its default).
@@ -2929,6 +2943,8 @@ struct ToolShape {
     length: f64,
     angle: f64,
     tip: f64,
+    /// A bull nose's corner radius.
+    corner: f64,
 }
 
 impl ToolShape {
@@ -2943,7 +2959,19 @@ impl ToolShape {
                 .ok()
                 .filter(|v| v.is_finite() && *v > 0.0)
         };
-        ToolShape::with(f.kind, mm(&f.diameter), mm(&f.flute_length), mm(&f.shank_diameter), mm(&f.length), mm(&f.tip_angle), mm(&f.tip_diameter))
+        let shape = ToolShape::with(
+            f.kind,
+            mm(&f.diameter),
+            mm(&f.flute_length),
+            mm(&f.shank_diameter),
+            mm(&f.length),
+            mm(&f.tip_angle),
+            mm(&f.tip_diameter),
+        );
+        match mm(&f.corner_radius) {
+            Some(c) => ToolShape { corner: c.min(shape.diameter * 0.5), ..shape },
+            None => shape,
+        }
     }
     /// A shape with `kind`'s defaults wherever a value is left out (or makes no tool).
     fn with(kind: usize, d: Option<f64>, f: Option<f64>, s: Option<f64>, l: Option<f64>, a: Option<f64>, tip: Option<f64>) -> ToolShape {
@@ -2961,6 +2989,8 @@ impl ToolShape {
             length: l.filter(|l| *l >= flute_length).unwrap_or(flute_length + diameter.max(4.0) * 2.0),
             angle,
             tip: tip_d,
+            // A bull nose's corner: a sixth of the diameter when not given.
+            corner: diameter / 6.0,
         }
     }
 }
@@ -2991,6 +3021,15 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
     let point = |half_width: f32| (f64::from(half_width) / half_angle.tan()) as f32;
     let mut side: Vec<egui::Pos2> = vec![egui::pos2(cx + r, cut_top)];
     match shape.kind {
+        // Bull nose: down the side to the corner, round the corner, then the flat end.
+        4 => {
+            let c = (shape.corner as f32 * scale).min(r);
+            side.push(egui::pos2(cx + r, tip_y - c));
+            for k in 1..=12 {
+                let a = std::f32::consts::FRAC_PI_2 * k as f32 / 12.0;
+                side.push(egui::pos2(cx + r - c + c * a.cos(), tip_y - c + c * a.sin()));
+            }
+        }
         // Ball: down the side to a radius above the end, round the end.
         1 => {
             side.push(egui::pos2(cx + r, tip_y - r));
@@ -3055,6 +3094,17 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
         let inside = if lit == Some(d) { t.accent } else { t.text };
         painter.text(apex + egui::vec2(0.0, -(r * 0.45).clamp(10.0, 26.0)), egui::Align2::CENTER_CENTER, "α", font(d), inside);
     }
+    if shape.kind == 4 {
+        // The corner's radius: from its centre out through the round, at 45°.
+        let d = Dim::Corner;
+        let c = (shape.corner as f32 * scale).min(r).max(3.0);
+        let centre = egui::pos2(cx + r - c, tip_y - c);
+        let out = centre + egui::vec2(1.0, 1.0).normalized() * c;
+        let stroke = Stroke::new(width(d), colour(d));
+        painter.line_segment([centre, out], stroke);
+        painter.circle_filled(centre, 1.5, colour(d));
+        painter.text(centre + egui::vec2(-8.0, -6.0), egui::Align2::CENTER_CENTER, "r", font(d), colour(d));
+    }
     if shape.kind == 3 {
         let d = Dim::Tip;
         let tip = ((shape.tip * 0.5) as f32 * scale).max(2.0);
@@ -3077,10 +3127,11 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
             ui.horizontal_wrapped(|ui| {
                 for (k, name) in TOOL_KIND_NAMES.iter().enumerate() {
                     // Stubby, so that each kind's end shows: (diameter, cutting length, shank, length).
-                    let (d, fl, sh, l) = [(10.0, 14.0, 8.0, 24.0), (10.0, 14.0, 8.0, 24.0), (8.0, 18.0, 8.0, 26.0), (14.0, 7.0, 7.0, 22.0)]
-                        .get(k)
-                        .copied()
-                        .unwrap_or((10.0, 14.0, 8.0, 24.0));
+                    let (d, fl, sh, l) =
+                        [(10.0, 14.0, 8.0, 24.0), (10.0, 14.0, 8.0, 24.0), (8.0, 18.0, 8.0, 26.0), (14.0, 7.0, 7.0, 22.0), (10.0, 14.0, 8.0, 24.0)]
+                            .get(k)
+                            .copied()
+                            .unwrap_or((10.0, 14.0, 8.0, 24.0));
                     let shape = ToolShape::with(k, Some(d), Some(fl), Some(sh), Some(l), None, if k == 3 { Some(0.6) } else { None });
                     // A tile of its own size: the tool drawn, its name under it; the whole tile is the button.
                     let (rect, r) = ui.allocate_exact_size(egui::vec2(112.0, 132.0), egui::Sense::click());
@@ -3130,6 +3181,9 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                     }
                     if f.kind == 3 {
                         row(ui, "Tip diameter (d)", &mut f.tip_diameter, "0 mm (a sharp point)", Dim::Tip);
+                    }
+                    if f.kind == 4 {
+                        row(ui, "Corner radius (r)", &mut f.corner_radius, "1 mm", Dim::Corner);
                     }
                     field(ui, need, "Flutes", &mut f.flutes, "2");
                     // The holder: checked against clamps, from where the tool comes out of it.
@@ -3544,6 +3598,9 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
             }
             if empty(&f.diameter) {
                 want("Diameter", "the tool's diameter");
+            }
+            if f.kind == 4 && empty(&f.corner_radius) {
+                want("Corner radius (r)", "the bull nose's corner radius");
             }
         }
         Form::Setup(f) => {

@@ -129,6 +129,7 @@ fn from_rp23cnc(tools: &[Value], materials: Option<&Value>, presets: Option<&Val
         let kind = match t.get("Type").and_then(Value::as_str).unwrap_or("").to_ascii_lowercase().as_str() {
             "endmill" | "flatendmill" | "flat" => ToolKind::FlatEndmill,
             "ballendmill" | "ballnose" | "ball" => ToolKind::BallEndmill,
+            "bullnose" | "bull_nose" | "bull-nose" | "bullnoseendmill" | "torus" => ToolKind::BullNose,
             "drill" => ToolKind::Drill,
             "vbit" | "v-bit" | "v_bit" => ToolKind::VBit,
             other => {
@@ -140,7 +141,19 @@ fn from_rp23cnc(tools: &[Value], materials: Option<&Value>, presets: Option<&Val
             notes.push(format!("{which}: no diameter"));
             continue;
         };
+        // An end mill rounded at its rim is a bull nose (rounded all the way: a ball).
+        let corner = t.get("CornerRadiusMm").and_then(Value::as_f64).filter(|r| *r > 0.0 && r.is_finite());
+        let kind = match (kind, corner) {
+            (ToolKind::FlatEndmill | ToolKind::BullNose, Some(c)) if c >= diameter * 0.5 - 1e-9 => ToolKind::BallEndmill,
+            (ToolKind::FlatEndmill, Some(_)) => ToolKind::BullNose,
+            _ => kind,
+        };
+        if kind == ToolKind::BullNose && corner.is_none() {
+            notes.push(format!("{which}: a bull nose without its corner radius"));
+            continue;
+        }
         let mut tool = Tool::new(number, kind, diameter, diameter * 3.0);
+        tool.corner_radius = corner.filter(|_| kind == ToolKind::BullNose);
         tool.description = name;
         if let Some(n) = t.get("FluteCount").and_then(Value::as_u64).filter(|n| (1..=100).contains(n)) {
             tool.flutes = n as u32;
@@ -149,9 +162,6 @@ fn from_rp23cnc(tools: &[Value], materials: Option<&Value>, presets: Option<&Val
         if kind == ToolKind::VBit {
             tool.tip_angle = t.get("VeeAngleDeg").and_then(Value::as_f64).filter(|a| *a > 0.0 && *a < 180.0);
             tool.tip_diameter = t.get("TipDiameterMm").and_then(Value::as_f64).filter(|d| *d > 0.0 && *d < diameter);
-        }
-        if t.get("CornerRadiusMm").and_then(Value::as_f64).is_some_and(|r| r > 0.0) && kind == ToolKind::FlatEndmill {
-            notes.push(format!("{which}: taken as a flat end mill, without its corner radius"));
         }
         // Its presets: the first without a material is the tool's own data, the first for a material its data in that.
         let mut own: Option<&Value> = None;

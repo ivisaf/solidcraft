@@ -59,7 +59,7 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
-            "number: 1–9999; kind: flat|ball|drill|vbit; diameter: expr; tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
+            "number: 1–9999; kind: flat|ball|bull|drill|vbit (bull: a bull-nose end mill, its end rounded at the rim); diameter: expr; corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it); cutting?: [{material, spindle_rpm?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
@@ -230,9 +230,10 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
     let kind = match str_(p, "kind").map(|k| k.trim().to_ascii_lowercase()).as_deref() {
         Some("flat" | "flat_endmill" | "endmill") => ToolKind::FlatEndmill,
         Some("ball" | "ball_endmill") => ToolKind::BallEndmill,
+        Some("bull" | "bull_nose" | "bull-nose" | "bullnose") => ToolKind::BullNose,
         Some("drill") => ToolKind::Drill,
         Some("vbit" | "v_bit" | "v-bit") => ToolKind::VBit,
-        _ => return Err(bad(cmd, "`kind` must be flat, ball, drill or vbit")),
+        _ => return Err(bad(cmd, "`kind` must be flat, ball, bull, drill or vbit")),
     };
     let diameter = length(s, cmd, "diameter", &req_expr(cmd, p, "diameter")?)?;
     // What is not named stays as the tool had it.
@@ -308,6 +309,8 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
                     .filter(|d| *d > 0.0)
             }
         },
+        // A bull nose's corner radius; another kind has none.
+        corner_radius: data("corner_radius", was.and_then(|t| t.corner_radius))?.filter(|_| kind == ToolKind::BullNose),
         shank_diameter: data("shank_diameter", was.and_then(|t| t.shank_diameter))?,
         length: data("length", was.and_then(|t| t.length))?,
         holder_diameter: data("holder_diameter", was.and_then(|t| t.holder_diameter))?,
