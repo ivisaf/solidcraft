@@ -4733,11 +4733,14 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
                 Some("point") => o["at"].clone(),
                 _ => json!({ "of": o["of"], "x": o["x"], "y": o["y"], "z": o["z"] }),
             };
+            // The same block turned over: what was on top is below it now.
+            let st = &s["stock"];
+            let stock = json!({ "side": st["side"], "top": st["bottom"], "bottom": st["top"] });
             let mut p = json!({
                 "axis": axis,
                 "x_axis": x_axis,
                 "origin": origin,
-                "stock": s["stock"],
+                "stock": stock,
                 "post": s["post"],
                 "work_offset": s["work_offset"],
                 "stock_from": setup,

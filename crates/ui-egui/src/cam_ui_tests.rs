@@ -1479,12 +1479,18 @@ fn a_setup_turned_over_takes_its_stock_from_the_first() {
         setup.work_offset = 1;
     });
     let first = h.app.session.doc.manufacture.setups[0].id;
+    h.app.run("cam.setup.edit", json!({"setup": first, "stock": {"side": 3, "top": 1, "bottom": 0}})).unwrap();
     menu_action(&mut h.app, &json!({"do": "turn", "setup": first}));
     let setups = &h.app.session.doc.manufacture.setups;
     assert_eq!(setups.len(), 2, "{:?}", h.app.manufacture.error);
     let turned = &setups[1];
     assert_eq!((turned.axis.z, turned.stock_from, turned.work_offset), (-1.0, Some(first), 55));
     assert_eq!(turned.x_axis.map(|x| x.x), Some(1.0), "about X: X as it was");
+    // The same block turned over: 1 mm on top of the first is 1 mm below the turned one, whose
+    // origin is on the block's underside.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let z = |k: usize| listed["setups"][k]["frame"]["origin"][2].as_f64().unwrap();
+    assert!((z(0) - 11.0).abs() < 1e-9 && z(1).abs() < 1e-9, "{} {}", z(0), z(1));
     menu_action(&mut h.app, &json!({"do": "turn_y", "setup": first}));
     let about_y = h.app.session.doc.manufacture.setups.get(2).cloned().expect("the setup turned about Y");
     assert_eq!((about_y.axis.z, about_y.x_axis.map(|x| x.x)), (-1.0, Some(-1.0)), "about Y: X the other way");
