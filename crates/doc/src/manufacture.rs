@@ -277,6 +277,10 @@ pub enum CamOperationKind {
         /// stock when none), rather than a pocket of the geometry's profiles.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         model: bool,
+        /// Roughing in 3D: levels in between on slopes, this far apart at most (a length
+        /// expression; none: a quarter of the stepdown; 0: none).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_up: Option<Expr>,
     },
     /// Chamfers top edges with a pointed tool: `width` across the top, its point `tip_offset`
     /// deeper than the chamfer (length expressions).

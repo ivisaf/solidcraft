@@ -1755,42 +1755,113 @@ fn a_tool_s_floor_over_a_part_follows_its_shape() {
     assert!(tool_floor(&part, ToolKind::Drill, 2.0, 0.0).is_err());
 }
 
-#[test]
-fn adaptive_3d_roughs_down_to_the_part_level_by_level() {
-    // A slab with its floor at -15 and a block on it whose top is at -5, in a stock from -20 to 0.
+/// The slab and block of the 3D roughing tests: a slab with its floor at -15 and on it a block
+/// 20 to 40 by 12 to 28 whose top is at -5; the stock from -20 to 0 over 60 by 40.
+fn slab_and_block() -> (Vec<[Vec3; 3]>, (Vec3, Vec3)) {
     let mut part = box_triangles(Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, -15.0));
     part.extend(box_triangles(Vec3::new(20.0, 12.0, -20.0), Vec3::new(40.0, 28.0, -5.0)));
-    let stock = (Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, 0.0));
+    (part, (Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, 0.0)))
+}
+
+fn rough<'a>(part: &'a [[Vec3; 3]], stock: (Vec3, Vec3), boundary: &'a [Region2]) -> Rough3d<'a> {
+    Rough3d { boundary, part, stock, left: None, step_up: 0.0, holder: None }
+}
+
+/// The path cut on finer columns of the stock: how deep it cuts into the part (with no
+/// allowance), the share of the material over the allowance it leaves, and its deepest bite.
+fn rough_check(part: &[[Vec3; 3]], stock: (Vec3, Vec3), path: &Toolpath, t: &Tool, allowance: f64) -> (f64, f64, f64) {
+    let mut field = HeightField::block(stock.0, stock.1, 0.25).unwrap();
+    let report = simulate(&mut field, path, t).unwrap();
+    let seen = HeightField::of_triangles(v(stock.0.x, stock.0.y), v(stock.1.x, stock.1.y), 0.25, stock.0.z, part, false).unwrap();
+    let (mut into, mut left, mut total) = (0.0f64, 0.0, 0.0);
+    for (h, p) in field.z.iter().zip(&seen.z) {
+        into = into.max(p - h);
+        total += (stock.1.z - p - allowance).max(0.0);
+        left += (h - p - allowance).max(0.0);
+    }
+    (into, left / total, report.max_engagement)
+}
+
+#[test]
+fn adaptive_3d_roughs_down_to_the_part_level_by_level() {
+    let (part, stock) = slab_and_block();
     let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
-    // A ball end mill is refused rather than planned as if it cut flat.
-    let ball = Tool::new(1, ToolKind::BallEndmill, 6.0, 20.0);
-    assert!(adaptive_3d(&[rect(0.0, 0.0, 60.0, 40.0)], &part, stock, &ball, &params, &cut(0.0, -15.0, 4.0)).is_err());
-    {
-        let kind = ToolKind::FlatEndmill;
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    // A ball bites a stepdown and the cusps the level above left (up to half its radius).
+    for (kind, deepest_bite, most_left) in [(ToolKind::FlatEndmill, 4.0, 0.03), (ToolKind::BallEndmill, 4.0 + 1.5, 0.06)] {
         let t = Tool::new(1, kind, 6.0, 20.0);
-        let c = cut(0.0, -15.0, 4.0);
         let started = std::time::Instant::now();
-        let path = adaptive_3d(&[rect(0.0, 0.0, 60.0, 40.0)], &part, stock, &t, &params, &c).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        let path = adaptive_3d(&rough(&part, stock, &area), &t, &params, &cut(0.0, -15.0, 4.0)).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
         let points = cutting_points(&path, 1.0);
         let lowest = points.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
         // Flat floors are levels of their own, the allowance above them.
         close(lowest, -14.5, 1e-9);
         assert!(points.iter().any(|p| (p.z + 4.5).abs() < 1e-9), "{kind:?}: a level on the block's top");
-        // Cut on a stock of finer columns: never into the part, never deeper than a stepdown.
-        let mut field = HeightField::block(stock.0, stock.1, 0.25).unwrap();
-        let report = simulate(&mut field, &path, &t).unwrap();
-        assert!(report.max_engagement <= 4.0 + 1e-6, "{kind:?}: {}", report.max_engagement);
-        let seen = HeightField::of_triangles(v(0.0, 0.0), v(60.0, 40.0), 0.25, -20.0, &part, false).unwrap();
-        let (mut into, mut left, mut total) = (0.0f64, 0.0, 0.0);
-        for (h, p) in field.z.iter().zip(&seen.z) {
-            into = into.max(p - h);
-            total += (0.0 - p - 0.5).max(0.0);
-            left += (h - p - 0.5).max(0.0);
-        }
+        // Never into the part; never deeper than a stepdown.
+        let (into, left, bite) = rough_check(&part, stock, &path, &t, 0.5);
         assert!(into <= 1e-6, "{kind:?}: cuts {into} into the part");
-        // What stands above the allowance: the round of the tool along the block's corners.
-        let share = left / total;
-        assert!(share < 0.03, "{kind:?}: {:.1} % left", share * 100.0);
-        eprintln!("{kind:?}: {:.2} % left, engaged {:.2}, {} moves, {:?}", share * 100.0, report.max_engagement, path.moves.len(), started.elapsed());
+        assert!(bite <= deepest_bite + 1e-6, "{kind:?}: {bite}");
+        // What stands above the allowance: the round of the tool along the block's corners (a
+        // ball: and its cusps).
+        assert!(left < most_left, "{kind:?}: {:.1} % left", left * 100.0);
+        eprintln!("{kind:?}: {:.2} % left, bite {bite:.2}, {} moves, {:?}", left * 100.0, path.moves.len(), started.elapsed());
     }
+}
+
+/// A slope from -15 at x = 0 up to -3 at x = 60, on a stock from -20 to 0.
+fn slope() -> (Vec<[Vec3; 3]>, (Vec3, Vec3)) {
+    let p = |x: f64, y: f64, z: f64| Vec3::new(x, y, z);
+    let (a, b, c, d) = (p(0.0, 0.0, -15.0), p(60.0, 0.0, -3.0), p(60.0, 40.0, -3.0), p(0.0, 40.0, -15.0));
+    (vec![[a, b, c], [a, c, d]], (Vec3::new(0.0, 0.0, -20.0), Vec3::new(60.0, 40.0, 0.0)))
+}
+
+#[test]
+fn levels_in_between_take_the_steps_a_slope_leaves() {
+    let (part, stock) = slope();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let params = AdaptiveParams { stock_to_leave: 0.3, ..adaptive_params() };
+    let t = tool(6.0);
+    let c = cut(0.0, -15.0, 4.0);
+    let plain = adaptive_3d(&rough(&part, stock, &area), &t, &params, &c).unwrap();
+    let stepped = adaptive_3d(&Rough3d { step_up: 1.0, ..rough(&part, stock, &area) }, &t, &params, &c).unwrap();
+    let (into, left_plain, _) = rough_check(&part, stock, &plain, &t, 0.3);
+    let (into_stepped, left_stepped, bite) = rough_check(&part, stock, &stepped, &t, 0.3);
+    assert!(into <= 1e-6 && into_stepped <= 1e-6, "{into} {into_stepped}");
+    // Steps of a stepdown on the slope, against steps of a millimetre.
+    assert!(left_stepped < left_plain * 0.4, "{left_plain} → {left_stepped}");
+    assert!(bite <= 4.0 + 1e-6, "{bite}");
+    eprintln!("slope: {:.2} % left plain, {:.2} % with a 1 mm step-up", left_plain * 100.0, left_stepped * 100.0);
+    assert!(adaptive_3d(&Rough3d { step_up: -1.0, ..rough(&part, stock, &area) }, &t, &params, &c).is_err());
+}
+
+#[test]
+fn roughing_starts_from_what_earlier_cuts_left() {
+    let (part, stock) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    // The stock faced down to -10 already: only the block above it.
+    let mut faced = HeightField::block(stock.0, stock.1, 0.5).unwrap();
+    faced.z.iter_mut().for_each(|z| *z = -10.0);
+    let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
+    let path = adaptive_3d(&Rough3d { left: Some(&faced), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).unwrap();
+    let highest = cutting_points(&path, 1.0).iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+    // Links lift half a millimetre over the level they are on.
+    assert!(highest <= -10.0 + 0.5 + 1e-9, "{highest}: cuts in the air over what was faced");
+}
+
+#[test]
+fn the_holder_keeps_the_tool_up_beside_a_tall_block() {
+    let (part, stock) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
+    // A 20 mm holder, the tool 6 mm out of it: within 10 mm of the block (top -5) it goes no
+    // lower than -11; further off it reaches the slab.
+    let (d, out) = (20.0, 6.0);
+    let path = adaptive_3d(&Rough3d { holder: Some((d, out)), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).unwrap();
+    let seen = HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), 0.25, -20.0, &part, true).unwrap().dilated(d * 0.5).unwrap();
+    let points = cutting_points(&path, 1.0);
+    for q in &points {
+        assert!(seen.at(v(q.x, q.y)) <= q.z + out + 0.3, "the holder hits the part over {q:?}");
+    }
+    assert!(points.iter().any(|q| (q.z + 14.5).abs() < 1e-9), "the slab is reached away from the block");
+    assert!(adaptive_3d(&Rough3d { holder: Some((5.0, 6.0)), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).is_err());
 }

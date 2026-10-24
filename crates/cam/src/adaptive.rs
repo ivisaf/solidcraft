@@ -506,11 +506,19 @@ pub(crate) fn enter(b: &mut Builder, entry: Entry, from: f64, z: f64, cut: &Cut,
 pub(crate) fn plan(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams) -> Result<(Option<Entry>, Vec<Run>)> {
     // Material smaller than this is left to the lap along the walls.
     let crumbs = p.stepover * tool.diameter * g.cell * 2.0;
-    plan_to(g, reachable, tool, p, crumbs)
+    plan_to(g, reachable, tool, p, crumbs, usize::MAX)
 }
 
-/// [`plan`], cutting until no more than `crumbs` (mm²) of the material in reach is left.
-pub(crate) fn plan_to(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &AdaptiveParams, crumbs: f64) -> Result<(Option<Entry>, Vec<Run>)> {
+/// [`plan`], cutting until no more than `crumbs` (mm²) of the material in reach is left, or
+/// `patience` starts in a row cut nothing (what is left is beyond the tool).
+pub(crate) fn plan_to(
+    g: &mut Grid,
+    reachable: &[bool],
+    tool: &Tool,
+    p: &AdaptiveParams,
+    crumbs: f64,
+    patience: usize,
+) -> Result<(Option<Entry>, Vec<Run>)> {
     let ae = p.stepover * tool.diameter;
     // The engagement angle of a straight cut `ae` wide.
     let phi = (1.0 - 2.0 * p.stepover).clamp(-1.0, 1.0).acos();
@@ -539,7 +547,8 @@ pub(crate) fn plan_to(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &Adaptiv
     // Starts from which nothing could be cut: not tried again.
     let mut dead = vec![false; g.allowed.len()];
     let mut tries = 0usize;
-    while runs.len() < MAX_CUTS && tries < MAX_CUTS * 4 && g.left(reachable) > crumbs {
+    let mut idle = 0usize;
+    while runs.len() < MAX_CUTS && tries < MAX_CUTS * 4 && idle < patience && g.left(reachable) > crumbs {
         tries += 1;
         let (start, link, entry) = match next_start(g, at, phi, &dead) {
             Some((q, link)) => (q, link, None),
@@ -557,8 +566,10 @@ pub(crate) fn plan_to(g: &mut Grid, reachable: &[bool], tool: &Tool, p: &Adaptiv
             if let Some(d) = g.index(start).and_then(|k| dead.get_mut(k)) {
                 *d = true;
             }
+            idle += 1;
             continue;
         }
+        idle = 0;
         at = points.last().copied().unwrap_or(start);
         // Without an entry the tool is not down yet at the first cut: it comes down to it.
         let down = first.is_none() && runs.is_empty();
@@ -577,12 +588,18 @@ pub(crate) fn entry_end(e: Entry) -> Vec2 {
 }
 
 /// An entry where there is the most room (among positions over material still standing, when
-/// `fresh` is given), clearing what it cuts on the grid.
+/// `fresh` is given: with material not yet cut under the tool there), clearing what it cuts on
+/// the grid.
 fn entry_at(g: &mut Grid, tool: &Tool, p: &AdaptiveParams, fresh: Option<&[bool]>) -> Option<Entry> {
-    let best = (0..g.allowed.len())
+    let mut open: Vec<usize> = (0..g.allowed.len())
         .filter(|&k| g.allowed.get(k).copied().unwrap_or(false))
         .filter(|&k| fresh.is_none_or(|reach| reach.get(k).copied().unwrap_or(false) && !g.cleared.get(k).copied().unwrap_or(true)))
-        .max_by(|&a, &b| g.room.get(a).copied().unwrap_or(0.0).total_cmp(&g.room.get(b).copied().unwrap_or(0.0)))?;
+        .collect();
+    open.sort_by(|&a, &b| g.room.get(b).copied().unwrap_or(0.0).total_cmp(&g.room.get(a).copied().unwrap_or(0.0)));
+    let best = match fresh {
+        Some(_) => open.into_iter().find(|&k| g.area(g.centre(k % g.nx, k / g.nx)) > 0.0)?,
+        None => open.first().copied()?,
+    };
     let c = g.centre(best % g.nx, best / g.nx);
     let room = g.room.get(best).copied().unwrap_or(0.0);
     let rh = (p.helix_max * tool.diameter * 0.5).min(room);

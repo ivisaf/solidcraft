@@ -341,6 +341,9 @@ pub struct OpForm {
     pub helix_min: String,
     /// Adaptive clearing: how fast light steps may go, percent of the feed (empty: never faster).
     pub feed_up: String,
+    /// 3D roughing: how far apart its levels in between on slopes are at most (empty: a quarter
+    /// of the stepdown).
+    pub step_up: String,
     /// A chamfer's width across the top, and how much deeper than it the tool's point goes.
     pub width: String,
     pub tip_offset: String,
@@ -602,6 +605,18 @@ pub struct CamUi {
     /// The open operation form's toolpath before OK (or why there is none), for the design
     /// revision and the command it was worked out for.
     preview: Option<(u64, Value, Result<solidcraft_engine::CamPreview, String>)>,
+    /// A 3D roughing form's preview being worked out off the window thread: the revision and
+    /// command it is for, and where it arrives.
+    #[cfg(not(target_arch = "wasm32"))]
+    preview_job: Option<(u64, Value, std::sync::mpsc::Receiver<Result<solidcraft_engine::CamPreview, String>>)>,
+    /// `cam.list` worked out on a copy off the window thread (for the design revision given):
+    /// 3D roughing toolpaths take seconds; the copy shares the engine's cache of them.
+    #[cfg(not(target_arch = "wasm32"))]
+    listing_job: Option<(u64, std::sync::mpsc::Receiver<()>)>,
+    /// The last `cam.list` read: shown while a newer one is worked out.
+    last_listing: Value,
+    /// To ask for a frame when work done off the window thread arrives.
+    repaint: Option<egui::Context>,
     /// The toolpaths of every setup, for the design revision they were worked out at.
     cache: Option<(u64, Vec<Path>, Vec<SetupView>)>,
     /// The open operation form's own heights, for the design revision, the command and the geometry asked about.
@@ -690,6 +705,12 @@ impl Default for CamUi {
             hidden: Default::default(),
             path_ids: Vec::new(),
             preview: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            preview_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            listing_job: None,
+            last_listing: Value::Null,
+            repaint: None,
             cache: None,
             heights: None,
             selection_heights: None,
@@ -721,7 +742,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
     if !id.starts_with("cam.") {
         return false;
     }
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let listed = listed(app).0;
     let lists = {
         let library = library_listing(app, true);
         choices(app, &listed, &library)
@@ -794,6 +815,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             helix_max: String::new(),
             helix_min: String::new(),
             feed_up: String::new(),
+            step_up: String::new(),
             width: String::new(),
             tip_offset: String::new(),
             peck: String::new(),
@@ -1140,6 +1162,13 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     }
                     optional(&mut p, "helix_angle", &f.helix_angle);
                     optional(&mut p, "stock_to_leave", &f.stock_to_leave);
+                    if f.kind == OpKind::Adaptive3d {
+                        if !f.step_up.trim().is_empty() {
+                            p.insert("step_up".into(), json!(f.step_up.trim()));
+                        } else if f.editing.is_some() {
+                            p.insert("step_up".into(), Value::Null);
+                        }
+                    }
                     // 3D roughing has no rest machining (yet).
                     match f.rest_from.trim().parse::<u64>().ok().filter(|_| f.kind == OpKind::Adaptive) {
                         Some(n) => {
@@ -1479,6 +1508,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         helix_max: number(&inputs["helix_max"]),
         helix_min: number(&inputs["helix_min"]),
         feed_up: number(&inputs["feed_up"]),
+        step_up: text(inputs, "step_up"),
         width: text(inputs, "width"),
         tip_offset: text(inputs, "tip_offset"),
         peck: text(inputs, "peck"),
@@ -1696,6 +1726,37 @@ fn update_preview(app: &mut SolveApp, lists: &Choices) {
     let revision = app.session.revision;
     if app.manufacture.preview.as_ref().is_some_and(|(r, k, _)| *r == revision && *k == key) {
         return;
+    }
+    // 3D roughing takes seconds: worked out off the window thread, which shows none meanwhile.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg!(test) && solidcraft_engine::cam_slow(&app.session, id, &key["params"]) {
+        if let Some((r, k, rx)) = &app.manufacture.preview_job
+            && *r == revision
+            && *k == key
+        {
+            match rx.try_recv() {
+                Ok(path) => {
+                    app.manufacture.preview = Some((revision, key, path));
+                    app.manufacture.preview_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => app.manufacture.preview = None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => app.manufacture.preview_job = None,
+            }
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (copy, params, cmd, repaint) = (app.session.scratch(), key["params"].clone(), id.to_string(), app.manufacture.repaint.clone());
+        let spawned = std::thread::Builder::new().name("cam-preview".into()).spawn(move || {
+            let _ = tx.send(solidcraft_engine::cam_preview(&copy, &cmd, &params).map_err(|e| e.to_string()));
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+        if spawned.is_ok() {
+            app.manufacture.preview_job = Some((revision, key, rx));
+            app.manufacture.preview = None;
+            return;
+        }
     }
     let path = solidcraft_engine::cam_preview(&app.session, id, &key["params"]).map_err(|e| e.to_string());
     app.manufacture.preview = Some((revision, key, path));
@@ -2044,13 +2105,56 @@ fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
     }
 }
 
+/// `cam.list` for the design as it is, and whether it is (`false`: the last one read, while 3D
+/// roughing toolpaths it needs are worked out off the window thread, which then asks for a
+/// frame). Without 3D roughing, or once its toolpaths are known, it is read at once.
+fn listed(app: &mut SolveApp) -> (Value, bool) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if !cfg!(test) {
+        let revision = app.session.revision;
+        let cam = &mut app.manufacture;
+        let done_here = match &cam.listing_job {
+            Some((r, rx)) => match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) if *r == revision => return (cam.last_listing.clone(), false),
+                // Worked out for this revision: what it could not cache (a failing operation) is quick now.
+                _ => *r == revision,
+            },
+            None => false,
+        };
+        if !done_here && !solidcraft_engine::cam_list_ready(&app.session) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut copy = app.session.scratch();
+            let repaint = app.manufacture.repaint.clone();
+            let spawned = std::thread::Builder::new().name("cam-list".into()).spawn(move || {
+                let _ = copy.execute("cam.list", &json!({}));
+                let _ = tx.send(());
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            });
+            if spawned.is_ok() {
+                app.manufacture.listing_job = Some((revision, rx));
+                return (app.manufacture.last_listing.clone(), false);
+            }
+        }
+        app.manufacture.listing_job = None;
+    }
+    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    app.manufacture.last_listing = listed.clone();
+    (listed, true)
+}
+
 /// Works the toolpaths and the setups' frames out again when the design has changed.
 fn refresh(app: &mut SolveApp) {
     let revision = app.session.revision;
     if app.manufacture.cache.as_ref().is_some_and(|(r, ..)| *r == revision) {
         return;
     }
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    // While 3D roughing is worked out, the toolpaths drawn stay as they were.
+    let (listed, fresh) = listed(app);
+    if !fresh {
+        return;
+    }
     let (mut all, mut views, mut ids) = (Vec::new(), Vec::new(), Vec::new());
     for setup in listed["setups"].as_array().into_iter().flatten() {
         let f = &setup["frame"];
@@ -2404,6 +2508,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Helix angle" => "How steeply the tool goes down into the material on its entry helix (or ramp, where a helix has no room).",
         "Helix largest (%)" | "Helix smallest (%)" => {
             "The entry helix's diameter, as a percentage of the tool's: as large as there is room for, at most the largest; with less room than the smallest, a ramp instead."
+        }
+        "Step-up height" => {
+            "On slopes and rounds a level leaves steps as high as the stepdown. Levels in between, at most this far apart, take them where they stand. Empty: a quarter of the stepdown; 0: none."
         }
         "Light-cut feed (%)" => {
             "How fast a step that cuts narrower than the stepover may go, in percent of the feed: its chips are thinner, so it goes faster until they are as thick as at the full stepover, at most this. Empty: always the feed."
@@ -3344,6 +3451,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 OpKind::Adaptive3d => {
                     field(ui, need, "Stepover (%)", &mut f.stepover_percent, "20");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm, sides and floors");
+                    field(ui, need, "Step-up height", &mut f.step_up, "a quarter of the stepdown (0: none)");
                     field(ui, need, "Helix angle", &mut f.helix_angle, "5 deg");
                     field(ui, need, "Helix largest (%)", &mut f.helix_max, "100");
                     field(ui, need, "Helix smallest (%)", &mut f.helix_min, "10");
@@ -4201,10 +4309,11 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
         return;
     }
     tick(app, ctx);
+    app.manufacture.repaint = Some(ctx.clone());
     if app.manufacture.open && (app.manufacture.show_paths || app.manufacture.show_setups) {
         refresh(app);
     }
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let listed = listed(app).0;
     let selected = selected_faces(app);
     let library = library_listing(app, false);
     let mut lists = choices(app, &listed, &library);
@@ -4411,7 +4520,7 @@ pub struct PendingPost {
 
 /// The operations of a setup (or the one given) that run into one of its clamps.
 fn clamped_ops(app: &mut SolveApp, setup: u64, op: Option<u64>) -> Vec<String> {
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let listed = listed(app).0;
     listed["setups"]
         .as_array()
         .into_iter()
@@ -4470,8 +4579,11 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
     // sketch drag in progress): listing would rebuild it under the drag.
     let revision = app.session.revision;
     if app.manufacture.browser_listing.as_ref().is_none_or(|(r, _)| *r != revision) && !app.session.model.is_stale() {
-        let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
-        app.manufacture.browser_listing = Some((revision, listed));
+        app.manufacture.repaint = Some(ui.ctx().clone());
+        // While 3D roughing is worked out, the rows stay as they were.
+        if let (listed, true) = listed(app) {
+            app.manufacture.browser_listing = Some((revision, listed));
+        }
     }
     let setups = app.manufacture.browser_listing.as_ref().and_then(|(_, l)| l["setups"].as_array().cloned()).unwrap_or_default();
     if setups.is_empty() {
@@ -4763,7 +4875,7 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         _ => {}
     }
     let (Some(setup), op) = (p["setup"].as_u64(), p["op"].as_u64()) else { return };
-    let listed = app.session.execute("cam.list", &json!({})).unwrap_or_default();
+    let listed = listed(app).0;
     let Some(s) = listed["setups"].as_array().into_iter().flatten().find(|s| s["id"].as_u64() == Some(setup)).cloned() else { return };
     let o = op.and_then(|op| s["operations"].as_array().into_iter().flatten().find(|o| o["id"].as_u64() == Some(op)).cloned());
     let mut asked = Asked::default();

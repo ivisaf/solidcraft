@@ -1292,26 +1292,26 @@ fn a_3d_adaptive_form_roughs_the_stock_with_or_without_a_sketch() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.adaptive3d");
     h.frames(2);
-    for row in ["3D ADAPTIVE", "Sketch", "Stepover (%)", "Stock to leave", "Helix angle", "Stepdown", "Climb"] {
+    for row in ["3D ADAPTIVE", "Sketch", "Stepover (%)", "Stock to leave", "Step-up height", "Helix angle", "Stepdown", "Climb"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     for row in ["Rest of tool", "Finish allowance"] {
         assert!(h.widget(row).is_none(), "{row} is not offered in 3D");
     }
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
-    (f.stepdown, f.stock_to_leave) = ("4".into(), "0.3".into());
+    (f.stepdown, f.stock_to_leave, f.step_up) = ("4".into(), "0.3".into(), "1 mm".into());
     apply(&mut h.app);
     assert_eq!(h.app.manufacture.error, None);
     let geometry = |h: &Harness| h.app.session.doc.manufacture.setups[0].operations[0].geometry.clone();
     let op = h.app.session.doc.manufacture.setups[0].operations[0].clone();
-    assert!(matches!(op.kind, CamOperationKind::Adaptive { model: true, .. }), "{:?}", op.kind);
+    assert!(matches!(&op.kind, CamOperationKind::Adaptive { model: true, step_up: Some(e), .. } if e == "1 mm"), "{:?}", op.kind);
     assert_eq!(geometry(&h), CamGeometry::Stock);
     // Edited: inside the sketch's rectangle, then the whole stock again.
     let edit = |h: &mut Harness, sketch: &str| {
         let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
         let setup = listed["setups"][0].clone();
         let Some(Form::Op(mut again)) = edit_form(&h.app, &setup, &setup["operations"][0]) else { panic!("no form") };
-        assert_eq!(again.kind, OpKind::Adaptive3d);
+        assert_eq!((again.kind, again.step_up.as_str()), (OpKind::Adaptive3d, "1 mm"));
         again.sketch = sketch.into();
         h.app.manufacture.form = Some(Form::Op(again));
         apply(&mut h.app);

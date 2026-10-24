@@ -35,8 +35,8 @@ use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
 pub use cmd::{
-    CamPlayback, CamPreview, CommandInfo, CommandSpec, PreviewHeights, auto_operation, cam_heights, cam_playback, cam_preview, cam_selection_heights,
-    command_specs, extrude_reach, find_command,
+    CamPlayback, CamPreview, CommandInfo, CommandSpec, PreviewHeights, auto_operation, cam_heights, cam_list_ready, cam_playback, cam_preview,
+    cam_selection_heights, cam_slow, command_specs, extrude_reach, find_command,
 };
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
@@ -278,6 +278,9 @@ pub struct Session {
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
     /// scratch copies): a body that did not change or move is not measured again.
     clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
+    /// 3D roughing toolpaths by a fingerprint of all they are made from (shared with scratch
+    /// copies): they take seconds, and the panel, the browser and a form's preview ask again.
+    cam_path_cache: std::sync::Arc<std::sync::Mutex<cmd::cam::PathCache>>,
     /// Recent body renames: the design before and after each, and the names, so undo and redo
     /// follow them without evaluating either.
     body_renames: Vec<BodyRename>,
@@ -440,6 +443,7 @@ impl Session {
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             clearance_cache: Default::default(),
+            cam_path_cache: Default::default(),
             body_renames: Vec::new(),
             contact_meshes: Default::default(),
             clipboard: Vec::new(),
@@ -976,6 +980,7 @@ impl Session {
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
+            cam_path_cache: self.cam_path_cache.clone(),
             body_renames: Vec::new(),
             contact_meshes: self.contact_meshes.clone(),
             clipboard: self.clipboard.clone(),

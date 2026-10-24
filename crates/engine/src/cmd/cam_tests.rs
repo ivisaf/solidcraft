@@ -1937,6 +1937,7 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -5, "operation": "cut"}));
     run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
     run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "drill", "diameter": 6, "spindle_rpm": 3000, "feed": 200}));
     // 2 mm of stock over the plate; the work zero on its top.
     let top = json!({"of": "stock", "x": "min", "y": "min", "z": "max"});
     run(&mut s, "cam.setup.create", json!({"name": "Rough", "origin": top, "stock": {"top": 2}}));
@@ -1955,14 +1956,32 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     let pocket = 30.0 * 20.0 * 4.8;
     assert!(removed > (skin + pocket) * 0.95 && removed < skin + pocket + 100.0, "{removed}");
     assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
-    // Only a flat end mill, and no finishing lap or rest machining in 3D yet.
+    // A flat or ball end mill; no finishing lap or rest machining in 3D yet, no negative step-up.
     for bad in [
-        json!({"setup": "Rough", "tool": 2}),
+        json!({"setup": "Rough", "tool": 3}),
         json!({"setup": "Rough", "tool": 1, "finish": 0.5}),
         json!({"setup": "Rough", "tool": 1, "rest_from": 2}),
+        json!({"setup": "Rough", "tool": 1, "step_up": -1}),
     ] {
         assert!(s.execute("cam.op.adaptive3d", &bad).is_err(), "{bad}");
     }
+    use solidcraft_doc::manufacture::CamOperationKind;
+    let ball = run(&mut s, "cam.op.adaptive3d", json!({"setup": "Rough", "tool": 2, "stepdown": 3, "stock_to_leave": 0.2, "step_up": 0}));
+    assert!(ball["lowest_z"].as_f64().unwrap() <= -6.8 + 1e-9, "{ball}");
+    let rough = |s: &Session| s.doc.manufacture.setups[0].operations.clone();
+    assert!(matches!(&rough(&s)[1].kind, CamOperationKind::Adaptive { model: true, step_up: Some(e), .. } if e == "0"));
+    run(&mut s, "cam.op.edit", json!({"setup": "Rough", "op": ball["operation"], "step_up": null}));
+    assert!(matches!(&rough(&s)[1].kind, CamOperationKind::Adaptive { step_up: None, .. }));
+    run(&mut s, "cam.op.remove", json!({"setup": "Rough", "op": ball["operation"]}));
+    // After a facing pass took the 2 mm over the plate, roughing starts where it stopped.
+    let minutes =
+        |s: &mut Session, k: usize| run(s, "cam.list", json!({}))["setups"][0]["operations"][k]["toolpath"]["cut_minutes"].as_f64().unwrap();
+    let alone = minutes(&mut s, 0);
+    let faced = run(&mut s, "cam.op.face", json!({"setup": "Rough", "tool": 1}));
+    run(&mut s, "cam.op.move", json!({"setup": "Rough", "op": faced["operation"], "to": 0}));
+    let after = minutes(&mut s, 1);
+    assert!(after < alone * 0.8, "{alone} min alone, {after} min after facing");
+    run(&mut s, "cam.op.remove", json!({"setup": "Rough", "op": faced["operation"]}));
     // With room for the tool beside the part, it still goes no deeper than the deepest floor seen
     // from above by itself: down beside the part to the stock's bottom would cut the part loose.
     run(&mut s, "cam.setup.create", json!({"name": "Wide", "origin": top, "stock": {"top": 2, "side": 8}}));
@@ -1974,4 +1993,9 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     // Told to go to the stock's bottom, it does, and says the part comes loose.
     run(&mut s, "cam.op.edit", json!({"setup": "Wide", "op": made["operation"], "bottom": -12}));
     assert!(warning(&mut s).as_str().is_some_and(|w| w.contains("without tabs")), "{}", warning(&mut s));
+    // Two copies on one stock: roughing the stock goes round both, cutting into neither.
+    run(&mut s, "cam.setup.create", json!({"name": "Two", "origin": top, "stock": {"top": 2}, "copies": {"nx": 2, "ny": 1, "dx": 70, "dy": 0}}));
+    run(&mut s, "cam.op.adaptive3d", json!({"setup": "Two", "tool": 1, "stepdown": 3, "stock_to_leave": 0.2}));
+    let sim = run(&mut s, "cam.simulate", json!({"setup": "Two", "columns": 300}));
+    assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
 }

@@ -117,7 +117,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.face", "Facing", op_face).at("MANUFACTURE", "MILLING").icon("cam_face").params(op_doc!("stepover?: expr (default: the tool's own, else half its diameter; at most the diameter); faces the box around the profiles or faces — or, without them, boundary?: stock|part (default stock), from the stock's top down to the part's; limit?: over|inside the boundary (default over); margin?: expr, how far over or inside (default: over by the tool's radius, inside by 0)")),
     CommandSpec::new("cam.op.contour", "2D Contour", op_contour).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!("lead?: expr, the radius of a quarter-circle lead-in and lead-out onto the wall (default none: it ramps along the loop; not with tabs); dogbones?: bool, into the sharp inside corners; skin?: expr, an onion skin left on the bottom, taken off in a last pass with skin_last?: bool; side?: outside|inside|on (default outside: the profiles are the part); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); tabs?: {count?: on each loop (default 4), width?: expr along the edge (default 6 mm), height?: expr over the bottom (default 2 mm)}, holding a part being cut out (null: none); finish?: expr, an allowance the depth passes leave on the wall for one more pass at full depth (null: none)")),
     CommandSpec::new("cam.op.pocket", "2D Pocket", op_pocket).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("dogbones?: bool, into the pocket's sharp corners; stepover?: expr (default: the tool's own, else 40% of its diameter; at most the diameter); climb?: bool (default true); stock_to_leave?: expr; ramp_angle?: angle expr (default 3 deg; 0 plunges straight down); finish?: expr, an allowance the depth passes leave on the walls for one more pass along them at full depth (null: none); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left (corners, narrow places) is cut (null: the whole pocket); inner profiles are islands")),
-    CommandSpec::new("cam.op.adaptive3d", "3D Adaptive", op_adaptive3d).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("roughs the stock down to the model level by level with a flat end mill, at the steady load of cam.op.adaptive: the tool follows the model's shape seen from the tool's side (no undercuts), levels a stepdown apart at most and one on each flat floor of the model, so floors come out level; without a sketch or faces it roughs the whole stock (boundary?: stock|part, the box it stays in), with them only inside their profiles (where the tool's axis stays); the top defaults to the stock's top and the bottom to the model's deepest floor seen from the tool (not beside the part down to the stock's bottom); stepover_percent?, helix_angle?, helix_max?, helix_min?, climb?, feed_up?: as cam.op.adaptive; stock_to_leave?: expr, left on the model all round (sides and floors)")),
+    CommandSpec::new("cam.op.adaptive3d", "3D Adaptive", op_adaptive3d).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("roughs the stock down to the model level by level with a flat or ball end mill, at the steady load of cam.op.adaptive: the tool follows the model's shape seen from the tool's side (no undercuts), levels a stepdown apart at most and one on each flat floor of the model, so floors come out level; without a sketch or faces it roughs the whole stock (boundary?: stock|part, the box it stays in), with them only inside their profiles (where the tool's axis stays); the top defaults to the stock's top and the bottom to the model's deepest floor seen from the tool (not beside the part down to the stock's bottom); stepover_percent?, helix_angle?, helix_max?, helix_min?, climb?, feed_up?: as cam.op.adaptive; stock_to_leave?: expr, left on the model all round (sides and floors); step_up?: expr, levels in between on slopes this far apart at most, taking the steps the levels leave (default a quarter of the stepdown; 0: none; null: the default); it starts from what earlier operations of the setup (and the setup it takes its stock from) left, and a tool with a length and a holder diameter keeps its holder clear of the model and the stock")),
     CommandSpec::new("cam.op.adaptive", "Adaptive", op_adaptive).at("MANUFACTURE", "MILLING").icon("cam_pocket").params(op_doc!("stepover_percent?: the heaviest cut, as a percentage of the tool's diameter (2 to 50, default 20): the tool steps through the material so that no step cuts wider, inner corners and narrow places included; stock_to_leave?: expr; finish?: expr, an allowance the passes leave on the walls for one more lap at full depth (null: none); helix_angle?: angle expr, the entry helix's (or ramp's) slope (default 5 deg); helix_max?, helix_min?: the entry helix's diameter as a percentage of the tool's, at most and at least (default 100, 10); climb?: bool (default true); rest_from?: a larger tool's number (of this design) that cleared the pocket before: only what it left is cut (null: the whole pocket); feed_up?: percent of the feed (100 to 500; null or 100: never faster): a step lighter than the stepover makes thinner chips and goes as much faster, up to this; cuts go as arcs where their steps lie on one; inner profiles are islands")),
     CommandSpec::new("cam.op.vcarve", "V-Carve", op_vcarve).at("MANUFACTURE", "MILLING").icon("cam_contour").params(op_doc!(
         "stepover?: expr, the distance between the rings (default: 2% of the tool's diameter); max_depth?: expr, the deepest the point goes \
@@ -1789,6 +1789,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             rest_from,
             feed_up,
             model,
+            step_up,
         } => {
             let rest_diameter = match rest_from {
                 Some(n) => {
@@ -1810,11 +1811,39 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             };
             if *model {
                 let stock = at.stock.ok_or_else(|| fail("there is no body to take the stock from".into()))?;
-                let part = part_triangles(s, at);
-                if part.is_empty() {
+                // Over the whole stock every copy of the part is in the way; inside a sketch the
+                // path is cut on each copy, as other operations are.
+                let one = part_triangles(s, at);
+                if one.is_empty() {
                     return Err(fail("there is no model to rough down to".into()));
                 }
-                cam::adaptive_3d(regions, &part, stock, tool, &params, &cut)
+                let all_copies = matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part);
+                let shifts: &[(f64, f64)] = if all_copies { &at.copies } else { &[(0.0, 0.0)] };
+                let part: Vec<[Vec3; 3]> =
+                    shifts.iter().flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0)))).collect();
+                let step_up = match step_up {
+                    Some(e) => len("step_up", e)?,
+                    None => cut.stepdown * 0.25,
+                };
+                let key = rough_key(s, op);
+                if let Some(path) = key.and_then(|k| s.cam_path_cache.lock().ok()?.get(&k).cloned()) {
+                    Ok(path)
+                } else {
+                    let left = stock_before(s, at, op, tool);
+                    let job = cam::Rough3d {
+                        boundary: regions,
+                        part: &part,
+                        stock,
+                        left: left.as_ref(),
+                        step_up,
+                        holder: tool.holder_diameter.zip(tool.length),
+                    };
+                    let made = cam::adaptive_3d(&job, tool, &params, &cut);
+                    if let (Some(k), Ok(path), Ok(mut cache)) = (key, &made, s.cam_path_cache.lock()) {
+                        cache.insert(k, path.clone());
+                    }
+                    made
+                }
             } else {
                 cam::adaptive(regions, tool, &params, &cut)
             }
@@ -1910,6 +1939,71 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     // Facing the stock covers every copy already: the stock reaches over them.
     let copies: &[(f64, f64)] = if matches!(op.geometry, CamGeometry::Stock) { &[(0.0, 0.0)] } else { &at.copies };
     path.map(|p| copied(p, copies)).map_err(|e| fail(e.to_string()))
+}
+
+/// 3D roughing toolpaths by [`rough_key`], the last few.
+#[derive(Default)]
+pub(crate) struct PathCache {
+    paths: Vec<(u64, Toolpath)>,
+}
+
+/// How many 3D roughing toolpaths are kept.
+const KEPT_PATHS: usize = 8;
+
+impl PathCache {
+    fn get(&self, key: &u64) -> Option<&Toolpath> {
+        self.paths.iter().find(|(k, _)| k == key).map(|(_, p)| p)
+    }
+
+    fn insert(&mut self, key: u64, path: Toolpath) {
+        self.paths.retain(|(k, _)| *k != key);
+        if self.paths.len() >= KEPT_PATHS {
+            self.paths.remove(0);
+        }
+        self.paths.push((key, path));
+    }
+}
+
+/// A fingerprint of everything a 3D roughing toolpath of `op` is made from: the design without
+/// its manufacturing (the model and its parameters), every setup up to and with `op`'s (their
+/// operations up to `op`: what they cut is its stock), and the tools.
+fn rough_key(s: &Session, op: &CamOperation) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let m = &s.doc.manufacture;
+    let at = m.setups.iter().position(|x| x.operations.iter().any(|o| o.id == op.id))?;
+    let mut setups: Vec<Value> = Vec::new();
+    for (k, setup) in m.setups.iter().take(at + 1).enumerate() {
+        let mut v = serde_json::to_value(setup).ok()?;
+        if k == at {
+            let upto = setup.operations.iter().position(|o| o.id == op.id)?;
+            v["operations"] = serde_json::to_value(setup.operations.get(..=upto)?).ok()?;
+        }
+        setups.push(v);
+    }
+    let mut design = (*s.doc).clone();
+    design.manufacture = Default::default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(&design).ok()?.hash(&mut h);
+    serde_json::to_vec(&(setups, &m.tools)).ok()?.hash(&mut h);
+    Some(h.finish())
+}
+
+/// What the operations before `op` in its setup (and the setup it takes its stock from) leave
+/// of the stock, on columns a fifth of `tool`'s radius wide (coarser on a large stock); `None`
+/// when nothing cut it before.
+fn stock_before(s: &Session, at: &Resolved, op: &CamOperation, tool: &Tool) -> Option<cam::HeightField> {
+    let (setup, index) = s.doc.manufacture.setups.iter().find_map(|x| x.operations.iter().position(|o| o.id == op.id).map(|k| (x, k)))?;
+    if index == 0 && setup.stock_from.is_none() {
+        return None;
+    }
+    let (lo, hi) = at.stock?;
+    let cell = (tool.radius() / 5.0).max((hi.x - lo.x).max(hi.y - lo.y) / 600.0);
+    let (mut field, _) = start_stock(s, setup, at, &json!({ "cell": cell }), "cam.op.adaptive3d").ok()?;
+    for earlier in setup.operations.iter().take(index) {
+        let (Ok(path), Some(t)) = (build_in(s, at, earlier), s.doc.manufacture.tool(earlier.tool)) else { continue };
+        cam::simulate(&mut field, &path, t).ok()?;
+    }
+    Some(field)
 }
 
 /// A toolpath cut on every copy, one after the other, the tool up at its highest between them.
@@ -2389,7 +2483,20 @@ fn adaptive_kind(s: &Session, p: &Value, cmd: &str, model: bool) -> Result<CamOp
         rest_from: rest_param(s, p, cmd)?,
         feed_up: feed_up_param(p, cmd)?,
         model,
+        step_up: if model { step_up_param(s, p, cmd)? } else { None },
     })
+}
+
+/// How far apart 3D roughing's levels in between on slopes are at most: a length of 0 or more
+/// (0: none; left out or null: a quarter of the stepdown).
+fn step_up_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<Expr>> {
+    match p.get("step_up") {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => {
+            let e = req_expr(cmd, p, "step_up")?;
+            if length(s, cmd, "step_up", &e)? >= 0.0 { Ok(Some(e)) } else { Err(bad(cmd, "`step_up` must be 0 or more")) }
+        }
+    }
 }
 
 /// How much faster light adaptive steps may go: percent of the feed, none when 100 or left out.
@@ -2597,6 +2704,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
         "helix_max",
         "helix_min",
         "feed_up",
+        "step_up",
         "pitch",
         "width",
         "tip_offset",
@@ -2638,6 +2746,7 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
             (CamOperationKind::Adaptive { helix_max, .. }, "helix_max") => *helix_max = number_in(p, k, 1.0, 1000.0, *helix_max, cmd)?,
             (CamOperationKind::Adaptive { helix_min, .. }, "helix_min") => *helix_min = number_in(p, k, 1.0, 1000.0, *helix_min, cmd)?,
             (CamOperationKind::Adaptive { feed_up, .. }, "feed_up") => *feed_up = feed_up_param(p, cmd)?,
+            (CamOperationKind::Adaptive { step_up, model: true, .. }, "step_up") => *step_up = step_up_param(s, p, cmd)?,
             (CamOperationKind::Bore { pitch, .. }, "pitch") => *pitch = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { width, .. }, "width") => *width = checked(k, Kind::Length)?,
             (CamOperationKind::Chamfer { tip_offset, .. }, "tip_offset") => *tip_offset = checked(k, Kind::Length)?,
@@ -2727,6 +2836,40 @@ fn op_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "removed": removed.map(|o| o.id) }))
 }
 
+/// Whether `cam.list` answers at once: it was worked out for the design as it is, or every 3D
+/// roughing toolpath it needs is known already (those take seconds; the rest is quick). A
+/// window asks before it lists, and lists a 3D roughing job on a copy in the background first.
+pub fn cam_list_ready(s: &Session) -> bool {
+    if let Ok(cache) = s.cam_list_cache.lock()
+        && let Some((revision, doc, _)) = cache.as_ref()
+        && *revision == s.revision
+        && std::sync::Arc::ptr_eq(doc, &s.doc)
+    {
+        return true;
+    }
+    let rough =
+        s.doc.manufacture.setups.iter().flat_map(|x| &x.operations).filter(|o| matches!(o.kind, CamOperationKind::Adaptive { model: true, .. }));
+    let Ok(cache) = s.cam_path_cache.lock() else { return true };
+    rough.into_iter().all(|op| rough_key(s, op).is_none_or(|k| cache.get(&k).is_some()))
+}
+
+/// Whether `cmd` with `p` (as [`cam_preview`] takes them) makes or changes a 3D roughing
+/// operation, whose toolpath takes seconds.
+pub fn cam_slow(s: &Session, cmd: &str, p: &Value) -> bool {
+    match cmd {
+        "cam.op.adaptive3d" => true,
+        "cam.op.edit" => key(p, "op").is_some_and(|k| {
+            s.doc
+                .manufacture
+                .setups
+                .iter()
+                .flat_map(|x| &x.operations)
+                .any(|o| matches!(o.kind, CamOperationKind::Adaptive { model: true, .. }) && (k == o.id.to_string() || k == o.name))
+        }),
+        _ => false,
+    }
+}
+
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
     if let Ok(cache) = s.cam_list_cache.lock()
         && let Some((revision, doc, listed)) = cache.as_ref()
@@ -2792,8 +2935,10 @@ fn list_now(s: &Session) -> Value {
                                         warnings.push(format!("the holder runs into clamp {clamp}"));
                                     }
                                 }
-                                // Deeper below the stock's top than the tool reaches out of its holder: the holder hits the stock.
-                                if let (Some(reach), Some(lowest), Some(top)) = (tool.length, path.stats().lowest_z, stock_top) {
+                                // Deeper below the stock's top than the tool reaches out of its holder: the holder hits the
+                                // stock. 3D roughing with a holder given keeps it clear itself.
+                                let holder_kept = matches!(op.kind, CamOperationKind::Adaptive { model: true, .. }) && tool.holder_diameter.is_some();
+                                if let (Some(reach), Some(lowest), Some(top), false) = (tool.length, path.stats().lowest_z, stock_top, holder_kept) {
                                     let depth = top - lowest;
                                     if depth > reach + 1e-6 {
                                         warnings.push(format!("goes {depth:.1} mm deep but the tool reaches {reach:.1} mm out of its holder"));

@@ -26,7 +26,7 @@ mod sim;
 mod tool;
 
 pub use adaptive::{AdaptiveParams, adaptive};
-pub use adaptive3d::adaptive_3d;
+pub use adaptive3d::{Rough3d, adaptive_3d};
 pub use check::verify;
 pub use gcode::{Operation, Program, Safety, emit, parse};
 pub use offset::offset_regions;
