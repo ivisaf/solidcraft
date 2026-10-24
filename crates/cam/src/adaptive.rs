@@ -111,6 +111,14 @@ pub(crate) struct Grid {
     pub(crate) room: Vec<f64>,
     pub(crate) material: Vec<bool>,
     pub(crate) cleared: Vec<bool>,
+    /// Material not cut yet (`material` and not `cleared`), kept as cells are cut: what every
+    /// look under the tool asks.
+    pub(crate) uncut: Vec<bool>,
+    /// Worked out once for the tool's radius: the points round its edge where its engagement is
+    /// measured (from its axis), and across its leading edge where its width of cut is (each
+    /// one's offset across the travel and how far ahead of the axis it is).
+    pub(crate) ring: std::cell::OnceCell<Vec<Vec2>>,
+    pub(crate) across: std::cell::OnceCell<Vec<(f64, f64)>>,
     /// The tool's radius.
     pub(crate) r: f64,
     /// The pocket, and how far from its boundary the tool's axis stays: positions near the
@@ -159,25 +167,32 @@ impl Grid {
             a..b
         };
         let (is, js) = (span(p.x, self.lo.x, self.nx), span(p.y, self.lo.y, self.ny));
-        js.flat_map(move |j| is.clone().map(move |i| (i, j))).filter(move |&(i, j)| self.centre(i, j).dist(p) <= r).map(move |(i, j)| j * self.nx + i)
+        // Clearly inside or outside without a square root; at the rim exactly as the distance says.
+        let r2 = r * r;
+        let within = move |c: Vec2| {
+            let d = c - p;
+            let d2 = d.x * d.x + d.y * d.y;
+            if d2 < r2 * (1.0 - 1e-9) {
+                true
+            } else if d2 > r2 * (1.0 + 1e-9) {
+                false
+            } else {
+                c.dist(p) <= r
+            }
+        };
+        js.flat_map(move |j| is.clone().map(move |i| (i, j))).filter(move |&(i, j)| within(self.centre(i, j))).map(move |(i, j)| j * self.nx + i)
     }
 
-    /// The material not yet cut under the tool at `p` (mm²).
-    fn area(&self, p: Vec2) -> f64 {
-        let n =
-            self.disc(p, self.r).filter(|&k| self.material.get(k).copied().unwrap_or(false) && !self.cleared.get(k).copied().unwrap_or(true)).count();
-        n as f64 * self.cell * self.cell
+    /// Whether any material not yet cut is under the tool at `p`.
+    fn touches(&self, p: Vec2) -> bool {
+        self.disc(p, self.r).any(|k| self.uncut.get(k).copied().unwrap_or(false))
     }
 
     /// How much of the tool's edge at `p` is in material not yet cut (radians, 0 to 2π): its
     /// engagement angle.
     fn engagement(&self, p: Vec2) -> f64 {
-        let n = (0..ROUND)
-            .filter(|&k| {
-                let q = p + Vec2::from_angle(TAU * k as f64 / ROUND as f64) * self.r;
-                self.index(q).is_some_and(|c| self.material.get(c).copied().unwrap_or(false) && !self.cleared.get(c).copied().unwrap_or(true))
-            })
-            .count();
+        let ring = self.ring.get_or_init(|| (0..ROUND).map(|k| Vec2::from_angle(TAU * k as f64 / ROUND as f64) * self.r).collect());
+        let n = ring.iter().filter(|&&off| self.index(p + off).is_some_and(|c| self.uncut.get(c).copied().unwrap_or(false))).count();
         TAU * n as f64 / ROUND as f64
     }
 
@@ -192,12 +207,19 @@ impl Grid {
         let u = d * (1.0 / len);
         let n = Vec2::new(-u.y, u.x);
         let samples = ((len / (self.cell * 0.5)).ceil() as usize).clamp(1, 1000);
-        let uncut =
-            |x: Vec2| self.index(x).is_some_and(|c| self.material.get(c).copied().unwrap_or(false) && !self.cleared.get(c).copied().unwrap_or(true));
-        let hits = (0..ACROSS)
-            .filter(|&k| {
-                let w = self.r * ((k as f64 + 0.5) / ACROSS as f64 * 2.0 - 1.0);
-                let edge = u * (self.r * self.r - w * w).max(0.0).sqrt() + n * w;
+        let uncut = |x: Vec2| self.index(x).is_some_and(|c| self.uncut.get(c).copied().unwrap_or(false));
+        let across = self.across.get_or_init(|| {
+            (0..ACROSS)
+                .map(|k| {
+                    let w = self.r * ((k as f64 + 0.5) / ACROSS as f64 * 2.0 - 1.0);
+                    (w, (self.r * self.r - w * w).max(0.0).sqrt())
+                })
+                .collect()
+        });
+        let hits = across
+            .iter()
+            .filter(|&&(w, ahead)| {
+                let edge = u * ahead + n * w;
                 (0..=samples).any(|t| uncut(p + edge + d * (t as f64 / samples as f64)))
             })
             .count();
@@ -218,13 +240,27 @@ impl Grid {
             for i in i0..i1 {
                 let c = self.centre(i, j);
                 let t = if len2 > 0.0 { ((c - a).dot(d) / len2).clamp(0.0, 1.0) } else { 0.0 };
-                if c.dist(a + d * t) <= r
-                    && let Some(x) = self.cleared.get_mut(j * self.nx + i)
-                {
-                    *x = true;
+                if c.dist(a + d * t) <= r {
+                    self.cut(j * self.nx + i);
                 }
             }
         }
+    }
+
+    /// Marks cell `k` as cut.
+    pub(crate) fn cut(&mut self, k: usize) {
+        if let Some(x) = self.cleared.get_mut(k) {
+            *x = true;
+        }
+        if let Some(x) = self.uncut.get_mut(k) {
+            *x = false;
+        }
+    }
+
+    /// Sets what is cut, and with it what is still to cut.
+    pub(crate) fn set_cleared(&mut self, cleared: Vec<bool>) {
+        self.uncut = self.material.iter().zip(&cleared).map(|(m, c)| *m && !*c).collect();
+        self.cleared = cleared;
     }
 
     /// Whether the straight move from `a` to `b` keeps the tool inside the walls and over cut material only.
@@ -232,19 +268,14 @@ impl Grid {
         let n = ((a.dist(b) / (self.cell * 0.5)).ceil() as usize).clamp(1, 1_000_000);
         (0..=n).all(|k| {
             let p = a.lerp(b, k as f64 / n as f64);
-            self.allowed_at(p) && self.area(p) <= 0.0
+            self.allowed_at(p) && !self.touches(p)
         })
     }
 
     /// The material the tool can reach that is still standing (mm²).
     fn left(&self, reachable: &[bool]) -> f64 {
-        let n = (0..self.material.len())
-            .filter(|&k| {
-                self.material.get(k).copied().unwrap_or(false)
-                    && !self.cleared.get(k).copied().unwrap_or(true)
-                    && reachable.get(k).copied().unwrap_or(false)
-            })
-            .count();
+        let n =
+            (0..self.material.len()).filter(|&k| self.uncut.get(k).copied().unwrap_or(false) && reachable.get(k).copied().unwrap_or(false)).count();
         n as f64 * self.cell * self.cell
     }
 }
@@ -305,7 +336,7 @@ fn adaptive_in(shape: &Shape, tool: &Tool, p: &AdaptiveParams, cut: &Cut) -> Res
                 }
             }
         }
-        grid.cleared = reached;
+        grid.set_cleared(reached);
         if !grid.material.iter().zip(&grid.cleared).any(|(m, c)| *m && !*c) {
             return invalid(format!("the {big} mm tool leaves nothing for this tool: it reached the whole pocket"));
         }
@@ -412,6 +443,9 @@ fn grid(shape: &Shape, r: f64, wall: f64) -> Result<Grid> {
         room: vec![f64::MIN; nx * ny],
         material: vec![false; nx * ny],
         cleared: vec![false; nx * ny],
+        uncut: Vec::new(),
+        ring: Default::default(),
+        across: Default::default(),
         r,
         shape: Some(shape.clone()),
         reach: r + wall,
@@ -432,6 +466,7 @@ fn grid(shape: &Shape, r: f64, wall: f64) -> Result<Grid> {
             }
         }
     }
+    g.uncut = g.material.clone();
     Ok(g)
 }
 
@@ -597,7 +632,7 @@ fn entry_at(g: &mut Grid, tool: &Tool, p: &AdaptiveParams, fresh: Option<&[bool]
         .collect();
     open.sort_by(|&a, &b| g.room.get(b).copied().unwrap_or(0.0).total_cmp(&g.room.get(a).copied().unwrap_or(0.0)));
     let best = match fresh {
-        Some(_) => open.into_iter().find(|&k| g.area(g.centre(k % g.nx, k / g.nx)) > 0.0)?,
+        Some(_) => open.into_iter().find(|&k| g.touches(g.centre(k % g.nx, k / g.nx)))?,
         None => open.first().copied()?,
     };
     let c = g.centre(best % g.nx, best / g.nx);
@@ -606,9 +641,7 @@ fn entry_at(g: &mut Grid, tool: &Tool, p: &AdaptiveParams, fresh: Option<&[bool]
     if rh >= p.helix_min * tool.diameter * 0.5 {
         let cells: Vec<usize> = g.disc(c, rh + g.r).collect();
         for k in cells {
-            if let Some(x) = g.cleared.get_mut(k) {
-                *x = true;
-            }
+            g.cut(k);
         }
         return Some(Entry::Helix { c, r: rh });
     }
@@ -654,7 +687,7 @@ fn next_start(g: &Grid, at: Vec2, target: f64, dead: &[bool]) -> Option<(Vec2, V
             return Some((g.centre(i, j), link));
         }
         // Only through what is cut: the link must not cut.
-        if (a > 0.0 || g.area(g.centre(i, j)) > 0.0) && k != k0 {
+        if (a > 0.0 || g.touches(g.centre(i, j))) && k != k0 {
             continue;
         }
         for (di, dj) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1)] {
@@ -886,7 +919,7 @@ fn step(g: &Grid, p: Vec2, pred: Vec2, target: f64, s: f64, into: f64) -> Option
                 }
                 let (q, u, a) = at(lo);
                 // Something must be cut, or the tool would run on through what is cleared.
-                if a >= target * MIN_SHARE && a.is_finite() && g.area(q) > 0.0 {
+                if a >= target * MIN_SHARE && a.is_finite() && g.touches(q) {
                     return Some((q, u, a));
                 }
                 return None;
@@ -894,7 +927,7 @@ fn step(g: &Grid, p: Vec2, pred: Vec2, target: f64, s: f64, into: f64) -> Option
             // Nowhere near enough: into the material as far as it goes, if that takes something.
             None => {
                 let (_, (q, u, a)) = samples.into_iter().filter(|(_, (_, _, a))| a.is_finite()).max_by(|x, y| x.1.2.total_cmp(&y.1.2))?;
-                return (a >= target * MIN_SHARE && g.area(q) > 0.0).then_some((q, u, a));
+                return (a >= target * MIN_SHARE && g.touches(q)).then_some((q, u, a));
             }
         }
     }

@@ -227,10 +227,14 @@ impl Levels<'_> {
             allowed,
             material,
             cleared: vec![false; nx * ny],
+            uncut: Vec::new(),
+            ring: Default::default(),
+            across: Default::default(),
             r: self.wide,
             shape: None,
             reach: self.wide + s,
         };
+        grid.uncut = grid.material.clone();
         // Every cell some position of the tool covers: within its reach of an allowed cell.
         let barred: Vec<bool> = grid.allowed.iter().map(|a| !a).collect();
         let reachable: Vec<bool> = room(&barred, nx, ny, cell, false)
