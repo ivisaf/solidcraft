@@ -2029,6 +2029,46 @@ fn z_level_finishing_goes_round_the_steep_flanks() {
     }
 }
 
+/// A flat end mill finishes a straight wall where it touches it, not a column or two away:
+/// round the block's vertical walls every level runs at the tool's radius from them (it used
+/// to stay 0.15 to 0.3 mm off them, which a simulation's measuring row saw as a wall-high strip).
+#[test]
+fn z_level_with_a_flat_end_mill_runs_against_vertical_walls() {
+    let (part, _) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let c = cut(0.0, -15.0, 4.0);
+    let flat = Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0);
+    for (allowance, climb) in [(0.0, true), (0.0, false), (0.2, true)] {
+        let path = zlevel_3d(&ZLevel3d { stock_to_leave: allowance, climb, ..zlevel(&part, &area) }, &flat, &c).unwrap();
+        // The straight runs along each wall, at every level down the block (-5 to -15, the
+        // last on the slab itself).
+        let mut walls = 0;
+        for p in path.moves.iter().filter_map(|m| m.target()).filter(|p| p.z < -5.0 && p.z > -15.0 - 1e-9) {
+            let gap = if (p.x - 30.0).abs() <= 10.0 + 1e-9 && (p.y - 20.0).abs() > 8.0 {
+                (p.y - 20.0).abs() - 8.0
+            } else if (p.y - 20.0).abs() <= 8.0 + 1e-9 && (p.x - 30.0).abs() > 10.0 {
+                (p.x - 30.0).abs() - 10.0
+            } else {
+                continue;
+            };
+            walls += 1;
+            close(gap, 3.0 + allowance, 1e-6);
+        }
+        assert!(walls >= 4 * 20, "{allowance} {climb}: {walls} wall points");
+        if allowance == 0.0 {
+            // On the slab within 1 mm of the walls, up their whole height and down to the slab:
+            // nothing left, nothing cut in.
+            let foot = |p: Vec2| {
+                let (dx, dy) = ((p.x - 30.0).abs() - 10.0, (p.y - 20.0).abs() - 8.0);
+                dx.max(dy) > 0.05 && dx.max(dy) < 1.0 && dx.min(dy) < -0.5
+            };
+            let (into, left) = finish_check(&part, &path, &flat, 0.0, foot);
+            assert!(into <= 2e-3, "cuts {into} into the part");
+            assert!(left <= 0.02, "{climb}: leaves {left} at the walls' foot");
+        }
+    }
+}
+
 #[test]
 fn rest_finishing_cleans_only_where_a_larger_ball_could_not_reach() {
     let (part, stock) = slab_and_block();

@@ -4,6 +4,10 @@
 //! grid. A sphere meets a triangle first at its face (the plane lifted by the radius), at an
 //! edge (a cylinder round it), or at a corner (a sphere round it); the highest over all the
 //! triangles near the point is where it stops.
+//!
+//! A flat end mill is dropped the same way: its end stops on the highest point of the part
+//! within its radius, which on a triangle is a corner inside the circle, where an edge crosses
+//! it, or the face's own highest point on the circle.
 
 use solidcraft_geom::{Vec2, Vec3};
 
@@ -14,7 +18,8 @@ const MAX_BUCKETS: usize = 4_000_000;
 /// A share of the radius squared under which a touch is only grazing: the sphere passes it.
 const GRAZE: f64 = 1e-9;
 
-/// The part's triangles, indexed by squares of the plane for quick lookups round a point.
+/// The part's triangles, indexed by squares of the plane for quick lookups round a point, for a
+/// sphere or a flat end mill of the radius it was made for.
 pub(crate) struct BallDrop {
     tris: Vec<[Vec3; 3]>,
     lo: Vec2,
@@ -103,6 +108,68 @@ impl BallDrop {
         }
         high
     }
+}
+
+impl BallDrop {
+    /// The highest point of the part within the radius of `p` (seen from above): where the end
+    /// of a flat end mill of that radius stops over `p`; `None` where no triangle reaches into it.
+    pub(crate) fn highest_within(&self, p: Vec2) -> Option<f64> {
+        let (fi, fj) = ((p.x - self.lo.x) / self.size, (p.y - self.lo.y) / self.size);
+        if !(fi >= 0.0 && fj >= 0.0) || fi >= self.nx as f64 || fj >= self.ny as f64 {
+            return None;
+        }
+        let bucket = self.buckets.get(fj as usize * self.nx + fi as usize)?;
+        let r2 = self.radius * self.radius;
+        let mut high: Option<f64> = None;
+        let mut up = |z: f64| high = Some(high.map_or(z, |h: f64| h.max(z)));
+        for &k in bucket {
+            let Some(&[a, b, c]) = self.tris.get(k as usize) else { continue };
+            // The corners inside the circle (one just on it is only touched).
+            for v in [a, b, c] {
+                if (p.x - v.x).powi(2) + (p.y - v.y).powi(2) < r2 {
+                    up(v.z);
+                }
+            }
+            // The edges, cut to the circle: their ends there are their highest inside it.
+            for (s, e) in [(a, b), (b, c), (c, a)] {
+                let (dx, dy, wx, wy) = (e.x - s.x, e.y - s.y, s.x - p.x, s.y - p.y);
+                let qa = dx * dx + dy * dy;
+                if !(qa > 1e-18) {
+                    continue;
+                }
+                let qb = 2.0 * (wx * dx + wy * dy);
+                let disc = qb * qb - 4.0 * qa * (wx * wx + wy * wy - r2);
+                if disc <= 0.0 {
+                    continue;
+                }
+                let (t0, t1) = (((-qb - disc.sqrt()) / (2.0 * qa)).max(0.0), ((-qb + disc.sqrt()) / (2.0 * qa)).min(1.0));
+                if t0 <= t1 {
+                    up(s.z + (e.z - s.z) * t0);
+                    up(s.z + (e.z - s.z) * t1);
+                }
+            }
+            // The face: its highest point in the circle is on it uphill from `p`, where that is
+            // inside the triangle (else an edge or a corner is higher).
+            let n = (b - a).cross(c - a);
+            if let Some(n) = n.normalized().map(|n| if n.z < 0.0 { n * -1.0 } else { n })
+                && n.z > 1e-9
+            {
+                let g = Vec2::new(-n.x / n.z, -n.y / n.z);
+                let q = g.normalized().map_or(p, |u| p + u * self.radius);
+                if inside_xy(q, a, b, c) {
+                    up(a.z + g.x * (q.x - a.x) + g.y * (q.y - a.y));
+                }
+            }
+        }
+        high
+    }
+}
+
+/// Whether `q` lies inside the triangle `a b c` seen from above (on its edges too).
+fn inside_xy(q: Vec2, a: Vec3, b: Vec3, c: Vec3) -> bool {
+    let side = |s: Vec3, e: Vec3| (e.x - s.x) * (q.y - s.y) - (e.y - s.y) * (q.x - s.x);
+    let (u, v, w) = (side(a, b), side(b, c), side(c, a));
+    (u >= -1e-12 && v >= -1e-12 && w >= -1e-12) || (u <= 1e-12 && v <= 1e-12 && w <= 1e-12)
 }
 
 /// Whether `q` (on the triangle's plane, its normal `n`) lies inside the triangle `a b c`.

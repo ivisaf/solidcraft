@@ -106,12 +106,15 @@ pub fn parallel_3d(job: &Finish3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
             }
         }
     }
-    // A ball is dropped onto the triangles themselves: exact, nothing kept back for between columns.
-    let ball = (tool.kind == ToolKind::BallEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
+    // A ball or a flat end mill is dropped onto the triangles themselves: exact, nothing kept
+    // back for between columns (a flat one grown by the allowance taken as its full width that
+    // much higher).
+    let dropped = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
     // The lowest the tip may go over `p`: the part under the tool, less its rise, plus the allowance.
     let tip = |p: Vec2| -> f64 {
-        if let Some(ball) = &ball {
-            return ball.centre(p).map_or(cut.heights.bottom, |c| c - r).max(cut.heights.bottom);
+        if let Some(d) = &dropped {
+            let low = if tool.kind == ToolKind::BallEndmill { d.centre(p).map(|c| c - r) } else { d.highest_within(p).map(|h| h + s) };
+            return low.unwrap_or(cut.heights.bottom).max(cut.heights.bottom);
         }
         let Some((i, j)) = part.column(p) else { return cut.heights.bottom };
         let mut low = f64::NEG_INFINITY;
@@ -346,10 +349,15 @@ pub fn zlevel_3d(job: &ZLevel3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
     let reach = sim::tool_floor(&part, tool, s)?;
     let (nx, ny) = (reach.nx, reach.ny);
     let at = |i: usize, j: usize| reach.get(i, j).unwrap_or(bottom - 1.0);
-    // A ball's contours are found on the columns, then put exactly where it touches the part at
-    // the level: along the way up the slope, by halving.
-    let ball = (tool.kind == ToolKind::BallEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
-    let exact = |p: Vec2| ball.as_ref().map(|b| b.centre(p).map_or(f64::NEG_INFINITY, |c| c - r));
+    // A ball's or a flat end mill's contours are found on the columns, then put exactly where it
+    // touches the part at the level: along the way up the slope, by halving.
+    let dropped = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
+    let exact = |p: Vec2| {
+        dropped.as_ref().map(|d| {
+            let low = if tool.kind == ToolKind::BallEndmill { d.centre(p).map(|c| c - r) } else { d.highest_within(p).map(|h| h + s) };
+            low.unwrap_or(f64::NEG_INFINITY)
+        })
+    };
     let uphill = |p: Vec2| -> Option<Vec2> {
         let (i, j) = reach.column(p)?;
         let (i0, j0) = (i.saturating_sub(1), j.saturating_sub(1));
@@ -389,17 +397,21 @@ pub fn zlevel_3d(job: &ZLevel3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
     let n = n_levels as usize;
     for k in 1..=n {
         let z = if k == n { bottom } else { top - (top - bottom) * k as f64 / n as f64 };
-        let mut runs = contours(&reach, z, job.climb, |i, j| {
+        // The walls are followed a hair above the bottom: on a floor exactly at it the tool's
+        // reach is the level everywhere, and no contour would be found round the wall's foot.
+        let seek = if k == n { z + 1e-6 } else { z };
+        let mut runs = contours(&reach, seek, job.climb, |i, j| {
             // Steep enough in this square: the tool's floor rises that much across it.
             let (a, b2, c, d) = (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
             let gx = ((b2 - a) + (c - d)) / (2.0 * cell);
             let gy = ((d - a) + (c - b2)) / (2.0 * cell);
             (gx * gx + gy * gy).sqrt() >= slope
         });
-        // Only inside the boundary, exactly at the part (a ball), and nothing shorter than the tool's radius.
+        // Only inside the boundary, exactly at the part (a ball or a flat end mill), and nothing
+        // shorter than the tool's radius.
         runs = runs
             .into_iter()
-            .map(|run| if ball.is_some() { run.into_iter().filter_map(|p| settle(p, z)).collect() } else { run })
+            .map(|run| if dropped.is_some() { run.into_iter().filter_map(|p| settle(p, seek)).collect() } else { run })
             .flat_map(|run: Vec<Vec2>| split_inside(&run, &shape, &near))
             // Rest machining: where the tool takes something off at this level, and a tool's
             // radius of run-up either side.
