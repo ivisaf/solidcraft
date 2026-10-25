@@ -4,7 +4,10 @@
 use solidcraft_engine::CommandSpec;
 use solidcraft_engine::doc::FeatureKind;
 
-pub const TABS: &[&str] = &["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "MANUFACTURE", "VIEW"];
+pub const TABS: &[&str] = &["MODEL", "SURFACE", "ASSEMBLE", "INSERT", "INSPECT", "MANAGE", "VIEW"];
+
+/// The Manufacture workspace's one tab (CAM): while it is the tab, the ribbon shows only it.
+pub const MANUFACTURE_TAB: &str = "MANUFACTURE";
 
 /// Reading order of the compact, three-column constraint gallery. Icons come from each spec.
 pub const CONSTRAINT_GALLERY: &[&str] = &[
@@ -542,9 +545,47 @@ pub fn sheet_body(app: &crate::SolveApp) -> Option<String> {
     state.sheets.iter().find(|s| s.body == body).map(|s| s.body.clone())
 }
 
+/// Whether the Manufacture workspace is the one shown.
+pub fn manufacture_active(app: &crate::SolveApp) -> bool {
+    app.ui.tab == MANUFACTURE_TAB
+}
+
+/// The workspace shown: `design`, `render` or `manufacture`.
+pub fn current(app: &crate::SolveApp) -> &'static str {
+    if crate::render_workspace::active(app) {
+        "render"
+    } else if manufacture_active(app) {
+        "manufacture"
+    } else {
+        "design"
+    }
+}
+
+/// Switch to a workspace by its slug. Render keeps its own entry and exit (camera, scene);
+/// Manufacture is its tab, entered from Design once Render is left.
+pub fn enter(app: &mut crate::SolveApp, workspace: &str) -> Result<(), String> {
+    if workspace != "manufacture" {
+        return crate::render_workspace::enter(app, workspace == "render");
+    }
+    if manufacture_active(app) {
+        return Ok(());
+    }
+    if app.session.active_sketch.is_some() || app.tool.is_some() || app.dialog.is_some() || app.file_load.busy() {
+        return Err("finish the current modelling operation before entering Manufacture".into());
+    }
+    if crate::render_workspace::active(app) {
+        crate::render_workspace::enter(app, false)?;
+    }
+    app.ui.tab = MANUFACTURE_TAB.into();
+    Ok(())
+}
+
 pub fn visible_tabs(app: &crate::SolveApp) -> Vec<&'static str> {
     if crate::render_workspace::active(app) {
         return vec!["RENDER"];
+    }
+    if manufacture_active(app) {
+        return vec![MANUFACTURE_TAB];
     }
     let mut tabs = TABS.to_vec();
     if app.session.active_sketch.is_some() {
@@ -578,6 +619,9 @@ pub fn sync_context(app: &mut crate::SolveApp) {
         };
         app.ui.tab = if app.session.active_sketch.is_some() {
             "SKETCH"
+        } else if back.as_deref() == Some(MANUFACTURE_TAB) {
+            // A sketch edited from Manufacture goes back to that workspace.
+            MANUFACTURE_TAB
         } else if let Some(back) = back.as_deref().filter(|t| *t != "SKETCH" && visible_tabs(app).contains(t)) {
             // Finishing a sketch goes back to the tab it came from (#3250).
             visible_tabs(app).into_iter().find(|t| t == &back).unwrap_or("MODEL")
@@ -605,6 +649,12 @@ pub fn select_command_tab(app: &mut crate::SolveApp, id: &str) {
         if tab == "RENDER" {
             return;
         } // The Render workspace owns its entry/exit lifecycle.
+        if tab == MANUFACTURE_TAB {
+            // A CAM command started from Design (search, Browser) opens its workspace, unless
+            // a sketch or another operation is still open.
+            let _ = enter(app, "manufacture");
+            return;
+        }
         if visible_tabs(app).contains(&tab) {
             app.ui.tab = tab.into();
         }

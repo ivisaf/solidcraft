@@ -1089,7 +1089,14 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
             t.secondary_line(&painter, [ws.right_top(), ws.right_bottom()], t.border);
         }
         let render = crate::render_workspace::active(app);
-        let workspace_icon = if render { "ws_render" } else { "ws_design" };
+        let manufacture = crate::workspace::manufacture_active(app);
+        let workspace_icon = if render {
+            "ws_render"
+        } else if manufacture {
+            "cam_setup"
+        } else {
+            "ws_design"
+        };
         icons::paint_icon(
             &painter,
             Rect::from_center_size(pos2(ws.center().x, ws.top() + if labels { 39.0 } else { 25.0 }), vec2(30.0, 30.0)),
@@ -1099,7 +1106,13 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
         ribbon_text(
             ui,
             pos2(ws.center().x, ws.top() + if labels { 69.0 } else { 50.0 }),
-            app.tr(if render { "ui.render" } else { "ui.design" }),
+            app.tr(if render {
+                "ui.render"
+            } else if manufacture {
+                "ui.manufacture"
+            } else {
+                "ui.design"
+            }),
             t.font_button,
             t.text,
             true,
@@ -2481,7 +2494,7 @@ mod header_report_tests {
         for dark in [false, true] {
             for vision in crate::theme::ColorVision::ALL {
                 let t = Tokens::themed(dark, vision);
-                for tab in TABS.iter().copied().chain(["SKETCH", "FORM", "RENDER"]) {
+                for tab in TABS.iter().copied().chain(["SKETCH", "FORM", "RENDER", "MANUFACTURE"]) {
                     assert_eq!(panel_accent(&t, tab, "CREATE"), crate::theme::TabAccent::for_tab(&t, tab).color);
                     assert_eq!(panel_accent(&t, tab, "CONSTRAIN"), t.glyph_text);
                 }

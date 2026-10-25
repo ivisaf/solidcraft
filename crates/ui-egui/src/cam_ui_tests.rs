@@ -513,7 +513,8 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
 
 #[test]
 fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
-    assert!(crate::toolbar::TABS.contains(&"MANUFACTURE"));
+    // Its own workspace: not among the Design tabs.
+    assert!(!crate::toolbar::TABS.contains(&"MANUFACTURE"));
     let specs = solidcraft_engine::command_specs();
     let on_tab: Vec<_> = specs.iter().filter(|c| c.tab == "MANUFACTURE").collect();
     assert_eq!(on_tab.len(), 18, "cam.op.edit and the removals are reached from the window");
@@ -530,6 +531,33 @@ fn manufacture_tab_shows_every_cam_command_with_a_drawn_icon() {
         );
         h.frames(2);
     }
+}
+
+/// Manufacture is a workspace of its own: the switcher enters it, the ribbon shows only its tab,
+/// a sketch edited from it comes back to it, and Design shows the Design tabs again.
+#[test]
+fn manufacture_is_its_own_workspace() {
+    let mut h = lab();
+    h.call("ui.resize", json!({"width":1200,"height":1000}));
+    h.step(&json!({"click":{"handle":"ribbon:workspace"}})).unwrap();
+    h.step(&json!({"click":{"handle":"workspace:menu:manufacture"}})).unwrap();
+    assert_eq!(crate::workspace::current(&h.app), "manufacture");
+    assert_eq!(crate::workspace::visible_tabs(&h.app), vec!["MANUFACTURE"]);
+    assert_eq!(h.call("ui.workspace", json!({}))["result"]["workspace"], "manufacture");
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.ui.tab, "SKETCH");
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[40,30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.frames(2);
+    assert_eq!(h.app.ui.tab, "MANUFACTURE", "back to the workspace the sketch was edited from");
+    h.call("ui.workspace", json!({"workspace":"render"}));
+    assert_eq!(crate::workspace::current(&h.app), "render");
+    h.call("ui.workspace", json!({"workspace":"manufacture"}));
+    assert_eq!(crate::workspace::current(&h.app), "manufacture");
+    h.call("ui.workspace", json!({"workspace":"design"}));
+    assert_eq!(crate::workspace::current(&h.app), "design");
+    assert!(!crate::workspace::visible_tabs(&h.app).contains(&"MANUFACTURE"));
 }
 
 /// The Manufacture and Tool Library panels move by their headers, each on its own and kept
