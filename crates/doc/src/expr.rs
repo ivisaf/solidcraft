@@ -583,6 +583,8 @@ pub fn length_unit_or_mm(units: &str) -> &str {
 
 struct Parser<'a> {
     toks: Vec<Tok>,
+    /// Each token's byte range in the source: whether a fraction is written closed up.
+    spans: Vec<(usize, usize)>,
     pos: usize,
     lookup: &'a dyn Fn(&str) -> Result<Value, DocError>,
     depth: usize,
@@ -666,6 +668,7 @@ impl Parser<'_> {
     }
     fn power(&mut self, glue: bool) -> Result<Value, DocError> {
         let number = matches!(self.peek(), Some(Tok::Num(_)));
+        let at = self.pos;
         let mut base = self.atom()?;
         // A number and the unit after it are one quantity, bound tighter than `*` and `/`:
         // `10 mm / 2 mm` is 5, not (10 mm / 2) mm = 5 mm². The unit keeps its own power
@@ -673,8 +676,11 @@ impl Parser<'_> {
         if glue && number {
             // A fraction of two numbers before a unit is one value, as sizes are written:
             // `1/2"` and `1/2 in` are half an inch (as the mixed number `2 1/8"` is one value).
+            // After a division only written closed up: `1 in / 1/2 in` is 2, but
+            // `width / 10 / 2 mm` is (width / 10) / 2 mm.
             if let (Some(Tok::Op('/')), Some(Tok::Num(d))) = (self.peek(), self.toks.get(self.pos + 1))
                 && self.unit_at(self.pos + 2)
+                && (!self.after_division(at) || self.closed_up(at, self.pos + 1))
             {
                 let d = Value::num(*d);
                 self.pos += 2;
@@ -694,6 +700,18 @@ impl Parser<'_> {
             return pow(base, e);
         }
         Ok(base)
+    }
+    /// Whether the operand starting at token `i` is divided by: a `/` before it, past any signs.
+    fn after_division(&self, i: usize) -> bool {
+        let mut k = i;
+        while k > 0 && matches!(self.toks.get(k - 1), Some(Tok::Op('+' | '-'))) {
+            k -= 1;
+        }
+        k > 0 && matches!(self.toks.get(k - 1), Some(Tok::Op('/')))
+    }
+    /// Whether tokens `a` to `b` are written without spaces between them.
+    fn closed_up(&self, a: usize, b: usize) -> bool {
+        (a..b).all(|i| matches!((self.spans.get(i), self.spans.get(i + 1)), (Some(x), Some(y)) if x.1 == y.0))
     }
     /// Whether the token at `i` is a unit name, not called as a function.
     fn unit_at(&self, i: usize) -> bool {
@@ -931,11 +949,11 @@ pub fn eval_with(s: &str, lookup: &dyn Fn(&str) -> Result<Value, DocError>) -> R
 
 /// Evaluate an expression reading bare numbers next to lengths / angles in `defaults`.
 pub fn eval_with_defaults(s: &str, lookup: &dyn Fn(&str) -> Result<Value, DocError>, defaults: Defaults) -> Result<Value, DocError> {
-    let toks = lex(s)?;
+    let (toks, spans): (Vec<Tok>, Vec<(usize, usize)>) = lex_spans(s)?.into_iter().map(|(t, a, b)| (t, (a, b))).unzip();
     if toks.is_empty() {
         return Err(DocError::Expr("empty expression".into()));
     }
-    let mut p = Parser { toks, pos: 0, lookup, depth: 0, defaults };
+    let mut p = Parser { toks, spans, pos: 0, lookup, depth: 0, defaults };
     let v = p.expr()?;
     if p.pos < p.toks.len() {
         return Err(DocError::Expr(format!("unexpected input in `{s}`")));
@@ -1152,6 +1170,11 @@ mod tests {
         assert_eq!(ev("1/2 in", Kind::Length).unwrap(), 12.7);
         assert_eq!(ev("width + 3/4\"", Kind::Length).unwrap(), 40.0 + 0.75 * 25.4);
         assert_eq!(ev("1 in / 1/2 in", Kind::Unitless).unwrap(), 2.0);
+        assert_eq!(ev("10 / 2 mm", Kind::Length).unwrap(), 5.0);
+        // After a division, a spaced-out `/` divides again: (width / 10) / 2 mm.
+        assert_eq!(ev("width / 10 / 2 mm", Kind::Unitless).unwrap(), 2.0);
+        assert_eq!(ev("width / -10 / 2 mm", Kind::Unitless).unwrap(), -2.0);
+        assert_eq!(ev("width / 10/2 mm", Kind::Unitless).unwrap(), 8.0);
         // The unit keeps its own power, and an exponent stays a plain number.
         assert_eq!(ev("sqrt(9 mm^2)", Kind::Length).unwrap(), 3.0);
         assert_eq!(ev("8 mm^3 / 2 mm^2", Kind::Length).unwrap(), 4.0);
