@@ -238,6 +238,30 @@ fn construction_toggle_takes_shapes_out_of_profiles_and_back() {
 }
 
 #[test]
+fn circles_and_arcs_honour_construction() {
+    let cases = [
+        ("sketch.arc.center_point", json!({"center": [0, 0], "start": [8, 0], "end": [-8, 0]})),
+        ("sketch.arc.center_point", json!({"center": [0, 0], "start": [8, 0], "sweep": -90})),
+        ("sketch.arc.three_point", json!({"start": [8, 0], "end": [-8, 0], "through": [0, 8]})),
+        ("sketch.circle.two_point", json!({"p0": [-8, 0], "p1": [8, 0]})),
+        ("sketch.circle.three_point", json!({"p0": [8, 0], "p1": [0, 8], "p2": [-8, 0]})),
+    ];
+    for (cmd, params) in cases {
+        for construction in [false, true] {
+            let mut s = new_sketch();
+            let mut p = params.clone();
+            if construction {
+                p["construction"] = json!(true);
+            }
+            run(&mut s, cmd, p);
+            let sk = sketch(&s);
+            let curve = sk.curves.last().expect("created curve");
+            assert_eq!(curve.construction, construction, "{cmd} {params}");
+        }
+    }
+}
+
+#[test]
 fn centerline_can_become_construction_directly() {
     let mut s = new_sketch();
     let l = curve_ids(&run(&mut s, "sketch.line", json!({"points": [[0, 0], [20, 0]]})));
@@ -1447,6 +1471,27 @@ fn a_drag_out_of_decomposition_budget_takes_short_steps() {
     assert_eq!(flips, 0);
 }
 
+/// A live frame whose numerical solves have done their share takes no more held solves. Before,
+/// a large sketch's frame could run 64 failing held solves of 150 ms each (10 s), where the
+/// geometry couldn't follow. Progress so far stays and asks for another frame (`retry`).
+#[test]
+fn a_live_frame_stops_once_its_numerical_solves_are_spent() {
+    let start = hung_arm();
+    let h = pt(&start, "eh.end");
+    let far = hung_hand_target(&start, 2.0, 1.5);
+    let drag = |s: &mut Session| run(s, "sketch.drag", json!({"entity": "eh.end", "from": [h.x, h.y], "to": [far.x, far.y], "live": true}));
+    let mut s = hung_arm();
+    drag(&mut s);
+    let whole = super::drag::last_drag::get();
+    let mut s = hung_arm();
+    let r = super::drag::last_drag::with_frame_numeric(1, || drag(&mut s));
+    let short = super::drag::last_drag::get();
+    assert!(short.numeric && short.count < whole.count, "{short:?} against {whole:?}");
+    // What it reached stays, and asks for the next frame.
+    let reached = r["reached"].as_f64().unwrap_or(0.0);
+    assert!(reached > 0.0 && reached < 1.0 && r["retry"] == json!(true), "{r}");
+}
+
 /// All the held solves of one live frame, halvings included, share one decomposition budget:
 /// together they do at most a frame's work, and one solve's more.
 #[test]
@@ -1525,6 +1570,34 @@ fn the_first_dimension_does_not_scale_a_sketch_that_has_a_size() {
     assert!(out.get("scaled").is_none(), "{out}");
 }
 
+/// #3786: shapes that nothing links together are not one drawing: the first dimension sizes
+/// the shape it measures and leaves the other alone.
+#[test]
+fn the_first_dimension_leaves_a_separate_shape_alone() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, 10], "p1": [45, 20]}));
+    let other = sketch(&s);
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "30 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_none(), "{out}");
+    let after = sketch(&s);
+    // The second rectangle (points 4..8, after the origin and the first rectangle's four) is untouched.
+    for (p, q) in other.points.iter().zip(&after.points).skip(5) {
+        assert!(q.pos.dist(p.pos) < 1e-6, "{} {:?} -> {:?}", p.id, p.pos, q.pos);
+    }
+}
+
+/// #1365 still holds for one drawing: shapes joined by a constraint scale together.
+#[test]
+fn the_first_dimension_scales_shapes_joined_by_a_constraint() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [30, 10], "p1": [45, 20]}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "l1.start", "b": "l5.start"}));
+    let out = run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": "40 mm", "scale_sketch": true}));
+    assert!(out.get("scaled").is_some(), "{out}");
+}
+
 /// The cursor fallback shares the held solves' frame budget; a scripted drag can finish later.
 #[test]
 fn cursor_fallback_respects_an_exhausted_live_frame_budget() {
@@ -1599,4 +1672,98 @@ fn budget_limited_cursor_progress_requests_a_frame_with_the_same_target() {
         assert_eq!(r["retry"], false);
     }
     assert!(exercised, "exercise continuation after budget-limited progress");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cancel Sketch (#3838)
+
+#[test]
+fn cancel_removes_a_new_sketch_with_its_dimensions_and_undo_brings_it_back() {
+    let mut s = Session::default();
+    let before = s.doc.to_json();
+    run(&mut s, "sketch.create", json!({"plane": "XY"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 25}));
+    let drawn = s.doc.to_json();
+    let r = run(&mut s, "sketch.cancel", json!({}));
+    assert_eq!(r["removed"], true);
+    assert_eq!(s.active_sketch, None);
+    assert_eq!(s.doc.to_json(), before, "the sketch and its dimension parameter are gone");
+    run(&mut s, "edit.undo", json!({}));
+    assert_eq!(s.doc.to_json(), drawn);
+    assert!(s.active_sketch.is_some(), "undo goes back into the sketch");
+    run(&mut s, "edit.redo", json!({}));
+    assert_eq!(s.doc.to_json(), before);
+}
+
+#[test]
+fn cancel_puts_an_edited_sketch_back_as_it_was_opened() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"distance": 5}));
+    let opened = s.doc.to_json();
+    let volume = |s: &mut Session| run(s, "inspect.measure", json!({}))["total"]["volume_mm3"].as_f64().unwrap();
+    assert!((volume(&mut s) - 1000.0).abs() < 1e-6);
+    run(&mut s, "sketch.edit", json!({"sketch": "Base"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 40}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 20], [10, 30]]}));
+    let r = run(&mut s, "sketch.cancel", json!({}));
+    assert_eq!(r["removed"], false);
+    assert_eq!(s.doc.to_json(), opened);
+    assert!((volume(&mut s) - 1000.0).abs() < 1e-6, "the solid is built from the sketch as it was");
+
+    // Finishing keeps the changes: there is nothing left to cancel.
+    run(&mut s, "sketch.edit", json!({"sketch": "Base"}));
+    run(&mut s, "sketch.dimension", json!({"entities": ["l1"], "value": 40}));
+    run(&mut s, "sketch.finish", json!({}));
+    assert!((volume(&mut s) - 2000.0).abs() < 1e-6);
+    assert!(s.execute("sketch.cancel", &json!({})).is_err(), "not in a sketch");
+}
+
+#[test]
+fn cancel_refuses_once_undo_has_gone_back_past_where_the_sketch_was_opened() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "S"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 0], [10, 0]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "sketch.edit", json!({"sketch": "S"}));
+    run(&mut s, "sketch.line", json!({"points": [[0, 5], [10, 5]]}));
+    // Back past the edit: the first line's step is undone too, still inside the sketch.
+    run(&mut s, "edit.undo", json!({}));
+    run(&mut s, "edit.undo", json!({}));
+    assert!(s.active_sketch.is_some());
+    let before = s.doc.to_json();
+    let e = s.execute("sketch.cancel", &json!({})).unwrap_err().to_string();
+    assert!(e.contains("Undo"), "{e}");
+    assert_eq!(s.doc.to_json(), before, "nothing changed");
+}
+
+/// A line tangent to a free circle, one end dragged off the line: the other end stays where it
+/// is and the circle takes the change (it moved the far end, by 0.4 mm towards the dragged one
+/// for a 5 mm pull, though nothing needed it to).
+#[test]
+fn dragging_an_end_of_a_tangent_line_leaves_its_other_end_still() {
+    let mut s = new_sketch();
+    let c = run(&mut s, "sketch.circle.center", json!({"center": [0, 0], "radius": 10}))["curves"][0].as_str().unwrap().to_string();
+    let l = run(&mut s, "sketch.line", json!({"points": [[-20, 10], [20, 10]], "infer": false, "connect": false}))["curves"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    run(&mut s, "sketch.constraint.tangent", json!({"a": l, "b": c}));
+    let at = |s: &Session, id: &str| {
+        let sk = sketch(s);
+        sk.resolve_point(id).and_then(|i| sk.point(i)).unwrap()
+    };
+    let start = at(&s, &format!("{l}.start"));
+    drag(&mut s, &format!("{l}.end"), [20.0, 10.0], [5.0, 12.0]);
+    assert!(at(&s, &format!("{l}.start")).dist(start) < 1e-7, "the far end moved: {:?}", at(&s, &format!("{l}.start")));
+    assert!(
+        at(&s, &format!("{l}.end")).dist(solidcraft_geom::Vec2::new(5.0, 12.0)) < 1e-6,
+        "the end went where dragged: {:?}",
+        at(&s, &format!("{l}.end"))
+    );
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert!(si["failing"].as_array().is_some_and(Vec::is_empty), "still tangent: {si}");
 }

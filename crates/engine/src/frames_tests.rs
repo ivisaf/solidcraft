@@ -37,7 +37,7 @@ fn volume(s: &mut Session) -> f64 {
 /// and a construction plane, moved 50 mm along X.
 fn moved_part() -> Session {
     let mut s = Session::default();
-    run(&mut s, "component.create", json!({"name": "Part"}));
+    run(&mut s, "component.create", json!({"name": "Part", "grounded": false}));
     run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Base"}));
     run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
     run(&mut s, "sketch.finish", json!({}));
@@ -211,7 +211,7 @@ fn sketch_world_points(s: &mut Session, sketch: &str) -> Vec<Vec3> {
 /// A block "C" (40 x 30 x 20) in its own component, the root active again.
 fn block_in_component() -> Session {
     let mut s = Session::default();
-    run(&mut s, "component.create", json!({"name": "C"}));
+    run(&mut s, "component.create", json!({"name": "C", "grounded": false}));
     run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 20}));
     run(&mut s, "component.activate", json!({"component": "root"}));
     s
@@ -285,4 +285,43 @@ fn root_picks_on_a_moved_component_build_where_it_is_shown() {
     run(&mut s, "construct.plane.along_path", json!({"path": {"edge": [65, 40, 0]}, "t": 0.5, "name": "Across"}));
     let across = crate::view::construction_planes(&s).into_iter().find(|(_, n, _)| n == "Across").unwrap().2;
     assert!((across.origin.y - 40.0).abs() < 1e-6, "{across:?}");
+}
+
+/// #6000: in a turned component, a named plane ("XY") is the component's own; an explicit
+/// `{origin, x_dir, y_dir}` is world unless `frame: "component"` says otherwise. The reply says
+/// which, with a note when the two differ.
+#[test]
+fn an_explicit_sketch_plane_is_read_in_the_frame_asked_for() {
+    let mut s = moved_part();
+    run(&mut s, "occurrence.move", json!({"occurrence": "Part:1", "axis": [1, 0, 0], "angle": "30 deg", "move_grounded": true}));
+    let explicit = json!({"origin": [0, 0, 0], "x_dir": [1, 0, 0], "y_dir": [0, 1, 0]});
+    let centre = |s: &mut Session, name: &str, p: Value| {
+        let r = run(s, "sketch.create", p);
+        run(s, "sketch.circle.center", json!({"center": [20, 10], "radius": 6}));
+        run(s, "sketch.finish", json!({}));
+        (r, *sketch_world_points(s, name).last().unwrap())
+    };
+    let (named, own) = centre(&mut s, "Named", json!({"plane": "XY", "name": "Named"}));
+    assert!(named.get("frame").is_none(), "{named}");
+    assert!((own.z - 5.0).abs() < 1e-6, "the component's XY is turned with it: {own:?}");
+
+    let (world, at) = centre(&mut s, "World", json!({"plane": explicit, "name": "World"}));
+    assert_eq!(world["frame"], "world");
+    assert!(world["note"].as_str().is_some_and(|n| n.contains("frame")), "{world}");
+    assert!(at.z.abs() < 1e-6, "today's reading: on the world XY plane: {at:?}");
+
+    let (comp, at) = centre(&mut s, "Own", json!({"plane": explicit, "frame": "component", "name": "Own"}));
+    assert_eq!(comp["frame"], "component");
+    assert!(comp.get("note").is_none(), "{comp}");
+    assert!(near(at, own), "the component's XY written out: {at:?} vs {own:?}");
+
+    // Redefine reads the same way.
+    let r = run(&mut s, "sketch.redefine", json!({"sketch": "World", "plane": explicit, "frame": "component"}));
+    assert_eq!(r["frame"], "component");
+    assert!(near(*sketch_world_points(&mut s, "World").last().unwrap(), own));
+
+    for (p, why) in [(json!({"plane": "XY", "frame": "component"}), "explicit"), (json!({"plane": explicit, "frame": "local"}), "world")] {
+        let e = s.execute("sketch.create", &p).expect_err("refused").to_string();
+        assert!(e.contains(why), "{p}: {e}");
+    }
 }

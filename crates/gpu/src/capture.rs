@@ -170,6 +170,12 @@ impl Capturer {
 
     /// `scene` seen by `cam`, `width` × `height` pixels: straight RGBA, rows top to bottom.
     pub fn rgba(&self, scene: &Scene, cam: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
+        self.rgba_highlighted(scene, None, cam, width, height)
+    }
+
+    /// [`Capturer::rgba`] with `highlight` drawn as the viewport draws its highlight scene
+    /// (selection and hover feedback), over the model scene.
+    pub fn rgba_highlighted(&self, scene: &Scene, highlight: Option<GpuScene>, cam: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
         if !(1..=self.max_side).contains(&width) || !(1..=self.max_side).contains(&height) {
             return Err(GpuError::Render(format!("a picture is 1 to {} pixels a side, not {width} × {height}", self.max_side)));
         }
@@ -187,7 +193,11 @@ impl Capturer {
             }
             _ => None,
         };
-        let frame = frame(scene, cam, [width, height], state.key, access);
+        let mut frame = frame(scene, cam, [width, height], state.key, access);
+        if let Some(h) = highlight {
+            frame.hl_key = state.key;
+            frame.hl_slot = Arc::new(Mutex::new(Some(h)));
+        }
         let (device, queue) = (&self.device, &self.queue);
         let scopes = error_scopes(device);
         let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
@@ -293,6 +303,12 @@ impl Capturer {
         Ok(rgba)
     }
 
+    /// What the last picture drew ([`crate::view::DrawStats`]).
+    pub fn last_stats(&self) -> crate::view::DrawStats {
+        let Ok(state) = self.state.lock() else { return Default::default() };
+        state.renderer.stats().lock().map(|s| *s).unwrap_or_default()
+    }
+
     /// [`Capturer::rgba`] as PNG bytes.
     pub fn png(&self, scene: &Scene, cam: &Camera, width: u32, height: u32) -> Result<Vec<u8>> {
         let rgba = self.rgba(scene, cam, width, height)?;
@@ -374,7 +390,7 @@ fn frame(scene: &Scene, cam: &Camera, [width, height]: [u32; 2], key: u64, acces
         back: cam.back().to_f32(),
         size_px: [width as f32, height as f32],
         clip: scene.clip.map_or([0.0; 4], |(n, d)| [n.x as f32, n.y as f32, n.z as f32, d as f32]),
-        cap: [f32::from(cap.0) / 255.0, f32::from(cap.1) / 255.0, f32::from(cap.2) / 255.0, 1.0],
+        cap: [f32::from(cap.0) / 255.0, f32::from(cap.1) / 255.0, f32::from(cap.2) / 255.0, if scene.plain_cap { 0.0 } else { 1.0 }],
         images: Vec::new(),
         analysis: analysis_uniform(mode, access.as_ref()),
         analysis_colors: scene.analysis.map_or([0.0; 36], |a| analysis_colors(&a.colors)),
@@ -383,6 +399,8 @@ fn frame(scene: &Scene, cam: &Camera, [width, height]: [u32; 2], key: u64, acces
         eye: [eye[0], eye[1], eye[2], if cam.fov > 0.0 { 1.0 } else { 0.0 }],
         ao_radius: 0.0,
         ssaa: 1.0,
+        hover_tint: [0.0; 3],
+        selection_tint: [0.0; 3],
     }
 }
 

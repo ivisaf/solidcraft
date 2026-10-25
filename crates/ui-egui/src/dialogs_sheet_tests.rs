@@ -69,33 +69,6 @@ fn flange_follows_the_picks() {
     }
 }
 
-#[test]
-fn hem_arrow_points_to_the_side_the_hem_builds_on() {
-    for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
-        for z in [0.0, 2.5] {
-            for flipped in [false, true] {
-                let mut app = plate(mode);
-                app.run("sheet.flange", json!({"sketch": "Base"})).unwrap();
-                let body = app.session.model.state().sheets[0].body.clone();
-                let before = app.session.world_state().body(&body).unwrap().mesh().bounds();
-                app.session.selection = vec![edge_sel(&app.session, Vec3::new(50.0, 0.0, z)).unwrap()];
-                app.start("sheet.hem");
-                let mut d = app.dialog.clone().unwrap();
-                let Kind::Sheet(Sm::Hem { flip, .. }) = &mut d.kind else { panic!("hem dialog") };
-                *flip = flipped;
-                let direction = arrow(&app, &d).unwrap();
-                let commands = apply_commands(&app, &d).unwrap();
-                run_all(&mut app, commands);
-                let after = app.session.world_state().body(&body).unwrap().mesh().bounds();
-                assert!(
-                    direction.dot(after.center() - before.center()) > 1e-6,
-                    "the arrow must point toward the added hem: z={z}, flip={flipped}, arrow={direction:?}, before={before:?}, after={after:?}"
-                );
-            }
-        }
-    }
-}
-
 /// Hem takes edges and an optional gap; rules make and pick a rule with its expressions.
 #[test]
 fn hem_and_rules() {
@@ -415,6 +388,51 @@ fn rules_dialog_picks_the_corner_relief_shape() {
         assert_eq!(h.app.session.doc.sheet_rule(None).corner_relief_shape, "tear");
         let torn = h.app.session.model.state().sheets.last().map(|s| s.flanges.iter().filter(|f| f.tear == (true, true)).count());
         assert_eq!((rounds(&h.app), torn), (Some(0), Some(4)));
+    }
+}
+
+/// The rule manager's angle display: picked in the dialog, it reaches the rule and the bend notes
+/// of the part made with it, and the dialog shows it the next time.
+#[test]
+fn rules_dialog_sets_how_bend_angles_read() {
+    for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+        let mut h = crate::scenario::Harness::new();
+        h.call("ui.set", json!({"layout":mode}));
+        h.app.run("sheet.manage_rules", json!({"name": "AL2", "thickness": "2 mm", "bend_radius": "1 mm", "active": true})).unwrap();
+        h.app.run("sketch.create", json!({"plane": "XY", "name": "Base"})).unwrap();
+        h.app.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [100, 60]})).unwrap();
+        h.app.run("sketch.finish", json!({})).unwrap();
+        h.app.run("sheet.flange", json!({"sketch": "Base"})).unwrap();
+        h.app.run("sheet.flange", json!({"edges": [[50, 0, 2]], "height": 20, "angle": "58 deg"})).unwrap();
+        let shown = |app: &SolveApp| match app.dialog.as_ref().map(|d| &d.kind) {
+            Some(Kind::Sheet(Sm::Rules { angles, .. })) => Some(*angles),
+            _ => None,
+        };
+        let note = |app: &mut SolveApp| {
+            let dxf = app.session.execute("sheet.export_dxf", &json!({"bend_notes": true})).unwrap();
+            dxf["dxf"].as_str().unwrap_or_default().lines().map(str::trim).find(|l| l.starts_with("B1 ")).map(str::to_string)
+        };
+        assert_eq!(note(&mut h.app).as_deref(), Some("B1 UP 58%%d R1"));
+        h.step(&json!({"start": "sheet.manage_rules"})).unwrap();
+        h.frames(3);
+        assert_eq!(shown(&h.app), Some(0), "a rule starts with bend angles");
+        h.step(&json!({"click": {"handle": "dialog:Angle Display"}})).unwrap();
+        h.step(&json!({"click": {"handle": "dialog:Angle Display:Included"}})).unwrap();
+        assert_eq!(shown(&h.app), Some(1));
+        h.step(&json!({"widget": "OK"})).unwrap();
+        assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog);
+        assert_eq!(h.app.session.doc.sheet_rule(None).angle_display, "included");
+        assert_eq!(note(&mut h.app).as_deref(), Some("B1 UP 122%%d R1"));
+        h.step(&json!({"start": "sheet.manage_rules"})).unwrap();
+        h.frames(3);
+        assert_eq!(shown(&h.app), Some(1), "the dialog shows the rule's display");
+        // Back to bend angles; the rule's other values are as they were.
+        h.step(&json!({"click": {"handle": "dialog:Angle Display"}})).unwrap();
+        h.step(&json!({"click": {"handle": "dialog:Angle Display:Bend"}})).unwrap();
+        h.step(&json!({"widget": "OK"})).unwrap();
+        let rule = h.app.session.doc.sheet_rule(None);
+        assert_eq!((rule.angle_display.as_str(), rule.thickness.as_str()), ("bend", "2 mm"));
+        assert_eq!(note(&mut h.app).as_deref(), Some("B1 UP 58%%d R1"));
     }
 }
 
@@ -877,5 +895,110 @@ fn fit_and_home_frame_the_flat_pattern() {
         app.dialog = None;
         frame(&mut app, &ctx, &mut t, none, vec![]);
         assert!(!app.flat_view.fitted);
+    }
+}
+
+fn perforated_flat() -> (SolveApp, Dialog) {
+    let mut app = plate(crate::shell::LayoutMode::Floating);
+    app.run("sheet.flange", json!({"sketch": "Base"})).unwrap();
+    app.run("sheet.perforate", json!({"diameter": 3, "pitch": 6})).unwrap();
+    let flat = app.session.execute("sheet.flat_pattern", &json!({})).unwrap();
+    assert_eq!(flat["perforations"][0]["count"], 155);
+    app.start("sheet.flat_pattern");
+    let mut dialog = app.dialog.clone().unwrap();
+    let Kind::Sheet(Sm::FlatPattern { data, .. }) = &mut dialog.kind else { panic!("flat dialog") };
+    *data = Some(Ok(flat));
+    (app, dialog)
+}
+
+fn flat_circles(app: &mut SolveApp, dialog: &Dialog, rect: Rect) -> Vec<egui::epaint::CircleShape> {
+    let ctx = crate::fonts::test_context();
+    let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+    let output = crate::test_support::frame(&ctx, input, |ui| {
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("perforation-test")));
+        assert!(overlay(app, &painter, rect, dialog));
+    });
+    output.shapes.into_iter().filter_map(|s| if let egui::Shape::Circle(c) = s.shape { Some(c) } else { None }).collect()
+}
+
+#[test]
+fn flat_perforations_match_export_centres_and_cutout_style() {
+    let (mut app, dialog) = perforated_flat();
+    let state = app.session.world_state();
+    let sheet = state.sheets.last().unwrap();
+    let holes = sheet.perforation_holes(&sheet.perforations[0]).unwrap();
+    let rect = Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0));
+    let circles = flat_circles(&mut app, &dialog, rect);
+    assert_eq!(circles.len(), holes.len());
+    let cam = app.flat_view.cam;
+    let scale = f64::from(rect.height()) / (2.0 * cam.half_height());
+    for (circle, hole) in circles.iter().zip(holes) {
+        let centre = pos2(
+            (f64::from(rect.center().x) + (hole.x - cam.target.x) * scale) as f32,
+            (f64::from(rect.center().y) - (hole.y - cam.target.y) * scale) as f32,
+        );
+        assert!(circle.center.distance(centre) < 0.001);
+        assert!((circle.radius - (1.5 * scale) as f32).abs() < 0.001);
+        assert_eq!(circle.stroke, Stroke::new(1.4, Tokens::get().text));
+        assert_eq!(circle.fill, Color32::TRANSPARENT);
+    }
+    let cached = app.flat_view.perforations.as_ptr();
+    assert_eq!(flat_circles(&mut app, &dialog, rect).len(), 155);
+    assert_eq!(app.flat_view.perforations.as_ptr(), cached, "navigation reuses the centres");
+    app.run("sheet.perforate", json!({"diameter": 2, "pitch": 10})).unwrap();
+    let state = app.session.world_state();
+    let sheet = state.sheets.last().unwrap();
+    let expected: usize = sheet.perforations.iter().map(|p| sheet.perforation_holes(p).unwrap().len()).sum();
+    assert!(expected > 155);
+    assert_eq!(flat_circles(&mut app, &dialog, rect).len(), expected, "model changes refresh the centres");
+}
+
+#[test]
+fn flat_perforations_cull_offscreen_and_subpixel_holes() {
+    let (mut app, dialog) = perforated_flat();
+    let rect = Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0));
+    assert_eq!(flat_circles(&mut app, &dialog, rect).len(), 155);
+    let fitted_distance = app.flat_view.cam.distance;
+    // Keep a hole crossing the left viewport edge, even when its centre is outside.
+    let scale = f64::from(rect.height()) / (2.0 * app.flat_view.cam.half_height());
+    app.flat_view.cam.target.x = 40.5 + (f64::from(rect.width()) / 2.0 + 0.75 * scale) / scale;
+    let partial = flat_circles(&mut app, &dialog, rect);
+    assert!(!partial.is_empty() && partial.len() < 155);
+    assert!(partial.iter().any(|c| c.center.x < rect.left() && c.center.x + c.radius > rect.left()));
+    app.flat_view.cam.target.x = 1e6;
+    assert!(flat_circles(&mut app, &dialog, rect).is_empty());
+    app.flat_view.cam.target.x = 50.0;
+    app.flat_view.cam.distance = fitted_distance * 1000.0;
+    assert!(flat_circles(&mut app, &dialog, rect).is_empty());
+}
+
+/// The hem's handle sits on the centre line of the hem layer, at the outer face of its fold, and
+/// points along the hem toward its tip (#5828): dragging it changes the Length, which is measured
+/// from the fold's outer face to the tip, so the handle's start plus Length lands on the tip.
+#[test]
+fn hem_handle_runs_along_the_hem_to_its_tip() {
+    for flipped in [false, true] {
+        let mut app = plate(crate::shell::LayoutMode::Floating);
+        app.run("sheet.flange", json!({"sketch": "Base"})).unwrap();
+        let body = app.session.model.state().sheets[0].body.clone();
+        app.session.selection = vec![edge_sel(&app.session, Vec3::new(50.0, 0.0, 2.5)).unwrap()];
+        app.start("sheet.hem");
+        let mut d = app.dialog.clone().unwrap();
+        let Kind::Sheet(Sm::Hem { flip, .. }) = &mut d.kind else { panic!("hem dialog") };
+        *flip = flipped;
+        let (at, dir) = crate::canvas::anchor(&app, &d).unwrap();
+        let dir = dir.unwrap();
+        let commands = apply_commands(&app, &d).unwrap();
+        run_all(&mut app, commands);
+        // The 5 mm hem layer: its tip is the far end of the added layer, along the sheet.
+        let m = app.session.world_state().body(&body).unwrap().mesh();
+        // The straight part of the layer, past the fold.
+        let layer_z = |z: f64| if flipped { z > 2.505 } else { z < -0.01 };
+        let tip_y = m.positions.iter().filter(|v| layer_z(v.z)).map(|v| v.y).fold(f64::NEG_INFINITY, f64::max);
+        let layer: Vec<f64> = m.positions.iter().filter(|v| layer_z(v.z) && v.y > 0.5).map(|v| v.z).collect();
+        let centre_z = (layer.iter().copied().fold(f64::INFINITY, f64::min) + layer.iter().copied().fold(f64::NEG_INFINITY, f64::max)) / 2.0;
+        assert!(dir.dist(Vec3::Y) < 1e-6, "flip={flipped}: the handle points along the hem to its tip, got {dir:?}");
+        assert!((at.z - centre_z).abs() < 0.05, "flip={flipped}: the handle starts on the hem's centre line: {at:?} vs z={centre_z}");
+        assert!((at.y + 5.0 - tip_y).abs() < 0.05, "flip={flipped}: start plus Length reaches the tip: {at:?} vs y={tip_y}");
     }
 }

@@ -11,7 +11,7 @@ use solidcraft_engine::Sel;
 use solidcraft_engine::doc::expr::Kind as ValueKind;
 use solidcraft_engine::doc::sheet::SheetRule;
 use solidcraft_engine::doc::{FeatureKind, ProfileSel};
-use solidcraft_engine::geom::Vec3;
+use solidcraft_engine::geom::{Vec2, Vec3};
 
 use crate::SolveApp;
 use crate::dialogs::{Dialog, Kind, edge_sel, face_sel, form_row, profile_indices};
@@ -37,6 +37,10 @@ const RULE_FIELDS: [(&str, &str); 8] = [
 /// The corner relief shapes the manager offers (the rule's `corner_relief_shape`) and their labels.
 const RELIEF_SHAPES: [&str; 4] = ["notch", "round", "rectangular", "tear"];
 const RELIEF_SHAPE_LABELS: [&str; 4] = ["Notch", "Round", "Rectangular", "Tear"];
+/// How the manager's rule reads bend angles in the DXF bend notes (the rule's `angle_display`)
+/// and their labels.
+const ANGLE_DISPLAYS: [&str; 2] = ["bend", "included"];
+const ANGLE_DISPLAY_LABELS: [&str; 2] = ["Bend", "Included"];
 /// The corner relief shapes an edge flange offers: the rule's (index 0, nothing of its own), then
 /// the shapes of `RELIEF_SHAPES` in order.
 const FLANGE_RELIEF_LABELS: [&str; 5] = ["Rule", "Notch", "Round", "Rectangular", "Tear"];
@@ -90,6 +94,8 @@ crate::dialog_descriptor::dialog_descriptors! {
                 values: Vec<String>,
                 /// The corner relief shape (index into `RELIEF_SHAPES`).
                 relief: usize,
+                /// How bend angles read (index into `ANGLE_DISPLAYS`).
+                angles: usize,
                 active: bool,
                 loaded: Option<usize>,
             },
@@ -165,7 +171,7 @@ pub fn start(app: &SolveApp, id: &str) -> Option<(Kind, Vec<SelInput>)> {
             let active = app.session.doc.sheet.active.clone();
             let rules = rule_list(app);
             let pick = active.and_then(|a| rules.iter().position(|r| r.name == a)).unwrap_or(0);
-            (Sm::Rules { pick, name: String::new(), values: Vec::new(), relief: 0, active: true, loaded: None }, vec![])
+            (Sm::Rules { pick, name: String::new(), values: Vec::new(), relief: 0, angles: 0, active: true, loaded: None }, vec![])
         }
         "sheet.flat_pattern" => (Sm::FlatPattern { data: None, key: None, status: None }, vec![SelInput::new("Body (last if none)", BODIES, false)]),
         _ => Sm::simple_start(id)?,
@@ -286,7 +292,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
         }
         Sm::Unfold { .. } => {}
         Sm::Convert { rule } => rule_combo(app, ui, "sm_conv_rule", rule),
-        Sm::Rules { pick, name, values, relief, active, loaded } => {
+        Sm::Rules { pick, name, values, relief, angles, active, loaded } => {
             let rules = rule_list(app);
             crate::rule_editor::rule_editor! {
                 ui, "sm_rules", rules, pick, name, active, loaded;
@@ -305,6 +311,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
                         base.gap.clone(),
                     ];
                     *relief = RELIEF_SHAPES.iter().position(|s| s.eq_ignore_ascii_case(base.corner_relief_shape.trim())).unwrap_or(0);
+                    *angles = ANGLE_DISPLAYS.iter().position(|d| d.eq_ignore_ascii_case(base.angle_display.trim())).unwrap_or(0);
                     *active = app.session.doc.sheet_rule(None).name == base.name || *pick >= rules.len();
                 },
                 fields: {
@@ -315,6 +322,7 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Sm, inputs: &mut [Sel
                         }
                         enter |= expr_row(ui, label, v);
                     }
+                    choice_row(ui, "Angle Display", "sm_angle_display", angles, &ANGLE_DISPLAY_LABELS);
                 }
             }
             if *pick < rules.len()
@@ -569,11 +577,12 @@ pub fn commands(app: &SolveApp, k: &Sm, inputs: &[SelInput], extra: &Map<String,
             }
             ("sheet.convert", p)
         }
-        Sm::Rules { pick, name, values, relief, active, .. } => {
+        Sm::Rules { pick, name, values, relief, angles, active, .. } => {
             let rules = rule_list(app);
             let fields = RULE_FIELDS.iter().map(|(key, _)| *key).zip(values);
             let mut p = crate::rule_editor::params(rules.get(*pick).map(|r| r.name.as_str()), name, *active, fields)?;
             p["corner_relief_shape"] = json!(RELIEF_SHAPES.get(*relief).copied().unwrap_or("notch"));
+            p["angle_display"] = json!(ANGLE_DISPLAYS.get(*angles).copied().unwrap_or("bend"));
             ("sheet.manage_rules", p)
         }
         Sm::FlatPattern { .. } => return Ok(Vec::new()),
@@ -715,15 +724,24 @@ pub fn for_feature(app: &SolveApp, kind: &FeatureKind) -> Option<(Kind, Vec<SelI
 
 // ---- view ----
 
-/// The direction an edge flange or hem grows from its first edge: out of the sheet's larger
-/// neighbouring face for a flange, toward it for a hem (flipped with Flip).
+/// The direction an edge flange grows from its first edge: out of the sheet's larger
+/// neighbouring face (flipped with Flip). A hem's handle runs along the hem instead
+/// ([`hem_handle`]).
 pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
     let Kind::Sheet(k) = &d.kind else { return None };
     let flip = match k {
         Sm::Flange { ty: 1, flip, .. } => *flip,
-        Sm::Hem { flip, .. } => !flip,
+        Sm::Hem { .. } => return hem_handle(app, d).map(|(_, dir)| dir),
         _ => return None,
     };
+    let (n, _, _) = edge_frame(app, d)?;
+    Some(if flip { -n } else { n })
+}
+
+/// The sheet at the dialog's first picked edge: the unit normal of the larger neighbouring face
+/// (out of the sheet), the unit normal of the other neighbour (the edge's end face, pointing away
+/// from the sheet), and the sheet's thickness along the first.
+fn edge_frame(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Vec3, f64)> {
     let Sel::Edge { body, index, point } = d.inputs.first()?.items.first()? else { return None };
     let st = app.session.world_state();
     let m = st.body(body)?.mesh();
@@ -737,16 +755,40 @@ pub fn arrow(app: &SolveApp, d: &Dialog) -> Option<Vec3> {
             .map(|[a, b, c]| (b - a).cross(c - a).len() * 0.5)
             .sum()
     };
+    let normal = |f: u32| -> Option<Vec3> {
+        m.triangles
+            .iter()
+            .zip(&m.tri_face)
+            .filter(|(_, tf)| **tf == f)
+            .filter_map(|(t, _)| m.tri(t))
+            .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(*point).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(*point)))
+            .and_then(|[a, b, c]| (b - a).cross(c - a).normalized())
+    };
     let f = faces.iter().copied().max_by(|a, b| area(*a).total_cmp(&area(*b)))?;
-    let n = m
-        .triangles
-        .iter()
-        .zip(&m.tri_face)
-        .filter(|(_, tf)| **tf == f)
-        .filter_map(|(t, _)| m.tri(t))
-        .min_by(|a, b| ((a[0] + a[1] + a[2]) / 3.0).dist(*point).total_cmp(&((b[0] + b[1] + b[2]) / 3.0).dist(*point)))
-        .and_then(|[a, b, c]| (b - a).cross(c - a).normalized())?;
-    Some(if flip { -n } else { n })
+    let g = faces.iter().copied().find(|g| *g != f)?;
+    let (n, end) = (normal(f)?, normal(g)?);
+    // The end face spans the sheet's thickness along the normal.
+    let heights = m.triangles.iter().zip(&m.tri_face).filter(|(_, tf)| **tf == g).filter_map(|(t, _)| m.tri(t)).flatten().map(|v| v.dot(n));
+    let (lo, hi) = heights.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), h| (lo.min(h), hi.max(h)));
+    let thickness = hi - lo;
+    (thickness.is_finite() && thickness > 0.0).then_some((n, end, thickness))
+}
+
+/// Where a hem's handle starts and where it points (#5828). Its Length is measured from the outer
+/// face of the fold to the hem's tip, so the handle starts on the centre line of the hem layer at
+/// that face and runs along the hem toward the tip: square to the picked edge, back over the sheet.
+/// The layer lies on the far side of the sheet from the larger face unless flipped. The Gap is
+/// taken from the dialog when it holds a number; otherwise the layer sits flat against the sheet.
+pub fn hem_handle(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Vec3)> {
+    let Kind::Sheet(Sm::Hem { gap, flip, .. }) = &d.kind else { return None };
+    let Sel::Edge { point, .. } = d.inputs.first()?.items.first()? else { return None };
+    let (n, end, thickness) = edge_frame(app, d)?;
+    let gap = app.session.doc.eval(gap, ValueKind::Length).ok().filter(|g| g.is_finite() && *g >= 0.0).unwrap_or(0.0);
+    // The hem's side of the sheet, as a unit vector along the larger face's normal, and the
+    // distance of the layer's centre line from the face the edge lies on.
+    let (side, depth) = if *flip { (n, gap + thickness / 2.0) } else { (-n, thickness + gap + thickness / 2.0) };
+    let start = *point + end * (thickness + gap) + side * depth;
+    Some((start, -end))
 }
 
 /// Bend line colours: up and down (theme tokens, legible on either theme and in every colour
@@ -756,8 +798,8 @@ fn bend_colors() -> (Color32, Color32) {
     (t.bend_up, t.bend_down)
 }
 
-/// The flat pattern view: the outline, cut-outs and bend lines (up and down in their colours)
-/// drawn flat over the viewport, fitted to it. True when the dialog is a flat pattern.
+/// The flat pattern view: outline, cut-outs, perforations and bend lines (up and down in
+/// their colours), fitted over the viewport. True when the dialog is a flat pattern.
 pub fn overlay(app: &mut SolveApp, painter: &egui::Painter, rect: Rect, d: &Dialog) -> bool {
     let Kind::Sheet(Sm::FlatPattern { data, .. }) = &d.kind else { return false };
     let t = Tokens::get();
@@ -817,6 +859,22 @@ pub fn overlay(app: &mut SolveApp, painter: &egui::Painter, rect: Rect, d: &Dial
         let pts: Vec<Pos2> = h.iter().map(|p| to(*p)).collect();
         if pts.len() >= 2 {
             painter.add(egui::Shape::closed_line(pts, Stroke::new(1.4, t.text)));
+        }
+    }
+    if let Some(body) = v["body"].as_str() {
+        app.flat_view.cache_perforations(&app.session, body);
+        let clip = rect.intersect(painter.clip_rect());
+        let pixels_per_point = painter.ctx().pixels_per_point();
+        for &(centre, radius) in &app.flat_view.perforations {
+            let radius = (radius * scale) as f32;
+            // Egui uses logical points; reject holes smaller than one physical pixel.
+            if !radius.is_finite() || radius * 2.0 * pixels_per_point < 1.0 {
+                continue;
+            }
+            let centre = to((centre.x, centre.y));
+            if centre.x.is_finite() && centre.y.is_finite() && clip.intersects(Rect::from_center_size(centre, vec2(radius * 2.0, radius * 2.0))) {
+                painter.circle_stroke(centre, radius, Stroke::new(1.4, t.text));
+            }
         }
     }
     // A pocket retains material below (or above) the cut. Dashed contours and a depth
@@ -894,6 +952,9 @@ pub struct FlatView {
     pub cam: solidcraft_engine::render::Camera,
     /// The camera frames the pattern; cleared by Fit and Home, and whenever the dialog is closed.
     pub fitted: bool,
+    /// Flat centres stay out of the command JSON and are reused while navigating.
+    perforation_key: Option<(std::sync::Weak<solidcraft_engine::doc::ModelState>, String)>,
+    perforations: Vec<(Vec2, f64)>,
 }
 
 impl Default for FlatView {
@@ -902,11 +963,35 @@ impl Default for FlatView {
         cam.set_view(solidcraft_engine::render::StandardView::Top);
         cam.fov = 0.0;
         cam.up = solidcraft_engine::render::UpAxis::Z;
-        FlatView { cam, fitted: false }
+        FlatView { cam, fitted: false, perforation_key: None, perforations: Vec::new() }
     }
 }
 
 impl FlatView {
+    fn cache_perforations(&mut self, session: &solidcraft_engine::Session, body: &str) {
+        let state = session.world_state();
+        let state_key = std::sync::Arc::downgrade(&state);
+        if self.perforation_key.as_ref().is_some_and(|(cached, name)| cached.ptr_eq(&state_key) && name == body) {
+            return;
+        }
+        self.perforation_key = Some((state_key, body.to_owned()));
+        self.perforations.clear();
+        let Some(sheet) = state.sheets.iter().find(|sheet| sheet.body == body) else { return };
+        // Bound overlay storage and drawing work, including designs with many fields.
+        const MAX_HOLES: usize = 1_000_000;
+        for field in &sheet.perforations {
+            if self.perforations.len() >= MAX_HOLES {
+                break;
+            }
+            if !field.diameter.is_finite() || field.diameter <= 0.0 {
+                continue;
+            }
+            let Ok(centres) = sheet.perforation_holes(field) else { continue };
+            let remaining = MAX_HOLES.saturating_sub(self.perforations.len());
+            self.perforations.extend(centres.into_iter().take(remaining).map(|centre| (centre, field.diameter / 2.0)));
+        }
+    }
+
     /// Frame the pattern's bounds `lo..hi` in `area`, the part of `rect` the command panel leaves.
     fn fit(&mut self, rect: Rect, area: Rect, lo: (f64, f64), hi: (f64, f64)) {
         let scale = (f64::from(area.width()) / (hi.0 - lo.0)).min(f64::from(area.height()) / (hi.1 - lo.1));

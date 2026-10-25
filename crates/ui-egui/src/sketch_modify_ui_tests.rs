@@ -468,6 +468,27 @@ fn rect(h: &mut crate::scenario::Harness, count: &str, spacing: &str, count2: &s
 }
 
 #[test]
+fn two_sided_offset_shows_a_dimension_for_each_distance() {
+    let (mut h, id) = open("sketch.offset");
+    {
+        let d = h.app.dialog.as_mut().unwrap();
+        d.inputs[0].items = vec![Sel::SketchCurve { id }];
+    }
+    h.frames(2);
+    assert!(crate::scenario::handle_at("arrow").is_some(), "Distance has its dimension");
+    assert!(crate::scenario::handle_at("arrow2").is_none(), "one side draws a single dimension");
+    if let Kind::SketchModify(Mod::Offset { distance, distance2, mode, .. }) = &mut h.app.dialog.as_mut().unwrap().kind {
+        *mode = 1;
+        *distance = "9 mm".into();
+        *distance2 = "2 mm".into();
+    }
+    h.frames(2);
+    let first = crate::scenario::handle_at("arrow").expect("Distance stays on the sketch");
+    let second = crate::scenario::handle_at("arrow2").expect("Distance 2 gets its own dimension");
+    assert!(first.distance(second) > 20.0, "the two dimensions sit on opposite sides: {first:?} {second:?}");
+}
+
+#[test]
 fn rectangular_pattern_window_opens_instead_of_a_click_tool() {
     let (h, _) = open("sketch.pattern.rectangular");
     assert!(h.app.tool.is_none(), "the click tool still takes the command");
@@ -604,8 +625,8 @@ fn an_axis_perpendicular_to_the_sketch_is_reported_not_silently_replaced() {
 }
 
 /// Upstream #218 is the same shape: `solid.pattern.circular` took expressions in its axis origin
-/// and stored `[0, 0, 0]`. The sketch patterns read `count` and `angle` with `num`, which takes a
-/// JSON number only, so the window evaluates every field itself.
+/// and stored `[0, 0, 0]`. Rectangular sketch patterns still read `count` with `num`, which
+/// takes a JSON number only, so the window evaluates their count fields itself.
 #[test]
 fn a_count_expression_is_evaluated_rather_than_sent_as_a_string() {
     let (mut h, id) = open("sketch.pattern.rectangular");
@@ -776,4 +797,30 @@ fn a_missing_centre_a_short_count_and_a_bad_angle_are_all_refused() {
     h.app.dialog.as_mut().unwrap().inputs[1].items.clear();
     let d = h.app.dialog.clone().unwrap();
     assert!(apply_commands(&h.app, &d).unwrap_err().contains("centre"));
+}
+
+#[test]
+fn circular_quantity_keeps_its_expression_when_reopened_and_follows_parameter_changes() {
+    let mut h = Harness::new();
+    h.app.run("parameters.add", json!({"name":"HoleAmount","expression":"5","unit":""})).unwrap();
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.circle.center", json!({"center":[20,0],"radius":2,"id":"seed"})).unwrap();
+    h.app.start("sketch.pattern.circular");
+    let d = h.app.dialog.as_mut().unwrap();
+    d.inputs[0].items = vec![Sel::SketchCurve { id: "seed".into() }];
+    d.inputs[1].items = vec![Sel::SketchPoint { id: "origin".into() }];
+    if let Kind::SketchModify(Mod::PatternCirc { count, .. }) = &mut d.kind {
+        *count = "HoleAmount".into();
+    } else {
+        panic!("expected circular pattern");
+    }
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands[0].1["count"], "HoleAmount");
+    let out = h.app.run(&commands[0].0, commands[0].1.clone()).unwrap();
+    h.app.dialog = None;
+    h.app.run("parameters.change", json!({"name":"HoleAmount","expression":"7"})).unwrap();
+    assert!(crate::sketch_modify_ui::edit_pattern(&mut h.app, out["pattern"].as_str().unwrap()));
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::SketchModify(Mod::PatternCirc { count, .. }) if count=="HoleAmount"));
+    let sid = h.app.session.active_sketch.unwrap();
+    assert_eq!(h.app.session.world_state().sketch(sid).unwrap().sketch.curves.len(), 7);
 }

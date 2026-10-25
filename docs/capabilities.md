@@ -31,7 +31,7 @@ and help is welcome: see [CONTRIBUTING.md](../CONTRIBUTING.md).
   and the rank of its Jacobian gives the remaining degrees of freedom. Constraints: coincident,
   point on curve, horizontal/vertical, parallel, perpendicular, tangent, curvature (G2), equal,
   concentric, collinear, midpoint, symmetry, fix; linear, aligned, horizontal, vertical,
-  point-to-line, line-to-circle, radius, diameter, angle, arc sweep, arc length and slot length dimensions driven
+  point-to-line, line-to-circle, point-to-circle, circle-to-circle, radius, diameter, angle, arc sweep, arc length and slot length dimensions driven
   by parameters. Over-constraining edits are rejected; fully constrained geometry turns black.
   Dragging solves the sketch every frame and rebuilds the model once, when the drag ends.
   Select a line or its two endpoints, type its dimension and press Enter to commit one undo
@@ -70,7 +70,7 @@ and help is welcome: see [CONTRIBUTING.md](../CONTRIBUTING.md).
   that later features build on — open a `.step`/`.stp`/`.igs`/`.iges` file, insert one into a
   design, or drop it on the window ([docs/step-import.md](step-import.md)); FreeCAD
   `.FCStd` and Rhino `.3dm` solids import the same way through
-  [cadmpeg](https://github.com/cadmpeg/cadmpeg) in the desktop app and CLI.
+  [cadmpeg](https://github.com/cadmpeg/cadmpeg) in the desktop app, the browser app and the CLI.
 - **Render:** opaque surfaces can use metal fraction, roughness and dielectric IOR in the
   integrated product viewport and CPU preview PNGs. Existing simple colors remain supported.
   Fixed direct lighting is a preview; HDRI, refraction and texture maps are not implemented.

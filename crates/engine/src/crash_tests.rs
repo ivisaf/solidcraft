@@ -64,15 +64,28 @@ fn child() {
         "kernel" => {
             assert!(s.execute("diagnostics.crash_test", &json!({"mode": "kernel"})).is_err());
         }
-        "thread" => {
+        // `thread_dies`: the panic ends the app, as one on the window's thread does.
+        "thread" | "thread_dies" => {
             let r = std::thread::Builder::new()
                 .name("worker".into())
                 .spawn(|| std::panic::panic_any(String::from("worker thread 42 failed")))
                 .unwrap()
                 .join();
             assert!(r.is_err());
+            if mode == "thread_dies" {
+                std::process::abort();
+            }
         }
         "abort" => {
+            let _ = s.execute("diagnostics.crash_test", &json!({"mode": "abort"}));
+        }
+        // Back to the root between two components: only the session's active component changes.
+        "components" => {
+            s.execute("component.create", &json!({"name": "Tray"})).unwrap();
+            s.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5})).unwrap();
+            s.execute("component.activate", &json!({"component": "root"})).unwrap();
+            s.execute("component.create", &json!({"name": "Bracket"})).unwrap();
+            s.execute("solid.box", &json!({"length": 4, "width": 4, "height": 4})).unwrap();
             let _ = s.execute("diagnostics.crash_test", &json!({"mode": "abort"}));
         }
         _ => {}
@@ -158,6 +171,21 @@ fn a_panic_outside_commands_is_reported() {
 }
 
 #[test]
+fn a_known_panic_that_ends_the_app_is_counted_not_reported_again_as_an_unclean_exit() {
+    let d = fresh_dir("repeat");
+    assert!(run_child(&d, "thread").1);
+    assert!(!run_child(&d, "thread_dies").1, "the child aborted");
+    assert!(run_child(&d, "none").1);
+    let (s, _) = only_report(&d);
+    assert_eq!(s.kind, "panic");
+    assert_eq!(s.count, 2);
+    // A repeat the app survives is counted once, though it then ends cleanly.
+    assert!(run_child(&d, "thread").1);
+    assert_eq!(only_report(&d).0.count, 3);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
 fn an_abort_is_reported_at_the_next_start_with_a_replay() {
     let d = fresh_dir("abort");
     let (_, ok) = run_child(&d, "abort");
@@ -202,6 +230,27 @@ fn render_settings_survive_unclean_exit_and_journal_replay() {
     }
     assert_eq!(recovered.doc.features.len(), 1);
     assert_eq!(recovered.doc.render.setups["Studio"].exposure_ev, 3.0);
+    let _ = fs::remove_dir_all(&d);
+}
+
+#[test]
+fn activating_a_component_is_journaled_so_the_replay_builds_in_the_same_component() {
+    let d = fresh_dir("components");
+    assert!(!run_child(&d, "components").1);
+    assert!(run_child(&d, "none").1);
+    let (_, report) = only_report(&d);
+    let replay: Value = serde_json::from_slice(&fs::read(report["replay_path"].as_str().unwrap()).unwrap()).unwrap();
+    let commands = replay["commands"].as_array().unwrap();
+    assert_eq!(commands.iter().filter(|c| c["command"] == "component.activate").count(), 1, "{replay}");
+    let mut recovered = Session::default();
+    for command in commands {
+        let id = command["command"].as_str().unwrap();
+        if id != "diagnostics.crash_test" {
+            recovered.execute(id, &command["params"]).unwrap();
+        }
+    }
+    let bracket = recovered.doc.components.iter().find(|c| c.name == "Bracket").unwrap();
+    assert_eq!(bracket.parent, 0, "the Bracket was made under the root");
     let _ = fs::remove_dir_all(&d);
 }
 

@@ -31,36 +31,32 @@ impl Catalog {
     }
 }
 
-static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/en.json")));
-static CZECH: Catalog = Catalog::new("cs", "Čeština", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/cs.json")));
-static DANISH: Catalog = Catalog::new("da", "Dansk", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/da.json")));
-static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/de.json")));
+static ENGLISH: Catalog = Catalog::new("en", "English", include_str!(concat!(env!("OUT_DIR"), "/locales/en.json")));
+static CZECH: Catalog = Catalog::new("cs", "Čeština", include_str!(concat!(env!("OUT_DIR"), "/locales/cs.json")));
+static DANISH: Catalog = Catalog::new("da", "Dansk", include_str!(concat!(env!("OUT_DIR"), "/locales/da.json")));
+static GERMAN: Catalog = Catalog::new("de", "Deutsch", include_str!(concat!(env!("OUT_DIR"), "/locales/de.json")));
 /// English in UK spelling: only the messages whose spelling differs; the rest are English's.
-static ENGLISH_UK: Catalog =
-    Catalog::new("en-GB", "English (UK)", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/en-GB.json")));
-static SPANISH: Catalog = Catalog::new("es", "Español (España)", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/es.json")));
-static FRENCH: Catalog = Catalog::new("fr", "Français", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/fr.json")));
-static GALICIAN: Catalog = Catalog::new("gl", "Galego", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/gl.json")));
-static HUNGARIAN: Catalog = Catalog::new("hu", "Magyar", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/hu.json")));
-static INDONESIAN: Catalog =
-    Catalog::new("id", "Bahasa Indonesia", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/id.json")));
-static ITALIAN: Catalog = Catalog::new("it", "Italiano", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/it.json")));
-static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ja.json")));
-static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ko.json")));
-static MALAY: Catalog = Catalog::new("ms", "Bahasa Melayu", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ms.json")));
-static DUTCH: Catalog = Catalog::new("nl", "Nederlands", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/nl.json")));
-static POLISH: Catalog = Catalog::new("pl", "Polski", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/pl.json")));
-static PORTUGUESE_BR: Catalog =
-    Catalog::new("pt-BR", "Português (Brasil)", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/pt-BR.json")));
-static ROMANIAN: Catalog = Catalog::new("ro", "Română", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ro.json")));
-static RUSSIAN: Catalog = Catalog::new("ru", "Русский", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/ru.json")));
-static SWEDISH: Catalog = Catalog::new("sv", "Svenska", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/sv.json")));
-static TURKISH: Catalog = Catalog::new("tr", "Türkçe", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/tr.json")));
-static UKRAINIAN: Catalog = Catalog::new("uk", "Українська", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/uk.json")));
-static VIETNAMESE: Catalog = Catalog::new("vi", "Tiếng Việt", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/vi.json")));
-static CHINESE: Catalog = Catalog::new("zh", "中文", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh.json")));
-static CHINESE_TRADITIONAL: Catalog =
-    Catalog::new("zh-TW", "繁體中文", include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/locales/zh-TW.json")));
+static ENGLISH_UK: Catalog = Catalog::new("en-GB", "English (UK)", include_str!(concat!(env!("OUT_DIR"), "/locales/en-GB.json")));
+static SPANISH: Catalog = Catalog::new("es", "Español (España)", include_str!(concat!(env!("OUT_DIR"), "/locales/es.json")));
+static FRENCH: Catalog = Catalog::new("fr", "Français", include_str!(concat!(env!("OUT_DIR"), "/locales/fr.json")));
+static GALICIAN: Catalog = Catalog::new("gl", "Galego", include_str!(concat!(env!("OUT_DIR"), "/locales/gl.json")));
+static HUNGARIAN: Catalog = Catalog::new("hu", "Magyar", include_str!(concat!(env!("OUT_DIR"), "/locales/hu.json")));
+static INDONESIAN: Catalog = Catalog::new("id", "Bahasa Indonesia", include_str!(concat!(env!("OUT_DIR"), "/locales/id.json")));
+static ITALIAN: Catalog = Catalog::new("it", "Italiano", include_str!(concat!(env!("OUT_DIR"), "/locales/it.json")));
+static JAPANESE: Catalog = Catalog::new("ja", "日本語", include_str!(concat!(env!("OUT_DIR"), "/locales/ja.json")));
+static KOREAN: Catalog = Catalog::new("ko", "한국어", include_str!(concat!(env!("OUT_DIR"), "/locales/ko.json")));
+static MALAY: Catalog = Catalog::new("ms", "Bahasa Melayu", include_str!(concat!(env!("OUT_DIR"), "/locales/ms.json")));
+static DUTCH: Catalog = Catalog::new("nl", "Nederlands", include_str!(concat!(env!("OUT_DIR"), "/locales/nl.json")));
+static POLISH: Catalog = Catalog::new("pl", "Polski", include_str!(concat!(env!("OUT_DIR"), "/locales/pl.json")));
+static PORTUGUESE_BR: Catalog = Catalog::new("pt-BR", "Português (Brasil)", include_str!(concat!(env!("OUT_DIR"), "/locales/pt-BR.json")));
+static ROMANIAN: Catalog = Catalog::new("ro", "Română", include_str!(concat!(env!("OUT_DIR"), "/locales/ro.json")));
+static RUSSIAN: Catalog = Catalog::new("ru", "Русский", include_str!(concat!(env!("OUT_DIR"), "/locales/ru.json")));
+static SWEDISH: Catalog = Catalog::new("sv", "Svenska", include_str!(concat!(env!("OUT_DIR"), "/locales/sv.json")));
+static TURKISH: Catalog = Catalog::new("tr", "Türkçe", include_str!(concat!(env!("OUT_DIR"), "/locales/tr.json")));
+static UKRAINIAN: Catalog = Catalog::new("uk", "Українська", include_str!(concat!(env!("OUT_DIR"), "/locales/uk.json")));
+static VIETNAMESE: Catalog = Catalog::new("vi", "Tiếng Việt", include_str!(concat!(env!("OUT_DIR"), "/locales/vi.json")));
+static CHINESE: Catalog = Catalog::new("zh", "中文", include_str!(concat!(env!("OUT_DIR"), "/locales/zh.json")));
+static CHINESE_TRADITIONAL: Catalog = Catalog::new("zh-TW", "繁體中文", include_str!(concat!(env!("OUT_DIR"), "/locales/zh-TW.json")));
 /// English first (the fallback), then by language id, one per line so that adding a language
 /// doesn't edit a line another addition edits.
 #[rustfmt::skip]
@@ -120,16 +116,30 @@ impl Locale {
     /// Translate source labels from engine/UI tables, preserving unknown labels.
     /// Also accepts stable IDs while table helpers migrate away from source text.
     pub fn label(self, label: &str) -> &str {
-        static LABEL_IDS: OnceLock<BTreeMap<&'static str, &'static str>> = OnceLock::new();
+        // Stable IDs are authoritative. An untranslated legacy ID identical to its
+        // English caption can still use another translated ID for that source label.
+        if ENGLISH.messages().get(label).is_some_and(|text| text != label || self.0.messages().contains_key(label)) {
+            return self.text(label);
+        }
+        static LABEL_IDS: OnceLock<BTreeMap<&'static str, Vec<&'static str>>> = OnceLock::new();
         let ids = LABEL_IDS.get_or_init(|| {
-            ENGLISH
-                .messages()
-                .iter()
-                .filter(|(id, text)| !text.contains('{') && !id.starts_with(MANUFACTURE))
-                .map(|(text_id, text)| (text.as_str(), text_id.as_str()))
-                .collect()
+            let mut ids: BTreeMap<_, Vec<_>> = BTreeMap::new();
+            for (id, text) in ENGLISH.messages().iter().filter(|(id, text)| !text.contains('{') && !id.starts_with(MANUFACTURE)) {
+                ids.entry(text.as_str()).or_default().push(id.as_str());
+            }
+            ids
         });
-        ids.get(label).map_or_else(|| self.text(label), |id| self.text(id))
+        if let Some(candidates) = ids.get(label) {
+            // Preserve the old last-ID preference among available translations. A new
+            // English-only alias must not hide a translation that already exists here.
+            if let Some(text) = candidates.iter().rev().find_map(|id| self.0.messages().get(*id)) {
+                return text;
+            }
+            if let Some(id) = candidates.last() {
+                return self.text(id);
+            }
+        }
+        self.text(label)
     }
 
     /// A label of the Manufacture (CAM) windows: their own entry for the English text where
@@ -275,6 +285,52 @@ pub fn tr_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strings a pull request adds under `assets/locales/pending/` work before they are folded
+    /// into the catalogs (the build merges them in).
+    #[test]
+    fn pending_messages_are_in_the_catalogs() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/locales/pending");
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "json")) {
+            let pending: BTreeMap<String, Messages> = serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+            for (locale, messages) in pending {
+                for (id, text) in messages {
+                    assert_eq!(Locale::for_language(&locale).text(&id), text, "{locale}: {id}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn alias_resolution_regression() {
+        static LEGACY: Catalog = Catalog::new("test-legacy", "Test", r#"{"Pitch":"legacy pitch"}"#);
+        static ALIAS: Catalog = Catalog::new("test-alias", "Test", r#"{"coupling.pitch":"mechanical pitch"}"#);
+        assert_eq!(ENGLISH.messages().get("Pitch").map(String::as_str), Some("Pitch"));
+        assert_eq!(ENGLISH.messages().get("coupling.pitch").map(String::as_str), Some("Pitch"));
+        let legacy = Locale(&LEGACY);
+        assert_eq!(legacy.label("Pitch"), "legacy pitch");
+        assert_eq!(legacy.label("coupling.pitch"), "Pitch");
+        let alias = Locale(&ALIAS);
+        assert_eq!(alias.label("Pitch"), "mechanical pitch");
+        assert_eq!(alias.label("coupling.pitch"), "mechanical pitch");
+        assert_eq!(alias.label("original unknown caption"), "original unknown caption");
+    }
+
+    #[test]
+    fn timeline_feature_hint_comes_from_the_catalog() {
+        let id = "timeline.feature_hint";
+        let english = "Double-click to edit · drag to reorder · right-click for more";
+        assert_eq!(ENGLISH.messages().get(id).map(String::as_str), Some(english));
+        for language in ["en", "ja", "zh", "de", "ko", "es"] {
+            let _scope = scope(language);
+            let hint = tr(id);
+            assert_eq!(hint, Locale::for_language(language).text(id));
+            assert_ne!(hint, id);
+            if ["ja", "zh", "de", "ko"].contains(&language) {
+                assert_ne!(hint, english, "{language}: the hint must be translated");
+            }
+        }
+    }
 
     /// English first, then by id, so adding a locale edits only its own line.
     #[test]
@@ -475,6 +531,27 @@ mod tests {
     /// escapes and test modules are handled, and calls inside macros count too. UI-kit calls that
     /// translate their label themselves (`row`, imported as `form_row`, and the rest of
     /// `KIT_CALLS`) are read at the same argument positions the kit translates.
+    #[test]
+    fn english_only_render_aliases_do_not_hide_existing_label_translations() {
+        for language in ["de", "fr"] {
+            let locale = Locale::for_language(language);
+            for (label, stable_id) in [
+                ("Library", "Library"),
+                ("Favorites", "Favorites"),
+                ("Center X", "Center X"),
+                ("Move up", "Move up"),
+                ("Appearance", "cmd.appearance_assign"),
+                ("Checkpoint", "cmd.edit_checkpoint"),
+                ("Pitch", "coupling.pitch"),
+            ] {
+                assert_eq!(locale.label(label), locale.text(stable_id), "{language}: {label}");
+                assert_ne!(locale.label(label), label, "{language}: {label} must retain its existing translation");
+            }
+            assert_eq!(locale.label("render.camera_pitch"), locale.text("render.camera_pitch"));
+            assert_eq!(locale.label("a custom untranslated caption"), "a custom untranslated caption");
+        }
+    }
+
     #[test]
     fn every_ui_label_literal_reaches_an_english_catalog_entry() {
         let english: Messages = serde_json::from_str(ENGLISH.source).unwrap();

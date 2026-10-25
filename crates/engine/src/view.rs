@@ -105,28 +105,23 @@ impl Default for Palette {
 /// joints and moves place them, and the sketches the view draws (not ones used by a feature,
 /// hidden ones, or ones in hidden components). What Home, Fit and the orbit pivot frame.
 pub fn bounds(s: &Session) -> Aabb3 {
-    visible_bounds(s, true)
+    bounds_by(s, |body| body.mesh_bounds())
 }
 
-/// [`bounds`], with the browser's Sketches folder shown (`sketches`) or hidden.
-pub fn visible_bounds(s: &Session, sketches: bool) -> Aabb3 {
-    bounds_by(s, sketches, |body| body.mesh_bounds())
-}
-
-/// [`visible_bounds`] without meshing anything: a body not meshed yet counts with its outline
+/// [`bounds`] without meshing anything: a body not meshed yet counts with its outline
 /// ([`solidcraft_kernel::Body::outline_bounds`]), which a face curving out past all of its edges
 /// can exceed. Frames a design whose bodies are still being meshed.
-pub fn unmeshed_bounds(s: &Session, sketches: bool) -> Aabb3 {
-    bounds_by(s, sketches, |body| body.cached_mesh().map(|m| m.bounds()).unwrap_or_else(|| body.outline_bounds()))
+pub fn unmeshed_bounds(s: &Session) -> Aabb3 {
+    bounds_by(s, |body| body.cached_mesh().map(|m| m.bounds()).unwrap_or_else(|| body.outline_bounds()))
 }
 
-fn bounds_by(s: &Session, sketches: bool, of: impl Fn(&solidcraft_doc::ModelBody) -> Aabb3) -> Aabb3 {
+fn bounds_by(s: &Session, of: impl Fn(&solidcraft_doc::ModelBody) -> Aabb3) -> Aabb3 {
     let st = s.world_state();
     let mut b = Aabb3::EMPTY;
     for body in st.bodies.iter().filter(|x| s.body_visible(&x.name)) {
         b = b.union(&of(body));
     }
-    for ss in st.sketches.iter().filter(|x| sketch_drawn(s, x.feature, sketches)) {
+    for ss in st.sketches.iter().filter(|x| sketch_shown(s, x.feature)) {
         // All four corners: on a tilted plane two opposite ones don't span the rectangle.
         if let Some((lo, hi)) = ss.sketch.bounds() {
             for p in [lo, hi, solidcraft_geom::Vec2::new(lo.x, hi.y), solidcraft_geom::Vec2::new(hi.x, lo.y)] {
@@ -453,6 +448,7 @@ fn build_scene(
         background: Some(p.background),
         clip: section.map(|(o, n)| (n, n.dot(o))),
         cap: Some(p.cap),
+        plain_cap: !s.section_hatch,
         analysis: s.analysis.map(|a| SceneAnalysis { mode: a.mode(), colors: p.analysis }),
         ..Default::default()
     };
@@ -642,21 +638,27 @@ impl SectionIndex {
     }
 }
 
-/// Is a sketch drawn? The active one is; others unless hidden. Finished sketches are hidden
-/// once a feature uses them, by default, unless shown one by one.
+/// Is a sketch drawn? The sketch being edited always is; otherwise not in a hidden component,
+/// Sketches folder or group (even one shown on its own). The sketch immediately before a
+/// rollback marker is shown regardless of its individual visibility; other hidden sketches, and
+/// ones used by a feature unless shown on their own, retain their stored visibility.
 pub fn sketch_shown(s: &Session, id: u64) -> bool {
-    sketch_drawn(s, id, true)
-}
-
-/// Is a sketch drawn, with sketches shown (`folder`) or hidden? The sketch being edited always
-/// is; otherwise not when hidden, nor in a hidden component, Sketches folder or group (even one
-/// shown on its own), and one used by a feature only when shown on its own.
-pub fn sketch_drawn(s: &Session, id: u64, folder: bool) -> bool {
     let v = &s.visibility;
-    if s.active_sketch == Some(id) {
+    if s.active_sketch == Some(id) || s.feature_edit_sketch == Some(id) {
         return true;
     }
-    if !folder || v.hidden_sketches.contains(&id) || !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
+    if !sketch_component_visible(s, id) || s.feature_folder_hidden(id, "sketches") {
+        return false;
+    }
+    if s.doc
+        .marker
+        .and_then(|position| position.checked_sub(1))
+        .and_then(|index| s.doc.features.get(index))
+        .is_some_and(|f| f.id == id && matches!(f.kind, solidcraft_doc::FeatureKind::Sketch { .. }))
+    {
+        return true;
+    }
+    if v.hidden_sketches.contains(&id) {
         return false;
     }
     v.shown_sketches.contains(&id) || !sketch_consumed(s, id)
@@ -901,6 +903,28 @@ mod tests {
             let cap = px().filter(|p| p[0] as i32 - p[2] as i32 > 20).count();
             assert!(cap > 500, "fov {fov}: cap pixels {cap}");
         }
+    }
+
+    /// The cut faces are hatched (stripes over the body's colour tinted toward the cap colour)
+    /// unless the section's `hatch` is off; then the cut is the body's own solid colour.
+    #[test]
+    fn cpu_picture_section_hatch_is_optional() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 40, "width": 30, "height": 20})).unwrap();
+        s.execute("appearance.assign", &json!({"bodies": ["Body1"], "color": [40, 160, 90]})).unwrap();
+        let cam = home_camera(&s);
+        let mut picture = |hatch: bool| {
+            let plane = json!({"origin": [0, 15, 0], "normal": [0, -1, 0]});
+            s.execute("inspect.section", &json!({"plane": plane, "hatch": hatch})).unwrap();
+            solidcraft_render::render(&scene(&s, &cam), &cam, 300, 220).rgba
+        };
+        // Pixels in the body's exact colour: only a plain cut has them (lit faces are shaded).
+        let solid = |img: &[u8]| img.chunks(4).filter(|p| p[..3] == [40, 160, 90]).count();
+        let (hatched, plain) = (picture(true), picture(false));
+        assert!(solid(&plain) > 500, "plain cut: {} pixels in the body's colour", solid(&plain));
+        assert_eq!(solid(&hatched), 0, "the hatched cut is tinted");
+        let shades = |img: &[u8]| img.chunks(4).map(|p| [p[0], p[1], p[2]]).collect::<std::collections::BTreeSet<_>>().len();
+        assert!(shades(&hatched) > shades(&plain), "the hatch adds its stripes' shades");
     }
 }
 

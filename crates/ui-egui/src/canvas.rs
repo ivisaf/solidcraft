@@ -68,15 +68,11 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
         }
         // A corner picked into a sketch window ("<sketch id>:<point id>", or a bare id when it
         // was selected outside one): the value box sits on the corner itself.
-        Sel::SketchPoint { id } => {
-            let (sketch, point) = match id.split_once(':') {
-                Some((sketch, point)) => (sketch.parse().ok()?, point),
-                None => (app.session.active_sketch?, id.as_str()),
-            };
-            let ss = st.sketch(sketch)?;
-            (ss.plane.to_world(ss.sketch.point(ss.sketch.resolve_point(point)?)?), None)
-        }
+        Sel::SketchPoint { id } => (sketch_point_at(app, &st, id)?, None),
         Sel::Body { name } => (st.body(name)?.mesh().bounds().center(), None),
+        // A feature picked as a whole (a pattern or mirror of features): the middle of what it
+        // made, as a body sits at the middle of its box.
+        Sel::Feature { id } => (crate::viewport::feature_bounds(app, *id)?.center(), None),
         Sel::Plane { name } => {
             let pl = solidcraft_engine::geom::Plane::named(name).or_else(|| {
                 solidcraft_engine::view::construction_planes(&app.session).into_iter().find(|(_, n, _)| n == name).map(|(_, _, pl)| pl)
@@ -116,7 +112,9 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             let dir = by_sketch.first().and_then(|(sk, ids)| solidcraft_engine::doc::sketch_hole_direction(&st, *sk, ids, flip));
             (at, normal.or(dir.map(|d| -d)))
         }
-        Kind::Section { .. } | Kind::OffsetPlane { .. } | Kind::OffsetFaces { .. } => (at, normal),
+        // A curved face offsets along its outward normal where it was picked.
+        Kind::OffsetFaces { .. } => (at, normal.or_else(|| solidcraft_engine::doc::hole_direction_at(&st, at).map(|d| -d))),
+        Kind::Section { .. } | Kind::OffsetPlane { .. } => (at, normal),
         // Fillet radii and chamfer distances grow the way `blend_grow_dir` gives (into the body
         // on an outside edge, into the open corner on an inside one); shell thickness grows into
         // the body.
@@ -127,6 +125,11 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             (at, along_face.or_else(|| st.body(body).and_then(|b| blend_grow_dir(&b.mesh(), *index, at))))
         }
         Kind::Fillet { .. } | Kind::Shell { .. } => (at, normal.map(|n| -n)),
+        // A hem's handle starts on the centre line of its layer and runs to its tip (#5828).
+        Kind::Sheet(crate::dialogs_sheet::Sm::Hem { .. }) => match crate::dialogs_sheet::hem_handle(app, d) {
+            Some((start, dir)) => (start, Some(dir)),
+            None => (at, normal),
+        },
         Kind::Sheet(_) => (at, crate::dialogs_sheet::arrow(app, d).or(normal)),
         Kind::Plastic(_) => (at, normal),
         Kind::PatternRect { .. } => (at, d.inputs.get(1).and_then(|i| i.items.first()).and_then(|x| crate::dialogs::axis_of(app, x)).map(|a| a.1)),
@@ -345,6 +348,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         draw(app, ui, painter, proj, &mut d, base, bs, dir);
     }
     app.dialog = Some(d);
+    // A Single hole's handles, over the depth arrow's stem: a press on a hole moves it.
+    crate::hole_place::show(app, ui, painter, proj);
 }
 
 /// A round step for dragged values at this zoom (1, 2 or 5 times a power of ten).
@@ -361,7 +366,7 @@ pub fn snap_step(half_height: f64) -> f64 {
 }
 
 /// Parameter along the line `base + dir * t` closest to the view ray through `pos`.
-fn along(proj: &Proj, pos: Pos2, base: Vec3, dir: Vec3) -> Option<f64> {
+pub(crate) fn along(proj: &Proj, pos: Pos2, base: Vec3, dir: Vec3) -> Option<f64> {
     let (o, r) = proj.ray(pos);
     let w0 = base - o;
     let (b, d, e) = (dir.dot(r), dir.dot(w0), r.dot(w0));
@@ -373,10 +378,20 @@ fn along(proj: &Proj, pos: Pos2, base: Vec3, dir: Vec3) -> Option<f64> {
     Some((b * e - d) / den)
 }
 
-fn format_len(v: f64) -> String {
+pub(crate) fn format_len(v: f64) -> String {
     let s = format!("{v:.3}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     format!("{} mm", if s == "-0" { "0" } else { s })
+}
+
+/// Where a sketch point picked as "<sketch id>:<point id>" (or a bare id of the active sketch) is.
+fn sketch_point_at(app: &SolveApp, st: &solidcraft_engine::doc::ModelState, id: &str) -> Option<Vec3> {
+    let (sketch, point) = match id.split_once(':') {
+        Some((sketch, point)) => (sketch.parse().ok()?, point),
+        None => (app.session.active_sketch?, id),
+    };
+    let ss = st.sketch(sketch)?;
+    Some(ss.plane.to_world(ss.sketch.point(ss.sketch.resolve_point(point)?)?))
 }
 
 /// The offset plane preview: a square of half side `h` around `c`, square to `n`.
@@ -443,7 +458,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             | Kind::OffsetFaces { .. }
             | Kind::SketchModify(crate::sketch_modify_ui::Mod::Move { .. })
     );
-    let focus = std::mem::take(&mut d.focus);
+    let mut focus = std::mem::take(&mut d.focus);
     let half_height = app.cam.half_height();
     let axis = revolve_axis(app, d);
     if matches!(d.kind, Kind::Revolve { .. }) {
@@ -478,9 +493,14 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             drag_arrow(ui, painter, proj, base, bs, n2, l2, false, egui::Id::new("sc_manipulator2"), half_height, spacing2);
         }
     }
-    // An offset plane shows where it will be.
+    // An offset plane shows where it will be: at the distance, or through the picked point.
+    let through = crate::dialogs::offset_through_point(d).and_then(|p| match p {
+        Sel::Vertex { point, .. } => Some(*point),
+        Sel::SketchPoint { id } => sketch_point_at(app, &app.session.world_state(), id),
+        _ => None,
+    });
     if let (Kind::OffsetPlane { offset }, Some(n)) = (&d.kind, dir)
-        && let Ok(off) = app.session.doc.eval(offset, ValueKind::Length)
+        && let Some(off) = through.map(|p| (p - base).dot(n)).or_else(|| app.session.doc.eval(offset, ValueKind::Length).ok())
         && let Some(q) = offset_plane_quad(proj, base + n * off, n, half_height * 0.25)
     {
         painter.extend(projected_polygon(&q, t.construction_plane, Stroke::new(1.2, t.origin_plane_edge)));
@@ -529,11 +549,39 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             opts.all = false;
         }
         dir = None;
+        // A Single hole's distances from its reference edges (#37); a newly picked edge's box
+        // takes the keyboard.
+        if crate::hole_refs::canvas(app, ui, painter, proj, d) {
+            focus = false;
+        }
     }
     // A fillet with a radius spline is shaped by its handles along the edge; the arrow would sit
     // on one of them.
     if radius_spline_handles(app, ui, painter, proj, d) {
         dir = None;
+    }
+    // Two-sided sketch offset: Distance 2 is its own dimension, the other way from Distance.
+    // One Side and Symmetric keep the single Distance box.
+    if let Kind::SketchModify(crate::sketch_modify_ui::Mod::Offset { distance2, mode, .. }) = &mut d.kind
+        && crate::sketch_modify_ui::offset_two_sides(*mode)
+        && let Some(n) = dir
+        && let Some(l2) = app.session.doc.eval(distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
+    {
+        let before = distance2.clone();
+        if let Some(ts) =
+            drag_arrow(ui, painter, proj, base, bs, -n, l2.abs(), false, egui::Id::new("sc_manipulator_offset2"), half_height, distance2)
+        {
+            // Its own area and field, so it does not share Distance's focus or text.
+            value_box_in(
+                ui,
+                (egui::Id::new("sc_canvas_area2"), egui::Id::new("sc_canvas_value2")),
+                "Distance 2",
+                distance2,
+                (ts + vec2(14.0, 8.0), egui::Align2::LEFT_TOP),
+                *distance2 != before,
+                false,
+            );
+        }
     }
     let Some((label, kind, value)) = d.primary() else { return };
     let len = all_span.or_else(|| {
@@ -563,7 +611,8 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             box_at = ts + vec2(14.0, -12.0);
         }
     }
-    value_box(ui, label, value, box_at, focus || *value != before);
+    let note = crate::drag_extrude::step_note(app);
+    value_box_noted(ui, label, value, box_at, focus || *value != before, note.as_deref());
     if *value != before
         && let Kind::Extrude { all, .. } = &mut d.kind
     {
@@ -576,7 +625,10 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
 /// top-left corner. `select_all` re-selects the whole field, both right after a pick and on every
 /// frame a drag is changing the value underneath it: without the latter, a drag that grows the
 /// text (e.g. "4 mm" -> "15 mm") would leave the stale, shorter selection from the pick in place,
-/// covering only part of the new text.
+/// covering only part of the new text. With value stepping on, the box stays where it is while
+/// the pointer is over it: the wheel steps its value (`value_step`), which moves the arrow tip
+/// the box follows, and a box sliding out from under the pointer would hand the next notch to
+/// the camera.
 fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool) {
     value_box_with(ui, label, value, at, select_all, false);
 }
@@ -584,28 +636,72 @@ fn value_box(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, selec
 /// [`value_box`]; with `keep_tab` Tab stays in the box for the caller (the Move box steps
 /// through its values with it).
 fn value_box_with(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool, keep_tab: bool) {
+    let ids = (egui::Id::new("sc_canvas_area"), egui::Id::new("sc_canvas_value"));
+    value_box_in(ui, ids, label, value, (at, egui::Align2::LEFT_TOP), select_all, keep_tab);
+}
+
+/// [`value_box`] with a note after the field (a pull's step size).
+fn value_box_noted(ui: &mut egui::Ui, label: &str, value: &mut String, at: Pos2, select_all: bool, note: Option<&str>) {
+    let ids = (egui::Id::new("sc_canvas_area"), egui::Id::new("sc_canvas_value"));
+    value_box_full(ui, ids, label, value, (at, egui::Align2::LEFT_TOP), (select_all, false), note);
+}
+
+/// [`value_box_with`] under its own ids (its area's and its field's), for a value beside the main
+/// one (a hole's reference distances), with the point of the box that sits at `at`. Returns where
+/// the field is.
+pub(crate) fn value_box_in(
+    ui: &mut egui::Ui,
+    ids: (egui::Id, egui::Id),
+    label: &str,
+    value: &mut String,
+    at: (Pos2, egui::Align2),
+    select_all: bool,
+    keep_tab: bool,
+) -> Option<egui::Rect> {
+    value_box_full(ui, ids, label, value, at, (select_all, keep_tab), None)
+}
+
+/// [`value_box_in`] with a short dimmed note after the field (a pull's step size).
+fn value_box_full(
+    ui: &mut egui::Ui,
+    (area, id): (egui::Id, egui::Id),
+    label: &str,
+    value: &mut String,
+    (at, pivot): (Pos2, egui::Align2),
+    (select_all, keep_tab): (bool, bool),
+    note: Option<&str>,
+) -> Option<egui::Rect> {
     let t = Tokens::get();
-    let id = egui::Id::new("sc_canvas_value");
-    Container::new(ui.ctx(), Surface::Canvas).area(egui::Id::new("sc_canvas_area")).fixed_pos(at).order(egui::Order::Foreground).show(
-        ui.ctx(),
-        |ui| {
-            Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(crate::i18n::tr_label(label)).color(t.text_dim).size(crate::theme::Tokens::get().font_caption));
-                    let r = crate::ui_kit::canvas_value_field(ui, id, value, keep_tab);
-                    crate::params_dialog::complete(ui, &r, value);
-                    if select_all {
-                        r.request_focus();
-                        let n = value.chars().count();
-                        let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
-                        st.cursor
-                            .set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
-                        st.store(ui.ctx(), id);
-                    }
-                });
+    // Held in place while the pointer is over it and value stepping is on (see `value_box`): by
+    // its pivot, the point of the box that sits at `at`, which is not always its top-left corner.
+    let pointer = ui.ctx().pointer_hover_pos();
+    let at = ui
+        .ctx()
+        .memory(|m| m.area_rect(area))
+        .filter(|r| crate::value_step::enabled(ui.ctx()) && pointer.is_some_and(|p| r.contains(p)))
+        .map_or(at, |r| pivot.pos_in_rect(&r));
+    let mut field = None;
+    Container::new(ui.ctx(), Surface::Canvas).area(area).fixed_pos(at).pivot(pivot).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
+        Container::popup_frame(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(crate::i18n::tr_label(label)).color(t.text_dim).size(crate::theme::Tokens::get().font_caption));
+                let r = crate::ui_kit::canvas_value_field(ui, id, value, keep_tab);
+                crate::params_dialog::complete(ui, &r, value);
+                if select_all {
+                    r.request_focus();
+                    let n = value.chars().count();
+                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+                    st.cursor.set_char_range(Some(egui::text_selection::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(n))));
+                    st.store(ui.ctx(), id);
+                }
+                if let Some(note) = note {
+                    ui.label(egui::RichText::new(note).color(t.text_dim).size(crate::theme::Tokens::get().font_caption));
+                }
+                field = Some(r.rect);
             });
-        },
-    );
+        });
+    });
+    field
 }
 
 /// How far (logical points) from an arrow's stem a press still takes the arrow.
@@ -917,7 +1013,7 @@ fn measure_line(app: &SolveApp, painter: &egui::Painter, proj: &Proj, r: &serde_
     if app.preferences.measure_axis_distances {
         measure_components(app, painter, proj, a, b, rect);
     }
-    painter.rect(rect, 3.0, t.overlay, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+    painter.rect(rect, t.radius_sm.saturating_sub(1), t.overlay, t.control_border_stroke(t.border), egui::StrokeKind::Inside);
     painter.galley(rect.min + vec2(5.0, 3.0), galley, t.text);
 }
 
@@ -977,7 +1073,7 @@ fn measure_components(app: &SolveApp, painter: &egui::Painter, proj: &Proj, a: V
             }
         }
         painter.line_segment([at, rect.center()], Stroke::new(0.8, color));
-        painter.rect(rect, 3.0, t.overlay, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+        painter.rect(rect, t.radius_sm.saturating_sub(1), t.overlay, Stroke::new(1.0, color), egui::StrokeKind::Inside);
         painter.galley(rect.min + vec2(5.0, 3.0), galley, t.text);
         let handle = format!("measure:label:{axis}");
         crate::scenario::publish_target(&handle, rect);

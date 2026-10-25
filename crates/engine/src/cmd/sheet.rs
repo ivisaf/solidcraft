@@ -11,7 +11,7 @@ use solidcraft_geom::{Aabb2, Ring, Vec2, Vec3};
 
 use super::CommandSpec;
 use super::features::{add_feature, check_expr, feature_sketch, profiles, sketch_id};
-use crate::params::{bad, bool_, expr, req_expr, str_, string_list, vec3};
+use crate::params::{bad, bool_, expr, expr_problem, req_expr, str_, string_list, vec3};
 use crate::{EngineError, Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -57,6 +57,8 @@ pub static COMMANDS: &[CommandSpec] = &[
          gap: between flanges that meet at a corner, whose ends are closed toward each other at any angle); \
          corner_relief_shape?: notch|round|rectangular|tear (what is cut where two bends meet at a corner of the base: round and rectangular a relief \
          `corner_relief` across; tear none, each bend's end is cut straight from the corner to its flange's end; default notch); \
+         angle_display?: bend|included (how the DXF bend notes read the bend angles: the bend angle, default, or the included angle \
+         left between the bend's sides, 180° less it; the bend table gives both, and a flange's `angle` is always the bend angle); \
          active?: bool; delete?: bool",
     ),
     CommandSpec::new("sheet.rules", "List Sheet Metal Rules", list_rules).icon("sheet_rules").noundo().doc_only().params("→ rules with their expressions and values, and the active one"),
@@ -72,14 +74,17 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(
             "body?, path?, curves?: exact|arcs (default exact: an ellipse as ELLIPSE, splines, text outlines and other Béziers as SPLINE; arcs: tangent arcs and lines within 0.001 mm, for machines that read only those), \
              text?: cut|etch (default cut: letters that text cut through the sheet are cut contours on layer TEXT; etch: single contours on layer ETCH and the sheet keeps its material there; text machined to a depth is always on ETCH), \
-             bend_notes?: bool (default false: a note beside each bend line on layer BEND_NOTES, `B1 UP 90%%d R1`), note_height?: mm (default 3), \
+             bend_notes?: bool (default false: a note beside each bend line on layer BEND_NOTES, `B1 UP 90%%d R1`, its angle the included angle \
+              when the body's rule has angle_display: included), note_height?: mm (default 3), \
+             bend_lines?: bool (default true; false leaves BEND_UP and BEND_DOWN out, for a cutter that would cut them), \
+             layers?: roles|single (default roles, the layers below; single: every entity on layer 0), \
              per_body?: bool (a file for every sheet body, `<path>-<body>.dxf`, or their DXF texts without a path → files: [{body, path | dxf, bends}]; not with `body`) \
              → DXF (AutoCAD 2000, mm): layers OUTLINE (the outer contour), CUT (what is cut out inside it), TEXT or ETCH (letters), BEND_UP and BEND_DOWN (dashed centre lines), BEND_NOTES, \
              POCKET_<BOTTOM|TOP|INTERNAL>_Z<from>_TO_<to>_MM (one per side and depth) and PERFORATION; inner contours come before the outline",
         ),
     CommandSpec::new("sheet.export_bend_table", "Export Bend Table", export_bend_table).icon("bendtable")
         .noundo()
-        .params("body?, format?: csv|json (default csv), path? → bend table in mm and degrees, including rule and flat centre-line coordinates; a bend that cut-outs split has a row for each piece"),
+        .params("body?, format?: csv|json (default csv), path? → bend table in mm and degrees, including rule and flat centre-line coordinates; angle_deg is the bend angle and included_angle_deg the angle left between the bend's sides (180° less it); a bend that cut-outs split has a row for each piece"),
 ];
 
 fn points(p: &Value, k: &str, cmd: &str) -> Result<Vec<Vec3>> {
@@ -116,7 +121,7 @@ fn flange_edges(s: &Session, p: &Value, cmd: &str) -> Result<Vec<FlangeEdge>> {
             if o.get(k).is_none_or(Value::is_null) {
                 return Ok(None);
             }
-            let e = expr(v, k).ok_or_else(|| bad(cmd, format!("edges[{i}]: `{k}` must be a number or an expression")))?;
+            let e = expr(v, k).ok_or_else(|| bad(cmd, format!("edges[{i}]: `{k}` {}", expr_problem(v.get(k)))))?;
             check_expr(s, &e, kind, cmd, &format!("edges[{i}].{k}"))?;
             Ok(Some(e))
         };
@@ -405,16 +410,7 @@ fn rules(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut rule =
         s.doc.sheet.rules.iter().find(|r| r.name == name).cloned().unwrap_or_else(|| SheetRule { name: name.clone(), ..s.doc.sheet_rule(None) });
-    for (k, slot) in [
-        ("thickness", &mut rule.thickness),
-        ("k_factor", &mut rule.k_factor),
-        ("bend_radius", &mut rule.bend_radius),
-        ("relief_width", &mut rule.relief_width),
-        ("relief_depth", &mut rule.relief_depth),
-        ("corner_relief", &mut rule.corner_relief),
-        ("hem_gap", &mut rule.hem_gap),
-        ("gap", &mut rule.gap),
-    ] {
+    for (k, slot) in rule.fields_mut() {
         if let Some(e) = expr(p, k) {
             *slot = e.into();
         }
@@ -422,6 +418,10 @@ fn rules(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(shape) = p.get("corner_relief_shape").filter(|v| !v.is_null()) {
         let shape = shape.as_str().and_then(solidcraft_doc::sheet::ReliefShape::parse);
         rule.corner_relief_shape = shape.ok_or_else(|| bad(cmd, "`corner_relief_shape` must be notch, round, rectangular or tear"))?.name().into();
+    }
+    if let Some(display) = p.get("angle_display").filter(|v| !v.is_null()) {
+        let display = display.as_str().and_then(sheet::AngleDisplay::parse);
+        rule.angle_display = display.ok_or_else(|| bad(cmd, "`angle_display` must be bend or included"))?.name().into();
     }
     let (vals, _) = s.doc.param_values();
     let values = s.doc.rule_values(&vals, &rule).map_err(|e| bad(cmd, e.to_string()))?;
@@ -440,7 +440,17 @@ fn rules(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.refresh();
     let errors: Vec<Value> = s.model.results.iter().filter_map(|r| r.error.as_ref().map(|e| json!({"feature": r.name, "error": e}))).collect();
-    Ok(json!({"rule": rule, "values": values, "errors": errors}))
+    Ok(json!({"rule": rule_json(&rule), "values": values, "errors": errors}))
+}
+
+/// A rule as the rule commands list it: as saved, and with its `angle_display` also while it is
+/// the `bend` a design leaves out.
+fn rule_json(r: &SheetRule) -> Value {
+    let mut v = json!(r);
+    if let Value::Object(m) = &mut v {
+        m.insert("angle_display".into(), json!(r.angle_display));
+    }
+    v
 }
 
 fn list_rules(s: &mut Session, _p: &Value) -> Result<Value> {
@@ -449,7 +459,7 @@ fn list_rules(s: &mut Session, _p: &Value) -> Result<Value> {
     if all.is_empty() {
         all.push(SheetRule::steel());
     }
-    let rules: Vec<Value> = all.iter().map(|r| json!({"rule": r, "values": s.doc.rule_values(&vals, r).ok()})).collect();
+    let rules: Vec<Value> = all.iter().map(|r| json!({"rule": rule_json(r), "values": s.doc.rule_values(&vals, r).ok()})).collect();
     let active = s.doc.sheet_rule(None).name;
     Ok(json!({"rules": rules, "active": active}))
 }
@@ -515,7 +525,7 @@ fn flat_json(sh: &SheetBody) -> Result<Value> {
         .bends()
         .iter()
         .map(|b| {
-            json!({"bend": b.index, "angle_deg": b.angle_deg, "radius": b.radius, "direction": if b.up { "up" } else { "down" },
+            json!({"bend": b.index, "angle_deg": b.angle_deg, "included_angle_deg": b.included_angle_deg(), "radius": b.radius, "direction": if b.up { "up" } else { "down" },
                 "allowance": b.allowance, "length": b.length, "start": pt(&b.start), "end": pt(&b.end)})
         })
         .collect();
@@ -599,6 +609,10 @@ pub struct DxfOptions {
     pub text: DxfText,
     /// The height (mm) of the note beside each bend line, when it is to have one.
     pub bend_notes: Option<f64>,
+    /// Leave the bend lines out (BEND_UP, BEND_DOWN), for a cutter that would cut them (#4314).
+    pub no_bend_lines: bool,
+    /// Everything on layer 0 instead of a layer for each role (#4314).
+    pub one_layer: bool,
 }
 
 /// The layer of a role: its AutoCAD colour index (1 red, 2 yellow, 3 green, 4 cyan, 5 blue,
@@ -625,10 +639,10 @@ fn compact(v: f64) -> String {
     if t.is_empty() || t == "-0" { "0".into() } else { t.into() }
 }
 
-/// The note beside a bend line, `B1 UP 90%%d R2.5` (number, direction, angle, inner radius): as
-/// high as `height`, centred half a height beside the middle of the line, parallel to it and
-/// readable from below or from the right. (`%%d` is AutoCAD's degree sign.)
-fn bend_note(b: &solidcraft_doc::sheet::BendInfo, height: f64) -> solidcraft_io::DxfShape {
+/// The note beside a bend line, `B1 UP 90%%d R2.5` (number, direction, angle as `display` reads
+/// it, inner radius): as high as `height`, centred half a height beside the middle of the line,
+/// parallel to it and readable from below or from the right. (`%%d` is AutoCAD's degree sign.)
+fn bend_note(b: &solidcraft_doc::sheet::BendInfo, height: f64, display: sheet::AngleDisplay) -> solidcraft_io::DxfShape {
     let along = (b.end - b.start).normalized().unwrap_or(Vec2::X);
     let mut angle = along.angle().to_degrees();
     if angle > 90.0 + 1e-9 {
@@ -641,7 +655,7 @@ fn bend_note(b: &solidcraft_doc::sheet::BendInfo, height: f64) -> solidcraft_io:
         at: (b.start + b.end) * 0.5 + beside * (height * 0.5),
         height,
         angle_deg: angle,
-        text: format!("B{} {} {}%%d R{}", b.index, if b.up { "UP" } else { "DOWN" }, compact(b.angle_deg), compact(b.radius)),
+        text: format!("B{} {} {}%%d R{}", b.index, if b.up { "UP" } else { "DOWN" }, compact(display.of(b.angle_deg)), compact(b.radius)),
     }
 }
 
@@ -741,13 +755,22 @@ pub fn flat_dxf(sh: &SheetBody, o: &DxfOptions) -> Result<String> {
         entities.extend(solidcraft_io::loop_shapes(h).into_iter().map(|shape| DxfEntity { layer: layer.clone(), shape }));
     }
     for b in sh.bends() {
-        entities.push(DxfEntity { layer: if b.up { "BEND_UP" } else { "BEND_DOWN" }.into(), shape: DxfShape::Line(b.start, b.end) });
+        if !o.no_bend_lines {
+            entities.push(DxfEntity { layer: if b.up { "BEND_UP" } else { "BEND_DOWN" }.into(), shape: DxfShape::Line(b.start, b.end) });
+        }
         if let Some(height) = o.bend_notes {
-            entities.push(DxfEntity { layer: "BEND_NOTES".into(), shape: bend_note(&b, height) });
+            entities.push(DxfEntity { layer: "BEND_NOTES".into(), shape: bend_note(&b, height, sh.angle_display) });
         }
     }
     for (c, r) in perforation {
         entities.push(DxfEntity { layer: "PERFORATION".into(), shape: DxfShape::Circle { c, r } });
+    }
+    // One layer: every entity on layer 0, which every drawing has.
+    if o.one_layer {
+        for e in &mut entities {
+            e.layer = "0".into();
+        }
+        return Ok(solidcraft_io::write_dxf_drawing(&[], &entities));
     }
     // The four layers of every flat pattern, and those the rest is on.
     let mut names: std::collections::BTreeSet<String> = ["OUTLINE", "CUT", "BEND_UP", "BEND_DOWN"].map(String::from).into();
@@ -782,7 +805,20 @@ fn dxf_options(p: &Value, cmd: &str) -> Result<DxfOptions> {
         Some(Value::Bool(true)) => Some(height),
         Some(_) => return Err(bad(cmd, "`bend_notes` must be true or false")),
     };
-    Ok(DxfOptions { curves, text, bend_notes })
+    let no_bend_lines = match p.get("bend_lines").filter(|v| !v.is_null()) {
+        None | Some(Value::Bool(true)) => false,
+        Some(Value::Bool(false)) => true,
+        Some(_) => return Err(bad(cmd, "`bend_lines` must be true or false")),
+    };
+    let one_layer = match p.get("layers").filter(|v| !v.is_null()) {
+        None => false,
+        Some(v) => match v.as_str().map(str::to_ascii_lowercase).as_deref() {
+            Some("roles") => false,
+            Some("single") => true,
+            _ => return Err(bad(cmd, "`layers` must be roles or single")),
+        },
+    };
+    Ok(DxfOptions { curves, text, bend_notes, no_bend_lines, one_layer })
 }
 
 /// The files of an export of every sheet body: `path` with `-<body>` before its extension
@@ -874,11 +910,11 @@ fn export_bend_table(s: &mut Session, p: &Value) -> Result<Value> {
         // Always quote text fields: body/rule names may include commas, quotes or newlines.
         let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
         let mut csv =
-            "body,rule,thickness_mm,k_factor,bend,angle_deg,direction,radius_mm,allowance_mm,length_mm,start_x_mm,start_y_mm,end_x_mm,end_y_mm\r\n"
+            "body,rule,thickness_mm,k_factor,bend,angle_deg,direction,radius_mm,allowance_mm,length_mm,start_x_mm,start_y_mm,end_x_mm,end_y_mm,included_angle_deg\r\n"
                 .to_string();
         for b in sh.bends() {
             csv.push_str(&format!(
-                "{},{},{:.9},{:.9},{},{:.9},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9}\r\n",
+                "{},{},{:.9},{:.9},{},{:.9},{},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9}\r\n",
                 quote(&sh.body),
                 quote(&sh.rule),
                 sh.t,
@@ -892,7 +928,8 @@ fn export_bend_table(s: &mut Session, p: &Value) -> Result<Value> {
                 b.start.x,
                 b.start.y,
                 b.end.x,
-                b.end.y
+                b.end.y,
+                b.included_angle_deg()
             ));
         }
         csv

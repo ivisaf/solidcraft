@@ -17,8 +17,10 @@
 - **Browser** (left). The design as a tree: document settings and units, named views, the
   origin, bodies, sketches, construction planes, canvases, joints and components. The eye shows or
   hides an item, a component's radio button makes it the active component, and right-clicking any
-  row gives that item's menu. Rows drag into groups and other components.
-- **Viewport.** Click to select, Shift or Ctrl to add (Preferences › Selection), drag for a window or crossing box. While sketching, Ctrl/Cmd or Alt/Option suppress auto-snap by default; Shift prefers a midpoint. To
+  row gives that item's menu. Right-click the design or a component and choose **Expand All** or
+  **Collapse All** to open or close every folder under that row (the design row stays visible
+  when the whole tree is collapsed). Rows drag into groups and other components.
+- **Viewport.** Click to select, Shift or Ctrl to add (Preferences › Selection), drag for a window or crossing box. While sketching, Ctrl/Cmd or Alt/Option suppress auto-snap by default; Shift prefers a midpoint; the pointer also snaps to where two curves cross. To
   reach something under something else (two lines drawn on top of each other, coincident points,
   an edge in front of a face, overlapping bodies), hold the left button still for half a second
   (long-press on a touch screen) or right-click › **Select Other…**: a list of everything under
@@ -30,6 +32,10 @@
   preset in Preferences switches to SolidWorks, Inventor, Alias, Blender, Tinkercad, OpenSCAD or Touchpad style). On a
   trackpad, pinch zooms and two-finger scroll pans (Navigation › Two-finger scroll pans;
   off: scroll zooms like the wheel); mouse wheels zoom and the thumb wheel pans sideways.
+  With the **Fusion** preset and two-finger pan enabled, hold **Shift** while scrolling with
+  two fingers to orbit freely instead of panning. No click is needed. Releasing Shift returns
+  to panning, even during the same gesture. Shift does not snap this gesture to standard views;
+  orbit gestures do nothing on flat 2D pages. Other presets keep their existing scroll behaviour.
   Shift+middle orbits freely
   in the default and Inventor presets. In every preset, Ctrl+left drag (Cmd on macOS) that starts
   on empty space orbits; a Ctrl+click still adds to the selection. Shift+right-drag snaps to the nearest standard or
@@ -116,7 +122,7 @@ Gruvbox themes (dark and light, each in hard, normal and soft contrast) and any 
 imported. A choice applies at once.
 
 A theme is a small JSON file that starts from the Dark or Light palette and changes any of its
-colours by name:
+colours and corner radii by name:
 
 ```json
 {
@@ -130,12 +136,30 @@ colours by name:
     "viewport_top": "#32302f",
     "viewport_bottom": "#32302f",
     "triad": ["#fb4934", "#b8bb26", "#83a598"]
+  },
+  "radii": {
+    "radius_sm": 2,
+    "radius_md": 4,
+    "radius_lg": 6,
+    "radius_xl": 8,
+    "control_radius": 4,
+    "sketch_mode_radius": 4
   }
 }
 ```
 
 Colours are `#rrggbb`, or `#rrggbbaa` for translucent ones. A few colours, such as the view
 triad's X, Y and Z, take a list. Any colour the file leaves out keeps the base palette's value.
+
+`radii` is optional. Its six keys above accept integers from 0 to 32 in logical UI points;
+zero makes square corners. Omitted keys keep today's base values: 4, 6, 8, 10, 6 and 7,
+respectively. The first four style small accents through large surfaces; `control_radius`
+styles form controls, and `sketch_mode_radius` styles sketch creation buttons. Themes own
+these settings, with matching shapes across light and dark variants. Dock joins remain
+square, circular controls remain circular, and control sizes and spacing stay the same.
+Platinum 9 and the phosphor themes use square corners, SolidCraft 95 uses subtle 3-point
+corners, Blueprint uses the standard radii, and Cupertino uses softer corners. Other built-in
+themes retain the defaults.
 
 Tab accents also have separate fill, small-text ink and tint keys. Sketch uses
 `sketch_accent`, `sketch_ink`, `sketch_soft`; Surface, Mesh, Sheet Metal and Render
@@ -150,7 +174,7 @@ pills when `on_accent` has less than 4.5:1 contrast with the fill. See the
 - **Import…** adds a theme file and turns it on. Importing a file with the same name again updates
   that theme. A file with an unknown colour name or a malformed colour is refused, and the message
   names every problem.
-- **Export…** saves the theme on now as a complete file listing every colour. It is a good starting
+- **Export…** saves the theme on now as a complete file listing every colour and radius. It is a good starting
   point for your own theme.
 - **Remove** deletes the selected imported theme.
 
@@ -159,6 +183,21 @@ Command icons use the shared SVG palette.
 
 Imported themes are kept with your preferences, so they work in the browser app too. Colour
 vision modes still apply on top of any theme.
+
+Graphics › **Frame rate** shows frames per second in the view's bottom-right corner. Click it,
+or turn on **Frame rate details**, for the performance overlay:
+
+- a graph of the last few seconds of frames, one bar per frame, with lines at 60 and 30 frames
+  per second. The triangles drawn are a line over it, and a tick at the top marks each frame that
+  rebuilt the scene, so you can see how geometry changes the frame time;
+- a histogram of frame times, the 1% low (the mean of the slowest 1% of frames) and the worst
+  frame, which show stutters that an average hides;
+- what the GPU drew last frame (triangles, line segments, draw calls), the viewport's size in
+  pixels with its MSAA and supersampling, the time the interface took, the last scene build and
+  the graphics backend and adapter.
+
+While the readout is on, the view redraws every frame. With vertical sync the frame rate tops
+out at the display's refresh rate; the interface time and the GPU counts still show the work.
 
 Navigation › **Smooth wheel zoom** is on by default. Turn it off to apply each wheel or
 trackpad event immediately, with no smoothing tail. It is independent of **Animate view
@@ -183,3 +222,22 @@ lightly damped spring transition and a small boundary margin to prevent flicker.
 On desktop, Ctrl/Cmd+Plus (or Equals) enlarges the interface, Ctrl/Cmd+Minus reduces it,
 and Ctrl/Cmd+0 restores 100%. These shortcuts update the UI scale preference. The UI scale
 slider in Preferences applies the new layout when released, so it stays still while dragging.
+
+
+Theme files can also define `borders`: `primary` outer outlines, `secondary` major section
+rules, `tertiary` small dividers, `container` solid preview/card/keycap outlines, and independent
+`control` outlines. Each accepts a `width`
+from 0 to 4 UI points and a `color` in hex. Optional `primary_inset` adds a companion outline
+inside panel chrome, with a `gap` from 0 to 12 points. Missing settings keep existing borders.
+Blueprint uses a single white outer outline, dotted section lines and dark minor dividers. Secondary rules optionally accept `pattern: "dotted"`; the default is `solid`. Focus, selection and
+error outlines retain their semantic colours. See the UI-kit border hierarchy for the schema.
+
+SolidCraft 95 also defines optional `borders.bevel`: a per-band `width` and the
+`highlight`, `light`, `shadow` and `dark_shadow` colours. The shared UI uses these
+for raised panels/buttons, recessed fields and reversed pressed-button lighting.
+Themes that omit this setting keep their existing flat borders.
+
+Theme files may also set `icon_palette`: opaque colours for SVG display roles,
+and three-colour pale/medium/strong ramps for Solid, Surface, Mesh, Form, Sketch,
+constraints and construction. These settings colour the existing command artwork
+without changing its shapes. Omitted roles keep the default light/dark palette.

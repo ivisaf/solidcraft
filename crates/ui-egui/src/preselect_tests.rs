@@ -270,7 +270,7 @@ fn path_plane_click_retains_source_and_previews_then_edits_in_place() {
     let duplicate = h.app.run("sketch.line3d", json!({"points":[[-30,0,0],[-20,0,0]]})).unwrap()["curves"][0].as_str().unwrap().to_string();
     assert_eq!(wire, duplicate, "exercise duplicate curve ids in different sketches");
     h.app.run("sketch.finish", json!({})).unwrap();
-    h.app.ui.show_origin = false;
+    h.app.set_origin_shown(false);
     h.settle();
     h.call("ui.view", json!({"view":"home"}));
     h.call("ui.view", json!({"view":"fit"}));
@@ -404,7 +404,7 @@ fn cylinder_emboss_target_face_and_edit_keep_the_anchored_operation() {
 #[test]
 fn cylinder_emboss_edit_retains_second_source_and_author_paths_and_all_profiles() {
     let mut h = crate::scenario::Harness::new();
-    let source = h.app.run("component.create", json!({"name":"Source"})).unwrap()["component"].as_u64().unwrap();
+    let source = h.app.run("component.create", json!({"name":"Source","grounded":false})).unwrap()["component"].as_u64().unwrap();
     h.app.run("solid.cylinder", json!({"radius":10,"height":20,"body_name":"Sleeve"})).unwrap();
     h.app.run("occurrence.move", json!({"occurrence":"Source:1","axis":[0,0,1],"angle":"90 deg","translate":[50,0,0]})).unwrap();
     let source_second = h.app.run("occurrence.copy", json!({"component":source,"translate":[80,0,0]})).unwrap()["occurrence"].as_u64().unwrap();
@@ -499,7 +499,11 @@ fn cylinder_emboss_edit_retains_second_source_and_author_paths_and_all_profiles(
 fn cylinder_emboss_profile_guide_uses_target_or_unique_foreign_sketch_frame() {
     for target_owned in [true, false] {
         let mut h = crate::scenario::Harness::new();
-        let source = if target_owned { h.app.run("component.create", json!({"name":"Source"})).unwrap()["component"].as_u64().unwrap() } else { 0 };
+        let source = if target_owned {
+            h.app.run("component.create", json!({"name":"Source","grounded":false})).unwrap()["component"].as_u64().unwrap()
+        } else {
+            0
+        };
         h.app.run("solid.cylinder", json!({"radius":10,"height":20,"body_name":"Sleeve"})).unwrap();
         let (profile_owner, expected, target, face) = if target_owned {
             h.app.run("occurrence.move", json!({"occurrence":"Source:1","axis":[0,0,1],"angle":"90 deg","translate":[50,0,0]})).unwrap();
@@ -507,7 +511,7 @@ fn cylinder_emboss_profile_guide_uses_target_or_unique_foreign_sketch_frame() {
             let target = h.app.session.occurrence_bodies(&[second], false).unwrap().remove(0);
             (source, Vec3::new(120.0, 0.0, 0.0), target, json!([120, 0, 7.5]))
         } else {
-            let profile = h.app.run("component.create", json!({"name":"Profile"})).unwrap()["component"].as_u64().unwrap();
+            let profile = h.app.run("component.create", json!({"name":"Profile","grounded":false})).unwrap()["component"].as_u64().unwrap();
             h.app.run("occurrence.move", json!({"occurrence":"Profile:1","axis":[0,0,1],"angle":"90 deg","translate":[50,20,0]})).unwrap();
             (profile, Vec3::new(0.0, 10.0, 0.0), "Sleeve".to_string(), json!([0, 10, 7.5]))
         };
@@ -733,6 +737,56 @@ fn face_then_extrude_press_pulls_it() {
     let d = start(&mut app, vec![top], "solid.extrude");
     let cmds = apply_commands(&app, &d).unwrap();
     assert!(cmds[0].1.get("face").is_some());
+}
+
+/// Press Pull on a hole's wall offsets it, rather than refusing it as Extrude does (#2873).
+#[test]
+fn curved_face_then_press_pull_offsets_it() {
+    let mut app = app_with(json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20}},
+        {"command": "solid.cylinder", "params": {"radius": 5, "height": 20, "base": [20, 15, 0], "operation": "cut"}}
+    ]));
+    let st = app.session.model.state();
+    let wall = st.body("Body1").unwrap().body.faces(0.01).unwrap().into_iter().find(|f| f.plane_normal.is_none()).unwrap().index;
+    drop(st);
+    let d = start(&mut app, vec![Sel::Face { body: "Body1".into(), index: wall, point: Vec3::new(25.0, 15.0, 10.0) }], "solid.press_pull");
+    assert!(matches!(d.kind, Kind::OffsetFaces { .. }));
+    let cmds = apply_commands(&app, &d).unwrap();
+    assert_eq!(cmds[0].0, "solid.offset_face");
+}
+
+/// Press Pull with nothing selected: a click on a hole's wall reopens it as Offset Face, a click
+/// on the top keeps the extrude (#2873).
+#[test]
+fn press_pull_then_curved_face_offsets_it() {
+    let script = json!([
+        {"command": "solid.box", "params": {"length": 40, "width": 30, "height": 20}},
+        {"command": "solid.cylinder", "params": {"radius": 5, "height": 20, "base": [20, 15, 0], "operation": "cut"}}
+    ]);
+    let mut app = app_with(script.clone());
+    let st = app.session.model.state();
+    let wall = st.body("Body1").unwrap().body.faces(0.01).unwrap().into_iter().find(|f| f.plane_normal.is_none()).unwrap().index;
+    drop(st);
+    app.start("solid.press_pull");
+    assert!(matches!(app.dialog.as_ref().unwrap().kind, Kind::Extrude { .. }));
+    let p = Vec3::new(25.0, 15.0, 10.0);
+    let hit = crate::viewport::Hit::Face { body: "Body1".into(), index: wall, point: p };
+    crate::viewport::dialog_pick(&mut app, &hit, Sel::Face { body: "Body1".into(), index: wall, point: p });
+    let d = app.dialog.clone().unwrap();
+    assert!(matches!(d.kind, Kind::OffsetFaces { .. }));
+    // Both halves of the hole's wall.
+    assert_eq!(d.inputs[0].items.len(), 2);
+
+    let mut app = app_with(script);
+    app.start("solid.press_pull");
+    let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
+    let hit = crate::viewport::Hit::Face {
+        body: "Body1".into(),
+        index: if let Sel::Face { index, .. } = &top { *index } else { 0 },
+        point: Vec3::new(5.0, 5.0, 20.0),
+    };
+    crate::viewport::dialog_pick(&mut app, &hit, top);
+    assert!(matches!(app.dialog.as_ref().unwrap().kind, Kind::Extrude { .. }));
 }
 
 #[test]
@@ -1477,8 +1531,9 @@ fn newer_options_reach_their_commands() {
     app.dialog = None;
     let top = face(&app, Vec3::new(20.0, 15.0, 20.0));
     let mut d = start(&mut app, vec![top], "solid.hole");
-    d.inputs.push(crate::selection::SelInput::new("To Object", crate::selection::FACES | crate::selection::VERTICES, false));
-    d.inputs[1].items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    let mut to = crate::selection::SelInput::new("To Object", crate::selection::FACES | crate::selection::VERTICES, false);
+    to.items = vec![face(&app, Vec3::new(20.0, 15.0, 0.0))];
+    d.inputs.push(to);
     let p = apply_commands(&app, &d).unwrap().remove(0).1;
     assert!(p["to"].is_array() && p.get("depth").is_none(), "{p}");
 }
@@ -2076,6 +2131,30 @@ fn midplane_asks_for_two_planes_then_builds_the_one_between_them() {
     assert!((pl.origin.z - 10.0).abs() < 1e-6, "{pl:?}");
 }
 
+/// Offset Plane through a point: a vertex picked as well as the plane puts the plane through
+/// it, the distance row goes away, and editing the plane shows both picks again.
+#[test]
+fn offset_plane_through_a_picked_vertex() {
+    let mut h = crate::scenario::Harness::new();
+    h.app.run("solid.box", json!({"length":40,"width":30,"height":20,"body_name":"Box"})).unwrap();
+    h.app.start("construct.plane.offset");
+    h.frames(1);
+    let d = h.app.dialog.as_mut().unwrap();
+    assert_eq!(d.inputs.len(), 2);
+    d.inputs[0].items = vec![Sel::Plane { name: "XY".into() }];
+    d.inputs[1].items = vec![Sel::Vertex { body: "Box".into(), point: Vec3::new(40.0, 30.0, 20.0) }];
+    assert!(d.primary().is_none(), "no distance to type or drag");
+    let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+    assert_eq!(commands.first().map(|c| c.1.clone()), Some(json!({"base":"XY","through":{"vertex":[40.0,30.0,20.0]},"offset":null})));
+    h.step(&json!({"key":"Enter"})).unwrap();
+    assert!(h.app.dialog.is_none(), "{:?}", h.app.dialog.as_ref().and_then(|d| d.error.clone()));
+    let (id, _, pl) = solidcraft_engine::view::construction_planes(&h.app.session).into_iter().next().expect("the plane");
+    assert!(pl.normal().cross(Vec3::Z).len() < 1e-6 && (pl.origin.z - 20.0).abs() < 1e-6, "{pl:?}");
+    let reopened = crate::dialogs::for_feature(&h.app, id, None).unwrap();
+    assert_eq!(reopened.inputs[0].items, vec![Sel::Plane { name: "XY".into() }]);
+    assert!(matches!(reopened.inputs[1].items.as_slice(), [Sel::Vertex { body, .. }] if body == "Box"), "{:?}", reopened.inputs[1].items);
+}
+
 /// #2474, #2494: every construct tool asks for what it needs. Started from the toolbar with
 /// nothing selected, none of them runs its command and reports that `a` (or `face`, `edge`…)
 /// is required; a construct command added later without a dialog fails here too.
@@ -2311,4 +2390,52 @@ fn combine_takes_bodies_clicked_in_the_browser_in(layout: &str, control: bool) {
     let d = h.app.dialog.as_ref().expect("Combine stays open");
     assert_eq!(d.inputs[0].items, vec![Sel::Body { name: "Block".into() }], "{layout} control={control} target: {:?}", d.inputs);
     assert_eq!(d.inputs[1].items, vec![Sel::Body { name: "Cutter".into() }], "{layout} control={control} tools: {:?}", d.inputs);
+}
+
+/// The model's box (what every `projection` reads for the scene's depth) is kept per world state,
+/// so a design with hundreds of sketches no longer samples them all again each frame, and it still
+/// follows the model: a sketch added far away grows it.
+#[test]
+fn model_bounds_are_kept_until_the_model_changes() {
+    let mut app = app_with(json!([
+        {"command": "sketch.create", "params": {"plane": "XY", "name": "Near"}},
+        {"command": "sketch.circle.center", "params": {"center": [0, 0], "radius": 10}},
+        {"command": "sketch.finish", "params": {}},
+    ]));
+    let near = crate::viewport::model_bounds(&app);
+    assert!((near.max.x - 10.0).abs() < 1e-6, "{near:?}");
+    assert_eq!(crate::viewport::model_bounds(&app), near, "the same state gives the same box");
+    for (cmd, p) in [
+        ("sketch.create", json!({"plane": "XY", "name": "Far"})),
+        ("sketch.circle.center", json!({"center": [500, 0], "radius": 5})),
+        ("sketch.finish", json!({})),
+    ] {
+        app.run(cmd, p).unwrap();
+    }
+    let far = crate::viewport::model_bounds(&app);
+    assert!((far.max.x - 505.0).abs() < 1e-6, "a new sketch grows the box: {far:?}");
+}
+
+/// #2747: the Revolve window takes a planar body face as its profile, as the engine already
+/// does: the box's front face (on Y = 0, from the Z axis to X = 40) turned about Z is a
+/// Ø80 × 20 cylinder.
+#[test]
+fn face_then_revolve_turns_the_face() {
+    let mut app = boxed();
+    let front = face(&app, Vec3::new(20.0, 0.0, 10.0));
+    let mut d = start(&mut app, vec![front], "solid.revolve");
+    assert_eq!(d.inputs[0].items.len(), 1, "the face is the profile");
+    d.inputs[1].items = vec![Sel::Axis { name: "Z".into() }];
+    let cmds = apply_commands(&app, &d).unwrap();
+    assert_eq!(cmds[0].1["face"], json!([20.0, 0.0, 10.0]), "{:?}", cmds[0].1);
+    assert_eq!(cmds[0].1["face_body"], "Body1");
+    assert!(cmds[0].1.get("sketch").is_none(), "{:?}", cmds[0].1);
+    for (cmd, p) in cmds {
+        app.run(&cmd, p).unwrap();
+    }
+    let st = app.session.world_state();
+    let made = st.bodies.iter().find(|b| b.name != "Body1").expect("the revolve makes a new body");
+    let v = solidcraft_engine::doc::kernel::measure(&made.body).unwrap().volume;
+    let want = std::f64::consts::PI * 40.0 * 40.0 * 20.0;
+    assert!((v - want).abs() < want * 1e-3, "{v} vs {want}");
 }

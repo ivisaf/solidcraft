@@ -58,6 +58,9 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<(), String> {
 
 fn needs_attribution(path: &str) -> bool {
     // Include code masters, native work, catalogs, metadata and licence texts in the collection.
+    if path.starts_with("assets/locales/pending/") {
+        return false;
+    }
     if path.starts_with("assets/") {
         return !path.ends_with(".md");
     }
@@ -71,7 +74,12 @@ fn missing<'a>(files: &'a [String], attribution: &str) -> Vec<&'a str> {
 }
 
 pub fn run(root: &Path) -> Result<(), String> {
-    let attribution = std::fs::read_to_string(root.join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
+    let mut attribution = std::fs::read_to_string(root.join("ATTRIBUTION.md")).map_err(|e| format!("ATTRIBUTION.md: {e}"))?;
+    // Rows still pending (attribution/pending/*.md) count: they are folded on main.
+    for (_, row) in crate::pending::attribution_rows(root)? {
+        attribution.push('\n');
+        attribution.push_str(&row);
+    }
     let mut files = Vec::new();
     walk(root, root, &mut files)?;
     files.sort();
@@ -79,6 +87,7 @@ pub fn run(root: &Path) -> Result<(), String> {
     if !missing.is_empty() {
         return Err(format!("assets missing attribution rows:\n{}", missing.iter().map(|path| format!("  {path}")).collect::<Vec<_>>().join("\n")));
     }
+    crate::render_assets::run(root, &files, &attribution)?;
     println!("assets: {} files, all attributed", files.iter().filter(|path| needs_attribution(path)).count());
     Ok(())
 }

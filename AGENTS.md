@@ -35,7 +35,8 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   method), the Windows-only `apps/solidcraft/src/native_crash.rs` (the exception filter that
   records crashes inside native code such as graphics drivers), the Windows-only
   `apps/solidcraft/src/native_frame.rs` (the window procedure that answers the resize-border hit
-  test of the window without OS decorations) and the Windows-only
+  test of the window without OS decorations, and gives its class the icon the taskbar falls back
+  on) and the Windows-only
   `apps/solidcraft/src/space_mouse/windows_hid.rs` (asks Plug and Play which HID interfaces are 3D
   mice, so no other device is sent anything).
 - **Errors are `Result<T, E>`** through the crate's error type and `?`. An unfinished feature
@@ -155,6 +156,9 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
 - If someone already has it, comment on their PR or issue instead of opening a second one. Two
   PRs for one change can't both land, and one of them is wasted work and CI.
 
+- Keep the `Changes a default:` line in the PR description filled in, and don't open a second PR for
+  an issue a lower-numbered open PR already closes; `pr-checks.yml` fails both (CONTRIBUTING.md, "Sending a change").
+
 ## Claim = a draft PR
 - Before working on issue #N, check nobody has it: `gh pr list -R tangency-labs/solidcraft --state open --search "#N"`.
 - If none, branch from the latest `origin/main`, `git commit --allow-empty -m "claim: #N"`, push,
@@ -214,3 +218,5 @@ workflow; never regenerate them in a PR.
 Keep them conflict-free (CONTRIBUTING.md, "Lists many changes add to"): message catalogs sorted
 (`cargo xtask lists --fix`), `mod` lines in their sorted group, the language list English first
 then by id, generated files left to `main`, and a design-format change as one new file.
+New UI strings go in a new `assets/locales/pending/<slug>.json` and new ATTRIBUTION.md rows in a new
+`attribution/pending/<slug>.md`, never into the catalogs or the table (see the README in each folder).

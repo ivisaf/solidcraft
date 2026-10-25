@@ -78,6 +78,19 @@ Changes:
   does. They multiplied by p only, so the second derivatives of every B-spline and NURBS surface
   of degree p ≥ 3 were 1/(p − 1) of their value (a cubic surface's curvature read as half, #763).
   `crates/kernel/src/surface_second_derivative_tests.rs` holds them to finite differences.
+- `decorators/intersection_curve.rs`: `IntersectionCurve::parameter_division` with a tolerance
+  below truck's `TOLERANCE` (1e-6), or one that is not a number, divides at `TOLERANCE` instead
+  of panicking in truck's tolerance assertion; a join failed on that panic (#4623).
+  `crates/kernel/src/issue_1038_tests.rs` holds it to the division at 1e-6.
+- `decorators/intersection_curve.rs`: where the hinted projection behind `parameter_division`
+  and the search from nothing both fail, the leader's point stands in, the division stops, and
+  the failure is recorded for `take_projection_failure`. It fell back to `subs`, which unwraps
+  that same failed search: a revolve cut whose sphere's pole sat on a box's edge panicked
+  dividing an edge (#5562).
+- truck-shapeops `transversal/divide_face/mod.rs`: an edge whose division recorded such a
+  failure gives up the face division (`None`), so the Boolean attempt fails as quickly as the
+  panic made it, and the kernel goes on to its other tries. Carrying the approximate points on
+  made one test's Boolean run for minutes.
 
 ## truck-stepio 0.3.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 
@@ -102,6 +115,12 @@ Changes:
 ## truck-meshalgo 0.4.0 (Apache-2.0, © RICOS Co. Ltd., https://github.com/ricosjp/truck)
 
 Changes:
+- `tessellation/triangulation.rs`: a boundary segment that crosses constraints already added
+  is split where it crosses by `add_split_constraint` (a vertex at each crossing, the pieces
+  added where they can be), not by spade's `add_constraint_and_split`, which asserts when a
+  split lands so near another vertex or constraint that the piece up to it is blocked. That
+  assertion lost whole bodies and operations (#4031, #4598); a blocked piece is now left out, as
+  truck did before #1653.
 - `tessellation/triangulation.rs`, `closed.rs`: retry nearest trim projections outside a
   spline's knot domain without the preceding point's hint, preferring a bounded fit within
   the caller's chord tolerance, with a bounded damped least-squares fallback where

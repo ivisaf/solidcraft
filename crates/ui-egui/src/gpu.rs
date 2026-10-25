@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use egui_wgpu::wgpu;
 pub use solidcraft_gpu::view::{
-    AccessMap, BlockBytes, Frame, GpuImage, GpuScene, GpuTarget, INSTANCE_SIZE, InstanceLook, InstancedMesh, LINE_SIZE, LOD_PX, PBR_SIZE,
-    PlannedBody, Renderer, SHARED_SIZE, SceneBlock, SceneSlot, SharedTris, TRI_SIZE, level_for, placement_scale, supersampled_size,
+    AccessMap, BlockBytes, BlockTris, DrawStats, DrawStatsHandle, Frame, GpuImage, GpuScene, GpuTarget, INSTANCE_SIZE, InstanceLook, InstancedMesh,
+    LINE_SIZE, LOD_PX, PBR_SIZE, PlannedBody, Renderer, SHARED_SIZE, SceneBlock, SceneSlot, SharedTris, TRI_SIZE, level_for, placement_scale,
+    supersampled_size,
 };
 
 /// A frame of the viewport as an egui paint callback.
@@ -19,13 +20,15 @@ pub struct ViewportCallback(pub Frame);
 /// MSAA settings, and the target of the pass the picture is shown in. Without a stencil the
 /// section cap does not hide the inside of cut bodies. Without `gpu_meshing` (safe mode) bodies
 /// are meshed on the CPU. When the two targets differ, the scene is drawn offscreen and blitted.
-pub fn install(rs: &egui_wgpu::RenderState, scene: GpuTarget, window: GpuTarget, gpu_meshing: bool) -> GpuTarget {
+/// Also returns the handle to what each frame drew.
+pub fn install(rs: &egui_wgpu::RenderState, scene: GpuTarget, window: GpuTarget, gpu_meshing: bool) -> (GpuTarget, DrawStatsHandle) {
     let tess = if gpu_meshing { solidcraft_gpu::view::tessellation(&rs.adapter, &rs.device, &rs.queue, solidcraft_gpu::SHADER) } else { None };
     let scene = GpuTarget { tess: tess.is_some(), ..scene };
     let window = GpuTarget { tess: tess.is_some(), ..window };
     let res = Renderer::with_window_target(&rs.device, scene, window, tess);
+    let stats = res.stats();
     rs.renderer.write().callback_resources.insert(res);
-    scene
+    (scene, stats)
 }
 
 /// Draw this process's headless pictures (`ui.render`, the agent's view image, thumbnails of
@@ -161,9 +164,13 @@ pub(crate) fn offscreen_backends() -> wgpu::Backends {
 }
 
 /// A device of its own for an offscreen render or check (`None` without a GPU adapter), on
-/// [`offscreen_backends`].
+/// [`offscreen_backends`]. One test at a time starts its instance, adapter and device: starting an
+/// instance scans the Vulkan drivers, and tests doing that side by side crashed the test process
+/// inside the Vulkan loader (`loader_icd_scan`). Rendering on the devices still runs side by side.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn offscreen_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    static STARTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = STARTING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
     desc.backends = offscreen_backends();
     let instance = wgpu::Instance::new(desc);
@@ -311,6 +318,8 @@ fn offscreen(
         eye,
         ao_radius: 0.0,
         ssaa,
+        hover_tint: [0.0; 3],
+        selection_tint: [0.0; 3],
     });
     let texture = |format, usage| {
         device.create_texture(&wgpu::TextureDescriptor {

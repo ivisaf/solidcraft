@@ -20,7 +20,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("open")
         .key("Ctrl+O")
         .noundo()
-        .params("path: .solidcraft design, or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step)"),
+        .params("path: .solidcraft design, or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh)"),
     CommandSpec::new("file.insert_step", "Insert STEP", insert_step)
         .at("SOLID", "INSERT")
         .icon("import")
@@ -33,11 +33,11 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("save")
         .key("Ctrl+S")
         .noundo()
-        .params("path? (default: current file); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false)"),
+        .params("path? (default: current file); format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (replace the design's file even though another program or computer changed it since it was opened or saved; without it that save is refused)"),
     CommandSpec::new("file.save_as", "Save As", save_as)
         .icon("save")
         .noundo()
-        .params("path; format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false)"),
+        .params("path; format?: container|json (default: json for .json, otherwise container); compression?: fast|compact (default: fast); cache?: bool (the evaluated model, so the design opens without rebuilding; default: true); preview?: bool (saved display meshes, default: false); overwrite?: bool (as file.save, when `path` is the design's own file)"),
     CommandSpec::new("doc.recovery_list", "Recoverable Designs", recovery_list).icon("restore")
         .noundo()
         .params("dir? (default: the recovery folder) → designs autosaved by apps that crashed or closed with unsaved changes"),
@@ -50,7 +50,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .noundo()
         .params("path; format?: stl|stla|obj|step|3mf|3mf-tagged|urdf|json (default from extension; 3mf-tagged: 3MF whose triangles carry their B-rep face, at full precision, for meshing and analysis tools; docs/formats/3mf-face-tags.md; urdf: the whole assembly as a robot, with STL meshes written next to it; docs/urdf.md); bodies?: [names] (JSON and URDF export the complete design); urdf only: mesh_prefix? (before each mesh file name, e.g. package://robot/meshes/), effort? (default 1000), velocity? (default 10)"),
     CommandSpec::new("file.save_mesh", "Save As Mesh", save_mesh)
-        .at("MESH", "MODIFY")
+        .at("INSERT", "FILES")
         .icon("mesh_export")
         .noundo()
         .params("path; format?: stl|3mf|3mf-tagged (default from the extension, else stl; 3mf-tagged: docs/formats/3mf-face-tags.md); bodies?: [names] (default: all); ascii?: bool (STL); slicer?: id, name or program path from file.slicers (open the saved file there)"),
@@ -285,14 +285,27 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
         }
         return Ok(out);
     }
+    let read_only = bool_(p, "read_only").unwrap_or(false);
+    // Stamped before it is read: a write while it is being read is a change too.
+    let disk = solidcraft_io::design_lock::stamp(path);
     let (mut doc, saved) = solidcraft_io::read_design_file(path, s.open_preview.take()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if let Some(stem) = default_name_for(&doc.name, path) {
         doc.name = stem;
     }
     s.replace_design(Session::opened(doc, saved.as_ref()));
     s.path = Some(path.to_string());
+    s.disk = disk;
+    s.read_only = read_only;
     let errors = s.model.results.iter().filter(|r| r.error.is_some()).count();
-    Ok(json!({"path": path, "features": s.doc.features.len(), "errors": errors, "name": s.doc.name}))
+    let mut out = json!({"path": path, "features": s.doc.features.len(), "errors": errors, "name": s.doc.name});
+    if read_only {
+        out["read_only"] = json!(true);
+    }
+    let now = solidcraft_io::design_lock::now_secs();
+    if let Some(lock) = solidcraft_io::design_lock::held_elsewhere(std::path::Path::new(path), now) {
+        out["open_elsewhere"] = json!({"host": lock.host, "user": lock.user, "app": lock.app, "opened": lock.opened});
+    }
+    Ok(out)
 }
 
 /// The name a design never given one by its user is shown under.
@@ -344,8 +357,18 @@ fn rename_design(s: &mut Session, from: &str, to: &str) {
     }
 }
 
-fn write(s: &mut Session, path: &str, format: &str, compression: &str, preview: bool, cache: bool) -> Result<Value> {
+fn write(s: &mut Session, path: &str, format: &str, compression: &str, preview: bool, cache: bool, overwrite: bool) -> Result<Value> {
     solidcraft_io::vfs::check(path).map_err(|e| EngineError::Other(e.to_string()))?;
+    if s.path.as_deref() == Some(path) {
+        if s.read_only {
+            return Err(EngineError::Other(format!("{path}: the design was opened read-only; save it to another file with file.save_as")));
+        }
+        if !overwrite && s.disk_changed() {
+            return Err(EngineError::Other(format!(
+                "{path}: the file was changed by another program or computer since it was opened or last saved; save to another file with file.save_as, or pass `overwrite: true` to replace it"
+            )));
+        }
+    }
     // Saving an unnamed design, or one named after the file it was saved as, names it after its
     // file (not an undoable edit).
     let renamed = saved_name(&s.doc.name, s.path.as_deref(), path).map(|stem| (s.doc.name.clone(), stem));
@@ -395,6 +418,8 @@ fn write_bytes(
     // Atomic, keeping the version being replaced as `<file>.bak`.
     solidcraft_io::write_atomic(std::path::Path::new(path), &bytes, true).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     s.path = Some(path.to_string());
+    s.disk = solidcraft_io::design_lock::stamp(path);
+    s.read_only = false;
     s.mark_saved();
     Ok(json!({"path": path, "bytes": bytes.len(), "name": s.doc.name}))
 }
@@ -413,7 +438,18 @@ impl Session {
             self.doc_mut().links.clone_from(&done.doc.links);
         }
         self.path.clone_from(&done.path);
+        self.disk = done.disk;
+        self.read_only = done.read_only;
         self.mark_saved();
+    }
+
+    /// Another program or computer wrote the design's file since it was opened or last saved:
+    /// saving to it would replace that work (#5467). A file that is gone has not changed.
+    pub fn disk_changed(&self) -> bool {
+        match (&self.path, &self.disk) {
+            (Some(path), Some(known)) => solidcraft_io::design_lock::changed_since(path, known),
+            _ => false,
+        }
     }
 
     /// Container bytes for desktop and browser saves. Only already evaluated bodies
@@ -478,6 +514,7 @@ fn save(s: &mut Session, p: &Value) -> Result<Value> {
         str_(p, "compression").unwrap_or("fast"),
         bool_(p, "preview").unwrap_or(false),
         bool_(p, "cache").unwrap_or(true),
+        bool_(p, "overwrite").unwrap_or(false),
     )
 }
 
@@ -494,6 +531,7 @@ fn save_as(s: &mut Session, p: &Value) -> Result<Value> {
         str_(p, "compression").unwrap_or("fast"),
         bool_(p, "preview").unwrap_or(false),
         bool_(p, "cache").unwrap_or(true),
+        bool_(p, "overwrite").unwrap_or(false),
     )
 }
 
@@ -705,6 +743,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #5467: a script, the CLI or the control channel never gets a prompt. A Save over a file
+    /// another program or computer changed since it was opened is refused with an error naming
+    /// `overwrite`, which replaces it; a design opened read-only only saves to another file.
+    #[test]
+    fn a_save_over_a_file_changed_on_disk_or_opened_read_only_is_refused() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-changed-on-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("Bracket.solidcraft");
+        let a_str = a.to_string_lossy().to_string();
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        s.execute("file.save_as", &json!({"path": a_str})).unwrap();
+        assert!(!s.disk_changed());
+        s.execute("file.save", &json!({})).unwrap();
+        // Another computer writes the file.
+        let mut other = Session::default();
+        other.execute("doc.open", &json!({"path": a_str})).unwrap();
+        other.execute("solid.sphere", &json!({"diameter": 4})).unwrap();
+        other.execute("file.save", &json!({})).unwrap();
+        assert!(s.disk_changed());
+        s.execute("solid.sphere", &json!({"diameter": 6})).unwrap();
+        let e = s.execute("file.save", &json!({})).unwrap_err().to_string();
+        assert!(e.contains("changed by another program or computer") && e.contains("overwrite"), "{e}");
+        assert!(s.is_dirty(), "nothing was saved");
+        s.execute("file.save", &json!({"overwrite": true})).unwrap();
+        assert!(!s.disk_changed() && !s.is_dirty());
+        s.execute("file.save", &json!({})).unwrap();
+
+        let mut ro = Session::default();
+        let r = ro.execute("doc.open", &json!({"path": a_str, "read_only": true})).unwrap();
+        assert_eq!(r["read_only"], json!(true));
+        let e = ro.execute("file.save", &json!({"overwrite": true})).unwrap_err().to_string();
+        assert!(e.contains("read-only"), "{e}");
+        let b = dir.join("Bracket copy.solidcraft");
+        ro.execute("file.save_as", &json!({"path": b.to_string_lossy()})).unwrap();
+        assert!(!ro.read_only);
+        ro.execute("file.save", &json!({})).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     #[ignore = "manual warmed engine save and provisional-open benchmark"]
     fn benchmark_warm_design_save_with_preview() {
@@ -794,7 +872,7 @@ mod tests {
     #[test]
     fn preview_saves_do_not_build_cold_placements_or_persist_transient_edits() {
         let mut s = Session::default();
-        let created = s.execute("component.create", &json!({"name":"PreviewPart"})).unwrap();
+        let created = s.execute("component.create", &json!({"name":"PreviewPart","grounded":false})).unwrap();
         let occurrence = created["occurrence"].as_u64().unwrap();
         s.execute("solid.box", &json!({"length":2,"width":3,"height":4,"body_name":"Block","operation":"new"})).unwrap();
         for body in &s.model.state().bodies {
@@ -864,6 +942,30 @@ mod tests {
         std::fs::remove_file(format!("{}.bak", path.display())).unwrap();
     }
 
+    /// #5286: a saved model whose feature records the boolean retries it took (as the kernel
+    /// writes them, with no `rejected` list when there were none) is taken on opening, not
+    /// refused and evaluated again.
+    #[test]
+    fn a_saved_model_with_boolean_retries_is_adopted() {
+        let mut session = Session::new(Document::new("Retried"));
+        session.execute("solid.box", &json!({"length":10,"width":20,"height":30})).unwrap();
+        let mut saved = saved_geometry(&session, &session.doc).unwrap();
+        // What a coplanar-face retry leaves in the file (a user's design, #5286).
+        let retry = json!({"events": [{"face_shift_mm": 0.6477, "rotation_rad": 0.0, "strategy": "coplanar_separation", "tolerance_mm": 0.0, "translation_mm": 0.0}], "truncated": false});
+        saved.records["features"][0]["diagnostics"] = retry;
+        let bytes =
+            solidcraft_io::write_design_container_with_cache(&session.doc, solidcraft_io::DesignCompression::Fast, None, Some(&saved)).unwrap();
+        let path = std::env::temp_dir().join(format!("solidcraft-saved-retries-{}.solidcraft", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let mut reopened = Session::default();
+        reopened.execute("doc.open", &json!({"path": path})).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(reopened.model.results.iter().all(|r| r.ms == session.model.results[0].ms), "taken from the file, not evaluated");
+        let d = &reopened.model.results[0].boolean_diagnostics;
+        assert_eq!(d.events.len(), 1, "{d:?}");
+        assert!(d.rejected.is_empty());
+    }
+
     #[test]
     fn saved_model_needs_no_meshes_and_is_adopted_only_for_its_document() {
         let mut session = Session::new(Document::new("Saved model"));
@@ -896,6 +998,49 @@ mod tests {
         reopened.execute("doc.open", &json!({"path":path})).unwrap();
         let measured = reopened.execute("inspect.measure", &json!({})).unwrap();
         assert!((measured["bodies"][0]["volume_mm3"].as_f64().unwrap() - 12000.).abs() < 1e-6);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A sheet-metal design keeps each sheet body once in its saved model, not again with every
+    /// later feature's state: a design of many features after its sheet metal wrote the sheets
+    /// over and over, and past the cache's size limit kept only some of its states.
+    #[test]
+    fn a_saved_model_keeps_each_sheet_body_once() {
+        let design = |boxes: usize| {
+            let mut s = Session::new(Document::new("Sheet"));
+            let run = |s: &mut Session, id: &str, p: Value| s.execute(id, &p).unwrap();
+            run(
+                &mut s,
+                "sheet.manage_rules",
+                json!({"name":"AL2","thickness":"2 mm","k_factor":0.5,"bend_radius":"1 mm","gap":"0.5 mm","active":true}),
+            );
+            run(&mut s, "sketch.create", json!({"plane":"XY","name":"Base"}));
+            run(&mut s, "sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[200,150]}));
+            run(&mut s, "sketch.finish", json!({}));
+            run(&mut s, "sheet.flange", json!({"sketch":"Base"}));
+            run(&mut s, "sheet.flange", json!({"edges":[[100,0,2],[200,75,2],[100,150,2],[0,75,2]],"height":"20 mm","angle":"90 deg"}));
+            // A panel's holes: each one is a cut-out the sheet keeps.
+            for i in 0..16 {
+                run(&mut s, "solid.hole", json!({"position":[25 + 10 * i,40,2],"diameter":5}));
+            }
+            for i in 0..boxes {
+                run(&mut s, "solid.box", json!({"length":5,"width":5,"height":5,"corner":[300 + 10 * i,0,0],"operation":"new"}));
+            }
+            s
+        };
+        let size = |s: &Session| serde_json::to_vec(&saved_geometry(s, &s.doc).unwrap().records).unwrap().len();
+        let (few, many) = (design(2), design(12));
+        let sheet = serde_json::to_vec(&many.model.state().sheets).unwrap().len();
+        let per_feature = (size(&many) - size(&few)) / 10;
+        assert!(per_feature * 2 < sheet, "each later feature adds {per_feature} bytes, the sheet is {sheet}");
+        // Taken from the file as saved: the sheet is the one evaluated.
+        let flat = many.model.state().sheets.clone();
+        let path = std::env::temp_dir().join(format!("solidcraft-sheet-cache-{}.solidcraft", std::process::id()));
+        std::fs::write(&path, many.design_container(solidcraft_io::DesignCompression::Fast, false, true).unwrap()).unwrap();
+        let mut reopened = Session::default();
+        reopened.execute("doc.open", &json!({"path":path})).unwrap();
+        assert!(reopened.model.results.iter().zip(&many.model.results).all(|(a, b)| a.ms == b.ms), "taken from the file, not evaluated");
+        assert_eq!(serde_json::to_value(&reopened.model.state().sheets).unwrap(), serde_json::to_value(&flat).unwrap());
         std::fs::remove_file(path).unwrap();
     }
 

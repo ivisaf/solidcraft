@@ -10,7 +10,8 @@
 //!   so at most [`MAX_PER_KIND`] rows are kept per kind, nearest first, and the list reports how
 //!   many things there were in all.
 //! - Hovering a row lights its entity up in the viewport; clicking it selects it (Shift/Ctrl add,
-//!   as clicks do) or, with a dialog open, gives it to the dialog's active selection input.
+//!   as clicks do, held then or at the click or press that opened the list) or, with a dialog
+//!   open, gives it to the dialog's active selection input.
 //!   Esc or a click elsewhere closes the list.
 //! - Clicking again on the same spot with nothing changed selects the next thing in that list
 //!   (click cycling). The second click of a double-click keeps its own actions.
@@ -26,6 +27,7 @@ use std::hash::{Hash, Hasher};
 
 use crate::SolveApp;
 use crate::theme::Tokens;
+use crate::tool_modifiers::Held;
 use crate::viewport::{Hit, Proj};
 
 /// How long the left button stays down, without moving, before the list opens.
@@ -60,6 +62,8 @@ pub struct Popup {
     dialog: bool,
     /// The browser's body highlight is ours to clear.
     lit_body: bool,
+    /// The keys held at the press or click that opened it.
+    held: Held,
 }
 
 /// The last plain click, for cycling.
@@ -74,8 +78,8 @@ struct Cycle {
 #[derive(Default)]
 pub struct State {
     pub popup: Option<Popup>,
-    /// A left press that may become a hold: where and when.
-    hold: Option<(Pos2, f64)>,
+    /// A left press that may become a hold: where, when and with which keys.
+    hold: Option<(Pos2, f64, Held)>,
     /// The current press belongs to Select Other (it opened or closed the list): the viewport
     /// doesn't also click, drag or box-select with it.
     held: bool,
@@ -149,7 +153,7 @@ fn shown_as(hit: &Hit, sel: &Sel) -> Sel {
 /// Sort key: in a sketch its own points and curves come first; then by kind.
 fn rank(s: &Sel, sketching: bool) -> (u8, u8) {
     let kind = match s {
-        Sel::SketchPoint { .. } | Sel::ExternalSketchPoint { .. } => 0,
+        Sel::SketchPoint { .. } | Sel::SketchMidpoint { .. } | Sel::ExternalSketchPoint { .. } => 0,
         Sel::SketchCurve { .. } | Sel::ExternalSketchCurve { .. } => 1,
         Sel::SketchConstraint { .. } => 2,
         Sel::Vertex { .. } => 3,
@@ -160,7 +164,7 @@ fn rank(s: &Sel, sketching: bool) -> (u8, u8) {
         Sel::Plane { .. } => 8,
         Sel::Axis { .. } => 9,
     };
-    let own = matches!(s, Sel::SketchPoint { .. } | Sel::SketchCurve { .. });
+    let own = matches!(s, Sel::SketchPoint { .. } | Sel::SketchMidpoint { .. } | Sel::SketchCurve { .. });
     (if sketching && !own { 1 } else { 0 }, kind)
 }
 
@@ -235,6 +239,9 @@ pub fn label(app: &SolveApp, sel: &Sel) -> String {
     let in_sketch =
         |sketch: u64, f: &dyn Fn(&solidcraft_engine::sketch::Sketch) -> String| st.sketch(sketch).map(|ss| f(&ss.sketch)).unwrap_or_default();
     match sel {
+        Sel::SketchMidpoint { id } => {
+            format!("MID · {}", app.session.active_sketch.map(|s| in_sketch(s, &|sk| curve_label(sk, id))).unwrap_or_else(|| id.clone()))
+        }
         Sel::SketchPoint { id } => app.session.active_sketch.map(|s| in_sketch(s, &|sk| point_label(sk, id))).unwrap_or_else(|| id.clone()),
         Sel::SketchCurve { id } => app.session.active_sketch.map(|s| in_sketch(s, &|sk| curve_label(sk, id))).unwrap_or_else(|| id.clone()),
         Sel::ExternalSketchPoint { sketch, id } => format!("{} · {}", in_sketch(*sketch, &|sk| point_label(sk, id)), sketch_name(app, *sketch)),
@@ -267,7 +274,7 @@ fn icon(app: &SolveApp, sel: &Sel) -> &'static str {
         }
     };
     match sel {
-        Sel::SketchPoint { .. } | Sel::ExternalSketchPoint { .. } | Sel::Vertex { .. } => "point",
+        Sel::SketchPoint { .. } | Sel::SketchMidpoint { .. } | Sel::ExternalSketchPoint { .. } | Sel::Vertex { .. } => "point",
         Sel::SketchCurve { id } => curve(app.session.active_sketch, id),
         Sel::ExternalSketchCurve { sketch, id } => curve(Some(*sketch), id),
         Sel::SketchConstraint { .. } => "dimension",
@@ -289,13 +296,14 @@ fn projection_now(app: &SolveApp) -> Option<Proj> {
     app.viewport.rect.map(|r| crate::viewport::projection(app, r))
 }
 
-/// Open the list at a screen point; false (with a status message) when nothing is there.
-pub fn open(app: &mut SolveApp, at: Pos2) -> bool {
+/// Open the list at a screen point; false (with a status message) when nothing is there. `held`:
+/// the keys held at the click that opened it.
+pub fn open(app: &mut SolveApp, at: Pos2, held: Held) -> bool {
     let Some(proj) = projection_now(app) else { return false };
-    open_with(app, &proj, at)
+    open_with(app, &proj, at, held)
 }
 
-fn open_with(app: &mut SolveApp, proj: &Proj, at: Pos2) -> bool {
+fn open_with(app: &mut SolveApp, proj: &Proj, at: Pos2, held: Held) -> bool {
     let (rows, total) = rows_capped(app, proj, at);
     if rows.is_empty() {
         app.set_status("Nothing to select here", false);
@@ -303,7 +311,7 @@ fn open_with(app: &mut SolveApp, proj: &Proj, at: Pos2) -> bool {
     }
     close(app);
     app.viewport.select_other.popup =
-        Some(Popup { at, rows, total, hovered: None, revision: app.session.revision, dialog: app.dialog.is_some(), lit_body: false });
+        Some(Popup { at, rows, total, hovered: None, revision: app.session.revision, dialog: app.dialog.is_some(), lit_body: false, held });
     true
 }
 
@@ -322,10 +330,12 @@ pub fn is_open(app: &SolveApp) -> bool {
 /// Pick row `i` of the open list and close it.
 ///
 /// `add` / `toggle` match viewport selection (Shift pure-add, Primary toggle when
-/// `selection_shift_add_only` is on).
+/// `selection_shift_add_only` is on); the keys held when the list opened add too.
 pub fn choose(app: &mut SolveApp, i: usize, add: bool, toggle: bool) -> Result<Row, String> {
     let Some(p) = app.viewport.select_other.popup.as_ref() else { return Err("Select Other is not open".into()) };
     let at = p.at;
+    let (opened_add, opened_toggle) = crate::tool_modifiers::selection_click(p.held, app.preferences.selection_shift_add_only);
+    let (add, toggle) = (add || opened_add, toggle || opened_toggle);
     let row = p.rows.get(i).cloned().ok_or_else(|| format!("no row {i} (the list has {})", p.rows.len()))?;
     close(app);
     apply(app, &row, add, toggle);
@@ -370,7 +380,7 @@ pub fn control(app: &mut SolveApp, p: &Value) -> Result<Value, String> {
         if app.viewport.rect.is_none() {
             return Err("no viewport".into());
         }
-        open(app, pos2(x as f32, y as f32));
+        open(app, pos2(x as f32, y as f32), Held::default());
         return Ok(describe(app));
     }
     if let Some(i) = p.get("hover").and_then(Value::as_u64) {
@@ -414,16 +424,17 @@ pub fn track_hold(
         && app.dialog.as_ref().is_none_or(|d| d.wants_picks())
         && app.viewport.point_drag.is_none();
     if pressed && inside && free && !navigating {
-        app.viewport.select_other.hold = hover.map(|p| (p, now));
+        let held = Held::from_modifiers(ctx.input(|i| i.modifiers));
+        app.viewport.select_other.hold = hover.map(|p| (p, now, held));
     }
     let mut opened = false;
-    if let Some((p0, t0)) = app.viewport.select_other.hold {
+    if let Some((p0, t0, held)) = app.viewport.select_other.hold {
         let slop = ctx.options(|o| o.input_options.max_click_dist);
         if !down || navigating || !free || hover.is_some_and(|p| p.distance(p0) > slop) {
             app.viewport.select_other.hold = None;
         } else if now - t0 >= HOLD_SECS {
             app.viewport.select_other.hold = None;
-            opened = open_with(app, proj, p0);
+            opened = open_with(app, proj, p0, held);
             app.viewport.select_other.held = true;
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(30));
@@ -539,7 +550,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                         crate::scenario::publish_handle(&format!("select_other:{i}"), r.center());
                         if resp.hovered() {
                             hovered = Some(i);
-                            ui.painter().rect_filled(r.shrink2(vec2(2.0, 1.0)), 4.0, t.hover);
+                            ui.painter().rect_filled(r.shrink2(vec2(2.0, 1.0)), t.radius_sm, t.hover);
                         }
                         crate::icons::paint_icon(
                             ui.painter(),
@@ -547,13 +558,19 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
                             row.icon,
                             f32::from(t.icon.a()) / 255.0,
                         );
-                        ui.painter().text(
-                            pos2(r.left() + 32.0, r.center().y),
-                            Align2::LEFT_CENTER,
-                            &row.label,
-                            FontId::proportional(crate::theme::Tokens::get().font_button),
-                            t.text,
-                        );
+                        // Names can be wider than the list. Keep one line inside the row and
+                        // expose the full name on hover, as the browser tree does.
+                        let text_rect = Rect::from_min_max(pos2(r.left() + 32.0, r.top()), pos2(r.right() - 8.0, r.bottom()));
+                        let mut job =
+                            egui::text::LayoutJob::simple(row.label.clone(), FontId::proportional(t.font_button), t.text, text_rect.width());
+                        job.wrap.max_rows = 1;
+                        job.wrap.break_anywhere = true;
+                        job.wrap.overflow_character = Some('\u{2026}');
+                        let galley = ui.painter().layout_job(job);
+                        let elided = galley.elided;
+                        let at = pos2(text_rect.left(), r.center().y - galley.size().y / 2.0);
+                        ui.painter().with_clip_rect(ui.clip_rect().intersect(text_rect)).galley(at, galley, t.text);
+                        let resp = if elided { resp.on_hover_text(&row.label) } else { resp };
                         if resp.clicked() {
                             picked = Some(i);
                         }
@@ -569,7 +586,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     }
     let (pressed, pointer, mods) = ctx.input(|i| (i.pointer.any_pressed(), i.pointer.interact_pos(), i.modifiers));
     if let Some(i) = picked {
-        let held = crate::tool_modifiers::Held::from_modifiers(mods);
+        let held = Held::from_modifiers(mods);
         let (add, toggle) = crate::tool_modifiers::selection_click(held, app.preferences.selection_shift_add_only);
         let _ = choose(app, i, add, toggle);
     } else if pressed && !pointer.is_some_and(|q| resp.response.rect.contains(q)) {

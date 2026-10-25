@@ -1909,7 +1909,8 @@ fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
         }
     }
     let mut texts = std::collections::BTreeSet::new();
-    h.painted_frame().iter().for_each(|s| walk(&s.shape, &mut texts));
+    h.frame();
+    h.shapes.iter().for_each(|s| walk(&s.shape, &mut texts));
     texts
 }
 

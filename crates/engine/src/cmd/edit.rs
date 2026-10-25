@@ -45,9 +45,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("timeline.roll_to", "Roll History Marker", roll_to).icon("rollback")
         .params("position: number of features to keep active, or \"end\" (omit = end) | feature: id|name (the marker goes right after it)"),
     CommandSpec::new("timeline.reorder", "Reorder Feature", reorder).icon("reorder")
-        .params("feature: id|name, position: its new index, active?: bool (true = it ends up before the history marker, false = behind it; other features keep their state); refused when a feature that worked would fail"),
+        .params("feature: id|name, position: its new index, active?: bool (true = it ends up before the history marker, false = behind it; other features keep their state); refused when a feature that worked would fail, unless allow_errors?: bool (default false): then made, and broken: [{feature, error}] lists the features it broke"),
     CommandSpec::new("timeline.reorder_many", "Reorder Features", reorder_many).icon("reorder").params(
-        "features: [id|name], position: insertion slot in the current history; selected features keep their relative order; refused when a feature that worked would fail",
+        "features: [id|name], position: insertion slot in the current history; selected features keep their relative order; active?: bool (as timeline.reorder's); refused when a feature that worked would fail, unless allow_errors?: bool (default false): then made, and broken: [{feature, error}] lists the features it broke",
     ),
     CommandSpec::new("timeline.redefine", "Edit Feature", redefine).icon("edit")
         .params("feature: id|name, command: the feature's command id, params: its parameters (the feature is rebuilt in place)"),
@@ -92,15 +92,28 @@ fn redo(s: &mut Session, _p: &Value) -> Result<Value> {
 
 /// Put the session at `snap`; returns where it was, under the same label.
 fn go_to(s: &mut Session, snap: Snapshot) -> Snapshot {
-    let was = Snapshot { label: snap.label, doc: s.doc.clone(), active_sketch: s.active_sketch, pending_moves: s.pending_moves.clone() };
+    let was = Snapshot {
+        label: snap.label,
+        doc: s.doc.clone(),
+        active_sketch: s.active_sketch,
+        pending_moves: s.pending_moves.clone(),
+        visibility: s.visibility.clone(),
+    };
     let same = std::sync::Arc::ptr_eq(&s.doc, &snap.doc);
+    // Undoing a hide (or a show) leaves the document alone: the model needs no evaluating.
+    let display_only = same && s.visibility != snap.visibility;
     s.doc = snap.doc;
     s.active_sketch = snap.active_sketch;
     s.pending_moves = snap.pending_moves;
+    s.visibility = snap.visibility;
     s.selection.clear();
     // A new document is evaluated by `execute`.
     if same {
-        s.refresh();
+        if display_only {
+            s.refresh_display();
+        } else {
+            s.refresh();
+        }
     }
     was
 }
@@ -168,6 +181,10 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
     if s.active_sketch.is_some_and(|a| gone.contains(&a)) {
         s.active_sketch = None;
     }
+    // An inserted file's feature takes its components with it.
+    if s.active_component != 0 && !s.doc.components.iter().any(|c| c.id == s.active_component) {
+        s.active_component = 0;
+    }
     s.selection.clear();
     s.refresh();
     let failing: Vec<Value> = s
@@ -206,6 +223,15 @@ fn rename(s: &mut Session, p: &Value) -> Result<Value> {
     }
     for f in doc.features.iter_mut() {
         f.kind.remap_refs(&sketches, &names);
+    }
+    doc.rename_feature_keys(&old, name);
+    // The hidden list follows in `Session::refresh_from` (undo and redo too).
+    for sel in &mut s.selection {
+        if let Sel::Plane { name: n } = sel
+            && *n == old
+        {
+            *n = name.to_string();
+        }
     }
     Ok(json!({"feature": id, "name": name}))
 }
@@ -492,7 +518,7 @@ fn move_many(s: &mut Session, p: &Value) -> Result<Value> {
     sort_group_features(&mut next);
     let slot = num(p, "position").map(|x| x.max(0.0) as usize).ok_or_else(|| bad(cmd, "`position` must be a number"))?;
     let active = active_param(p, cmd)?;
-    let (mut next, ordered) = reorder_features(s, next, &moving, slot, cmd)?;
+    let (mut next, ordered, _) = reorder_features(s, next, &moving, slot, false, cmd)?;
     place_marker(s, &mut next, &moving, active, cmd)?;
     if next != *s.doc {
         *s.doc_mut() = next;
@@ -569,6 +595,24 @@ fn feature_ids(s: &Session, p: &Value, cmd: &str) -> Result<Vec<u64>> {
     Ok(ids)
 }
 
+/// The names the features from the first of `ids` to be suppressed on made, for those that made a
+/// body numbered by the counter (`BodyN`). Counted bodies take the next free number each time the
+/// design is computed, so once a feature that made one is suppressed, every counted body after it
+/// would move down one (`Body2` becoming `Body1`) and break what names it, such as a Move of
+/// `Body2` (#4302). Stored as their names, they stay as they were, as when a counted body is
+/// renamed (#1109). The suppressed feature keeps its own too: the counter passes the names of
+/// suppressed features by, so a body made meanwhile does not take `Body1` and lose it again when
+/// the feature is back.
+fn counted_names_from(s: &Session, ids: &[u64]) -> Vec<(u64, Vec<String>)> {
+    let made = |f: &Feature| -> Vec<String> {
+        s.model.result(f.id).map(|r| r.state.bodies.iter().filter(|b| b.feature == f.id).map(|b| b.name.clone()).collect()).unwrap_or_default()
+    };
+    let makes_counted = |f: &Feature| (0..made(f).len()).any(|i| super::browser::counted(f, i));
+    let first = s.doc.features.iter().position(|f| ids.contains(&f.id) && !f.suppressed && makes_counted(f));
+    let Some(at) = first else { return Vec::new() };
+    s.doc.features.iter().skip(at).filter(|f| makes_counted(f)).map(|f| (f.id, made(f))).collect()
+}
+
 fn suppress(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "timeline.suppress";
     let ids = feature_ids(s, p, cmd)?;
@@ -578,8 +622,14 @@ fn suppress(s: &mut Session, p: &Value) -> Result<Value> {
         // Toggle: one feature flips; several are all suppressed unless all already are.
         None => !ids.iter().all(|id| s.doc.feature(*id).is_some_and(|f| f.suppressed)),
     };
+    let keep = if want { counted_names_from(s, &ids) } else { Vec::new() };
     // One command, so one undo step however many features it changes.
     let doc = s.doc_mut();
+    for (id, made) in &keep {
+        if let Some(f) = doc.feature_mut(*id) {
+            f.body_names.clone_from(made);
+        }
+    }
     for id in &ids {
         let f = doc.feature_mut(*id).ok_or_else(|| bad(cmd, format!("no feature {id}")))?;
         f.suppressed = want;
@@ -1000,6 +1050,13 @@ fn edit_feature(s: &mut Session, p: &Value) -> Result<Value> {
             nf.edge_names = solidcraft_doc::sheet::sheet_edge_names(&s.model.state_before(id), &solidcraft_doc::plain(&points(a)));
         }
     }
+    // New reference edges for a hole (#37): the names of the edges there now.
+    if let (FeatureKind::Hole { references: a, position, .. }, FeatureKind::Hole { references: b, .. }) = (&nf.kind, &f.kind) {
+        let edges = |r: &[solidcraft_doc::HoleReference]| r.iter().map(|x| x.edge.0).collect::<Vec<_>>();
+        if edges(a) != edges(b) {
+            nf.edge_names = solidcraft_doc::hole_reference::reference_edge_names(&s.model.state_before(id), position.0, &edges(a));
+        }
+    }
     // New bend edges for a conversion: the names of the body's edges there now.
     if let (FeatureKind::SheetConvert { bends: a, body, .. }, FeatureKind::SheetConvert { bends: b, body: was, .. }) = (&nf.kind, &f.kind)
         && (a != b || body != was)
@@ -1068,6 +1125,30 @@ fn newly_broken(before: &solidcraft_doc::Model, after: &solidcraft_doc::Model) -
         .collect()
 }
 
+/// [`newly_broken`] over the whole history, from `before` (the model of `before_doc`) to `after`
+/// (the model of `after_doc`). With the history rolled back, the features after the marker are
+/// evaluated too, on copies of the models (which share their cache): a delete made in the
+/// rolled-back history that breaks them says so before it is made, rather than leaving error marks
+/// that only show at the end of the timeline (#3471).
+pub(super) fn newly_broken_in_history(
+    before_doc: &solidcraft_doc::Document,
+    before: &solidcraft_doc::Model,
+    after_doc: &solidcraft_doc::Document,
+    after: &solidcraft_doc::Model,
+) -> Vec<(String, String)> {
+    if before_doc.marker.is_none() && after_doc.marker.is_none() {
+        return newly_broken(before, after);
+    }
+    let whole = |doc: &solidcraft_doc::Document, model: &solidcraft_doc::Model| {
+        let mut doc = doc.clone();
+        doc.marker = None;
+        let mut model = model.clone();
+        model.evaluate(&doc);
+        model
+    };
+    newly_broken(&whole(before_doc, before), &whole(after_doc, after))
+}
+
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "timeline.reorder";
     let id = feature_id(s, p.get("feature"), cmd)?;
@@ -1088,7 +1169,9 @@ fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     let mut after = s.model.clone();
     after.evaluate(&next);
     let broken = newly_broken(&s.model, &after);
-    if !broken.is_empty() {
+    // `allow_errors`: made anyway, with what it broke said (#5962).
+    let allow = allow_errors(p, cmd)?;
+    if !broken.is_empty() && !allow {
         let list: Vec<String> = broken.iter().map(|(n, e)| format!("{n} ({e})")).collect();
         return Err(bad(cmd, format!("moving {name} there breaks {}", list.join("; "))));
     }
@@ -1096,7 +1179,25 @@ fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
     if next != *s.doc {
         *s.doc_mut() = next;
     }
-    Ok(json!({"feature": id, "position": to}))
+    let mut out = json!({"feature": id, "position": to});
+    if allow {
+        out["broken"] = broken_json(&broken);
+    }
+    Ok(out)
+}
+
+/// The optional `allow_errors` of a move: make it even when it breaks features that worked.
+fn allow_errors(p: &Value, cmd: &str) -> Result<bool> {
+    match p.get("allow_errors") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(allow)) => Ok(*allow),
+        Some(_) => Err(bad(cmd, "`allow_errors` must be true or false")),
+    }
+}
+
+/// The features a move broke, as `[{feature, error}]`.
+fn broken_json(broken: &[(String, String)]) -> Value {
+    broken.iter().map(|(feature, error)| json!({"feature": feature, "error": error})).collect()
 }
 
 /// The optional `active` of a move: whether the moved features end up before the history marker.
@@ -1129,11 +1230,18 @@ fn reorder_many(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "timeline.reorder_many";
     let ids = group_features(s, p, true, cmd)?;
     let slot = num(p, "position").map(|x| x.max(0.0) as usize).ok_or_else(|| bad(cmd, "`position` must be a number"))?;
-    let (next, ordered) = reorder_features(s, (*s.doc).clone(), &ids, slot, cmd)?;
+    let active = active_param(p, cmd)?;
+    let allow = allow_errors(p, cmd)?;
+    let (mut next, ordered, broken) = reorder_features(s, (*s.doc).clone(), &ids, slot, allow, cmd)?;
+    place_marker(s, &mut next, &ordered, active, cmd)?;
     if next != *s.doc {
         *s.doc_mut() = next;
     }
-    Ok(json!({"features": ordered, "position": slot.min(s.doc.features.len())}))
+    let mut out = json!({"features": ordered, "position": slot.min(s.doc.features.len())});
+    if allow {
+        out["broken"] = broken_json(&broken);
+    }
+    Ok(out)
 }
 
 fn reorder_features(
@@ -1141,8 +1249,9 @@ fn reorder_features(
     mut next: solidcraft_doc::Document,
     ids: &[u64],
     slot: usize,
+    allow_errors: bool,
     cmd: &str,
-) -> Result<(solidcraft_doc::Document, Vec<u64>)> {
+) -> Result<(solidcraft_doc::Document, Vec<u64>, Vec<(String, String)>)> {
     let n = next.features.len();
     let slot = slot.min(n);
     let selected: std::collections::BTreeSet<u64> = ids.iter().copied().collect();
@@ -1167,16 +1276,17 @@ fn reorder_features(
     next.features.splice(insert_at..insert_at, moving);
     sort_group_features(&mut next);
     require_contiguous_groups(&next, cmd)?;
+    let mut broken = Vec::new();
     if !unchanged {
         let mut after = solidcraft_doc::Model::new();
         after.evaluate(&next);
-        let broken = newly_broken(&s.model, &after);
-        if !broken.is_empty() {
+        broken = newly_broken(&s.model, &after);
+        if !broken.is_empty() && !allow_errors {
             let list: Vec<String> = broken.iter().map(|(name, error)| format!("{name} ({error})")).collect();
             return Err(bad(cmd, format!("moving the selected features there breaks {}", list.join("; "))));
         }
     }
-    Ok((next, ordered))
+    Ok((next, ordered, broken))
 }
 
 fn input_keys(kind: &FeatureKind) -> Vec<(String, solidcraft_doc::expr::Kind)> {
@@ -1229,6 +1339,7 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
                 | "plastic.lip"
                 | "plastic.snap_fit"
                 | "plastic.rest"
+                | "frame.member"
         );
     if !constructor {
         return Err(bad(cmd, format!("`{cid}` does not make a feature")));
@@ -1252,6 +1363,14 @@ fn redefine(s: &mut Session, p: &Value) -> Result<Value> {
         && let Some(parameters) = params.as_object_mut()
     {
         parameters.entry("convention").or_insert_with(|| json!(convention));
+    }
+    // Members keep their names through an edit, unless it gives them another name.
+    if let FeatureKind::FrameMember { names, body_name, .. } = &old.kind
+        && cid == "frame.member"
+        && let Some(parameters) = params.as_object_mut()
+        && parameters.get("body_name").and_then(Value::as_str) == body_name.as_deref()
+    {
+        parameters.entry("names").or_insert_with(|| json!(names));
     }
     if !old.participants.is_empty()
         && let Some(parameters) = params.as_object_mut()
@@ -1388,7 +1507,7 @@ fn dependents(s: &mut Session, p: &Value) -> Result<Value> {
     let mut after = s.model.clone();
     after.evaluate(&next);
     let names = |ids: &[u64]| -> Vec<String> { ids.iter().filter(|x| **x != id).filter_map(|x| s.doc.feature(*x).map(|f| f.name.clone())).collect() };
-    let broken: Vec<String> = newly_broken(&s.model, &after).into_iter().map(|(n, _)| n).collect();
+    let broken: Vec<String> = newly_broken_in_history(&s.doc, &s.model, &next, &after).into_iter().map(|(n, _)| n).collect();
     Ok(json!({"deleted_with_it": names(&gone), "would_fail": broken}))
 }
 

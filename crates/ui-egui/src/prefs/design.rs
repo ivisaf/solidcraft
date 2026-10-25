@@ -32,6 +32,9 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
                 ui_kit::settings_precision_sample(ui, &format!("{:.*}°", usize::from(app.preferences.angle_decimals.min(6)), 45.0));
             });
         });
+        let tip = app.tr("ui.step_values_tip").to_string();
+        let step = setting::step_values(app, ui).on_hover_text(tip);
+        crate::scenario::publish_handle("prefs:step_values", step.rect.center());
     });
     ui_kit::settings_section(ui, "orientation", app.tr("prefs.orientation"), |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -49,8 +52,27 @@ pub(super) fn show(app: &mut SolveApp, ui: &mut egui::Ui) {
             crate::i18n::tr_label("Which axis points up in the views (axis view, Home, Look At). Designs are unchanged."),
             ui_kit::Text::Hint("orientation"),
         );
-        setting::auto_stand_up(app, ui);
         setting::offer_stand_up(app, ui);
         ui_kit::text(ui, app.tr("prefs.stand_up_note"), ui_kit::Text::Hint("stand_up"));
+        setting::extrude_auto_to_object(app, ui);
+        setting::hide_origin(app, ui);
+        ui_kit::text(ui, app.tr("ui.hide_origin_note"), ui_kit::Text::Hint("hide_origin"));
+    });
+    // The Hole command's own settings, under its name.
+    ui_kit::settings_section(ui, "create_hole", crate::i18n::tr_label("Create Hole"), |ui| {
+        setting::hole_snaps(app, ui);
+        ui_kit::text(
+            ui,
+            crate::i18n::tr_label("A Single hole snaps to the middle of its face and to the centres of its round edges"),
+            ui_kit::Text::Hint("hole_snaps"),
+        );
+        setting::hole_moves(app, ui);
+        ui_kit::text(
+            ui,
+            crate::i18n::tr_label(
+                "A placed Single hole has a handle to drag it, and picking its face again moves the hole there instead of taking it out",
+            ),
+            ui_kit::Text::Hint("hole_moves"),
+        );
     });
 }

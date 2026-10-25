@@ -386,12 +386,17 @@ pub struct SnapPt {
     pub param: Value,
 }
 
-/// The occurrence placing a body (0: the root design), when the body is its primary instance.
+/// The occurrence placing a world body (0: the root design), the instance its name says.
 pub(crate) fn occurrence_of_body(s: &Session, body: &str) -> Option<u64> {
+    // The world name tells the instance: a further occurrence of a component is not its first.
     let st = s.world_state();
     let b = st.body(body)?;
-    let comp = s.doc.model_body_component(b);
-    if comp == 0 { Some(0) } else { s.doc.occurrence_of(comp).map(|o| o.id) }
+    if s.doc.model_body_component(b) == 0 {
+        return Some(0);
+    }
+    let model = s.model.state();
+    let (_, _, _, path, _) = s.doc.body_frames_with_source(&model).into_iter().find(|(world, ..)| world == body)?;
+    path.last().copied()
 }
 
 /// Centre and unit normal of the circle through a polyline's points, if it lies on one.
@@ -415,6 +420,19 @@ pub fn circle_of(pts: &[Vec3]) -> Option<(Vec3, Vec3)> {
     let tol = (r * 2e-3).max(1e-6);
     let normal = nn.normalized()?;
     pts.iter().all(|p| (p.dist(center) - r).abs() < tol && (*p - center).dot(normal).abs() < tol).then_some((center, normal))
+}
+
+/// Axis of a straight edge. Its largest component points positive so reversing the
+/// tessellation does not reverse a joint's drive direction.
+fn straight_edge_axis(pts: &[Vec3]) -> Option<Vec3> {
+    let (a, b) = (*pts.first()?, *pts.last()?);
+    let dir = (b - a).normalized()?;
+    let tol = 1e-6 * a.dist(b).max(1.0);
+    if !pts.iter().all(|p| (*p - a).cross(dir).len() < tol) {
+        return None;
+    }
+    let leading = [dir.x, dir.y, dir.z].into_iter().max_by(|a, b| a.abs().total_cmp(&b.abs()))?;
+    Some(if leading < 0.0 { -dir } else { dir })
 }
 
 /// Normal of the mesh face `f` near `p`.
@@ -468,7 +486,9 @@ pub fn snap_of(s: &Session, sel: &Sel) -> Option<SnapPt> {
                 }
                 None => {
                     let mid = polyline_mid(e);
-                    let z = m.edge_faces.get(*index).and_then(|fs| fs.first()).and_then(|f| face_normal_near(&m, *f, mid)).unwrap_or(Vec3::Z);
+                    let z = straight_edge_axis(e)
+                        .or_else(|| m.edge_faces.get(*index).and_then(|fs| fs.first()).and_then(|f| face_normal_near(&m, *f, mid)))
+                        .unwrap_or(Vec3::Z);
                     (body, SnapPt { at: mid, z, kind: SnapKind::EdgeMid, param: json!({"point": pt(mid), "z": pt(z)}) })
                 }
             }
@@ -662,6 +682,10 @@ pub fn rows(app: &mut SolveApp, ui: &mut egui::Ui, k: &mut Asm, inputs: &mut [Se
                     ui.label(RichText::new(why).color(t.warning));
                 });
             }
+            // The moved parts' old place, drawn as a ghost; remembered between uses (#5905).
+            form_row(ui, "Show ghost", |ui| {
+                crate::ui_kit::checkbox(ui, "", &mut app.preferences.drive_joints_ghost);
+            });
         }
         Asm::MotionLink { a, b, ia, ib, ratio, offset } => {
             let s = &app.session;
@@ -1042,6 +1066,9 @@ pub fn world_preview(s: &Session, cmds: &[(String, Value)], colors: Colors) -> O
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::preview::build(&before, &after, colors)));
     Some(match built {
         Ok(mut b) => {
+            if !colors.ghost {
+                b.scene.ghost.clear();
+            }
             b.bounds = after.bodies.iter().fold(Aabb3::EMPTY, |acc, x| acc.union(&x.mesh().bounds()));
             b.stopped = stopped;
             Ok(b)
@@ -1159,7 +1186,7 @@ fn glyph(painter: &egui::Painter, proj: &Proj, s: &SnapPt, col: Color32, half_he
 }
 
 /// What a snap is called (the hover label).
-fn snap_name(k: SnapKind) -> &'static str {
+pub(crate) fn snap_name(k: SnapKind) -> &'static str {
     match k {
         SnapKind::FaceCenter => "Face center",
         SnapKind::CircleCenter => "Circle center",
@@ -1220,7 +1247,7 @@ pub fn timeline_joints(app: &mut SolveApp, ui: &mut egui::Ui, p: &egui::Painter,
         } else {
             t.timeline_item
         };
-        p.rect(br, 3.0, bg, Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
+        p.rect(br, t.radius_sm.saturating_sub(1), bg, t.control_border_stroke(t.border), egui::StrokeKind::Inside);
         crate::icons::paint_icon(p, br.shrink(4.0), "joint", f32::from((if suppressed { t.border } else { t.icon }).a()) / 255.0);
         if suppressed {
             p.line_segment([br.left_bottom() + vec2(4.0, -4.0), br.right_top() + vec2(-4.0, 4.0)], Stroke::new(1.5, t.text_dim));
@@ -1267,9 +1294,9 @@ pub fn timeline_joints_vertical(app: &mut SolveApp, ui: &mut egui::Ui) {
         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), egui::Sense::click());
         crate::scenario::publish_handle(&format!("timeline-joint:{name}"), rect.center());
         if app.tree.picked_joints.contains(&id) {
-            ui.painter().rect_filled(rect, 3.0, t.accent_soft);
+            ui.painter().rect_filled(rect, t.radius_sm.saturating_sub(1), t.accent_soft);
         } else if response.hovered() {
-            ui.painter().rect_filled(rect, 3.0, t.hover);
+            ui.painter().rect_filled(rect, t.radius_sm.saturating_sub(1), t.hover);
         }
         let icon = egui::Rect::from_min_size(egui::pos2(rect.left() + 4.0, rect.top() + 4.0), vec2(22.0, 22.0));
         crate::icons::paint_icon(ui.painter(), icon, "joint", f32::from((if suppressed { t.border } else { t.icon }).a()) / 255.0);
