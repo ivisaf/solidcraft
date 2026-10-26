@@ -67,6 +67,10 @@
   keep the nearest quarter-turn heading. The house, the navigation bar's Home button and a middle-button double-click in the view go
   home, framing what is shown now (Navigation › **Middle double-click** can make it Fit, which
   keeps the orientation, or turn it off).
+  Interface › **OK and Cancel in the view's corner** puts a large check and cross at the view's
+  top right while a dialog or a sketch is open, and moves the axis view or cube down below them.
+  With a dialog open they do what its OK and Cancel do (the check is grey whenever OK is); in a
+  sketch without a dialog they are Finish Sketch and Cancel Sketch.
   Right-click for the marking menu: eight commands around the cursor, plus a
   menu for whatever is under it. Near the window's bottom or right edge a menu opens above or
   to the left of the cursor, so it stays in view.
@@ -117,9 +121,12 @@ and command menus remain available.
 
 ### Colour themes
 
-General › **Theme** lists Dark, Light and System (follows the operating system), the built-in
-Gruvbox themes (dark and light, each in hard, normal and soft contrast) and any themes you have
-imported. A choice applies at once.
+Interface › **Theme** lists Dark, Light and System (follows the operating system), the built-in
+themes and any themes you have imported. A choice applies at once. Under the themes, **Viewport** draws the 3D view in the Light or Dark theme's colours whatever the window uses, for example the model on a light view in a dark window (**Follow theme**, the default, keeps the theme's own). The built-in themes are Gruvbox
+(dark and light, each in hard, normal and soft contrast), SolidCraft 95, Platinum 9, Cupertino,
+Green Phosphor, Amber Phosphor, Blueprint, One Dark, Tokyo Night, Solarized Light, Nord, High
+Contrast, Graphite, Nosferatu, Catppuccin Mocha, and Okibi and Akari (dark and light, from the
+[Okibi design system](https://kaievns.github.io/okibi-akiri-design-system-spec/)).
 
 A theme is a small JSON file that starts from the Dark or Light palette and changes any of its
 colours and corner radii by name:
@@ -135,7 +142,9 @@ colours and corner radii by name:
     "accent": "#83a598",
     "viewport_top": "#32302f",
     "viewport_bottom": "#32302f",
-    "triad": ["#fb4934", "#b8bb26", "#83a598"]
+    "axis_x": "#fb4934",
+    "axis_y": "#b8bb26",
+    "axis_z": "#83a598"
   },
   "radii": {
     "radius_sm": 2,
@@ -148,8 +157,11 @@ colours and corner radii by name:
 }
 ```
 
-Colours are `#rrggbb`, or `#rrggbbaa` for translucent ones. A few colours, such as the view
-triad's X, Y and Z, take a list. Any colour the file leaves out keeps the base palette's value.
+Colours are `#rrggbb`, or `#rrggbbaa` for translucent ones. A few colours, such as the four
+Continuity Analysis seams (`continuity`), take a list. Any colour the file leaves out keeps the
+base palette's value. `axis_x`, `axis_y` and `axis_z` colour every X, Y and Z axis: the origin,
+the view triad, the navigation cube and the Move gizmo. A file from an earlier version may set
+`triad` or `gizmo` instead; it still reads, and those colours now go to every axis.
 
 `radii` is optional. Its six keys above accept integers from 0 to 32 in logical UI points;
 zero makes square corners. Omitted keys keep today's base values: 4, 6, 8, 10, 6 and 7,

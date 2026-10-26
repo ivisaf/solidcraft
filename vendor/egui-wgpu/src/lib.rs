@@ -85,6 +85,10 @@ pub enum WgpuError {
     #[error(transparent)]
     RequestDeviceError(#[from] wgpu::RequestDeviceError),
 
+    /// SolidCraft: pipeline validation must return to the startup retry.
+    #[error("Could not create the egui renderer: {0}")]
+    CreateRendererError(wgpu::Error),
+
     #[error(transparent)]
     CreateSurfaceError(#[from] wgpu::CreateSurfaceError),
 
@@ -335,17 +339,23 @@ impl RenderState {
                         request_adapter(instance, power_preference, compatible_surface, &[]).await
                     }
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(native_adapter_selector) = _native_adapter_selector {
-                        native_adapter_selector(&available_adapters, compatible_surface)
-                            .map_err(WgpuError::CustomNativeAdapterSelectionError)
-                    } else {
-                        request_adapter(
-                            instance,
-                            power_preference,
-                            compatible_surface,
-                            &available_adapters,
-                        )
-                        .await
+                    {
+                        let selected = _native_adapter_selector
+                            .map(|select| select(&available_adapters, compatible_surface))
+                            .transpose()
+                            .map_err(WgpuError::CustomNativeAdapterSelectionError)?
+                            .flatten();
+                        if let Some(adapter) = selected {
+                            Ok(adapter)
+                        } else {
+                            request_adapter(
+                                instance,
+                                power_preference,
+                                compatible_surface,
+                                &available_adapters,
+                            )
+                            .await
+                        }
                     }
                 }?;
 
@@ -408,7 +418,25 @@ impl RenderState {
             ..options
         };
         startup_step(STEP_RENDERER, ""); // SolidCraft
+        // SolidCraft: capture errors on the real surface/device, including driver shader
+        // compilation failures, before wgpu's default uncaptured-error handler can panic.
+        // Await every scope (also on WebGPU); an invalid renderer is never handed to eframe.
+        let scopes = [
+            wgpu::ErrorFilter::OutOfMemory,
+            wgpu::ErrorFilter::Internal,
+            wgpu::ErrorFilter::Validation,
+        ]
+        .map(|filter| device.push_error_scope(filter));
         let renderer = Renderer::new(&device, target_format, options);
+        let mut failed = None;
+        for scope in scopes.into_iter().rev() {
+            if let Some(error) = scope.pop().await {
+                failed.get_or_insert(error);
+            }
+        }
+        if let Some(error) = failed {
+            return Err(WgpuError::CreateRendererError(error));
+        }
 
         // On wasm, depending on feature flags, wgpu objects may or may not implement sync.
         // It doesn't make sense to switch to Rc for that special usecase, so simply disable the lint.

@@ -24,6 +24,41 @@ flat pattern. Every copy takes further sheet metal features of its own. Mirrorin
 `combine` joins the two halves into one solid, which has no single sheet model yet; mirroring
 or patterning flange features themselves is not supported yet.
 
+An edge flange's `height` runs along the flange to its far edge. Where it is measured from is
+the feature's `height_from` (Height From in the Flange dialog): `outer` (the default, Outer
+Sharp) starts at the outer virtual sharp, where the lines of the base's and the flange's outer
+faces meet, so (R + T)·tan(θ/2) of it is bend before the flat leg starts (θ the bend angle, R
+the inner radius, T the thickness); `inner` (Inner Sharp) starts at the inner virtual sharp,
+R·tan(θ/2) before the leg; `tangent` is for bends past 90°, where the outer sharp runs far
+out: it starts at the line square to the flange that touches the outside of the bend, R + T
+before the leg. Up to 90° `tangent` is the outer sharp (at 90° the two are the same line, the
+base's outer face, so the leg does not jump as the angle passes 90°). A height shorter than
+what lies before the leg is refused with the smallest one that fits. With a 2 mm sheet and a
+2 mm radius, a 90° flange 20 high has a leg of 16 from the outer sharp or the tangent and 18
+from the inner sharp; at 120° it has a leg of 13.07 from the outer sharp, 16.54 from the inner
+sharp and 16 from the tangent.
+
+```json
+{"command":"sheet.flange","params":{"edges":[[50,0,2]],"height":20,"height_from":"inner"}}
+```
+
+Where an edge flange's bend starts is its `position` (Bend Position in the Flange dialog): how
+far inside the picked edge the base is cut back. `inside` (the default) puts the outer virtual
+sharp on the edge, (R + T)·tan(θ/2) inside it, so at 90° the flange's outer face is flush with
+the edge's face; `outside` (`sheet.flange` also takes `bend_outside` and saves it as `outside`) starts the bend at the edge, which
+leaves the base whole and the bend wholly outside; `middle` cuts back half of `inside`;
+`material_outside` puts the inner virtual sharp on the edge, R·tan(θ/2) inside it, so at 90°
+the flange's inner face is flush with the edge's face and its material is outside; `tangent`
+is for bends past 90°: it cuts back R + T, so the outside of the bend is tangent to the edge's
+face, touching it a quarter turn into the bend with nothing of the bend past it. At 90° that
+is `inside`. Below 90° the outside of the bend never turns parallel to the edge's face, so
+`tangent` cuts back (R + T)·sin θ instead: the bend's end is on the edge's face and the leg
+leans on out past it.
+
+```json
+{"command":"sheet.flange","params":{"edges":[[50,0,2]],"height":20,"angle":"120 deg","position":"tangent"}}
+```
+
 An edge flange takes its setback off its own edge only. Where that edge ends at an inside
 corner of the base (the base runs on past it, like the leg of an L), the rest of the base
 stays, and the rule's **bend relief** (`relief_width` and `relief_depth`; Relief Width and
@@ -117,6 +152,38 @@ per edge with an angle and a height box; an empty box takes the value above.
 {"command":"sheet.flange","params":{"edges":[[60,0,2],{"point":[120,45,2],"angle":"90 deg"},
  {"point":[60,90,2],"angle":"105 deg","height":"30 mm"},{"point":[0,45,2],"angle":"120 deg","height":"25 mm"}],
  "height":38.6,"angle":"75 deg"}}
+```
+
+An edge flange can bend more than once: `then` lists further bends, each an `angle` and a
+`height`, and each is a flange on the far edge of the one before it, made in the same command
+and undone with one step. It is the way to make a flap with two or more bends that is part of
+the same sheet (a Contour Flange is always a sheet of its own). The example bends the end edge of
+a wall 45° outward, then 45° again, the second leg 80 mm long. Each bend is a flange feature of
+its own in the timeline, so each can be edited there. In the Flange dialog, an edge flange has
+**Further Bends** under Bend Position: **Add bend** adds a row with an angle and a height, and the
+bin beside a row takes it out.
+
+```json
+{"command":"sheet.flange","params":{"edges":[[1,0,20]],"height":40,"angle":"45 deg",
+ "then":[{"angle":"45 deg","height":80}]}}
+```
+
+A further bend turns the way the one before it did. `"flip": true` on a bend turns it the other
+way, which makes an offset (a jog): bend 45° out, then 45° back, and the last leg runs parallel to
+the first. In the dialog each further bend has a **turns** choice, Same way or Other way.
+
+When the shape is easier to draw than to count out, **Path Flange** (`sheet.path_flange`) makes
+the same chain from a sketch. Sketch an open chain of lines on a plane across the edge (square to
+it), starting at the edge, then pick the edge and the lines. Each line becomes a flange as long
+as the line (measured like an edge flange's height: to the outer face from the virtual sharp),
+and each corner a bend. The first line's angle to the sheet sets the first bend, and the path's
+turns set which way each later bend goes, so a jog is just a path that turns back. Changing the
+sketch changes the flap. It is one feature in the timeline and part of the same sheet. Lines
+that run straight on from each other count as one; a line that does not turn from the sheet is
+refused, and so is a line too short for its bend. Arcs are not supported yet.
+
+```json
+{"command":"sheet.path_flange","params":{"edge":[1,0,20],"sketch":"Path","curves":["p1","p2"]}}
 ```
 
 A flange can also stand on the far edge of another flange: a return, such as a lip turned in

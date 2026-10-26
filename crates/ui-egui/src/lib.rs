@@ -12,6 +12,7 @@ use crate::ui_kit::{Container, Surface};
 pub mod access;
 pub mod agent_chat;
 pub mod agent_cursor;
+pub mod ai_connect;
 pub mod bom_panel;
 pub mod browser;
 pub mod browser_canvas;
@@ -89,6 +90,7 @@ pub mod install;
 pub mod issue_report;
 pub mod joint_drag;
 pub mod keymap;
+mod length_input;
 mod linked_source;
 #[cfg(test)]
 mod loft_rails_dialog_tests;
@@ -263,6 +265,7 @@ pub mod ui_kit;
 mod ui_kit_guard_tests;
 pub mod update;
 mod value_step;
+mod view_confirm;
 pub mod view_pick;
 pub mod viewport;
 mod viewport_layout;
@@ -358,6 +361,8 @@ pub struct Services {
     pub graphics_path: Option<String>,
     /// Linux: the window system this run uses, `wayland` or `x11` (Preferences shows it, #3083).
     pub window_system: Option<&'static str>,
+    /// Adapter names and descriptive labels from the desktop renderer's chosen backends.
+    pub graphics_adapters: Vec<(String, String)>,
     /// HTTPS GET for the update check (`update`); None: never check (browser, tests).
     pub http_get: Option<update::HttpGet>,
     /// HTTPS download to a file, with progress, for one-click updates (`update::install`).
@@ -382,6 +387,8 @@ pub struct Services {
 }
 
 pub struct SolveApp {
+    /// Compact browser embed: retain model panels and joint controls without application chrome.
+    pub embedded: bool,
     pub session: Session,
     pub ui: UiState,
     pub(crate) shell: shell::State,
@@ -448,6 +455,9 @@ pub struct SolveApp {
     /// thread, and those asked for meanwhile ([`deferred`]).
     pub deferred: Option<deferred::Deferred>,
     pub deferred_queue: Vec<(String, Value)>,
+    /// A feature started from a sketch while the marker rolls back, and that sketch: it starts
+    /// once the marker is back.
+    pub start_after_roll: Option<(String, u64)>,
     /// A delete's check of what it takes with it or breaks, computing off the window thread
     /// ([`deferred::DeleteCheck`], #2678).
     pub delete_check: Option<deferred::DeleteCheck>,
@@ -483,8 +493,12 @@ pub struct SolveApp {
     pub stand_up_occurrence: Option<u64>,
     /// The file's header names an exporter that saves Y up (SolidWorks): the offer says so.
     pub stand_up_reason: bool,
-    /// The anti-aliasing sample counts the graphics device supports (empty without a GPU).
+    /// The anti-aliasing sample counts the scene colour/depth formats support (empty without a GPU).
     pub msaa_supported: Vec<u32>,
+    /// The startup check selected 1x; Graphics explains the workaround.
+    pub msaa_compatibility: bool,
+    /// Startup fallback diagnostic, also shown in Graphics preferences.
+    pub graphics_fallback: Option<String>,
     /// Settings put back at start because they kept SolidCraft from starting, one line each,
     /// shown until dismissed (`prefs::show_reset_notice`).
     pub settings_reset: Vec<prefs::SettingReset>,
@@ -499,7 +513,7 @@ pub struct SolveApp {
     pub native_resize_border: bool,
     /// macOS: the traffic lights sit over the application bar's left end.
     pub integrated_titlebar: bool,
-    /// The desktop host installed a system File menu; omit the in-window duplicate.
+    /// The desktop host installed native menus alongside the application bar controls.
     pub native_file_menu: bool,
     /// Build bodies' display meshes on the CPU even where the GPU could (safe mode). Read by
     /// [`SolveApp::set_wgpu`].
@@ -522,6 +536,8 @@ pub struct SolveApp {
     pub agent: agent_cursor::AgentCursor,
     /// The agent chat panel (docs/design/in-app-agent-chat.md).
     pub agent_chat: agent_chat::AgentChat,
+    /// Making SolidCraft available to the AI apps installed here ([`ai_connect`]).
+    pub ai_connect: ai_connect::State,
     pending_shots: Vec<(u64, Option<String>, std::sync::mpsc::Sender<Value>, f64)>,
     shot_chat_turns: std::collections::HashMap<u64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
     queued_shots: Vec<(u64, f64, u32)>,
@@ -613,6 +629,7 @@ impl SolveApp {
             applying: None,
             deferred: None,
             deferred_queue: Vec::new(),
+            start_after_roll: None,
             delete_check: None,
             apply_off_thread: None,
             #[cfg(test)]
@@ -632,6 +649,8 @@ impl SolveApp {
             stand_up_occurrence: None,
             stand_up_reason: false,
             msaa_supported: Vec::new(),
+            msaa_compatibility: false,
+            graphics_fallback: None,
             settings_reset: Vec::new(),
             big_operation: false,
             autosave_minutes: 5.0,
@@ -646,6 +665,7 @@ impl SolveApp {
             synthetic_mods: egui::Modifiers::default(),
             control_rx: None,
             agent_chat: Default::default(),
+            ai_connect: Default::default(),
             control_held: Default::default(),
             control_job: None,
             control_answering: Vec::new(),
@@ -658,6 +678,7 @@ impl SolveApp {
             fitted: false,
             pending_fit: None,
             flat_view: Default::default(),
+            embedded: false,
             home: home::HomeState::default(),
             space_mouse: Default::default(),
             file_load: file_load::FileLoad::default(),
@@ -696,8 +717,9 @@ impl SolveApp {
 
     /// Draw the viewport on the GPU with the scene drawn offscreen: `depth_bits`/`stencil_bits`
     /// and `samples` are the scene's, while the window's pass (egui's) has no depth and one
-    /// sample. The scene keeps its depth and anti-aliasing; the UI pass pays for neither.
-    pub fn set_wgpu_split(&mut self, rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) {
+    /// sample. Native hosts check the installed renderer and fall back to 1x only when that
+    /// succeeds where multisampling fails. Returns the effective scene sample count.
+    pub fn set_wgpu_split(&mut self, rs: &egui_wgpu::RenderState, depth_bits: u8, stencil_bits: u8, samples: u32) -> u32 {
         let scene = crate::gpu::GpuTarget {
             format: rs.target_format,
             depth: egui_wgpu::depth_format_from_bits(depth_bits, stencil_bits),
@@ -706,11 +728,34 @@ impl SolveApp {
         };
         let window = crate::gpu::GpuTarget { format: rs.target_format, depth: None, samples: 1, tess: false };
         self.set_wgpu_targets(rs, scene, window);
+        self.viewport.gpu.map_or(samples, |g| g.samples)
     }
 
     fn set_wgpu_targets(&mut self, rs: &egui_wgpu::RenderState, scene: crate::gpu::GpuTarget, window: crate::gpu::GpuTarget) {
-        let (target, stats) = gpu::install(rs, scene, window, !self.cpu_meshing);
-        self.viewport.gpu = Some(target);
+        #[allow(unused_mut)] // Only native hosts can wait for the startup readback.
+        let (mut installed, stats) = gpu::install(rs, scene, window, !self.cpu_meshing);
+        #[cfg(not(target_arch = "wasm32"))]
+        if scene.depth.is_some() && window.depth.is_none() && window.samples == 1 {
+            let mut renderer = rs.renderer.write();
+            if let Some(res) = renderer.callback_resources.get_mut::<gpu::Renderer>() {
+                match res.check_msaa(&rs.device, &rs.queue) {
+                    Ok(solidcraft_gpu::view::MsaaCheck::Passed) => {}
+                    Ok(solidcraft_gpu::view::MsaaCheck::Fallback) => {
+                        installed.samples = 1;
+                        self.msaa_compatibility = true;
+                        eprintln!(
+                            "SolidCraft graphics: anti-aliasing check failed at {}x and passed at 1x; using 1x for this session",
+                            scene.samples
+                        );
+                    }
+                    Ok(solidcraft_gpu::view::MsaaCheck::FailedAtOne) => {
+                        eprintln!("SolidCraft graphics: anti-aliasing check also failed at 1x; keeping {}x", scene.samples);
+                    }
+                    Err(error) => eprintln!("SolidCraft graphics: anti-aliasing check error; keeping {}x: {error}", scene.samples),
+                }
+            }
+        }
+        self.viewport.gpu = Some(installed);
         self.viewport.draw_stats = Some(stats);
         render_workspace::invalidate_scene(self);
         let (samples, has_depth) = self.viewport.gpu.map_or((1, false), |g| (g.samples.max(1), g.depth.is_some()));
@@ -728,6 +773,7 @@ impl SolveApp {
             self.render_workspace.defer_path_host(key, move || solidcraft_gpu::path::host_on_adapter(&adapter).map_err(|e| e.to_string()));
         }
         render_workspace::sync_backend(self);
+        ai_connect::tick(self);
         self.msaa_supported = rs.msaa_supported.clone();
         let info = rs.adapter.get_info();
         self.help.gpu = Some(format!("{} ({:?}, {:?})", info.name.trim(), info.backend, info.device_type));
@@ -879,6 +925,11 @@ impl SolveApp {
                 if let Some(collapsed) = v.get("collapsed").and_then(Value::as_bool) {
                     self.preferences.timeline_collapsed = collapsed;
                 }
+            }
+            if id == "view.perspective"
+                && let Some(perspective) = v.get("enabled").and_then(Value::as_bool)
+            {
+                self.ui.perspective = perspective;
             }
             if matches!(id, "view.ambient_occlusion" | "view.graphics_preset") {
                 self.preferences.ambient_occlusion = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
@@ -1040,6 +1091,10 @@ impl SolveApp {
             }
             return;
         }
+        if id == "inspect.colored_components" {
+            drop(self.run(id, serde_json::json!({})));
+            return;
+        }
         if id == "material.properties.validate" {
             self.material_card_review = Some(material_card_review::ReviewWindow::default());
             self.home.open = false;
@@ -1057,6 +1112,10 @@ impl SolveApp {
         }
         if id == "view.ambient_occlusion" {
             let _ = self.run(id, json!({"enabled": !self.preferences.ambient_occlusion}));
+            return;
+        }
+        if id == "view.perspective" {
+            let _ = self.run(id, json!({"enabled": !self.ui.perspective}));
             return;
         }
         // Another command ends Edit Text (its dialog is not a feature edit to keep).
@@ -1078,8 +1137,17 @@ impl SolveApp {
         dim_view::cancel();
         self.tool = None;
         self.home.open = false;
+        if dialogs_sheet::start_export(self, id) {
+            return;
+        }
         if let Some(ext) = id.strip_prefix("sketch.insert_").filter(|e| matches!(*e, "dxf" | "svg")) {
             self.pick_open_command(id, json!({}), &[ext]);
+            return;
+        }
+        if id == "component.update_links" && !self.session.doc.links.is_empty() {
+            // Reading the linked designs again takes a while in a large assembly: off the window
+            // thread, the overlay naming the one being read (#5329).
+            let _ = file_load::begin_request(self, file_load::Request::new("", file_load::Kind::UpdateLinks));
             return;
         }
         if id == "component.insert_design" {
@@ -1171,8 +1239,22 @@ impl SolveApp {
             }
             return;
         }
+        let finished_sketch = self.session.active_sketch.filter(|_| ends_sketch(id) && self.interactive(id));
+        if finished_sketch.is_some() {
+            self.finish_sketch();
+            // A feature committed before the marker is back would go in where the sketch was.
+            if self.deferred.is_some() {
+                self.start_after_roll = finished_sketch.map(|sketch| (id.to_string(), sketch));
+                return;
+            }
+        }
+        self.start_interactive(id, finished_sketch);
+    }
+
+    /// The rest of [`SolveApp::start`], once any sketch `id` ends is finished.
+    pub(crate) fn start_interactive(&mut self, id: &str, finished_sketch: Option<u64>) {
         if let Some(spec) = solidcraft_engine::find_command(id)
-            && (tools::Tool::for_command(id).is_some() || dialogs::Dialog::for_command(self, id).is_some())
+            && self.interactive(id)
             && id != "sketch.create"
         {
             self.last_command = Some((spec.id.to_string(), spec.label.to_string()));
@@ -1206,7 +1288,7 @@ impl SolveApp {
                     | "sketch.constraint.tangent"
                     | "sketch.constraint.concentric"
                     | "sketch.constraint.collinear"
-            ) && let [solidcraft_engine::Sel::SketchCurve { id: a }, solidcraft_engine::Sel::SketchCurve { id: b }] =
+            ) && let [solidcraft_engine::Sel::SketchCurve { id: a, .. }, solidcraft_engine::Sel::SketchCurve { id: b, .. }] =
                 self.session.selection.as_slice()
                 && a != b
             {
@@ -1223,7 +1305,7 @@ impl SolveApp {
                     .selection
                     .iter()
                     .filter_map(|s| match s {
-                        solidcraft_engine::Sel::SketchCurve { id } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
+                        solidcraft_engine::Sel::SketchCurve { id, .. } | solidcraft_engine::Sel::SketchPoint { id } => Some(id.clone()),
                         _ => None,
                     })
                     .take(2)
@@ -1234,7 +1316,10 @@ impl SolveApp {
             self.set_status(tools::hint(id), false);
             return;
         }
-        if let Some(d) = dialogs::Dialog::for_command(self, id) {
+        if let Some(mut d) = dialogs::Dialog::for_command(self, id) {
+            if let Some(sketch) = finished_sketch {
+                d.take_sketch_profile(&self.session, sketch);
+            }
             // The pre-selection now belongs to the dialog's inputs.
             if d.wants_picks() && !self.session.selection.is_empty() {
                 let _ = self.session.execute("select.clear", &json!({}));
@@ -1248,6 +1333,11 @@ impl SolveApp {
             return;
         }
         let _ = self.run(id, json!({}));
+    }
+
+    /// Does starting `id` open a tool or a dialog?
+    fn interactive(&self, id: &str) -> bool {
+        tools::Tool::for_command(id).is_some() || dialogs::Dialog::for_command(self, id).is_some()
     }
 
     /// Edit a feature: sketches open in sketch mode; other features roll the
@@ -1397,7 +1487,7 @@ impl SolveApp {
     }
 
     pub fn set_status(&mut self, s: impl Into<String>, error: bool) {
-        let (text, at) = (s.into(), now_ms());
+        let (text, at) = (i18n::tr_diagnostic(&s.into()), now_ms());
         self.messages.push(&text, error, at);
         self.status = Some((text, at, error));
         self.status_undo = false;
@@ -1419,10 +1509,9 @@ impl SolveApp {
         file_load::begin(self, path, true);
     }
 
-    /// Insert a STEP file's bodies (an Import base feature) or a mesh file's meshes into the
-    /// current design.
+    /// Insert CAD bodies, meshes or sketch drawing geometry into the current design.
     pub fn insert_path(&mut self, path: &str) {
-        let cmd = if solidcraft_engine::io::is_mesh_path(path) { "file.insert_mesh" } else { "file.insert_step" };
+        let cmd = file_load::insert_command(path);
         let before: Vec<String> = self.session.world_state().bodies.iter().map(|b| b.name.clone()).collect();
         if let Ok(r) = self.run(cmd, json!({ "path": path })) {
             self.fit_view();
@@ -1433,10 +1522,11 @@ impl SolveApp {
         }
     }
 
-    /// A dropped file: a STEP or mesh file (3MF, STL, OBJ, glTF) joins a design that has features, anything else
-    /// opens.
+    /// A dropped CAD, mesh or drawing file joins a design that has features; otherwise it opens.
     pub fn drop_path(&mut self, path: &str) {
-        let import = solidcraft_engine::io::is_step_path(path) || solidcraft_engine::io::is_mesh_path(path);
+        let import = solidcraft_engine::io::is_step_path(path)
+            || solidcraft_engine::io::is_mesh_path(path)
+            || solidcraft_engine::cmd::drawing_import_command(path).is_some();
         if import && !self.session.doc.features.is_empty() {
             self.insert_path_async(path);
         } else {
@@ -1635,6 +1725,11 @@ impl SolveApp {
         self.cam_anim = None;
     }
 
+    /// Is the 3D view dark? As the window, unless Preferences give the view its own (#4146).
+    pub fn viewport_dark(&self) -> bool {
+        self.preferences.viewport_theme.dark().unwrap_or(self.ui.dark)
+    }
+
     /// Hand the view to an external navigation device without a pending mouse orbit or spin
     /// immediately taking it back on the next frame.
     pub fn begin_external_navigation(&mut self) {
@@ -1669,6 +1764,8 @@ impl SolveApp {
         open_meshing::refresh(self, ctx.input(|i| i.time));
         self.esc_handled = false;
         prefs::apply(self, ctx);
+        // The view's own dark or light only changes tokens, not egui's visuals: no restyle.
+        theme::set_viewport_dark(self.preferences.viewport_theme.dark());
         if !self.styled || theme::is_dark() != self.ui.dark || theme::vision() != self.preferences.color_vision {
             theme::set_dark(self.ui.dark);
             theme::set_vision(self.preferences.color_vision);
@@ -1699,7 +1796,9 @@ impl SolveApp {
             if !keymap::capturing(self) {
                 expression_complete::begin_frame(ctx);
             }
-            toolbar::shortcuts(self, ctx);
+            if !self.embedded {
+                toolbar::shortcuts(self, ctx);
+            }
         }
         recovery_ui::tick(self);
         open_elsewhere::tick(self, ctx);
@@ -1714,6 +1813,7 @@ impl SolveApp {
                 }
             }
         }
+        control::publish_design(self, &control::DESIGN_WATCH);
     }
 
     /// Inject synthetic events (one pointer event per frame).
@@ -1796,16 +1896,25 @@ impl SolveApp {
         if self.file_picker_busy() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
         }
+        control::publish_design(self, &control::DESIGN_WATCH);
         self.frame_ms = now_ms() - t0;
         frame_watch::end(self);
     }
 
     fn cad_ui(&mut self, ui: &mut egui::Ui, report_input: &mut Option<issue_report::CadInput>) {
+        if self.embedded {
+            self.ui.layout = shell::LayoutMode::Docked;
+            self.home.open = false;
+            self.ui.show_browser = true;
+            self.ui.show_timeline = true;
+        }
         self.ui.layout.publish(ui.ctx());
         scenario::clear_handles();
         self.poll_deferred(ui.ctx());
         self.poll_delete_check(ui.ctx());
-        toolbar::app_bar(self, ui);
+        if !self.embedded {
+            toolbar::app_bar(self, ui);
+        }
         issue_report::CadInput::block(self, ui, report_input);
         file_load::show(self, ui.ctx());
         open_meshing::show(self, ui.ctx());
@@ -1832,7 +1941,7 @@ impl SolveApp {
         let show_timeline = self.ui.show_timeline && !render_workspace::active(self);
         let left_timeline = show_timeline && self.preferences.timeline_left;
         timeline_left::animate_folds(self, ui.ctx());
-        if !floating {
+        if !floating && !self.embedded {
             toolbar::toolbar(self, ui);
         }
         theme::TabAccent::publish(self, ui.ctx());
@@ -1918,6 +2027,8 @@ impl SolveApp {
                     self.show_workspace(ui);
                 }
             });
+        // Before the dialog: a click on the view's OK or Cancel is for this frame's dialog.
+        view_confirm::show(self, ui.ctx());
         dialogs::show(self, ui.ctx());
         issue_report::CadInput::block(self, ui, report_input);
         sketch_palette::show(self, ui.ctx());
@@ -2139,3 +2250,12 @@ pub fn now_ms() -> f64 {
 mod picker_test_support;
 #[cfg(test)]
 mod test_support;
+
+/// Toolbar panels whose commands build features from the model; they finish an open sketch first.
+/// Construct, Inspect and Insert keep the sketch open.
+const SKETCH_ENDING_PANELS: [&str; 3] = ["CREATE", "MODIFY", "ASSEMBLE"];
+const SKETCH_TAB: &str = "SKETCH";
+
+fn ends_sketch(id: &str) -> bool {
+    solidcraft_engine::find_command(id).is_some_and(|c| c.tab != SKETCH_TAB && SKETCH_ENDING_PANELS.contains(&c.panel) && c.id != "sketch.create")
+}

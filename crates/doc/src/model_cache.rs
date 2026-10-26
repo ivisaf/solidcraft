@@ -618,7 +618,7 @@ impl Model {
             }
             results.push(result);
         }
-        let mut model = Model { results, param_errors, step_digests, frame_bodies, ..Model::default() };
+        let mut model = Model { results, param_errors, step_digests, context: ctx, frame_bodies, ..Model::default() };
         let unkept = model.results.iter().filter(|r| r.unkept).count();
         if unkept > 0 {
             // The features whose state the file did not keep, each evaluated again from the state
@@ -636,7 +636,7 @@ impl Model {
         let mut before = Arc::new(ModelState::default());
         if let Ok(mut cache) = model.cache.lock() {
             for (f, r) in doc.features.iter().zip(&model.results).filter(|(_, r)| !r.skipped && r.error.is_none()) {
-                let local = fingerprint(0, f, &vals, false, &model.step_digests) ^ placement_digest(doc, f, Some(&before));
+                let local = fingerprint(doc, 0, f, &vals, false, &model.step_digests) ^ placement_digest(doc, f, Some(&before));
                 cache.put(
                     cache_key(f, r.fingerprint, local, ctx, &before),
                     CachedEval {

@@ -236,6 +236,14 @@ fn editor_reserving(ui: &mut Ui, value: &mut String, hint: &str, completion: boo
         edit = edit.margin(egui::Margin { left: inset, right: inset.saturating_add(reserve.round() as i8), top: 0, bottom: 0 });
     }
     let response = ui.add_sized(vec2(width, row_height()), edit);
+    if completion && ui.is_enabled() {
+        ui.ctx().data_mut(|data| {
+            let id = egui::Id::new("sc_value_fields");
+            if data.get_temp::<Vec<(egui::Id, usize)>>(id).is_some() {
+                data.get_temp_mut_or_default::<Vec<(egui::Id, usize)>>(id).push((response.id, value.chars().count()));
+            }
+        });
+    }
     crate::theme::TabAccent::number_focus(ui, &response);
     t.input_bevel(ui, &response);
     let label = crate::i18n::tr_label(label(ui));
@@ -475,7 +483,10 @@ pub(crate) fn slider<T: egui::emath::Numeric>(ui: &mut Ui, value: &mut T, range:
         let slider = egui::Rect::from_min_size(response.rect.min, vec2(ui.spacing().slider_width, response.rect.height()));
         let mut background = ui.painter().clone();
         background.set_opacity(if ui.is_visible() { 1.0 } else { 0.0 });
-        background.rect_filled(slider, 0.0, t.dialog_body);
+        // At the top of the range egui's own handle reaches `slider.right()` exactly, and a fill
+        // that stops there leaves its last column showing beside the editor (#5708). The gap
+        // before the editor is `item_spacing.x`, so a pixel past the edge covers nothing else.
+        background.rect_filled(slider.with_max_x(slider.right() + 1.0), 0.0, t.dialog_body);
         // Match egui's native input range (handle_radius = thickness / 2.5), so the
         // painted thumb stays under the pointer even at the two ends of the range.
         let input_radius = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y) / 2.5;
@@ -510,6 +521,20 @@ pub(crate) fn scalar_field(ui: &mut Ui, value: &mut f64, range: std::ops::RangeI
 pub(crate) fn length_field(ui: &mut Ui, value: &mut f64, units: &str, decimals: u8) -> Response {
     let response = ui.add(length_drag(value, units, decimals));
     Tokens::get().input_bevel(ui, &response);
+    scenario::publish_target(&format!("dialog:length:{}", label(ui)), response.rect);
+    response
+}
+
+/// A model-space length with tool-specific bounds and drag step, shown in design units.
+pub(crate) fn bounded_length_field(
+    ui: &mut Ui,
+    value: &mut f64,
+    units: &str,
+    decimals: u8,
+    range: std::ops::RangeInclusive<f64>,
+    speed: f64,
+) -> Response {
+    let response = ui.add(length_drag(value, units, decimals).range(range).speed(speed));
     scenario::publish_target(&format!("dialog:length:{}", label(ui)), response.rect);
     response
 }
@@ -622,6 +647,8 @@ pub(crate) fn canvas_value_field(ui: &mut Ui, id: egui::Id, value: &mut String, 
     }
     let response = ui.add(edit);
     t.input_bevel(ui, &response);
+    let field = (ui.ctx().cumulative_pass_nr(), response.id, value.chars().count());
+    ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new("sc_canvas_value_focus"), field));
     response
 }
 

@@ -48,8 +48,11 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
         Sel::Face { body, index, point } => (*point, crate::dialogs::planar_face(&app.session, body, *index).map(|(_, n)| n)),
         Sel::Edge { body, index, point } => (*point, st.body(body).and_then(|b| edge_bisector(&b.mesh(), *index, *point))),
         Sel::Vertex { point, .. } => (*point, None),
-        Sel::SketchCurve { id } => {
-            let ss = st.sketches.iter().rev().find(|ss| ss.sketch.curve_index(id).is_some())?;
+        Sel::SketchCurve { id, sketch } => {
+            let ss = match sketch {
+                Some(k) => st.sketch(*k)?,
+                None => st.sketches.iter().rev().find(|ss| ss.sketch.curve_index(id).is_some())?,
+            };
             let pts = ss.sketch.polyline(ss.sketch.curve_index(id)?);
             let (mid, tangent) = poly_mid(&pts)?;
             // An offset's drag arrow: the in-plane direction the distance grows along. The
@@ -86,7 +89,7 @@ pub fn anchor(app: &SolveApp, d: &Dialog) -> Option<(Vec3, Option<Vec3>)> {
             let n = normal?;
             let plane = solidcraft_engine::geom::Plane::from_normal(at, n)?;
             let from = reference_height(app, d, "From Object", &plane, at).unwrap_or(0.0);
-            let offset = if start.trim().is_empty() { 0.0 } else { app.session.doc.eval(start, ValueKind::Length).ok()? };
+            let offset = if start.trim().is_empty() { 0.0 } else { crate::length_input::eval(&app.session.doc, start, ValueKind::Length).ok()? };
             (at + n * (from + offset), Some(n))
         }
         // A hole on a curved face drills against the face's normal where it was picked.
@@ -273,6 +276,12 @@ pub(crate) fn owns_pointer(app: &SolveApp, proj: &Proj, p: Pos2) -> bool {
     // The triad only registers an egui hit widget after a handle is under the pointer.
     // Test its geometry before navigation, including the first frame entering a handle.
     app.dialog.as_ref().and_then(|d| crate::dialogs_move::triad(app, d)).is_some_and(|t| crate::gizmo::contains_pointer(proj, &t, p))
+        || app
+            .dialog
+            .as_ref()
+            .and_then(|d| move_rotation(app, d, proj))
+            .and_then(|r| proj.to_screen(r.point(r.angle)))
+            .is_some_and(|end| egui::Rect::from_center_size(end, vec2(20.0, 20.0)).contains(p))
         || (app.dialog.is_none()
             && app.tool.is_none()
             && crate::browser::occurrence_triad_model(app).is_some_and(|t| crate::gizmo::contains_pointer(proj, &t, p)))
@@ -315,9 +324,11 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
             dragging = true;
         }
         // Read the triad again after the drag, so the box follows it in the same frame. Move
-        // types with no triad (Rotate, Point to Point, Point to Position) put the box on the
-        // picked bodies instead.
+        // types with no triad put the box on the picked bodies, or beside Rotate's handle
+        // once an axis is selected.
         let triad = crate::dialogs_move::triad(app, &d);
+        let rotation = draw_move_rotation(app, ui, painter, proj, &mut d);
+        dragging |= rotation.is_some_and(|(_, changed)| changed);
         let at = triad.map(|t| t.center).or_else(|| anchor(app, &d).map(|(base, _)| base));
         // Tab and Shift+Tab in the box show the next or previous value (Y after X; #4776),
         // keeping the keyboard in the box.
@@ -337,7 +348,8 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
             // Clear of the triad: its arrows reach LEN_PX and its rings RING of that, so a box
             // beside the centre would cover the handles the user is reaching for.
             let off = if triad.is_some() { vec2(crate::gizmo::LEN_PX as f32 + 16.0, -12.0) } else { vec2(16.0, -30.0) };
-            value_box_with(ui, label, value, bs + off, focus || dragging, true);
+            let box_at = rotation.map_or(bs + off, |(end, _)| end + vec2(16.0, -12.0));
+            value_box_with(ui, label, value, box_at, focus || dragging, true);
         }
         app.dialog = Some(d);
         return;
@@ -350,6 +362,59 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
     app.dialog = Some(d);
     // A Single hole's handles, over the depth arrow's stem: a press on a hole moves it.
     crate::hole_place::show(app, ui, painter, proj);
+}
+
+struct MoveRotation {
+    centre: Vec3,
+    axis: Vec3,
+    radius: f64,
+    angle: f64,
+}
+
+impl MoveRotation {
+    fn point(&self, angle: f64) -> Vec3 {
+        let e1 = self.axis.any_perp();
+        let e2 = self.axis.cross(e1);
+        self.centre + (e1 * angle.cos() + e2 * angle.sin()) * self.radius
+    }
+}
+
+fn move_rotation(app: &SolveApp, d: &Dialog, proj: &Proj) -> Option<MoveRotation> {
+    let Kind::Move { angle, .. } = &d.kind else { return None };
+    let (centre, axis) = crate::dialogs_move::rotation_axis(app, d)?;
+    let angle = crate::length_input::eval(&app.session.doc, angle, ValueKind::Angle).ok().filter(|a| a.is_finite()).unwrap_or(0.0);
+    Some(MoveRotation { centre, axis, radius: crate::gizmo::ring_radius(proj, centre)?, angle })
+}
+
+/// Reuse the angular handle's snapping and edge-on projection for Move's selected axis.
+fn draw_move_rotation(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj, d: &mut Dialog) -> Option<(Pos2, bool)> {
+    let r = move_rotation(app, d, proj)?;
+    let points: Vec<_> = (0..=64).filter_map(|i| proj.to_screen(r.point(i as f64 / 64.0 * std::f64::consts::TAU))).collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.8, Tokens::get().manipulator)));
+    let Kind::Move { angle, .. } = &mut d.kind else { return None };
+    let before = angle.clone();
+    let e1 = r.axis.any_perp();
+    // Keep full turns in the expression while the shared handle works near zero.
+    let boundary = r.angle % std::f64::consts::TAU;
+    let offset = r.angle - boundary;
+    let span = 2.0 * std::f64::consts::TAU;
+    let end = rotation_handle(
+        ui,
+        painter,
+        proj,
+        r.centre,
+        e1,
+        r.axis.cross(e1),
+        r.axis,
+        r.radius,
+        boundary,
+        1.0,
+        offset,
+        (offset - span, offset + span),
+        "move_rotate",
+        angle,
+    )?;
+    Some((end, *angle != before))
 }
 
 /// A round step for dragged values at this zoom (1, 2 or 5 times a power of ten).
@@ -378,10 +443,8 @@ pub(crate) fn along(proj: &Proj, pos: Pos2, base: Vec3, dir: Vec3) -> Option<f64
     Some((b * e - d) / den)
 }
 
-pub(crate) fn format_len(v: f64) -> String {
-    let s = format!("{v:.3}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    format!("{} mm", if s == "-0" { "0" } else { s })
+pub(crate) fn format_len(doc: &solidcraft_engine::doc::Document, v: f64) -> String {
+    crate::length_input::model(doc, v)
 }
 
 /// Where a sketch point picked as "<sketch id>:<point id>" (or a bare id of the active sketch) is.
@@ -469,16 +532,16 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
     }
     // Two sides: the second distance gets its own arrow, the other way from the first side.
     if let (Kind::Extrude { direction: crate::dialogs::TWO_SIDES | crate::dialogs::TWO_SIDES_REVERSED, distance2, .. }, Some(n)) = (&mut d.kind, dir)
-        && let Some(l2) = app.session.doc.eval(distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
+        && let Some(l2) = crate::length_input::eval(&app.session.doc, distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
     {
-        drag_arrow(ui, painter, proj, base, bs, -(n * sign), l2, true, egui::Id::new("sc_manipulator2"), half_height, distance2);
+        drag_arrow(&app.session.doc, ui, painter, proj, base, bs, -(n * sign), l2, true, egui::Id::new("sc_manipulator2"), half_height, distance2);
     }
     // A chamfer of two distances: Distance 2 gets its own arrow along the other face.
     let faces = chamfer_face_dirs(app, d, base);
     if let (Kind::Fillet { distance2, .. }, Some((_, t2))) = (&mut d.kind, faces)
-        && let Some(l2) = app.session.doc.eval(distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
+        && let Some(l2) = crate::length_input::eval(&app.session.doc, distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
     {
-        drag_arrow(ui, painter, proj, base, bs, t2, l2, false, egui::Id::new("sc_manipulator2"), half_height, distance2);
+        drag_arrow(&app.session.doc, ui, painter, proj, base, bs, t2, l2, false, egui::Id::new("sc_manipulator2"), half_height, distance2);
     }
     // A rectangular pattern's second direction gets its own arrow for Spacing 2 (#2462), as the
     // first direction's arrow sets Spacing.
@@ -488,9 +551,9 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
             _ => None,
         };
         if let Some(spacing2) = spacing2
-            && let Some(l2) = app.session.doc.eval(spacing2, ValueKind::Length).ok().filter(|v| v.is_finite())
+            && let Some(l2) = crate::length_input::eval(&app.session.doc, spacing2, ValueKind::Length).ok().filter(|v| v.is_finite())
         {
-            drag_arrow(ui, painter, proj, base, bs, n2, l2, false, egui::Id::new("sc_manipulator2"), half_height, spacing2);
+            drag_arrow(&app.session.doc, ui, painter, proj, base, bs, n2, l2, false, egui::Id::new("sc_manipulator2"), half_height, spacing2);
         }
     }
     // An offset plane shows where it will be: at the distance, or through the picked point.
@@ -500,7 +563,7 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
         _ => None,
     });
     if let (Kind::OffsetPlane { offset }, Some(n)) = (&d.kind, dir)
-        && let Some(off) = through.map(|p| (p - base).dot(n)).or_else(|| app.session.doc.eval(offset, ValueKind::Length).ok())
+        && let Some(off) = through.map(|p| (p - base).dot(n)).or_else(|| crate::length_input::eval(&app.session.doc, offset, ValueKind::Length).ok())
         && let Some(q) = offset_plane_quad(proj, base + n * off, n, half_height * 0.25)
     {
         painter.extend(projected_polygon(&q, t.construction_plane, Stroke::new(1.2, t.origin_plane_edge)));
@@ -512,14 +575,15 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
     let cam_right = app.cam.basis().0;
     if let (Kind::Extrude { direction: 0 | 1, distance, taper, taper_present, to_offset, .. }, Some(n)) = (&mut d.kind, dir) {
         let n = n * sign;
-        let span = to_span.map(|span| span.abs() + app.session.doc.eval(to_offset, ValueKind::Length).unwrap_or(0.0)).or(all_span);
-        if let Ok(l) = span.map(Ok).unwrap_or_else(|| app.session.doc.eval(distance, ValueKind::Length))
+        let span =
+            to_span.map(|span| span.abs() + crate::length_input::eval(&app.session.doc, to_offset, ValueKind::Length).unwrap_or(0.0)).or(all_span);
+        if let Ok(l) = span.map(Ok).unwrap_or_else(|| crate::length_input::eval(&app.session.doc, distance, ValueKind::Length))
             && l.is_finite()
             && l.abs() > 1e-9
             && let Some(e) = (cam_right - n * cam_right.dot(n)).normalized()
         {
             let px = 2.0 * half_height / f64::from(proj.rect.height().max(1.0));
-            let ang = app.session.doc.eval(taper, ValueKind::Angle).ok().filter(|v| v.is_finite()).unwrap_or(0.0);
+            let ang = crate::length_input::eval(&app.session.doc, taper, ValueKind::Angle).ok().filter(|v| v.is_finite()).unwrap_or(0.0);
             let before = taper.clone();
             let st = app.session.world_state();
             let regions: Vec<&solidcraft_engine::geom::Region2> = d
@@ -541,9 +605,13 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
         }
     }
     if let (Kind::Hole { depth, opts, .. }, Some(n)) = (&mut d.kind, dir) {
-        let l = if opts.all { 0.0 } else { app.session.doc.eval(depth, ValueKind::Length).ok().filter(|v| v.is_finite()).unwrap_or(0.0) };
+        let l = if opts.all {
+            0.0
+        } else {
+            crate::length_input::eval(&app.session.doc, depth, ValueKind::Length).ok().filter(|v| v.is_finite()).unwrap_or(0.0)
+        };
         let before = depth.clone();
-        drag_arrow(ui, painter, proj, base, bs, -n, l, false, egui::Id::new("sc_manipulator_depth"), half_height, depth);
+        drag_arrow(&app.session.doc, ui, painter, proj, base, bs, -n, l, false, egui::Id::new("sc_manipulator_depth"), half_height, depth);
         // Dragging the depth turns "through all" into a distance.
         if *depth != before {
             opts.all = false;
@@ -568,9 +636,20 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
         && let Some(l2) = app.session.doc.eval(distance2, ValueKind::Length).ok().filter(|v| v.is_finite())
     {
         let before = distance2.clone();
-        if let Some(ts) =
-            drag_arrow(ui, painter, proj, base, bs, -n, l2.abs(), false, egui::Id::new("sc_manipulator_offset2"), half_height, distance2)
-        {
+        if let Some(ts) = drag_arrow(
+            &app.session.doc,
+            ui,
+            painter,
+            proj,
+            base,
+            bs,
+            -n,
+            l2.abs(),
+            false,
+            egui::Id::new("sc_manipulator_offset2"),
+            half_height,
+            distance2,
+        ) {
             // Its own area and field, so it does not share Distance's focus or text.
             value_box_in(
                 ui,
@@ -585,7 +664,11 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
     }
     let Some((label, kind, value)) = d.primary() else { return };
     let len = all_span.or_else(|| {
-        if to_span.is_some() && value.trim().is_empty() { Some(0.0) } else { app.session.doc.eval(value, kind).ok().filter(|v| v.is_finite()) }
+        if to_span.is_some() && value.trim().is_empty() {
+            Some(0.0)
+        } else {
+            crate::length_input::eval(&app.session.doc, value, kind).ok().filter(|v| v.is_finite())
+        }
     });
     let before = value.clone();
     let mut box_at = bs + vec2(16.0, -30.0);
@@ -594,15 +677,28 @@ fn draw(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj: &Proj,
         let baseline = to_span.map(f64::abs).unwrap_or(0.0);
         // Through All already supplies a reach per side; dragging switches to an entered distance.
         let half = if all_span.is_some() { l } else { l * symmetric_scale };
-        let mut shown_value = format_len(half + baseline);
+        let mut shown_value = format_len(&app.session.doc, half + baseline);
         let original_shown = shown_value.clone();
         let dragged = if to_span.is_some() || symmetric_scale != 1.0 { &mut shown_value } else { &mut *value };
-        if let Some(ts) = drag_arrow(ui, painter, proj, base, bs, n, half + baseline, signed, egui::Id::new("sc_manipulator"), half_height, dragged) {
+        if let Some(ts) = drag_arrow(
+            &app.session.doc,
+            ui,
+            painter,
+            proj,
+            base,
+            bs,
+            n,
+            half + baseline,
+            signed,
+            egui::Id::new("sc_manipulator"),
+            half_height,
+            dragged,
+        ) {
             if (to_span.is_some() || symmetric_scale != 1.0)
                 && shown_value != original_shown
-                && let Ok(v) = app.session.doc.eval(&shown_value, ValueKind::Length)
+                && let Ok(v) = crate::length_input::eval(&app.session.doc, &shown_value, ValueKind::Length)
             {
-                *value = format_len((v - baseline) / symmetric_scale);
+                *value = format_len(&app.session.doc, (v - baseline) / symmetric_scale);
             }
             if symmetric && let Some(bt) = proj.to_screen(base - n * half) {
                 arrow(painter, bs, bt, t.manipulator);
@@ -720,6 +816,7 @@ fn to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 /// pointer does. Returns the tip's screen position.
 #[allow(clippy::too_many_arguments)]
 fn drag_arrow(
+    doc: &solidcraft_engine::doc::Document,
     ui: &mut egui::Ui,
     painter: &egui::Painter,
     proj: &Proj,
@@ -768,7 +865,7 @@ fn drag_arrow(
         if !signed {
             v = v.max(if free { 1e-3 } else { step });
         }
-        *value = format_len(v);
+        *value = format_len(doc, v);
         ts = tip(v)?;
     }
     // Paint the value just read from this frame's pointer, including the value box anchor.
@@ -818,7 +915,7 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
         })
         .collect();
     let Some(&(_, _, a0, b0)) = edges.first() else { return false };
-    let eval = |e: &str| app.session.doc.eval(e, ValueKind::Length).ok().filter(|v| v.is_finite());
+    let eval = |e: &str| crate::length_input::eval(&app.session.doc, e, ValueKind::Length).ok().filter(|v| v.is_finite());
     let style = d.extra.get("type").and_then(Value::as_str).unwrap_or("constant").to_string();
     // Each edge's spline with the end its positions start from; the spline the handles edit,
     // whether it starts at the first edge's far end, and whether it is still the taper's.
@@ -957,12 +1054,12 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
         Some(Edit::Set(k, v)) if !taper => {
             if k == 0 {
                 if let Kind::Fillet { radius, .. } = &mut d.kind {
-                    *radius = format_len(v);
+                    *radius = format_len(&app.session.doc, v);
                 }
             } else if let Some(Value::Array(rs)) = d.extra.get_mut("radii")
                 && let Some(slot) = rs.get_mut(k - 1)
             {
-                *slot = json!(format_len(v));
+                *slot = json!(format_len(&app.session.doc, v));
             }
             None
         }
@@ -982,9 +1079,9 @@ fn radius_spline_handles(app: &SolveApp, ui: &mut egui::Ui, painter: &egui::Pain
         d.extra.remove("fit");
         d.extra.insert("knots".into(), json!(law.knots));
         d.extra.insert("swap_ends".into(), json!(swap));
-        d.extra.insert("radii".into(), json!(law.radii.iter().skip(1).map(|r| format_len(*r)).collect::<Vec<_>>()));
+        d.extra.insert("radii".into(), json!(law.radii.iter().skip(1).map(|r| format_len(&app.session.doc, *r)).collect::<Vec<_>>()));
         if let Kind::Fillet { radius, .. } = &mut d.kind {
-            *radius = format_len(law.radii.first().copied().unwrap_or(0.0));
+            *radius = format_len(&app.session.doc, law.radii.first().copied().unwrap_or(0.0));
         }
     }
     true
@@ -1224,7 +1321,7 @@ fn draw_revolve(
                     .extra
                     .get("angle2")
                     .and_then(|value| value.as_str())
-                    .and_then(|value| app.session.doc.eval(value, ValueKind::Angle).ok())
+                    .and_then(|value| crate::length_input::eval(&app.session.doc, value, ValueKind::Angle).ok())
                     .unwrap_or(0.0);
                 let range = if extent.sweep < 0.0 { (-std::f64::consts::TAU, 0.0) } else { (0.0, std::f64::consts::TAU) };
                 if let Kind::Revolve { angle, .. } = &mut d.kind {
@@ -1353,8 +1450,13 @@ fn revolve_display_extent(app: &SolveApp, d: &Dialog, axis: (Vec3, Vec3)) -> Opt
     let angles = if to_mode {
         (0.0, None)
     } else {
-        let angle = app.session.doc.eval(angle, ValueKind::Angle).ok()?;
-        let other = d.extra.get("angle2").map(|value| app.session.doc.eval(value.as_str().unwrap_or_default(), ValueKind::Angle)).transpose().ok()?;
+        let angle = crate::length_input::eval(&app.session.doc, angle, ValueKind::Angle).ok()?;
+        let other = d
+            .extra
+            .get("angle2")
+            .map(|value| crate::length_input::eval(&app.session.doc, value.as_str().unwrap_or_default(), ValueKind::Angle))
+            .transpose()
+            .ok()?;
         (angle, other)
     };
     solidcraft_engine::doc::revolve_extent_with_convention(
@@ -1519,9 +1621,9 @@ mod tests {
         assert_eq!(snap_step(40.0), 1.0);
         assert_eq!(snap_step(100.0), 2.0);
         assert_eq!(snap_step(4.0), 0.1);
-        assert_eq!(format_len(12.0), "12 mm");
-        assert_eq!(format_len(-2.5), "-2.5 mm");
-        assert_eq!(format_len(-0.0001), "0 mm");
+        assert_eq!(format_len(&solidcraft_engine::doc::Document::default(), 12.0), "12 mm");
+        assert_eq!(format_len(&solidcraft_engine::doc::Document::default(), -2.5), "-2.5 mm");
+        assert_eq!(format_len(&solidcraft_engine::doc::Document::default(), -0.0001), "-0.0001 mm");
     }
 }
 

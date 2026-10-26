@@ -211,17 +211,47 @@ fn exact_extend_ellipse_preserves_support_target_and_history() {
 }
 
 #[test]
-fn exact_extend_arc_rejects_interior_hit_atomically() {
+fn exact_extend_arc_closes_round_a_cutter_inside_its_own_sweep() {
     let mut s = new_sketch();
     let arc = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[10,0],"end":[0,10],"connect":false}))["curves"])[0].clone();
     let x = 50.0_f64.sqrt();
+    // A cutter crossing the circle at 45°: inside the arc's own quarter, so it is not on the path
+    // the extension takes round the other way.
     let cutter = ids(&run(&mut s, "sketch.line", json!({"points":[[x,5],[x,9]],"connect":false,"infer":false}))["curves"])[0].clone();
     run(&mut s, "sketch.constraint.fix", json!({"entity":cutter}));
-    let before = s.doc.to_json();
-    let history = s.undo.len();
-    assert!(s.execute("sketch.extend", &json!({"curve":arc,"at":[10,0]})).is_err());
-    assert_eq!(s.doc.to_json(), before);
-    assert_eq!(s.undo.len(), history);
+    let before = sketch(&s);
+    run(&mut s, "sketch.extend", json!({"curve":arc,"at":[10,0]}));
+    let sk = sketch(&s);
+    let ci = sk.curve_index(&arc).expect("the arc");
+    // Nothing stops the extension, so the arc keeps its quarter...
+    assert!(matches!(sk.shape(ci), Some(solidcraft_sketch::Shape::Round { sweep, .. }) if (sweep - std::f64::consts::FRAC_PI_2).abs() < 1e-9));
+    // ...and a new arc runs from its far end back round to close the circle.
+    assert_eq!(sk.curves.len(), before.curves.len() + 1);
+    let sh = sk.shape(sk.curves.len() - 1).expect("the closing arc");
+    assert!(matches!(sh, solidcraft_sketch::Shape::Round { sweep, .. } if (sweep - 3.0 * std::f64::consts::FRAC_PI_2).abs() < 1e-9), "{sh:?}");
+    assert!(sh.dist(Vec2::new(10.0, 0.0)) < 1e-6 && sh.dist(Vec2::new(0.0, 10.0)) < 1e-6, "{sh:?}");
+}
+
+#[test]
+fn arc_extend_with_nothing_in_the_way_closes_into_a_full_circle() {
+    let mut s = new_sketch();
+    let arc = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[10,0],"end":[0,10],"connect":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let ci = before.curve_index(&arc).expect("the arc");
+    assert!(profiles(&s).is_empty(), "an arc alone bounds nothing");
+    // The preview shows the whole circle: the closing arc from the growing end to the far end.
+    let preview = super::extend_arc_preview(&before, ci, Vec2::new(10.0, 0.0)).expect("a closing preview");
+    assert!(preview.first().is_some_and(|p| p.dist(Vec2::new(10.0, 0.0)) < 1e-6), "the preview starts at the growing end: {preview:?}");
+    assert!(preview.last().is_some_and(|p| p.dist(Vec2::new(0.0, 10.0)) < 1e-6), "and ends on the arc's far end: {preview:?}");
+
+    run(&mut s, "sketch.extend", json!({"curve": arc, "at": [10, 0]}));
+
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), before.curves.len() + 1, "a new arc closes the circle");
+    assert_eq!(sk.points.len(), before.points.len(), "it joins the arc's own far end instead of laying a second point over it");
+    let area = profiles(&s);
+    assert_eq!(area.len(), 1, "the two arcs bound one disc: {area:?}");
+    assert!((area[0] - std::f64::consts::PI * 100.0).abs() < 1e-3, "{area:?}");
 }
 
 #[test]
@@ -396,17 +426,105 @@ fn extend_with_nothing_in_the_way_adds_the_line_the_preview_shows() {
 }
 
 #[test]
-fn exact_extend_refuses_ambiguous_stop_without_history_change() {
+fn line_extend_joins_a_stop_that_is_another_curves_end() {
+    // The end being extended already carries geometry (a horizontal line meets it there), so the
+    // extension is a new line. The first stop on the way is the end of another line: the new line
+    // joins that point instead of refusing or laying a second point over it.
     let mut s = new_sketch();
-    run(&mut s, "sketch.line", json!({"points":[[0,0],[5,0]],"connect":false,"infer":false}));
+    let vertical = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[0,45],[15,45]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let top = ids(&run(&mut s, "sketch.line", json!({"points":[[0,47],[10,47]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let stop = before.resolve_point(&format!("{top}.start")).expect("the top line's start");
+    assert!(before.point(stop).is_some_and(|p| p.dist(Vec2::new(0.0, 47.0)) < 1e-9));
+    let (curves, points) = (before.curves.len(), before.points.len());
+    let ci = before.curve_index(&vertical).expect("the vertical line");
+    let preview = super::extend_preview(&before, ci, Vec2::new(0.0, 45.0));
+
+    run(&mut s, "sketch.extend", json!({"curve": vertical, "at": [0,45]}));
+
+    assert!(preview.is_some_and(|q| q.dist(Vec2::new(0.0, 47.0)) < 1e-6), "the preview shows the line to the stop: {preview:?}");
+
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), curves + 1, "the extension is a new line");
+    assert_eq!(sk.points.len(), points, "the extension joins the point that is there");
+    assert!(matches!(sk.curves[sk.curves.len() - 1].kind, CurveKind::Line { b, .. } if b == stop), "the new line ends on the existing point");
+
+    // A free end moves onto the point that is there, and is held to it instead of doubling it.
+    let mut s = new_sketch();
+    let vertical = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[0,45]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let top = ids(&run(&mut s, "sketch.line", json!({"points":[[0,47],[10,47]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let stop = before.resolve_point(&format!("{top}.start")).expect("the top line's start");
+    run(&mut s, "sketch.extend", json!({"curve": vertical, "at": [0,45]}));
+    let sk = sketch(&s);
+    assert_eq!((sk.curves.len(), sk.points.len()), (before.curves.len(), before.points.len()), "the line itself reaches the point");
+    let end = sk.resolve_point(&format!("{vertical}.end")).expect("the line's end");
+    assert!(sk.point(end).is_some_and(|p| p.dist(Vec2::new(0.0, 47.0)) < 1e-9), "{end}");
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::Coincident { p, q } if (p, q) == (end, stop) || (p, q) == (stop, end))),
+        "the end is held to the point that was already there"
+    );
+}
+
+#[test]
+fn extend_joins_the_end_of_a_freeform_curve() {
+    // A line whose end is free grows onto a spline's start instead of laying a second point over
+    // the spline's own end.
+    let mut s = new_sketch();
+    let line = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[5,0]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let spline = ids(&run(&mut s, "sketch.spline.fit_point", json!({"points":[[10,0],[15,5],[20,0]],"connect":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let stop = before.resolve_point(&format!("{spline}.start")).expect("the spline's start");
+    run(&mut s, "sketch.extend", json!({"curve": line, "at": [5,0]}));
+    let sk = sketch(&s);
+    assert_eq!((sk.curves.len(), sk.points.len()), (before.curves.len(), before.points.len()));
+    let end = sk.resolve_point(&format!("{line}.end")).expect("the line's end");
+    assert!(
+        sk.point(end).zip(sk.point(stop)).is_some_and(|(a, b)| a.dist(b) < 1e-9),
+        "the line ends on the spline's own point: {:?} / {:?}",
+        sk.point(end),
+        sk.point(stop)
+    );
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::Coincident { p, q } if (p, q) == (end, stop) || (p, q) == (stop, end))),
+        "the end is held to the spline's point"
+    );
+
+    // An arc whose end is free grows onto a conic's start the same way.
+    let mut s = new_sketch();
+    let arc = ids(&run(&mut s, "sketch.arc.center_point", json!({"center":[0,0],"start":[10,0],"end":[0,10],"connect":false}))["curves"])[0].clone();
+    let conic =
+        ids(&run(&mut s, "sketch.conic", json!({"start":[0,-10],"end":[-20,-10],"apex":[-10,-20],"rho":0.5,"connect":false}))["curves"])[0].clone();
+    let before = sketch(&s);
+    let stop = before.resolve_point(&format!("{conic}.start")).expect("the conic's start");
+    run(&mut s, "sketch.extend", json!({"curve": arc, "at": [10,0]}));
+    let sk = sketch(&s);
+    assert_eq!((sk.curves.len(), sk.points.len()), (before.curves.len(), before.points.len()));
+    let end = sk.resolve_point(&format!("{arc}.start")).expect("the arc's start");
+    assert!(sk.point(end).is_some_and(|p| p.dist(Vec2::new(0.0, -10.0)) < 1e-6), "{end}");
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::Coincident { p, q } if (p, q) == (end, stop) || (p, q) == (stop, end))),
+        "the arc ends on the conic's own point"
+    );
+}
+
+#[test]
+fn exact_extend_takes_one_of_two_stops_at_the_same_distance() {
+    // A vertical line and a diagonal cross the line's support at the same point: two curves stop
+    // the extension equally far out. Either stop is the same point, so the extension takes it
+    // instead of refusing to choose, and the preview shows the line the command adds.
+    let mut s = new_sketch();
+    let line = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[5,0]],"connect":false,"infer":false}))["curves"])[0].clone();
     run(&mut s, "sketch.line", json!({"points":[[10,-5],[10,5]],"connect":false,"infer":false}));
     run(&mut s, "sketch.line", json!({"points":[[8,-2],[12,2]],"connect":false,"infer":false}));
-    let before = s.doc.to_json();
-    let history = s.undo.len();
-    let error = s.execute("sketch.extend", &json!({"curve":"l1","at":[5,0]})).unwrap_err();
-    assert!(error.to_string().contains("multiple curves"), "{error}");
-    assert_eq!(s.doc.to_json(), before);
-    assert_eq!(s.undo.len(), history);
+    let before = sketch(&s);
+    let ci = before.curve_index(&line).expect("the line");
+    let preview = super::extend_preview(&before, ci, Vec2::new(5.0, 0.0)).expect("a preview");
+    assert!(preview.dist(Vec2::new(10.0, 0.0)) < 1e-9, "{preview:?}");
+    run(&mut s, "sketch.extend", json!({"curve":line,"at":[5,0]}));
+    let sk = sketch(&s);
+    let end = sk.point(sk.resolve_point(&format!("{line}.end")).expect("the line's end")).expect("a point");
+    assert!(end.dist(Vec2::new(10.0, 0.0)) < 1e-6, "{end:?}");
 }
 
 #[test]
@@ -514,6 +632,102 @@ fn offset_chain_mirror_patterns_move_scale() {
     let cp = ids(&r["curves"])[0].clone();
     let sk = sketch(&s);
     assert!(sk.center(sk.curve_index(&cp).unwrap()).unwrap().dist(Vec2::new(-110.0, 0.0)) < 1e-7);
+}
+
+/// #4645: rotating a constrained 40 × 10 rectangle turns it at its size. Horizontal and vertical
+/// relations and dimensions swap at odd quarter turns, stay at half turns and go at other angles;
+/// lengths stay. A rotated copy is unconstrained and leaves the original as it was.
+#[test]
+fn move_rotation_turns_axis_constraints() {
+    for (angle, swap) in [(90.0, Some(true)), (-90.0, Some(true)), (450.0, Some(true)), (180.0, Some(false)), (30.0, None)] {
+        for dims in ["none", "length", "horizontal"] {
+            for copy in [false, true] {
+                let at = format!("angle={angle}, dims={dims}, copy={copy}");
+                let mut s = new_sketch();
+                let r = run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [40, 10]}));
+                let source = ids(&r["curves"]);
+                if dims != "none" {
+                    for (i, value, ty) in [(0, 40, dims), (1, 10, if dims == "length" { "length" } else { "vertical" })] {
+                        run(&mut s, "sketch.dimension", json!({"entities": [source[i]], "value": value, "type": ty}));
+                    }
+                }
+                let before = sketch(&s);
+                let out = run(&mut s, "sketch.move", json!({"entities": source, "angle": angle, "center": [0, 0], "copy": copy}));
+                assert_eq!(out["sketch"]["solved"], true, "{at}: {out}");
+                let after = sketch(&s);
+                let (sin, cos) = f64::to_radians(angle).sin_cos();
+                for (i, id) in ids(&out["curves"]).iter().enumerate() {
+                    let new = after.curve_index(id).unwrap();
+                    let old = before.curves[before.curve_index(&source[i]).unwrap()].kind.point_ids();
+                    for (p, q) in old.iter().zip(&after.curves[new].kind.point_ids()) {
+                        let p = before.point(*p).unwrap();
+                        let expected = Vec2::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos);
+                        assert!(after.point(*q).unwrap().dist(expected) < 1e-6, "{at}: {after:?}");
+                    }
+                    let horizontal_source = i % 2 == 0;
+                    let axes: Vec<bool> = after
+                        .constraints
+                        .iter()
+                        .filter_map(|c| match c.kind {
+                            ConstraintKind::Horizontal { l } if l == new => Some(true),
+                            ConstraintKind::Vertical { l } if l == new => Some(false),
+                            _ => None,
+                        })
+                        .collect();
+                    let expected = match (copy, swap) {
+                        (false, Some(swap)) => vec![horizontal_source ^ swap],
+                        _ => vec![],
+                    };
+                    assert_eq!(axes, expected, "{at}: line {i}");
+                }
+                let measured: Vec<(&str, f64)> = after.constraints[if copy { before.constraints.len() } else { 0 }..]
+                    .iter()
+                    .filter_map(|c| match c.kind {
+                        ConstraintKind::Length { value, .. } => Some(("length", value)),
+                        ConstraintKind::DistanceX { value, .. } => Some(("x", value)),
+                        ConstraintKind::DistanceY { value, .. } => Some(("y", value)),
+                        _ => None,
+                    })
+                    .collect();
+                let expected: Vec<(&str, f64)> = match (copy, dims, swap) {
+                    (true, ..) | (_, "none", _) => vec![],
+                    (_, "length", _) => vec![("length", 40.0), ("length", 10.0)],
+                    (_, _, Some(true)) => vec![("y", 40.0), ("x", 10.0)],
+                    (_, _, Some(false)) => vec![("x", 40.0), ("y", 10.0)],
+                    (_, _, None) => vec![],
+                };
+                assert_eq!(measured, expected, "{at}");
+                if copy {
+                    assert_eq!(&after.points[..before.points.len()], before.points.as_slice(), "{at}");
+                    assert_eq!(&after.constraints[..before.constraints.len()], before.constraints.as_slice(), "{at}");
+                }
+            }
+        }
+    }
+}
+
+/// #4645: a line's angle dimension turns with the line, and so does its parameter.
+#[test]
+fn move_rotation_turns_line_angle_dimension() {
+    let mut s = new_sketch();
+    let r = run(&mut s, "sketch.line", json!({"points": [[0, 0], [20, 0]], "connect": false}));
+    let line = ids(&r["curves"]).remove(0);
+    run(&mut s, "sketch.dimension", json!({"entities": [line], "type": "angle", "value": 30}));
+    let length = {
+        let sk = sketch(&s);
+        let ends = sk.curves[sk.curve_index(&line).unwrap()].kind.point_ids();
+        sk.point(ends[0]).unwrap().dist(sk.point(ends[1]).unwrap())
+    };
+    let out = run(&mut s, "sketch.move", json!({"entities": [line], "angle": 90, "center": [0, 0]}));
+    assert_eq!(out["sketch"]["solved"], true, "{out}");
+    let sk = sketch(&s);
+    let c = sk.constraints.iter().find(|c| matches!(c.kind, ConstraintKind::LineAngle { .. })).unwrap();
+    let value = if let ConstraintKind::LineAngle { value, .. } = c.kind { value } else { f64::NAN };
+    assert!(close(value, 120f64.to_radians()), "{value}");
+    assert_eq!(s.doc.param(c.param.as_deref().unwrap()).unwrap().expr, "120 deg");
+    let ends = sk.curves[sk.curve_index(&line).unwrap()].kind.point_ids();
+    let d = sk.point(ends[1]).unwrap() - sk.point(ends[0]).unwrap();
+    assert!(close(d.len(), length) && close(d.angle(), 120f64.to_radians()), "{d:?}");
 }
 
 /// #1485: after a circle is trimmed between two construction lines, clicking the trimmed end
@@ -2395,4 +2609,51 @@ fn freeform_chain_offsets_take_the_straight_pieces_of_the_chain_along() {
     let curves = ids(&out["curves"]);
     assert!(!curves.is_empty(), "{out}");
     certified(&s, &curves);
+}
+
+/// The arc's counter-clockwise sweep from its stored start to its end, degrees, from `sketch.inspect`.
+fn arc_sweep_deg(si: &Value, id: &str) -> f64 {
+    let c = si["curves"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap();
+    let at = |k: &str| Vec2::new(c[k][0].as_f64().unwrap(), c[k][1].as_f64().unwrap());
+    let (centre, a, b) = (at("center_at"), at("start_at"), at("end_at"));
+    ((b - centre).angle() - (a - centre).angle()).rem_euclid(std::f64::consts::TAU).to_degrees()
+}
+
+#[test]
+fn a_fillet_stays_a_quarter_arc_when_its_corner_is_pinned_or_dragged_to_the_other_side() {
+    let mut s = new_sketch();
+    run(&mut s, "sketch.line", json!({"points": [[10, 10], [40, 10], [40, 30]]}));
+    let f = run(&mut s, "sketch.fillet", json!({"point": "l1.end", "radius": 5}));
+    let arc = ids(&f["curves"])[0].clone();
+    run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "l1"}));
+    run(&mut s, "sketch.constraint.horizontal_vertical", json!({"line": "l2"}));
+    let curve = |si: &Value, id: &str| si["curves"].as_array().unwrap().iter().find(|c| c["id"] == id).unwrap().clone();
+    // Pin the vertical line's far end below the horizontal line: the corner mirrors, and the
+    // fillet is the quarter arc inside the mirrored corner (its lines leave it, none cuts
+    // through it).
+    run(&mut s, "sketch.point", json!({"point": [40, -20], "id": "q"}));
+    run(&mut s, "sketch.constraint.fix", json!({"entity": "q"}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "l2.end", "b": "q"}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert!((arc_sweep_deg(&si, &arc) - 90.0).abs() < 1e-6, "{}", arc_sweep_deg(&si, &arc));
+    assert_eq!(curve(&si, &arc)["center_at"], json!([35.0, 5.0]), "{}", curve(&si, &arc));
+    assert_eq!(curve(&si, "l2")["start_at"], json!([40.0, 5.0]), "{}", curve(&si, "l2"));
+    // Dragging the horizontal line's far end through the corner would push the line through its
+    // fillet: the drag stops at the arc.
+    let d = run(&mut s, "sketch.drag", json!({"entity": "l1.start", "from": [10, 10], "to": [70, 10]}));
+    assert!(d["reached"].as_f64().unwrap() < 0.5, "{d}");
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    let l1 = curve(&si, "l1");
+    assert!(l1["start_at"][0].as_f64().unwrap() <= 35.0 + 1e-6, "{l1}");
+    assert!((arc_sweep_deg(&si, &arc) - 90.0).abs() < 1e-6, "{}", arc_sweep_deg(&si, &arc));
+    assert_eq!(curve(&si, &arc)["center_at"], json!([35.0, 5.0]), "{}", curve(&si, &arc));
+    // Pinned on the far side instead, the corner mirrors again and the fillet follows.
+    run(&mut s, "sketch.point", json!({"point": [70, 10], "id": "r"}));
+    run(&mut s, "sketch.constraint.fix", json!({"entity": "r"}));
+    run(&mut s, "sketch.constraint.coincident", json!({"a": "l1.start", "b": "r"}));
+    let si = run(&mut s, "sketch.inspect", json!({}));
+    assert!((arc_sweep_deg(&si, &arc) - 90.0).abs() < 1e-6, "{}", arc_sweep_deg(&si, &arc));
+    assert_eq!(curve(&si, &arc)["center_at"], json!([45.0, 5.0]), "{}", curve(&si, &arc));
+    assert_eq!(curve(&si, "l1")["end_at"], json!([45.0, 10.0]), "{}", curve(&si, "l1"));
+    assert_eq!(curve(&si, "l2")["start_at"], json!([40.0, 5.0]), "{}", curve(&si, "l2"));
 }

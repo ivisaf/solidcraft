@@ -36,6 +36,12 @@ fillet, chamfer, offset (O), mirror, patterns, move/copy and scale. With trim on
 piece to remove it, or press and drag a path across several pieces: the ones it crosses light up
 and all go when you let go, in one undo step (`sketch.trim.path`).
 
+Tools with several variants (line and midpoint line; two-point, three-point, centre and rounded
+rectangle; the circle, arc, slot, polygon and spline variants) share one toolbar button with a
+drop-down. The button and the family's shortcut start the variant you picked last, so a
+shortcut such as L can start a Midpoint Line; pick the variant you want from the drop-down to
+change it ([Keyboard shortcuts](shortcuts.md)).
+
 The Sketch Palette's **Construction Geometries** option hides construction curves while you
 work. A hidden construction curve cannot be picked by a click or by a box. Nothing invisible
 is selectable. The option belongs to one sketch and is saved with the design. Centerlines are
@@ -204,7 +210,7 @@ The solver is SolidCraft's own (damped Gauss–Newton with degree-of-freedom ana
 coincident, horizontal/vertical, parallel, perpendicular, tangent, equal, concentric, collinear,
 midpoint, symmetry, fix, curvature (G2) and polygon. **Sketch Dimension** (D) adds linear,
 aligned, horizontal, vertical, point-to-line, line-to-circle, point-to-circle, circle-to-circle,
-radius, diameter and angle dimensions. Each is a parameter
+radius, diameter, arc length and angle dimensions. For an arc's length, click the arc and then one of its end points. Each is a parameter
 (`d1`, `d2`, …), so it can hold an expression.
 
 Press D, click what you want to measure and type the value: as soon as the click settles the

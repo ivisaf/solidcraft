@@ -7,11 +7,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod agent_setup;
 pub mod batch_params;
 pub mod capture;
 pub mod cmd;
 pub mod control_auth;
 pub mod control_pending;
+pub mod cosmetic_threads;
 pub mod crash;
 pub mod frames;
 pub mod fuzz;
@@ -39,7 +41,7 @@ use solidcraft_geom::Vec3;
 
 pub use cmd::{
     CamPlayback, CamPreview, CommandInfo, CommandSpec, PreviewHeights, auto_operation, cam_heights, cam_list_ready, cam_playback, cam_preview,
-    cam_selection_heights, cam_slow, command_specs, extrude_reach, find_command, standard_view,
+    cam_selection_heights, cam_slow, command_specs, extrude_reach, find_command, resolve_design_links, standard_view,
 };
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;
@@ -117,9 +119,12 @@ pub enum Sel {
     Feature {
         id: u64,
     },
-    /// A sketch curve or point (by id) of the active sketch.
+    /// A sketch curve or point (by id) of the active sketch. A curve picked into a dialog also
+    /// names its `sketch`: curve ids repeat from one sketch to the next (#3726).
     SketchCurve {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sketch: Option<u64>,
     },
     SketchPoint {
         id: String,
@@ -148,6 +153,10 @@ pub enum Sel {
     },
     /// An origin plane (XY, XZ, YZ) or a construction plane (by feature name).
     Plane {
+        name: String,
+    },
+    /// A construction point, by feature name.
+    ConstructionPoint {
         name: String,
     },
     /// An origin axis (X, Y, Z) or a construction axis (by feature name).
@@ -288,6 +297,11 @@ pub struct Session {
     pub log: Vec<String>,
     /// Increments on every document change (views use it to refresh).
     pub revision: u64,
+    /// This open design's id for programs that follow it (`document.revision`, #6646): kept
+    /// while it stays open, through saves and renames; another for each design started or opened.
+    pub document_id: String,
+    /// The design as `document.revision` last saw it, and the revision it gave it.
+    pub(crate) followed: Option<cmd::inspect::Followed>,
     /// Project a face's edges into a sketch created on it (the default; `sketch.auto_project`).
     pub auto_project: bool,
     /// How calls that break a command's parameter contract are treated (off by default). It
@@ -333,6 +347,8 @@ pub struct Session {
     pub section: Option<(Vec3, Vec3)>,
     /// Whether the section's cut faces are hatched (`inspect.section`'s `hatch`; on by default).
     pub section_hatch: bool,
+    /// Component identification colours are enabled when present; view state only.
+    pub colored_components: Option<()>,
     /// Surface analysis shading the model (zebra, draft, curvature map).
     pub analysis: Option<SurfaceAnalysis>,
     /// The seams `inspect.continuity` last measured, for the viewport to shade. View state: not
@@ -444,12 +460,15 @@ impl Default for Session {
 }
 
 impl Session {
+    /// A session on an in-memory document. For a document read from a file, use
+    /// [`Self::opened_at`] so relative component links are resolved against that file.
     pub fn new(doc: Document) -> Self {
         Self::opened(doc, None)
     }
 
     /// A session on `doc` whose evaluation is the model its file kept (`saved`), when that is
     /// `doc`'s evaluation ([`Model::adopt`]); otherwise the timeline is evaluated.
+    /// Use [`Self::opened_at`] when the document's file location is known.
     /// `SOLIDCRAFT_NO_MODEL_CACHE` set always evaluates.
     pub fn opened(mut doc: Document, saved: Option<&solidcraft_doc::SavedModel>) -> Self {
         // The session keeps what is hidden (an undo step of its own); the design file carries it.
@@ -479,6 +498,8 @@ impl Session {
             open_preview: None,
             log: Vec::new(),
             revision: 1,
+            document_id: cmd::inspect::new_document_id(),
+            followed: None,
             auto_project: true,
             param_check: schema::ParamCheck::Off,
             live_links: None,
@@ -499,6 +520,7 @@ impl Session {
             sketch_clipboard: None,
             section: None,
             section_hatch: true,
+            colored_components: None,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -609,14 +631,9 @@ impl Session {
         Ok(())
     }
 
-    /// The design as a file holds it: the document with what is hidden in it.
+    /// The design as its current file holds it, including visibility and relative link paths.
     pub fn design(&self) -> std::borrow::Cow<'_, Document> {
-        if self.visibility.is_empty() {
-            return std::borrow::Cow::Borrowed(&*self.doc);
-        }
-        let mut doc = (*self.doc).clone();
-        doc.visibility = self.visibility.clone();
-        std::borrow::Cow::Owned(doc)
+        self.design_at(self.path.as_deref())
     }
     /// The design has changes not in its file (a recovered design).
     pub fn mark_unsaved(&mut self) {
@@ -896,7 +913,9 @@ impl Session {
             .features
             .iter()
             .filter_map(|feature| match &feature.kind {
-                solidcraft_doc::FeatureKind::Sketch { sketch, .. } if sketch.patterns.iter().any(|p| p.count_expression.is_some()) => {
+                solidcraft_doc::FeatureKind::Sketch { sketch, .. }
+                    if sketch.patterns.iter().any(|p| p.count_expression.is_some() || !p.expressions.is_empty()) =>
+                {
                     Some((feature.id, sketch.clone()))
                 }
                 _ => None,
@@ -905,7 +924,7 @@ impl Session {
         if !updated.is_empty() {
             let (vals, _) = self.doc.param_values();
             for (_, sketch) in &mut updated {
-                self.doc.apply_pattern_quantities(&vals, sketch)?;
+                self.doc.apply_pattern_values(&vals, sketch)?;
             }
         }
         for (id, sketch) in updated {
@@ -1142,6 +1161,8 @@ impl Session {
             saved: self.saved.clone(),
             log: Vec::new(),
             revision: self.revision,
+            document_id: self.document_id.clone(),
+            followed: None,
             auto_project: self.auto_project,
             param_check: self.param_check,
             live_links: None,
@@ -1162,6 +1183,7 @@ impl Session {
             sketch_clipboard: self.sketch_clipboard.clone(),
             section: None,
             section_hatch: true,
+            colored_components: None,
             analysis: None,
             continuity: Vec::new(),
             checkpoints: Vec::new(),
@@ -1411,11 +1433,18 @@ pub(crate) type SketchValues = std::collections::BTreeMap<u64, std::collections:
 fn own_values(sk: &solidcraft_sketch::Sketch) -> std::collections::BTreeMap<String, f64> {
     let mut values: std::collections::BTreeMap<_, _> =
         sk.constraints.iter().filter(|c| c.param.is_some() && !c.driven).filter_map(|c| Some((c.id.clone(), c.kind.value()?))).collect();
-    for pattern in &sk.patterns {
-        if pattern.count_expression.is_some()
-            && let solidcraft_sketch::SketchPatternKind::Circular { count, .. } = pattern.kind
-        {
-            values.insert(format!("pattern:{}:count", pattern.id), count as f64);
+    for p in &sk.patterns {
+        use solidcraft_sketch::SketchPatternKind;
+        let inputs = match p.kind {
+            SketchPatternKind::Circular { count, angle, .. } => vec![("count", count as f64), ("angle", angle)],
+            SketchPatternKind::Rectangular { count, spacing, count2, spacing2, .. } => {
+                vec![("count", count as f64), ("spacing", spacing), ("count2", count2 as f64), ("spacing2", spacing2)]
+            }
+        };
+        for (key, value) in inputs {
+            if p.expressions.contains_key(key) || (key == "count" && p.count_expression.is_some()) {
+                values.insert(format!("{}.{}", p.id, key), value);
+            }
         }
     }
     values
@@ -1442,6 +1471,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         units,
         metadata,
         params,
+        text_params,
         features: _,
         marker,
         next_id,
@@ -1468,6 +1498,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         named_views,
         visibility,
         manufacture,
+        next_component_color_index,
     } = a;
     *render == b.render
         && *format == b.format
@@ -1476,6 +1507,7 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *units == b.units
         && *metadata == b.metadata
         && *params == b.params
+        && *text_params == b.text_params
         && *marker == b.marker
         && *next_id == b.next_id
         && *reserved_body_names == b.reserved_body_names
@@ -1501,4 +1533,5 @@ fn same_but_features(a: &Document, b: &Document) -> bool {
         && *named_views == b.named_views
         && *visibility == b.visibility
         && *manufacture == b.manufacture
+        && *next_component_color_index == b.next_component_color_index
 }

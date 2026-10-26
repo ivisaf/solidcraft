@@ -276,6 +276,8 @@ Original package sources from https://github.com/emilk/egui/tree/0.36.2/crates/e
 with both original licence texts retained. No images or bundled documentation are copied.
 
 SolidCraft changes:
+- `src/setup.rs`, `src/lib.rs`: let a named adapter selector defer to the normal wgpu
+  request when the requested card is unavailable or incompatible with the window surface.
 - `src/lib.rs`: use 1x MSAA on the selected OpenGL adapter before creating pipelines,
   exposing the effective sample count so host paint callbacks can match it.
 - `src/winit.rs`: use that same effective count for depth and resolve attachments.
@@ -316,3 +318,7 @@ SolidCraft changes:
   submits nothing (`DeviceLost::probe`), so a device the driver lost is found by that
   submission rather than by the first queue write, which panicked inside wgpu-core
   (`PendingWrites::activate`, #4172).
+- `src/lib.rs`: creation of the egui renderer uses validation, internal and out-of-memory
+  error scopes, awaiting every result before returning it. A refused UI pipeline (D3D12
+  `egui_pipeline` shader compilation, #6648) returns `WgpuError::CreateRendererError` through
+  eframe so startup can retry another backend instead of invoking wgpu's panic handler.

@@ -632,7 +632,7 @@ fn selection_actions(app: &mut SolveApp, ui: &mut egui::Ui, groups: &[solidcraft
             ui.separator();
         }
         if crate::context_menu::button(ui, "Delete Selected Folders", "delete")
-            .on_hover_text("Keep their features and nested folders in the history")
+            .on_hover_text(crate::i18n::tr("timeline.delete_folders_tip"))
             .clicked()
         {
             let ids = app.tree.picked_timeline_groups.clone();
@@ -1082,7 +1082,7 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
         });
         if response.clicked() && on_fold {
             crate::browser::toggle(app, &pattern_key, true);
-        } else if response.clicked() {
+        } else if response.clicked() && !crate::timeline::pick_feature_into_dialog(app, *id, ui.input(|i| i.modifiers)) {
             select_item(app, ui, TimelineItem::Feature(*id), &order);
         }
         if response.double_clicked() && !on_fold {
@@ -1241,6 +1241,24 @@ fn vertical_features(app: &mut SolveApp, ui: &mut egui::Ui, names: bool) {
 mod tests {
     use super::*;
     use crate::scenario::{Harness, handle_at};
+
+    #[test]
+    fn history_folder_delete_tooltip_uses_the_language() {
+        let mut h = Harness::new();
+        h.app.preferences.timeline_left = true;
+        h.app.preferences.language = "ja".into();
+        h.app.run("timeline.group", json!({"name": "My folder"})).unwrap();
+        h.frames(4);
+        h.step(&json!({"click": {"handle": "timeline-folder:My folder"}, "button": "right"})).unwrap();
+        let label = crate::i18n::Locale::for_language("ja").label("Delete Selected Folders");
+        let [x, y] = h.widget(label).unwrap();
+        h.call("ui.move", json!({"x": x, "y": y}));
+        h.frames(90);
+        let output = egui::FullOutput { shapes: h.shapes.clone(), ..Default::default() };
+        let texts: Vec<_> = crate::test_support::text_shapes(&output).map(|t| t.galley.text()).collect();
+        assert!(texts.contains(&"フィーチャーと入れ子のフォルダーを履歴に残します"), "{texts:?}");
+        assert_eq!(h.app.session.doc.timeline_groups.len(), 1, "hovering does not delete the folder");
+    }
 
     #[test]
     fn docking_previews_match_all_three_destinations_and_stacked_collapse_shares_height() {

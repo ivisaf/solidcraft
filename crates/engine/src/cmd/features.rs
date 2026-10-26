@@ -19,7 +19,7 @@ const BOX_CONTRACT: TypedContract<BoxParams> = TypedContract::new();
 const EXTRUDE_CONTRACT: TypedContract<ExtrudeParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
-    CommandSpec::new("solid.extrude", "Extrude", crate::checked!("solid.extrude", EXTRUDE_CONTRACT, extrude))
+    CommandSpec::new("solid.extrude", "Extrude", crate::checked!("solid.extrude", extrude))
         .at("SOLID", "CREATE")
         .icon("extrude")
         .key("E")
@@ -35,7 +35,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("sweep")
         .params("sketch: profile sketch; profiles?; path_sketch: sketch; path: [curve ids in order]; orientation?: perpendicular (default: square to the path, turning with it) | parallel (as drawn: the profile moves without turning; the path must keep crossing its plane) | [x,y,z] (square to the path, its turn about the path fixed by this direction); twist?: angle expr (the profile turns this much about the path over its length; within 4 turns); scale?: expr (the profile's scale at the end, linear along the path; 0.01…100); rails?: [{sketch?: sketch (default path_sketch), curves: [curve ids in order]}] (guide rails, one or two, each meeting every plane square to the path once along it, from the end nearest the path's start: one rail turns the profile so its point where the rail starts stays on the rail and scales it with the rail's distance from the path; two rails carry it between them, its points where they start staying on both; rails take the default orientation, no twist and no scale, and a path without sharp corners); rail_fit?: scale (default: the profile grows and shrinks evenly) | stretch (only across to the rail, between the rails); operation?, targets?, name?, body_name?"),
     CommandSpec::new("solid.loft", "Loft", loft).at("SOLID", "CREATE").icon("loft").params("sections: [{sketch, profiles?} | {sketch, point: id} (an apex)] (2…50, in order; matching hole counts, no holes at an apex); rails?: [{sketch, curves: [ids in order]}] (one or two guide rails from the first section to the last, through every section's outline: the loft follows them between the sections; not with sections that have holes); rail_fit?: scale|stretch (default scale: with one rail the sections grow evenly with the rail's distance from their middle, with two with the distance between the rails; stretch: only that way); operation?, targets?, name?, body_name?"),
-    CommandSpec::new("solid.box", "Box", crate::checked!("solid.box", BOX_CONTRACT, prim_box))
+    CommandSpec::new("solid.box", "Box", crate::checked!("solid.box", prim_box))
         .at("SOLID", "CREATE")
         .icon("box")
         .contract(&BOX_CONTRACT)
@@ -1208,7 +1208,8 @@ fn edge_points(s: &Session, p: &Value, cmd: &str) -> Result<Vec<Vec3>> {
     // of the body the feature names, or of any body: a pick far from every edge would round
     // whichever edge is nearest (#783). Each body's edges are worked out once.
     let named = str_(p, "body").filter(|n| st.body(n).is_some());
-    let mut candidates: Option<Vec<(f64, Vec<solidcraft_kernel::EdgeInfo>)>> = None;
+    // Per body: its size, its edges' polylines and which of them are seams.
+    let mut candidates: Option<Vec<(f64, Vec<Vec<Vec3>>, Vec<bool>)>> = None;
     let mut out = Vec::new();
     for e in a {
         let pt = match edge_ref_form(e).map_err(|why| bad(cmd, why))? {
@@ -1229,27 +1230,69 @@ fn edge_points(s: &Session, p: &Value, cmd: &str) -> Result<Vec<Vec3>> {
                 .filter(|b| named.is_none_or(|n| b.name == n) && !b.body.is_mesh())
                 .filter_map(|b| {
                     let size = b.body.size();
-                    b.body.edges((size * 2e-3).max(1e-3)).ok().map(|edges| (size, edges))
+                    let tol = (size * 2e-3).max(1e-3);
+                    // The display mesh flags seams (a smooth surface meeting itself, as down the side
+                    // of a cylinder), which nobody means by a pick where they end.
+                    match b.body.display_mesh(tol) {
+                        Ok(m) => Some((size, m.edges, m.seams)),
+                        Err(_) => b.body.edges(tol).ok().map(|edges| (size, edges.into_iter().map(|e| e.points).collect(), Vec::new())),
+                    }
                 })
                 .collect()
         });
+        // A point where several edges meet (a corner) is ambiguous: the kernel would round one of
+        // them, picked silently (#5173). Edges that carry straight on through the point (the two
+        // halves of a circle) are one edge to whoever picked it, and seams don't count. Directions
+        // come from the polylines' end chords, which lean off a curve's tangent: within about 45°
+        // of opposite counts as carrying on (edges at a real corner are far from opposite).
         let mut nearest = f64::INFINITY;
-        let on_edge = bodies.iter().any(|(size, edges)| {
-            let d = edges
-                .iter()
-                .flat_map(|e| e.points.windows(2))
-                .filter_map(|w| Some(pt.dist_to_segment(*w.first()?, *w.get(1)?)))
-                .fold(f64::INFINITY, f64::min);
-            nearest = nearest.min(d);
-            d <= size * 0.05 + 1e-3
-        });
-        if !on_edge && !bodies.is_empty() {
+        let mut near = Vec::new();
+        for (size, edges, seams) in bodies.iter() {
+            for (i, points) in edges.iter().enumerate() {
+                let d = points.windows(2).filter_map(|w| Some(pt.dist_to_segment(*w.first()?, *w.get(1)?))).fold(f64::INFINITY, f64::min);
+                nearest = nearest.min(d);
+                if d <= size * 0.05 + 1e-3 {
+                    near.push((d, seams.get(i).copied().unwrap_or(false), leaving(points, pt)));
+                }
+            }
+        }
+        let matches = near.len();
+        let mut meeting: Vec<Option<Vec3>> = near.iter().filter(|(d, seam, _)| !seam && *d <= nearest + 1e-3).map(|(_, _, dir)| *dir).collect();
+        let mut chains = 0usize;
+        while let Some(dir) = meeting.pop() {
+            chains += 1;
+            if let Some(dir) = dir
+                && let Some(j) = meeting.iter().position(|o| o.is_some_and(|other| other.dot(dir) < -0.7))
+            {
+                meeting.swap_remove(j);
+            }
+        }
+        if chains > 1 {
+            return Err(bad(
+                cmd,
+                format!("[{}, {}, {}] is where {chains} edges meet: give a point along one edge, such as its midpoint", pt.x, pt.y, pt.z),
+            ));
+        }
+        if matches == 0 && !bodies.is_empty() {
             let far = if nearest.is_finite() { format!("the nearest edge is {nearest:.3} mm away") } else { "there is no edge".to_string() };
             return Err(bad(cmd, format!("no edge at [{}, {}, {}]: {far}", pt.x, pt.y, pt.z)));
         }
         out.push(pt);
     }
     Ok(out)
+}
+
+/// The direction an edge's polyline leaves `pt` in, when `pt` is one of its ends; `None` when
+/// the edge runs on through `pt`.
+fn leaving(points: &[Vec3], pt: Vec3) -> Option<Vec3> {
+    let (first, last) = (points.first()?, points.last()?);
+    if first.dist(pt) <= 1e-3 {
+        (*points.get(1)? - *first).normalized()
+    } else if last.dist(pt) <= 1e-3 {
+        (*points.get(points.len().checked_sub(2)?)? - *last).normalized()
+    } else {
+        None
+    }
 }
 
 /// An edge reference as given, before it is looked up: see [`edge_points`].
@@ -1481,6 +1524,57 @@ fn combine(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn move_bodies(s: &mut Session, p: &Value) -> Result<Value> {
+    if let Some(plan) = crate::frames::placements_moved(s, p) {
+        return move_placements(s, p, plan);
+    }
+    move_body_feature(s, p)
+}
+
+/// A move of several placements of one part (`frames::placements_moved`, #4768): each placement
+/// moved in the world by the move's translation and turn (about the world origin, as the Move
+/// feature turns bodies), and the root component's bodies listed moved as bodies, in one step.
+fn move_placements(s: &mut Session, p: &Value, plan: crate::frames::PlacementMove) -> Result<Value> {
+    let cmd = "solid.move";
+    let length = |v: &Value| -> Result<f64> {
+        match v {
+            Value::Number(n) => n.as_f64().ok_or_else(|| bad(cmd, "translate entries must be numbers or expressions")),
+            Value::String(e) => s.doc.eval(e, Kind::Length).map_err(|e| bad(cmd, format!("translate: {e}"))),
+            _ => Err(bad(cmd, "translate entries must be numbers or expressions")),
+        }
+    };
+    let translate = match p.get("translate") {
+        Some(Value::Array(a)) if a.len() == 3 => a.iter().map(length).collect::<Result<Vec<f64>>>()?,
+        None => vec![0.0; 3],
+        _ => return Err(bad(cmd, "`translate` must be [x, y, z]")),
+    };
+    let angle = match expr(p, "angle") {
+        Some(a) => Some(s.doc.eval(&a, Kind::Angle).map_err(|e| bad(cmd, format!("angle: {e}")))?),
+        None => None,
+    };
+    let spec = super::find_command("occurrence.move").ok_or_else(|| EngineError::UnknownCommand("occurrence.move".into()))?;
+    let mut moved = Vec::new();
+    for path in &plan.paths {
+        let Some(&occurrence) = path.last() else { continue };
+        let mut q = json!({"occurrence": occurrence, "path": path, "space": "world", "translate": translate});
+        if let Some(axis) = p.get("axis") {
+            q["axis"] = axis.clone();
+        }
+        if let Some(angle) = angle {
+            q["angle"] = json!(angle);
+        }
+        spec.run_nested(s, &q)?;
+        moved.push(occurrence);
+    }
+    let mut out = json!({"placements": moved});
+    if !plan.bodies.is_empty() {
+        let mut rest = p.clone();
+        rest["bodies"] = json!(plan.bodies);
+        out["bodies"] = move_body_feature(s, &rest)?;
+    }
+    Ok(out)
+}
+
+fn move_body_feature(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "solid.move";
     let bodies = string_list(p, "bodies");
     if bodies.is_empty() {
@@ -2127,6 +2221,14 @@ fn hole(s: &mut Session, p: &Value) -> Result<Value> {
         (_, Some(x)) => x,
         (None, None) => return Err(bad(cmd, "`position` must be [x, y, z], numbers or length expressions (or give `sketch` and `points`)")),
     };
+    // A hole starts on a face: a point off every face (past a body's edge) would drill a hole
+    // nobody picked, and cutting across an edge that way is slow.
+    if points.is_none() && !super::face::on_a_face(s, position) {
+        return Err(bad(
+            cmd,
+            format!("`position` [{}, {}, {}] is not on a face of a body; pick a point on the face to drill", position.x, position.y, position.z),
+        ));
+    }
     let direction = match (p.get("direction").and_then(vec3), &points) {
         (None, Some((sp, _, d))) if !sp.single => *d,
         (d, _) => match d {

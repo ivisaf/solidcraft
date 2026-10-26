@@ -15,14 +15,18 @@ new uses of it anywhere else. Public docs/web/Flatpak deployments use project Pa
 `/solidcraft/`; do not add permanent old-name Pages aliases.
 
 ## Start every session here
-1. Read `plan/STATUS.md` (current milestone, next task), then the task in `plan/execution-plan.md`
-   and the relevant `plan/architecture.md` section.
-2. Kernel and library decisions: `plan/adr/0001-geometry-kernel.md` (what we may depend on, what
-   is rejected for licence reasons).
-3. Follow the autonomous operation protocol (`plan/execution-plan.md` §6). Don't stop to ask
-   unless it lists the decision as the owner's.
+1. What to work on: [ROADMAP.md](ROADMAP.md) (status and milestones), "Where help is wanted most"
+   in CONTRIBUTING.md, and the open issues labelled `help wanted`, `good first issue` and
+   `needs-triage`. Check what is already open first (below).
+2. How the code fits together: [docs/architecture.md](docs/architecture.md) (the layer table) and
+   "How the code is laid out" in CONTRIBUTING.md. Kernel work is paused ("Kernel work is paused"
+   in CONTRIBUTING.md).
+3. What we may depend on: the licence rules under Non-negotiables below, `deny.toml`, and
+   `cargo xtask licences --check`. Only `crates/kernel` may use `truck`.
+4. Work on your own: when the code, the docs and these rules settle a question, act on it. Ask on
+   the issue or the PR only when the answer changes what users see or what the change covers.
 
-`plan/` is gitignored (local only).
+Maintainers may keep local notes in `plan/` (gitignored); nothing in this file depends on them.
 
 ## Never crash
 People trust SolidCraft with their designs; a crash loses their work. **This outranks feature work.**
@@ -82,7 +86,10 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
 - **Everything is a command.** User-visible behaviour = a command in `crates/engine/src/cmd/*`
   (`CommandSpec`: id = our own dotted, lower-case id `<area>.<thing>[.<variant>]` such as
   `solid.extrude` or `sketch.rectangle.two_point`, never another product's command id; label;
-  toolbar tab and panel; icon; shortcut; params doc; `enabled`; JSON `run`) + tests. The toolbar,
+  toolbar tab and panel; icon; shortcut; params doc; `enabled`; JSON `run`) + input and output
+  schemas (a contract and a reply type in `crates/engine/src/schema/`, registered with
+  `checked!`, `.contract` and `.output`; a command should have them, and a test warns
+  without them (it will become required); `schema/unconverted.txt` only shrinks; how: docs/book/src/dev/schemas.md) + tests. The toolbar,
   dialogs, sketch tools, palette, scripts, CLI and control channel all reach the same commands.
 - **Programmatic calls never open dialogs.** `engine.execute` runs the JSON form; only toolbar
   clicks (`ui.start`) start interactive tools and dialogs, which then run commands.
@@ -110,7 +117,9 @@ People trust SolidCraft with their designs; a crash loses their work. **This out
   run service workers as JavaScript) and the small inline scripts in `apps/solidcraft-web/index.html`.
   Keep them minimal; `cargo xtask web-offline-test` covers the service worker.
 - **Quality gates** before every commit: `cargo xtask ci` (fmt, clippy -D warnings, tests,
-  assets, layers). Commit after every feature arc that builds.
+  assets, layers). Commit after every feature arc that builds. The gate reads the working tree,
+  so do not switch branches while it runs: it compiles the other branch's code and fails on a
+  change that is not in the PR. Run it in the background and wait for its log.
 - **Publishing**: the repository is github.com/tangency-labs/solidcraft. Changes land through
   **pull requests** and the **merge queue**: push a branch and open a PR. The heavy CI jobs start
   when a maintainer adds `approved-for-ci` after reviewing the code. Approved PRs go into the queue
@@ -209,7 +218,7 @@ before the draft is verified.
 - Build with `CARGO_TARGET_DIR=<repo>/target`. Windows: `cargo xwin build --release --target x86_64-pc-windows-msvc -p solidcraft`.
 
 ## Roadmap
-`ROADMAP.md` (committed) tracks status, milestones and estimates. Update it whenever a
+`docs/roadmap-detail.md` (committed) tracks status, milestones and estimates; `ROADMAP.md` is the short user-facing roadmap. Update it whenever a
 milestone task lands. `docs/features.md` (SolidCraft's commands by area, from the registry) and
 `THIRD-PARTY-LICENSES.txt` are regenerated on `main` after each merge by the Generated files
 workflow; never regenerate them in a PR.

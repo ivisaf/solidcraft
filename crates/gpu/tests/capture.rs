@@ -7,7 +7,7 @@
 use serde_json::json;
 use solidcraft_engine::Session;
 use solidcraft_engine::geom::Vec3;
-use solidcraft_engine::render::{Camera, Rgb, SceneLine};
+use solidcraft_engine::render::{Camera, Rgb, Scene, SceneLine};
 use solidcraft_engine::view::{self, Guides, colors};
 use solidcraft_gpu::GpuError;
 use solidcraft_gpu::capture::{self, Capturer};
@@ -162,7 +162,13 @@ fn pictures_show_the_section_and_its_cap() {
         let mut sc = view::scene(&s, &cam);
         // A marker inside the body, behind the cut face.
         let red = Rgb(255, 0, 0);
-        sc.lines.push(SceneLine { points: vec![Vec3::new(5.0, 25.0, 10.0), Vec3::new(35.0, 25.0, 10.0)], color: red, width: 3.0, on_top: false });
+        sc.lines.push(SceneLine {
+            points: vec![Vec3::new(5.0, 25.0, 10.0), Vec3::new(35.0, 25.0, 10.0)],
+            color: red,
+            alpha: 1.0,
+            width: 3.0,
+            on_top: false,
+        });
         let img = c.rgba(&sc, &cam, 300, 220).unwrap();
         let marker = pixels(&img).filter(|p| p[0] > 200 && p[1] < 60 && p[2] < 60).count();
         assert_eq!(marker, 0, "fov {fov}: the inside shows through the cut face");
@@ -190,6 +196,64 @@ fn pictures_show_a_plain_cut_without_the_hatch() {
     let (hatched, plain) = (picture(true), picture(false));
     assert!(solid(&plain) > 500, "plain cut: {} pixels in the body's colour", solid(&plain));
     assert!(solid(&hatched) < 50, "the hatched cut is tinted: {}", solid(&hatched));
+}
+
+/// A body inside another's hollow, behind the cut, leaves no trace on the cap (#6328): the cap
+/// used to be painted by every face behind it, last drawn last, so the inner body's colour and
+/// outline showed through the cut like an X-ray. Hatched and plain, orthographic and
+/// perspective, the picture is the same with the inner body as without it.
+#[test]
+fn a_body_behind_the_cut_does_not_colour_the_cap() {
+    let Some(c) = capturer() else { return };
+    let outer = [
+        ("solid.box", json!({"length": 40, "width": 40, "height": 30, "body_name": "outer"})),
+        ("solid.box", json!({"length": 20, "width": 20, "height": 16, "corner": [10, 10, 7], "operation": "cut"})),
+        ("appearance.assign", json!({"bodies": ["outer"], "color": [40, 160, 90]})),
+    ];
+    let inner = [
+        ("solid.box", json!({"length": 8, "width": 8, "height": 6, "corner": [16, 16, 12], "operation": "new_body", "body_name": "inner"})),
+        ("appearance.assign", json!({"bodies": ["inner"], "color": [220, 30, 30]})),
+    ];
+    let mut alone = session(&outer);
+    let mut with = session(&[outer[0].clone(), outer[1].clone(), outer[2].clone(), inner[0].clone(), inner[1].clone()]);
+    for hatch in [true, false] {
+        // Cut away y < 6: the hollow (and the inner body) lie 4 mm behind the cut face.
+        for s in [&mut alone, &mut with] {
+            s.execute("inspect.section", &json!({"plane": {"origin": [0, 6, 0], "normal": [0, -1, 0]}, "hatch": hatch})).unwrap();
+        }
+        for fov in [0.0, 0.6] {
+            let mut cam = view::home_camera(&alone);
+            cam.fov = fov;
+            let picture = |s: &Session| c.rgba(&view::scene(s, &cam), &cam, 300, 220).unwrap();
+            let (a, b) = (picture(&alone), picture(&with));
+            let differ = pixels(&a).zip(pixels(&b)).filter(|(p, q)| p.iter().zip(q).any(|(x, y)| x.abs_diff(*y) > 8)).count();
+            assert_eq!(differ, 0, "hatch {hatch}, fov {fov}: the inner body shows through the cap in {differ} pixels");
+        }
+    }
+}
+
+/// #4214: a line that is not opaque is blended with what is under it, so the grid's fade reaches
+/// the picture.
+#[test]
+fn pictures_blend_a_line_that_is_not_opaque() {
+    let Some(c) = capturer() else { return };
+    let cam = Camera { distance: 50.0, fov: 0.0, ..Default::default() };
+    let darkest = |alpha: f32| {
+        let mut sc = Scene { radius: 30.0, ..Default::default() };
+        sc.lines.push(SceneLine {
+            points: vec![Vec3::new(-8.0, 2.0, 0.0), Vec3::new(8.0, 2.0, 0.0)],
+            color: Rgb(0, 0, 0),
+            alpha,
+            width: 1.4,
+            on_top: false,
+        });
+        let img = c.rgba(&sc, &cam, 64, 64).unwrap();
+        pixels(&img).map(|p| i32::from(p[0])).min().unwrap_or(255)
+    };
+    let solid = darkest(1.0);
+    let half = darkest(0.5);
+    assert!(solid < 40, "the opaque line is black: {solid}");
+    assert!(half > 60 && half < 170, "the half-opaque line is between the background and the line: {half} against {solid}");
 }
 
 /// Surface analysis shades headless pictures as it shades the viewport: a box's flat faces in

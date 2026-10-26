@@ -805,7 +805,7 @@ fn edit_box(app: &mut SolveApp, ctx: &egui::Context) {
                     .and_then(|p| solidcraft_engine::doc::expr::unit_info(&p.unit))
                     .map(|(k, _)| k)
                     .unwrap_or(solidcraft_engine::doc::expr::Kind::Unitless);
-                let expression = app.session.doc.with_design_unit(&e.expr, kind);
+                let expression = crate::length_input::expression(&app.session.doc, &e.expr, kind);
                 app.run("parameters.change", json!({"name": e.param, "expression": expression})).map_err(|err| shown_error("parameters.change", &err))
             };
             match result {

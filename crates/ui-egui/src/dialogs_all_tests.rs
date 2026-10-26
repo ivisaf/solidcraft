@@ -93,7 +93,7 @@ fn representative(h: &Harness, command: &str) -> Dialog {
         } else if input.accept & crate::selection::SKETCH_LINES != 0 {
             vec![Sel::ExternalSketchCurve { sketch: s.world_state().sketches.last().unwrap().feature, id: path.clone() }]
         } else if input.accept & CURVES != 0 || command == "sheet.fold" && index == 0 {
-            vec![Sel::SketchCurve { id: path.clone() }]
+            vec![Sel::SketchCurve { id: path.clone(), sketch: None }]
         } else if input.accept & AXES != 0 {
             // The Revolve fixture's profile is in XY; its preview needs an axis in that plane.
             let axis = if command == "solid.revolve" { "Y" } else { "Z" };
@@ -291,7 +291,15 @@ fn mirror_object_type_switch_back_restores_preselected_feature() {
 
 #[test]
 fn mirror_timeline_click_keeps_picked_feature() {
+    for dock in ["bottom", "left", "under_browser"] {
+        mirror_history_click_keeps_picked_feature(dock);
+    }
+}
+
+fn mirror_history_click_keeps_picked_feature(dock: &str) {
     let (mut h, picked) = mirror_preselection();
+    h.app.run("view.history_layout", json!({"dock": dock})).unwrap();
+    h.frames(4);
     // Mirror moves on to the plane; the objects input takes timeline clicks once it is active.
     h.step(&json!({"click":{"handle":"dialog:Features"}})).unwrap();
     assert_eq!(h.app.dialog.as_ref().unwrap().active, 0);
@@ -303,6 +311,30 @@ fn mirror_timeline_click_keeps_picked_feature() {
     let d = h.app.dialog.as_ref().unwrap();
     assert!(matches!(d.kind, Kind::Mirror));
     assert!(d.inputs[0].items.is_empty());
+}
+
+#[test]
+fn rectangular_pattern_takes_features_from_every_history_layout() {
+    for dock in ["bottom", "left", "under_browser"] {
+        let mut h = Harness::new();
+        h.app.run("view.history_layout", json!({"dock": dock})).unwrap();
+        h.app.run("solid.box", json!({"length": 80, "width": 60, "height": 20})).unwrap();
+        h.app.run("solid.cylinder", json!({"base": [20, 20, 20], "radius": 5, "height": 10, "operation": "join"})).unwrap();
+        let id = h.app.session.doc.find_feature("Cylinder1").unwrap().id;
+        h.app.run("select.clear", json!({})).unwrap();
+        h.app.start("solid.pattern.rectangular");
+        h.frames(4);
+        mirror_object_type(&mut h, "Features");
+        h.step(&json!({"click": {"handle": "timeline:Cylinder1"}})).unwrap();
+
+        let d = h.app.dialog.as_ref().unwrap();
+        assert_eq!(d.inputs[0].items, vec![Sel::Feature { id }], "{dock}: the dialog receives the History feature");
+        assert_eq!(d.active, 0, "{dock}: Features stays active so more features can be picked");
+        assert!(h.app.session.selection.is_empty(), "{dock}: a dialog pick does not replace the ordinary selection");
+        h.app.dialog.as_mut().unwrap().inputs[1].items = vec![Sel::Axis { name: "X".into() }];
+        let commands = apply_commands(&h.app, h.app.dialog.as_ref().unwrap()).unwrap();
+        assert_eq!(commands[0].1["features"], json!(["Cylinder1"]), "{dock}: the command receives the chosen feature");
+    }
 }
 
 form_case!(loft, "solid.loft", ["Operation"]);
@@ -327,7 +359,7 @@ form_case!(boundary_fill, "solid.boundary_fill", ["Cells", "Operation"]);
 form_case!(align, "solid.align", ["From Snap", "To Snap"]);
 form_case!(remove, "solid.remove", []);
 form_case!(path_pattern, "solid.pattern.path", ["Type", "Object Type", "Quantity", "Spacing"]);
-form_case!(pipe, "solid.pipe", ["Diameter", "Wall"]);
+form_case!(pipe, "solid.pipe", ["Diameter", "Wall", "Operation"]);
 form_case!(stock, "solid.bounding_solid", ["Margin"]);
 form_case!(frame_member, "frame.member", ["All Lines", "Anchor", "Angle", "Mirror", "Name"]);
 form_case!(thread, "solid.thread", ["Profile", "Size", "Pitch", "Designation"]);
@@ -353,6 +385,7 @@ form_case!(surface_trim, "surface.trim", []);
 form_case!(surface_untrim, "surface.untrim", ["Holes"]);
 form_case!(split_face, "solid.split_face", []);
 form_case!(flange, "sheet.flange", ["Type", "Rule"]);
+form_case!(path_flange, "sheet.path_flange", ["Bend Radius"]);
 form_case!(hem, "sheet.hem", ["Type", "Length", "ui.sheet_gap"]);
 form_case!(fold, "sheet.fold", ["Bend Line Position", "Angle", "Bend Radius"]);
 form_case!(unfold, "sheet.unfold", []);
@@ -447,6 +480,53 @@ fn remaining_dialogs_keep_kit_chrome_and_cancel_restores_preview() {
     }
 }
 
+/// OK and Cancel in the view's corner (#6709) do what the dialog's own do: the check applies and
+/// closes, the cross cancels without a change, and the check is grey (and does nothing) whenever
+/// the dialog's OK is.
+#[test]
+fn view_corner_ok_and_cancel_answer_the_dialog_like_its_own_buttons() {
+    for how in ["ok", "cancel"] {
+        let mut h = fixture();
+        h.call("ui.resize", json!({"width":1600,"height":1200}));
+        h.call("ui.prefs", json!({"view_confirm_corner": true}));
+        h.app.dialog = Some(representative(&h, "solid.revolve"));
+        h.settle();
+        assert_eq!(scenario::count_of("view:confirm:ok:enabled"), scenario::count_of("dialog:ok:enabled"));
+        assert_eq!(scenario::count_of("view:confirm:ok:enabled"), Some(1.0));
+        let (design, bodies) = (h.app.session.doc.to_json(), h.app.session.world_state().bodies.len());
+        h.step(&json!({"click":{"handle":format!("view:confirm:{how}")}})).unwrap();
+        h.settle();
+        assert!(h.app.dialog.is_none(), "{how}: the dialog closes");
+        if how == "ok" {
+            assert_eq!(h.app.session.world_state().bodies.len(), bodies + 1, "the check made the revolve");
+        } else {
+            assert_eq!(h.app.session.doc.to_json(), design, "the cross leaves the design as it was");
+        }
+        assert!(scenario::rect_of("view:confirm").is_none(), "{how}: no dialog and no sketch, no pair");
+    }
+
+    // A dialog whose OK is grey: so is the check, and clicking it changes nothing.
+    let mut h = fixture();
+    h.call("ui.resize", json!({"width":1600,"height":1200}));
+    h.call("ui.prefs", json!({"view_confirm_corner": true}));
+    h.app.start("solid.shell");
+    h.settle();
+    assert_eq!(scenario::count_of("dialog:ok:enabled"), Some(0.0));
+    assert_eq!(scenario::count_of("view:confirm:ok:enabled"), Some(0.0));
+    let design = h.app.session.doc.to_json();
+    h.step(&json!({"click":{"handle":"view:confirm:ok"}})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_some(), "a grey check does nothing");
+    assert_eq!(h.app.session.doc.to_json(), design);
+    // Measure only closes: its check stays grey and the cross is its Close.
+    h.app.start("inspect.measure");
+    h.settle();
+    assert_eq!(scenario::count_of("view:confirm:ok:enabled"), Some(0.0));
+    h.step(&json!({"click":{"handle":"view:confirm:cancel"}})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_none(), "the cross closes Measure");
+}
+
 fn resized_box_editor(command: &str, params: Value) -> (Harness, u64) {
     let mut h = Harness::new();
     for (id, params) in [
@@ -516,6 +596,68 @@ fn face_editor_refills_named_faces_after_sketch_resize() {
 }
 
 #[test]
+fn draft_uses_the_picked_solid_beside_a_hidden_overlapping_mesh() {
+    use solidcraft_engine::doc::{Document, MeshData, naming};
+
+    let mesh = solidcraft_engine::kernel::box_solid(Vec3::ZERO, Vec3::new(20.0, 20.0, 10.0)).unwrap().tessellate(0.01).unwrap();
+    let mut doc = Document::default();
+    doc.add_feature(
+        FeatureKind::MeshImport {
+            file: "overlapping-box.stl".into(),
+            meshes: vec![MeshData {
+                name: "Hidden mesh".into(),
+                positions: mesh.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect(),
+                triangles: mesh.triangles.iter().flatten().copied().collect(),
+                color: None,
+            }],
+        },
+        Some("Imported mesh"),
+    )
+    .unwrap();
+    let mut h = Harness::new();
+    h.app.session = Session::new(doc);
+    h.app.run("solid.box", json!({"length":20,"width":20,"height":10})).unwrap();
+    h.app.run("browser.visibility", json!({"items":["Hidden mesh"],"visible":false})).unwrap();
+    let state = h.app.session.world_state();
+    let hidden_mesh = state.body("Hidden mesh").unwrap().mesh();
+    let body = state.bodies.iter().find(|body| !body.body.is_mesh()).unwrap();
+    let target = body.name.clone();
+    let point = Vec3::new(20.0, 10.0, 5.0);
+    let name = naming::face_name_at_body(body, point).unwrap();
+    let (index, _, _) = naming::face_on_body(body, &name, point).unwrap();
+    h.app.session.selection = vec![Sel::Face { body: target.clone(), index, point }];
+    let mut d = Dialog::for_command(&h.app, "solid.draft").unwrap();
+    d.inputs[1].items = vec![Sel::Plane { name: "XY".into() }];
+    d.kind = Kind::Draft { angle: "5 deg".into() };
+    let commands = apply_commands(&h.app, &d).unwrap();
+    assert_eq!(preview_commands(&h.app, &d).unwrap(), commands);
+    let (command, params) = &commands[0];
+    h.app.run(command, params.clone()).unwrap();
+    assert_eq!(params["body"], target);
+    let state = h.app.session.model.state();
+    assert_eq!(state.bodies.len(), 2);
+    assert!(state.body("Hidden mesh").unwrap().body.is_mesh());
+    assert_eq!(state.body("Hidden mesh").unwrap().mesh().positions, hidden_mesh.positions);
+    assert_eq!(state.body("Hidden mesh").unwrap().mesh().triangles, hidden_mesh.triangles);
+    let volume = state.body(&target).unwrap().body.volume_at(0.01).unwrap();
+    assert!((volume - 4000.0).abs() > 50.0, "the picked wall should taper: {volume}");
+    assert!(matches!(
+        &h.app.session.doc.features.last().unwrap().kind,
+        FeatureKind::Draft { body: Some(body), .. } if *body == target
+    ));
+}
+
+#[test]
+fn draft_rejects_faces_from_different_bodies() {
+    let h = Harness::new();
+    let mut d = Dialog::for_command(&h.app, "solid.draft").unwrap();
+    d.inputs[0].items =
+        vec![Sel::Face { body: "First".into(), index: 0, point: Vec3::ZERO }, Sel::Face { body: "Second".into(), index: 0, point: Vec3::X }];
+    d.inputs[1].items = vec![Sel::Plane { name: "XY".into() }];
+    assert_eq!(apply_commands(&h.app, &d).unwrap_err(), "pick faces of one body");
+}
+
+#[test]
 fn solid_pattern_quantity_arrows_step_the_count_the_command_receives() {
     let mut h = fixture();
     h.app.run("parameters.add", json!({"name":"copies","expression":"3","unit":""})).unwrap();
@@ -575,4 +717,62 @@ fn coil_from_a_profile_hides_the_primitive_section() {
     assert!(p.get("section_size").is_none(), "{p}");
     assert!(p.get("revolutions").is_some() && p.get("pitch").is_some(), "{p}");
     assert!(p.get("operation").is_some(), "{p}");
+}
+
+fn extrude_focus_fixture() -> Harness {
+    let mut h = Harness::new();
+    h.app.home.open = false;
+    h.app.run("sketch.create", json!({"plane":"XY"})).unwrap();
+    h.app.run("sketch.rectangle.two_point", json!({"p0":[0,0],"p1":[50,30]})).unwrap();
+    h.app.run("sketch.finish", json!({})).unwrap();
+    h.call("ui.view", json!({"view":"top"}));
+    h.call("ui.view", json!({"view":"fit"}));
+    h.step(&json!({"start":"solid.extrude"})).unwrap();
+    h.frames(8);
+    h
+}
+
+#[test]
+fn viewport_profile_click_returns_extrude_value_focus() {
+    let mut h = extrude_focus_fixture();
+    h.step(&json!({"click":{"world":[15,10,0]}})).unwrap();
+    h.step(&json!({"text":"30"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Extrude { distance, .. } if distance == "30"));
+    // Clicking an already selected profile removes it; pick it again before building.
+    h.step(&json!({"click":{"world":[15,10,0]}})).unwrap();
+    h.step(&json!({"text":"30"})).unwrap();
+    h.step(&json!({"key":"Enter"})).unwrap();
+    h.settle();
+    assert!(h.app.dialog.is_none());
+    let bounds = h.app.session.world_state().bodies.first().unwrap().mesh().bounds();
+    assert!((bounds.max.z - bounds.min.z - 30.0).abs() < 1e-7);
+}
+
+#[test]
+fn viewport_empty_click_falls_back_to_first_numeric_dialog_field() {
+    let mut h = extrude_focus_fixture();
+    if let Some(id) = h.ctx.memory(|m| m.focused()) {
+        h.ctx.memory_mut(|m| m.surrender_focus(id));
+    }
+    h.frames(2);
+    let viewport = h.app.viewport.rect.unwrap();
+    h.step(&json!({"click":[viewport.left()+80.0, viewport.bottom()-80.0]})).unwrap();
+    h.step(&json!({"text":"30"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Extrude { distance, .. } if distance == "30"));
+}
+
+#[test]
+fn viewport_click_preserves_active_secondary_dialog_value() {
+    let mut h = extrude_focus_fixture();
+    if let Kind::Extrude { direction, .. } = &mut h.app.dialog.as_mut().unwrap().kind {
+        *direction = crate::dialogs::TWO_SIDES;
+    }
+    h.frames(3);
+    crate::test_support::click(&mut h, "dialog:Distance 2");
+    h.step(&json!({"key":"A","cmd":true})).unwrap();
+    h.step(&json!({"text":"7"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Extrude { distance2, .. } if distance2 == "7"));
+    h.step(&json!({"click":{"world":[15,10,0]}})).unwrap();
+    h.step(&json!({"text":"30"})).unwrap();
+    assert!(matches!(&h.app.dialog.as_ref().unwrap().kind, Kind::Extrude { distance, distance2, .. } if distance == "10 mm" && distance2 == "30"));
 }

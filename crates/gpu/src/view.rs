@@ -17,7 +17,11 @@ use wgpu::util::DeviceExt;
 use crate::pbr;
 
 mod ao;
+#[cfg(not(target_arch = "wasm32"))]
+mod msaa_check;
 mod oit;
+#[cfg(not(target_arch = "wasm32"))]
+pub use msaa_check::MsaaCheck;
 
 /// Triangle vertex: position (3 × f32), normal (3 × f32), sRGB colour (4 × u8).
 pub const TRI_SIZE: usize = 28;
@@ -1780,7 +1784,8 @@ impl Renderer {
         let built = [Some(tri_layout())];
         let evaluated = [Some(planned_layout()), Some(color_layout())];
         let placed = [Some(shared_layout()), Some(instance_layout())];
-        let solid = |label: &str, fs: &str, cull: Option<wgpu::Face>, ds: Option<wgpu::DepthStencilState>, source: TriSource| {
+        // `colour`: whether the pipeline writes colour (the cap's depth pass writes none).
+        let solid_writes = |label: &str, fs: &str, cull: Option<wgpu::Face>, ds: Option<wgpu::DepthStencilState>, source: TriSource, colour: bool| {
             let fs = source.fragment(fs);
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -1801,12 +1806,19 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: Some(&fs),
-                    targets: &[Some(wgpu::ColorTargetState { format: t.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: t.format,
+                        blend: None,
+                        write_mask: if colour { wgpu::ColorWrites::ALL } else { wgpu::ColorWrites::empty() },
+                    })],
                     compilation_options: Default::default(),
                 }),
                 multiview_mask: None,
                 cache: None,
             })
+        };
+        let solid = |label: &str, fs: &str, cull: Option<wgpu::Face>, ds: Option<wgpu::DepthStencilState>, source: TriSource| {
+            solid_writes(label, fs, cull, ds, source, true)
         };
         // While a section is shown: the stencil marking and the cap (see `Renderer::tri_cut`).
         let cut = |source: TriSource| {
@@ -1844,7 +1856,11 @@ impl Renderer {
                 (
                     solid("sc_tris_mark", "fs_solid", None, Some(mark), source),
                     solid("sc_tris_mark_back", "fs_solid", Some(wgpu::Face::Front), Some(mark_back), source),
-                    solid("sc_tris_cap", "fs_solid_cut", Some(wgpu::Face::Front), Some(cap), source),
+                    // Depth only: every back face behind a marked pixel draws here, so writing
+                    // colour let the last one drawn paint the cut, other bodies behind it
+                    // included (their colours and outlines showed through it, #6328). The
+                    // marking passes already drew the nearest back face's colour.
+                    solid_writes("sc_tris_cap", "fs_solid_cut", Some(wgpu::Face::Front), Some(cap), source, false),
                 )
             })
         };
@@ -3440,6 +3456,65 @@ mod glass_tests {
         assert!(split.ss_ready, "the split frame is drawn offscreen");
         let max = drawn.iter().zip(&shown).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
         assert!(max <= 1, "the blitted picture matches the direct one (max difference {max})");
+    }
+
+    /// The Render workspace's preview once painted the modelling viewport's last frame instead of
+    /// its own (#5119): after a frame with see-through surfaces, drawn offscreen for
+    /// order-independent transparency, it stayed frozen on that frame whatever the camera did.
+    #[test]
+    fn product_preview_never_paints_the_last_modelling_frame() {
+        let Some((_, device, queue)) = crate::open_headless().ok() else { return };
+        let depth = crate::depth_format(&device, true);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut r = Renderer::new(&device, GpuTarget { format, depth: Some(depth), samples: 1, tess: false }, None);
+        let middle = |pixels: &[u8]| -> [i32; 4] {
+            let at = (32 * 64 + 32) * 4;
+            std::array::from_fn(|i| pixels.get(at + i).map_or(-1, |v| i32::from(*v)))
+        };
+        let red = [220, 40, 40, 128];
+        let model = middle(&render_frame(&mut r, &device, &queue, &test_frame(two_layers(red, red, true), 1.0), true));
+        assert!(r.ss_ready, "the see-through modelling frame is drawn offscreen");
+        assert!(model[0] > model[2] + 60, "the modelling frame shows its red layers: {model:?}");
+        let mut product = GpuScene::default();
+        for p in [[-5.0, -5.0], [5.0, -5.0], [5.0, 5.0], [-5.0, -5.0], [5.0, 5.0], [-5.0, 5.0]] {
+            product.tri([p[0], p[1], 0.0], [0.0, 0.0, 1.0], [40, 80, 220, 255]);
+        }
+        let mut frame = test_frame(product, 1.0);
+        frame.product = true;
+        let preview = middle(&render_frame(&mut r, &device, &queue, &frame, true));
+        assert!(preview[2] > preview[0] + 60, "the preview shows its own blue square: {preview:?}");
+    }
+
+    #[test]
+    fn startup_msaa_check_passes_and_detects_a_blank_resolve() {
+        let (adapter, device, queue) = crate::open_headless().expect("software adapter required for the startup check");
+        let depth = crate::depth_format(&device, true);
+        for format in [wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Bgra8UnormSrgb] {
+            let window = GpuTarget { format, depth: None, samples: 1, tess: false };
+            for samples in [1, 4] {
+                if ![format, depth].iter().all(|f| adapter.get_texture_format_features(*f).flags.sample_count_supported(samples)) {
+                    continue;
+                }
+                let target = GpuTarget { depth: Some(depth), samples, ..window };
+                let mut renderer = Renderer::with_window_target(&device, target, window, None);
+                let start = std::time::Instant::now();
+                assert_eq!(renderer.check_msaa(&device, &queue).unwrap(), super::MsaaCheck::Passed);
+                eprintln!("startup check: {} {format:?} {samples}x: {:?}", adapter.get_info().name, start.elapsed());
+                assert!(
+                    renderer.model.key.is_none() && renderer.highlight.key.is_none() && renderer.ss.is_none(),
+                    "probe uploads must not replace the first real frame"
+                );
+                assert_eq!(renderer.target().samples, samples);
+                assert_eq!(renderer.check_msaa_with(&device, &queue, 1).unwrap(), super::MsaaCheck::FailedAtOne);
+                assert_eq!(renderer.target().samples, samples, "a blank 1x result must preserve the selected count");
+                assert_eq!(
+                    renderer.check_msaa_with(&device, &queue, 4).unwrap(),
+                    if samples > 1 { super::MsaaCheck::Fallback } else { super::MsaaCheck::Passed }
+                );
+                assert_eq!(renderer.target().samples, 1);
+                assert_eq!(renderer.check_msaa(&device, &queue).unwrap(), super::MsaaCheck::Passed);
+            }
+        }
     }
 
     /// Two see-through squares, one at z = 5 (near) and one at z = -5, in `near` and `far`

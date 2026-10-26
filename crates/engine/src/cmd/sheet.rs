@@ -1,4 +1,4 @@
-//! Sheet metal: rules, Flange (base, edge, contour), Hem, Unfold/Refold, Convert to Sheet Metal,
+//! Sheet metal: rules, Flange (base, edge, contour), Path Flange, Hem, Unfold/Refold, Convert to Sheet Metal,
 //! the flat pattern (outline, bend lines, bend table) and its DXF export.
 
 use serde_json::{Value, json};
@@ -18,12 +18,22 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("sheet.flange", "Flange", flange).at("SHEET METAL", "CREATE").icon("flange").params(
         "base: sketch + profiles? (rule?, flip?) | contour: sketch + curves (open chain of lines) + distance (rule?, flip?, reverse?) | \
          edge: edges: [[x,y,z] on top/bottom edges, or {point: [x,y,z], angle?, height?} for an edge with its own angle and height] + \
-         height (to the outer face), angle? (default 90 deg), radius? (default: rule), \
-         position?: inside|outside|middle, flip?, body?, corner_relief_shape?: notch|round|rectangular|tear and corner_relief? (size across): \
+         height (along the flange, to its far edge), angle? (default 90 deg), radius? (default: rule), \
+         height_from?: outer|inner|tangent (where the height is measured from: the outer virtual sharp (default), \
+         the inner virtual sharp, or past 90 deg the line square to the flange touching the bend's outside (tangent; up to 90 deg the outer sharp)), \
+         position?: inside|outside|middle|material_outside|tangent (where the bend starts: the outer virtual sharp on the edge (default), \
+         the bend starting at the edge (bend_outside is the same), half way, the inner virtual sharp on the edge, \
+         or the bend's outer face tangent to the edge's face (below 90 deg the bend's end on that face)), flip?, body?, corner_relief_shape?: notch|round|rectangular|tear and corner_relief? (size across): \
          the relief at the corners these flanges make (default: the rule's); \
+         then?: [{angle?, height, flip?}] further bends (at most 16), each a flange on the far edge of the one before, flip: true turns that bend the other way (edge only); \
          type?: base|edge|contour (default from the inputs); name?, body_name? (the new body). \
          Thickness, K-factor and bend radius come from the rule (sheet.manage_rules); passing them here is refused, \
          and so is the corner relief on a base or contour flange",
+    ),
+    CommandSpec::new("sheet.path_flange", "Path Flange", path_flange).at("SHEET METAL", "CREATE").icon("path_flange").params(
+        "edge: [x,y,z] on a top or bottom edge of the sheet; sketch + curves: an open chain of sketch lines drawn on a plane across \
+         that edge, from the edge out (each line one flange as long as the line, to the outer face from the virtual sharp; each \
+         corner one bend, turning the way the lines turn); radius? (default: rule); body?. One feature, one body",
     ),
     CommandSpec::new("sheet.perforate", "Perforate", perforate).at("SHEET METAL", "CREATE").icon("perforate").params(
         "diameter, pitch: expr; margin?: expr (clear of edges, cut-outs and bends; default: the diameter); pattern?: staggered (60°, default) | square; body? - a perforation field over the whole flat sheet: holes in the flat pattern (perforations), the DXF (layer PERFORATION) and the measured volume, not cut into the B-rep (#732)",
@@ -99,6 +109,58 @@ fn points(p: &Value, k: &str, cmd: &str) -> Result<Vec<Vec3>> {
 
 /// The `edges` of an edge flange: points `[x, y, z]` on sheet edges, or `{point, angle?, height?}`
 /// for an edge with its own angle and height (expressions, checked like the feature's).
+/// Most bends `then` may add after an edge flange's own.
+const MAX_THEN: usize = 16;
+
+/// One further bend of an edge flange: its angle, its height and, if it has its own, which way
+/// it turns (`flip`; the flange's own otherwise).
+type ThenStep = (solidcraft_doc::Expr, solidcraft_doc::Expr, Option<bool>);
+
+/// The further bends of an edge flange (`then`): each an angle and a height, made one after
+/// the other, every one on the far edge of the flange before it.
+fn then_steps(s: &Session, p: &Value, cmd: &str) -> Result<Vec<ThenStep>> {
+    let Some(v) = p.get("then").filter(|v| !v.is_null()) else { return Ok(Vec::new()) };
+    let list = "`then` must list further bends {angle?, height, flip?}: each on the far edge of the flange before it";
+    let a = v.as_array().ok_or_else(|| bad(cmd, list))?;
+    if a.len() > MAX_THEN {
+        return Err(bad(cmd, format!("`then` may list at most {MAX_THEN} bends")));
+    }
+    let mut out = Vec::with_capacity(a.len());
+    for (i, step) in a.iter().enumerate() {
+        let o = step.as_object().ok_or_else(|| bad(cmd, format!("then[{i}]: {list}")))?;
+        if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "angle" | "height" | "flip")) {
+            return Err(bad(cmd, format!("then[{i}]: unknown key `{k}` (a bend takes angle, height and flip)")));
+        }
+        let flip = match o.get("flip").filter(|v| !v.is_null()) {
+            Some(v) => Some(v.as_bool().ok_or_else(|| bad(cmd, format!("then[{i}]: `flip` must be true or false")))?),
+            None => None,
+        };
+        let height = req_expr(cmd, step, "height").map_err(|_| bad(cmd, format!("then[{i}]: `height` is required")))?;
+        check_expr(s, &height, Kind::Length, cmd, &format!("then[{i}].height"))?;
+        let angle = expr(step, "angle").unwrap_or_else(|| "90 deg".into());
+        check_expr(s, &angle, Kind::Angle, cmd, &format!("then[{i}].angle"))?;
+        out.push((angle, height, flip));
+    }
+    Ok(out)
+}
+
+/// Where to pick the far edges of the flanges feature `id` made: a point on each, for the flanges
+/// of the next bend of a chain.
+fn far_edge_picks(s: &Session, id: u64, cmd: &str) -> Result<Vec<FlangeEdge>> {
+    let prefix = format!("F{id}.");
+    let st = s.model.state();
+    let picks: Vec<FlangeEdge> = st
+        .sheets
+        .iter()
+        .flat_map(|sh| sh.flanges.iter().enumerate().filter(|(_, f)| f.tag.starts_with(&prefix)).filter_map(|(i, _)| sh.far_edge_pick(i)))
+        .map(FlangeEdge::at)
+        .collect();
+    if picks.is_empty() {
+        return Err(bad(cmd, "the flange has no far edge to bend again"));
+    }
+    Ok(picks)
+}
+
 fn flange_edges(s: &Session, p: &Value, cmd: &str) -> Result<Vec<FlangeEdge>> {
     const KEYS: [&str; 3] = ["point", "angle", "height"];
     let list = "`edges` must list points [x, y, z] on sheet edges, or {point, angle?, height?}";
@@ -165,6 +227,9 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
             ),
         ));
     }
+    if ty != "edge" && p.get("then").is_some_and(|v| !v.is_null()) {
+        return Err(bad(cmd, "`then` (further bends) is only for edge flanges"));
+    }
     match ty.as_str() {
         "base" => {
             let sketch = feature_sketch(s, p, cmd)?;
@@ -199,6 +264,7 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
         }
         "edge" => {
             let edges = flange_edges(s, p, cmd)?;
+            let then = then_steps(s, p, cmd)?;
             let height = req_expr(cmd, p, "height")?;
             check_expr(s, &height, Kind::Length, cmd, "height")?;
             let angle = expr(p, "angle").unwrap_or_else(|| "90 deg".into());
@@ -207,10 +273,20 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(r) = &radius {
                 check_expr(s, r, Kind::Length, cmd, "radius")?;
             }
-            let position = str_(p, "position").unwrap_or("inside").to_ascii_lowercase();
-            if !matches!(position.as_str(), "inside" | "outside" | "middle") {
-                return Err(bad(cmd, "`position` must be inside, outside or middle"));
+            let mut position = str_(p, "position").unwrap_or("inside").to_ascii_lowercase();
+            if !matches!(position.as_str(), "inside" | "outside" | "bend_outside" | "middle" | "material_outside" | "tangent") {
+                return Err(bad(cmd, "`position` must be inside, outside, middle, material_outside or tangent"));
             }
+            // The bend starting at the edge is `outside`, whichever name asked for it.
+            if position == "bend_outside" {
+                position = "outside".into();
+            }
+            // Where the heights are measured from; the outer sharp (the default) is saved as nothing.
+            let height_from = match p.get("height_from").filter(|v| !v.is_null()) {
+                Some(v) => v.as_str().and_then(sheet::HeightFrom::parse).ok_or_else(|| bad(cmd, "`height_from` must be outer, inner or tangent"))?,
+                None => sheet::HeightFrom::Outer,
+            };
+            let height_from = (height_from != sheet::HeightFrom::Outer).then(|| height_from.name().to_string());
             if s.model.state().sheets.is_empty() {
                 return Err(no_sheet_body(cmd));
             }
@@ -229,21 +305,45 @@ fn flange(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(c) = &corner_relief {
                 check_expr(s, c, Kind::Length, cmd, "corner_relief")?;
             }
-            add_feature(
+            let flip = bool_(p, "flip").unwrap_or(false);
+            let mut made = add_feature(
                 s,
                 p,
                 FeatureKind::SheetFlange {
                     edges,
                     height,
                     angle,
-                    radius,
-                    position,
-                    flip: bool_(p, "flip").unwrap_or(false),
-                    body: body.map(BodyName),
+                    radius: radius.clone(),
+                    position: position.clone(),
+                    flip,
+                    body: body.clone().map(BodyName),
                     corner_relief_shape,
                     corner_relief,
+                    height_from: height_from.clone(),
                 },
-            )
+            )?;
+            // Each further bend stands on the far edge of the flange before it.
+            for (angle, height, own_flip) in then {
+                let id = made.get("feature").and_then(Value::as_u64).ok_or_else(|| bad(cmd, "no feature to bend again"))?;
+                let edges = far_edge_picks(s, id, cmd)?;
+                made = add_feature(
+                    s,
+                    &json!({}),
+                    FeatureKind::SheetFlange {
+                        edges,
+                        height,
+                        angle,
+                        radius: radius.clone(),
+                        position: position.clone(),
+                        flip: own_flip.unwrap_or(flip),
+                        body: body.clone().map(BodyName),
+                        corner_relief_shape: None,
+                        corner_relief: None,
+                        height_from: height_from.clone(),
+                    },
+                )?;
+            }
+            Ok(made)
         }
         other => Err(bad(cmd, format!("unknown flange type `{other}` (base, edge or contour)"))),
     }
@@ -358,6 +458,25 @@ fn fold(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     Ok(r)
+}
+
+fn path_flange(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "sheet.path_flange";
+    let edge = p.get("edge").and_then(vec3).ok_or_else(|| bad(cmd, "`edge` must be a point [x, y, z] on a sheet edge"))?;
+    let sketch = sketch_id(s, p.get("sketch"), cmd, "sketch")?;
+    let curves = string_list(p, "curves");
+    if curves.is_empty() || curves.len() > sheet::MAX_PATH_LINES {
+        return Err(bad(cmd, format!("`curves` must list the path's lines (1…{})", sheet::MAX_PATH_LINES)));
+    }
+    let radius = expr(p, "radius");
+    if let Some(r) = &radius {
+        check_expr(s, r, Kind::Length, cmd, "radius")?;
+    }
+    add_feature(
+        s,
+        p,
+        FeatureKind::SheetPath { edge: Position(edge), sketch: SketchId(sketch), curves, radius, body: str_(p, "body").map(BodyName::from) },
+    )
 }
 
 fn unfold(s: &mut Session, p: &Value) -> Result<Value> {
@@ -770,13 +889,13 @@ pub fn flat_dxf(sh: &SheetBody, o: &DxfOptions) -> Result<String> {
         for e in &mut entities {
             e.layer = "0".into();
         }
-        return Ok(solidcraft_io::write_dxf_drawing(&[], &entities));
+        return Ok(solidcraft_io::write_dxf_drawing(&[], &entities)?);
     }
     // The four layers of every flat pattern, and those the rest is on.
     let mut names: std::collections::BTreeSet<String> = ["OUTLINE", "CUT", "BEND_UP", "BEND_DOWN"].map(String::from).into();
     names.extend(entities.iter().map(|e| e.layer.clone()));
     let layers: Vec<_> = names.iter().map(|name| dxf_layer(name)).collect();
-    Ok(solidcraft_io::write_dxf_drawing(&layers, &entities))
+    Ok(solidcraft_io::write_dxf_drawing(&layers, &entities)?)
 }
 
 /// What a `sheet.export_dxf` call asks for; a value it cannot use is refused.

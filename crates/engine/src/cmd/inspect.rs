@@ -1,5 +1,10 @@
 //! Inspection: measure bodies, describe the document, sketches and model topology.
 
+use std::collections::BTreeMap;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
+
 use serde_json::{Value, json};
 use solidcraft_sketch::CurveKind;
 
@@ -8,13 +13,21 @@ use crate::params::{bad, bool_, str_, string_list};
 use crate::{EngineError, Result, Session};
 
 pub static COMMANDS: &[CommandSpec] = &[
+    CommandSpec::new("inspect.colored_components", "Enable Component Colors", colored_components)
+        .at("SOLID", "INSPECT").icon("colored_components").noundo()
+        .params("enabled?: bool (omitted: toggle); temporary component colours, without changing appearances"),
     CommandSpec::new("inspect.measure", "Measure", measure)
         .at("SOLID", "INSPECT")
         .icon("measure")
         .key("I")
         .noundo()
-        .params("bodies?: [names] (default all); or items: [1-2 selections] (face/edge: type, body, point; index optional) → length/area/volume; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
+        .params("bodies?: [names] (default all) → closed per body; volume_mm3, center_of_mass, density_g_cm3 and mass_g only for closed, consistently oriented bodies; area, bbox and counts for all; total.open_bodies_skipped counts bodies excluded from volume/mass totals; or items: [1-2 selections] (face/edge: type, body, point; index optional) → length/area/volume; diameter, radius, circumference or arc_length/angle_deg of circles, arcs and cylinders; slot sizes; min (distance_mm, from, to), max, center_distance (centre to centre, or from an axis) and angle"),
     CommandSpec::new("document.inspect", "Inspect Design", inspect).icon("inspect").noundo().params("measure?: bool (include body measurements)"),
+    CommandSpec::new("document.revision", "Design Revision", revision).icon("inspect").noundo().params(
+        "→ document_id (this open design's id: kept while it stays open, another for each design started or opened), \
+         revision (moves whenever the design, what is hidden or a component's uncaptured position changes, \
+         never on a selection or a view; from one counter for the whole run, so it never repeats). Read-only",
+    ),
     CommandSpec::new("sketch.inspect", "Inspect Sketch", sketch_inspect).icon("inspect").noundo().params("sketch?: id|name (default active)"),
     CommandSpec::new("model.edges", "List Edges", model_edges).icon("inspect").noundo().params("body: name"),
     CommandSpec::new("model.faces", "List Faces", model_faces).icon("inspect").noundo().params(
@@ -44,7 +57,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .doc_only()
         .params("→ built-in and design-owned materials (user: true, look, optional physical_card/physical_validation/density_comparison). Read-only; candidate engineering records do not certify sources or supply a solver"),
     CommandSpec::new("engine.commands", "List Commands", commands).icon("list").noundo(),
-    CommandSpec::new("engine.describe", "Describe Command", crate::checked!("engine.describe", DESCRIBE_CONTRACT, describe))
+    CommandSpec::new("engine.describe", "Describe Command", crate::checked!("engine.describe", describe))
         .icon("list")
         .noundo()
         .doc_only()
@@ -53,20 +66,33 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params("command: a command id. Returns {id, label, params, input, output} (and param_warnings in the warn parameter-check mode): the command's parameter documentation and, once the command has a typed contract, the JSON Schemas (2020-12) of its parameters and of a successful result (null otherwise). Read-only."),
 ];
 
+/// Does `body` enclose a volume? A B-rep body does when every shell is closed and consistently
+/// oriented (not a surface body), a mesh body when every triangle side is shared by exactly two
+/// triangles. Only that is asked: other findings of a full validity check (faces that don't
+/// mesh, tolerance gaps of an imported solid) don't take a closed body's volume away, and the
+/// check stays cheap for designs with many bodies.
+pub(crate) fn encloses_volume(body: &solidcraft_kernel::Body) -> bool {
+    if body.is_mesh() { body.is_closed_mesh() } else { !body.is_surface() }
+}
+
 pub fn measure_json(b: &solidcraft_doc::ModelBody) -> Value {
     match b.measure() {
-        Ok(m) => json!({
-            "name": b.name,
-            "volume_mm3": m.volume,
-            "area_mm2": m.area,
-            "center_of_mass": m.centroid,
-            "bbox": {"min": m.bbox.min, "max": m.bbox.max},
-            "faces": m.merged.faces,
-            "edges": m.merged.edges,
-            "vertices": m.merged.vertices,
-            "face_types": m.merged.face_types,
-            "kernel": {"faces": m.faces, "edges": m.edges, "vertices": m.vertices, "shells": m.shells},
-        }),
+        Ok(m) => {
+            let closed = encloses_volume(&b.body);
+            json!({
+                "name": b.name,
+                "closed": closed,
+                "volume_mm3": closed.then_some(m.volume),
+                "area_mm2": m.area,
+                "center_of_mass": closed.then_some(m.centroid),
+                "bbox": {"min": m.bbox.min, "max": m.bbox.max},
+                "faces": m.merged.faces,
+                "edges": m.merged.edges,
+                "vertices": m.merged.vertices,
+                "face_types": m.merged.face_types,
+                "kernel": {"faces": m.faces, "edges": m.edges, "vertices": m.vertices, "shells": m.shells},
+            })
+        }
         Err(e) => json!({"name": b.name, "error": e.to_string()}),
     }
 }
@@ -112,12 +138,13 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
             // and the area (both faces minus the holes, plus the bores).
             let open = sh.perforated_area();
             if open > 0.0 {
-                let v = b["volume_mm3"].as_f64().unwrap_or(0.0);
-                let nv = v - open * sh.t;
-                if let Some(m) = b["mass_g"].as_f64().filter(|_| v > 0.0) {
-                    b["mass_g"] = json!(m * nv / v);
+                if let Some(v) = b["volume_mm3"].as_f64() {
+                    let nv = v - open * sh.t;
+                    if let Some(m) = b["mass_g"].as_f64().filter(|_| v > 0.0) {
+                        b["mass_g"] = json!(m * nv / v);
+                    }
+                    b["volume_mm3"] = json!(nv);
                 }
-                b["volume_mm3"] = json!(nv);
                 let bores: f64 = sh
                     .perforations
                     .iter()
@@ -127,6 +154,7 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
     }
+    let skipped = bodies.iter().filter(|b| b["closed"] == false).count();
     let tv: f64 = bodies.iter().filter_map(|b| b["volume_mm3"].as_f64()).sum();
     let ta: f64 = bodies.iter().filter_map(|b| b["area_mm2"].as_f64()).sum();
     let tf: u64 = bodies.iter().filter_map(|b| b["faces"].as_u64()).sum();
@@ -134,7 +162,7 @@ fn measure(s: &mut Session, p: &Value) -> Result<Value> {
     let tvx: u64 = bodies.iter().filter_map(|b| b["vertices"].as_u64()).sum();
     let tm: f64 = bodies.iter().filter_map(|b| b["mass_g"].as_f64()).sum();
     Ok(
-        json!({"body_count": bodies.len(), "bodies": bodies, "total": {"volume_mm3": tv, "area_mm2": ta, "mass_g": tm, "faces": tf, "edges": te, "vertices": tvx}}),
+        json!({"body_count": bodies.len(), "bodies": bodies, "total": {"open_bodies_skipped": skipped, "volume_mm3": tv, "area_mm2": ta, "mass_g": tm, "faces": tf, "edges": te, "vertices": tvx}}),
     )
 }
 
@@ -221,6 +249,59 @@ fn sketch_inspect(s: &mut Session, p: &Value) -> Result<Value> {
     }
     .ok_or_else(|| bad("sketch.inspect", "no such sketch (and none is active)"))?;
     sketch_json(s, id).ok_or_else(|| EngineError::Other("that sketch is not evaluated (rolled back or not a sketch)".into()))
+}
+
+/// Revisions of every design of this run (#6646).
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// The design as `document.revision` last saw it, which its revision names.
+pub(crate) struct Followed {
+    /// Held weakly: a design something holds weakly is never changed in place (`Arc::make_mut`
+    /// moves it), and its address can't go to another design meanwhile.
+    doc: Weak<solidcraft_doc::Document>,
+    visibility: crate::Visibility,
+    pending_moves: BTreeMap<u64, solidcraft_doc::Mat>,
+    revision: u64,
+}
+
+/// A new design's id: one for this run, then a number, so no two designs of one run, or of two
+/// runs, have the same.
+pub(crate) fn new_document_id() -> String {
+    static RUN: OnceLock<u64> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let run = RUN.get_or_init(|| {
+        let started = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        // Hashed with this process's random keys (where the system has them), so two runs differ
+        // even with the clock set back.
+        RandomState::new().hash_one(started)
+    });
+    format!("{run:016x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+impl Session {
+    /// The revision of what the design holds now (`document.revision`), a new one when it changed
+    /// since last asked. Changes between two asks that end where they began (an edit undone) need
+    /// no new one: the design is the one that revision named.
+    pub fn design_revision(&mut self) -> u64 {
+        let seen = |f: &Followed| {
+            std::ptr::eq(f.doc.as_ptr(), Arc::as_ptr(&self.doc)) && f.visibility == self.visibility && f.pending_moves == self.pending_moves
+        };
+        match self.followed.as_ref().filter(|f| seen(f)) {
+            Some(f) => f.revision,
+            None => {
+                let revision = NEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+                let (doc, visibility, pending_moves) = (Arc::downgrade(&self.doc), self.visibility.clone(), self.pending_moves.clone());
+                self.followed = Some(Followed { doc, visibility, pending_moves, revision });
+                revision
+            }
+        }
+    }
+}
+
+/// `document.revision`: the design's id and [`Session::design_revision`].
+fn revision(s: &mut Session, _p: &Value) -> Result<Value> {
+    let revision = s.design_revision();
+    Ok(json!({"document_id": s.document_id, "revision": revision}))
 }
 
 fn inspect(s: &mut Session, p: &Value) -> Result<Value> {
@@ -708,4 +789,17 @@ fn material_list(s: &mut Session, _p: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(json!({"materials": built_in.chain(user).collect::<Vec<_>>()}))
+}
+
+fn colored_components(s: &mut Session, p: &Value) -> Result<Value> {
+    if p.get("enabled").is_some_and(|v| !v.is_boolean()) {
+        return Err(bad("inspect.colored_components", "enabled must be a boolean"));
+    }
+    let enabled = bool_(p, "enabled").unwrap_or(s.colored_components.is_none());
+    if enabled && s.colored_components.is_none() {
+        s.colored_components = Some(());
+    } else if !enabled {
+        s.colored_components = None;
+    }
+    Ok(json!({"enabled": enabled}))
 }
