@@ -298,10 +298,16 @@ pub struct SetupForm {
     pub origin: usize,
     pub anchors: [usize; 3],
     pub point: [String; 3],
+    /// Index into [`STOCK_SHAPES`]; a set box's size along X, Y and Z, and a round bar's diameter.
+    pub stock_shape: usize,
+    pub stock_size: [String; 3],
+    pub diameter: String,
     /// Stock offsets.
     pub side: String,
     pub top: String,
     pub bottom: String,
+    /// The bodies that are the part, as typed: names apart by commas (empty: every body).
+    pub bodies: String,
     pub post: usize,
     /// What the stock is made of ("": not said).
     pub material: String,
@@ -316,6 +322,9 @@ pub struct SetupForm {
     /// Index into [`X_DIRECTIONS`].
     pub x_axis: usize,
 }
+
+/// The shapes a setup's stock can have, as `cam.setup.create` names them, and as forms say them.
+const STOCK_SHAPES: [(&str, &str); 3] = [("offset", "box round the part"), ("box", "box of a set size"), ("round", "round bar")];
 
 /// A setup's X directions: worked out from the axis, or along a world axis.
 const X_DIRECTIONS: [&str; 5] = ["automatic", "+x", "-x", "+y", "-y"];
@@ -598,6 +607,8 @@ pub type Path = Vec<(Vec3, bool)>;
 pub struct SetupView {
     pub frame: [Vec3; 4],
     pub stock: Option<(Vec3, Vec3)>,
+    /// A round stock's centre and radius across, in work coordinates (its box is `stock`).
+    pub round: Option<(Vec3, f64)>,
     /// Its clamps as boxes in work coordinates: from the stock's bottom up to each one's top.
     pub clamps: Vec<(Vec3, Vec3)>,
 }
@@ -944,9 +955,13 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             origin: if app.session.world_state().bodies.is_empty() { 2 } else { 0 },
             anchors: [0, 0, 2],
             point: ["0".into(), "0".into(), "0".into()],
+            stock_shape: 0,
+            stock_size: Default::default(),
+            diameter: String::new(),
             side: String::new(),
             top: String::new(),
             bottom: String::new(),
+            bodies: String::new(),
             post: 0,
             material: String::new(),
             work_offset: 0,
@@ -1100,8 +1115,26 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     stock.insert(k.into(), json!(0));
                 }
             }
+            let shape = STOCK_SHAPES.get(f.stock_shape).map_or("offset", |(k, _)| *k);
+            if shape != "offset" || f.editing.is_some() {
+                stock.insert("shape".into(), json!(shape));
+            }
+            match shape {
+                "box" => {
+                    stock.insert("size".into(), json!(f.stock_size.iter().map(|t| t.trim()).collect::<Vec<_>>()));
+                }
+                "round" => {
+                    stock.insert("diameter".into(), json!(f.diameter.trim()));
+                }
+                _ => {}
+            }
             if !stock.is_empty() {
                 p.insert("stock".into(), Value::Object(stock));
+            }
+            // Every body when none is named.
+            let bodies: Vec<&str> = f.bodies.split(',').map(str::trim).filter(|b| !b.is_empty()).collect();
+            if !bodies.is_empty() || f.editing.is_some() {
+                p.insert("bodies".into(), if bodies.is_empty() { Value::Null } else { json!(bodies) });
             }
             p.insert("post".into(), json!(solidcraft_engine::cam::Post::BUILTIN.get(f.post).copied().unwrap_or("rs274")));
             p.insert("material".into(), if f.material.trim().is_empty() { Value::Null } else { json!(f.material.trim()) });
@@ -1505,9 +1538,13 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
         },
         anchors: [anchor("x"), anchor("y"), anchor("z")],
         point: [at.x.to_string(), at.y.to_string(), at.z.to_string()],
+        stock_shape: STOCK_SHAPES.iter().position(|(k, _)| Some(*k) == setup["stock"]["shape"]["type"].as_str()).unwrap_or(0),
+        stock_size: ["x", "y", "z"].map(|k| text(&setup["stock"]["shape"], k)),
+        diameter: text(&setup["stock"]["shape"], "diameter"),
         side: offset("side"),
         top: offset("top"),
         bottom: offset("bottom"),
+        bodies: setup["bodies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
         post: solidcraft_engine::cam::Post::BUILTIN.iter().position(|p| Some(*p) == setup["post"].as_str()).unwrap_or(0),
         material: text(setup, "material"),
         work_offset: setup["work_offset"]
@@ -2302,7 +2339,11 @@ fn refresh(app: &mut SolveApp) {
                     Some((Vec3::new(at("min", 0)?, at("min", 1)?, floor.min(top)), Vec3::new(at("max", 0)?, at("max", 1)?, top)))
                 })
                 .collect();
-            views.push(SetupView { frame: [o, x, y, z], stock, clamps });
+            let round = setup["stock_round"]["centre"]
+                .as_array()
+                .and_then(|c| Some(Vec3::new(c.first()?.as_f64()?, c.get(1)?.as_f64()?, 0.0)))
+                .zip(setup["stock_round"]["radius"].as_f64());
+            views.push(SetupView { frame: [o, x, y, z], stock, round, clamps });
         }
         // A setup with an operation that cannot be cut draws no toolpath; the window says why.
         let Ok(v) = app.session.execute("cam.toolpath", &json!({ "setup": setup["id"] })) else { continue };
@@ -2345,7 +2386,10 @@ pub fn setup_lines(view: &SetupView) -> (Vec<(Vec3, Vec3)>, [(Vec3, Vec3); 3]) {
     let mut edges = Vec::new();
     let mut size = 20.0;
     if let Some((lo, hi)) = view.stock {
-        edges = box_edges(view, lo, hi);
+        edges = match view.round {
+            Some((c, r)) => round_edges(view, c, r, lo.z, hi.z),
+            None => box_edges(view, lo, hi),
+        };
         size = (hi - lo).len() * 0.15;
     }
     (edges, [(o, o + x * size), (o, o + y * size), (o, o + z * size)])
@@ -2363,6 +2407,25 @@ fn box_edges(view: &SetupView, lo: Vec3, hi: Vec3) -> Vec<(Vec3, Vec3)> {
             if i & bit == 0 {
                 edges.push((corner(i), corner(i | bit)));
             }
+        }
+    }
+    edges
+}
+
+/// The edges, in the world, of a round bar about `c` (`r` across) from `bottom` to `top` in a
+/// setup's work coordinates: its two end circles and four lines along it.
+fn round_edges(view: &SetupView, c: Vec3, r: f64, bottom: f64, top: f64) -> Vec<(Vec3, Vec3)> {
+    const SIDES: usize = 64;
+    let [o, x, y, z] = view.frame;
+    let world = |a: f64, h: f64| o + x * (c.x + r * a.cos()) + y * (c.y + r * a.sin()) + z * h;
+    let angle = |k: usize| k as f64 * std::f64::consts::TAU / SIDES as f64;
+    let mut edges = Vec::with_capacity(2 * SIDES + 4);
+    for k in 0..SIDES {
+        for h in [bottom, top] {
+            edges.push((world(angle(k), h), world(angle(k + 1), h)));
+        }
+        if k % (SIDES / 4) == 0 {
+            edges.push((world(angle(k), bottom), world(angle(k), top)));
         }
     }
     edges
@@ -2603,7 +2666,17 @@ fn help(label: &str) -> Option<&'static str> {
         "Stepover" => "How far apart the side-by-side passes are. Smaller is cleaner but slower.",
         "Name" => "Your own name for it. Empty: one is made up.",
         "Tool axis" => "The direction the tool comes from. +z: from above.",
-        "Stock on the sides" | "Stock on top" | "Stock below" => "Extra material round the part: the raw block is the part's box plus these.",
+        "Stock on the sides" | "Stock on top" | "Stock below" => {
+            "Extra material round the part: the raw block is the part's box plus these. A set box and a round bar sit this far over the part's top (a round bar also this far below its foot)."
+        }
+        "Stock" => {
+            "The raw block: the part's box with extra material round it, a box of a set size (a sawn plate), or a round bar standing along the tool axis. Both of the last are centred on the part across."
+        }
+        "Stock size X" | "Stock size Y" | "Stock size Z" => "How big the raw block is along the setup's X, Y and Z.",
+        "Bar diameter" => "How thick the round bar is. It stands along the tool axis, centred on the part.",
+        "Part bodies" => {
+            "Which bodies are the part, by name, apart by commas. Others (a fixture, a modelled stock) are neither cut round nor checked against. Empty: every body."
+        }
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
@@ -3019,6 +3092,8 @@ struct Choices {
     material: Option<String>,
     /// The design's setups in order, by id and name: what a setup can take its stock from.
     setups: Vec<(String, String)>,
+    /// The bodies the selection is on, each once: what a setup can take as its part.
+    bodies: Vec<String>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -3085,7 +3160,18 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
         ));
     }
     let setups = listed["setups"].as_array().into_iter().flatten().filter_map(|x| Some((x["id"].as_u64()?.to_string(), text(x, "name")))).collect();
-    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups }
+    let mut bodies: Vec<String> = Vec::new();
+    for item in &app.session.selection {
+        let name = match item {
+            solidcraft_engine::Sel::Body { name } => name,
+            solidcraft_engine::Sel::Face { body, .. } | solidcraft_engine::Sel::Edge { body, .. } => body,
+            _ => continue,
+        };
+        if !bodies.contains(name) {
+            bodies.push(name.clone());
+        }
+    }
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups, bodies }
 }
 
 /// The spindle speed (rev/min) and feed (mm/min) a listed tool cuts at: in a material, `cut`'s
@@ -3493,9 +3579,36 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
         Form::Setup(f) => {
             field(ui, need, "Name", &mut f.name, "automatic");
             choice(ui, need, "sc_cam_setup_axis", "Tool axis", &mut f.axis, &AXES);
-            field(ui, need, "Stock on the sides", &mut f.side, "0 mm");
-            field(ui, need, "Stock on top", &mut f.top, "0 mm");
-            field(ui, need, "Stock below", &mut f.bottom, "0 mm");
+            // The part: every body, or those named.
+            field(ui, need, "Part bodies", &mut f.bodies, "every body");
+            if !choices.bodies.is_empty() && choices.bodies.join(", ") != f.bodies {
+                ui.label("");
+                if button(ui, tf("manufacture.part_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small).clicked() {
+                    f.bodies = choices.bodies.join(", ");
+                }
+                ui.end_row();
+            }
+            let shapes = STOCK_SHAPES.map(|(_, label)| label);
+            choice(ui, need, "sc_cam_setup_stock", "Stock", &mut f.stock_shape, &shapes);
+            match f.stock_shape {
+                1 => {
+                    let [x, y, z] = &mut f.stock_size;
+                    field(ui, need, "Stock size X", x, "required");
+                    field(ui, need, "Stock size Y", y, "required");
+                    field(ui, need, "Stock size Z", z, "required");
+                    field(ui, need, "Stock on top", &mut f.top, "0 mm");
+                }
+                2 => {
+                    field(ui, need, "Bar diameter", &mut f.diameter, "required");
+                    field(ui, need, "Stock on top", &mut f.top, "0 mm");
+                    field(ui, need, "Stock below", &mut f.bottom, "0 mm");
+                }
+                _ => {
+                    field(ui, need, "Stock on the sides", &mut f.side, "0 mm");
+                    field(ui, need, "Stock on top", &mut f.top, "0 mm");
+                    field(ui, need, "Stock below", &mut f.bottom, "0 mm");
+                }
+            }
             choice(ui, need, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
             if f.origin == 2 {
                 let [x, y, z] = &mut f.point;
@@ -3857,6 +3970,18 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
                         want(field, "where the work zero is, in the world");
                     }
                 }
+            }
+            match f.stock_shape {
+                1 => {
+                    for (field, value) in [("Stock size X", &f.stock_size[0]), ("Stock size Y", &f.stock_size[1]), ("Stock size Z", &f.stock_size[2])]
+                    {
+                        if empty(value) {
+                            want(field, "how big the raw block is");
+                        }
+                    }
+                }
+                2 if empty(&f.diameter) => want("Bar diameter", "how thick the round bar is"),
+                _ => {}
             }
         }
         Form::Op(f) => {

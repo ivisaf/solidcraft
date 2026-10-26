@@ -10,7 +10,7 @@ use solidcraft_cam::{
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{
-    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, FaceRef, Setup, SetupOrigin, StockDef, TabsDef,
+    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, FaceRef, Setup, SetupOrigin, StockDef, StockShape, TabsDef,
 };
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
@@ -46,7 +46,10 @@ macro_rules! op_doc {
 }
 
 const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direction the tool comes from: the setup's +Z (default +z); \
-     stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0); origin?: the work origin: \
+     stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0), and shape?: offset (that box, the default) | \
+     box, with size: [x, y, z] (lengths along the setup's axes; centred on the part across, its top `top` above the part's) | round, with diameter (a bar along \
+     the axis, centred on the part across, from `bottom` below the part to `top` above it; no copies); bodies?: [names] the bodies that are the part \
+     (default, or null: all; others are neither cut round nor checked against); origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
@@ -95,7 +98,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, post, material, work_offset, stock_from, x_axis, clamps, copies as in cam.setup.create (stock offsets left out stay as they are)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, bodies, post, material, work_offset, stock_from, x_axis, clamps, copies as in cam.setup.create (what stock leaves out stays as it is)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -853,12 +856,14 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let x_axis = x_axis_param(p, cmd)?.flatten();
     let clamps = clamps_param(p, cmd)?.unwrap_or_default();
     let copies = copies_param(p, cmd)?.flatten();
+    let bodies = bodies_param(s, p, cmd)?.unwrap_or_default();
     let mut setup = Setup {
         id: 0,
         name: name.clone(),
         axis,
         origin,
         stock,
+        bodies,
         material,
         post,
         work_offset,
@@ -898,6 +903,9 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = p.get("stock") {
         setup.stock = stock_param(s, v, &setup.stock, cmd)?;
+    }
+    if let Some(bodies) = bodies_param(s, p, cmd)? {
+        setup.bodies = bodies;
     }
     if let Some(offset) = work_offset_param(p, cmd)? {
         setup.work_offset = offset;
@@ -975,10 +983,10 @@ fn origin_param(v: &Value, cmd: &str) -> Result<SetupOrigin> {
     Ok(SetupOrigin::Box { of, x: anchor("x", Anchor::Min)?, y: anchor("y", Anchor::Min)?, z: anchor("z", Anchor::Max)? })
 }
 
-/// Stock offsets from `{side?, top?, bottom?}`; what is left out keeps its value in `was`.
+/// Stock from `{side?, top?, bottom?, shape?, size?, diameter?}`; what is left out keeps its value in `was`.
 fn stock_param(s: &Session, v: &Value, was: &StockDef, cmd: &str) -> Result<StockDef> {
     if !v.is_object() {
-        return Err(bad(cmd, "`stock` must be {side?, top?, bottom?}: lengths added to the box around the bodies"));
+        return Err(bad(cmd, "`stock` must be {side?, top?, bottom?, shape?, size?, diameter?}"));
     }
     let offset = |k: &str, was: &Expr| -> Result<Expr> {
         match v.get(k) {
@@ -990,7 +998,71 @@ fn stock_param(s: &Session, v: &Value, was: &StockDef, cmd: &str) -> Result<Stoc
             }
         }
     };
-    Ok(StockDef { side: offset("side", &was.side)?, top: offset("top", &was.top)?, bottom: offset("bottom", &was.bottom)? })
+    // A size above nothing, as typed.
+    let size = |what: &str, e: &Value| -> Result<Expr> {
+        let e = match e {
+            Value::Number(n) => format!("{n} mm"),
+            Value::String(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => return Err(bad(cmd, format!("the stock's {what} must be a length"))),
+        };
+        let d = length(s, cmd, what, &e)?;
+        if d > 0.0 && d <= 1.0e6 { Ok(e.into()) } else { Err(bad(cmd, format!("the stock's {what} must be above 0"))) }
+    };
+    let named = v.get("shape").map(|n| n.as_str().unwrap_or_default());
+    let shape = match (named, &was.shape) {
+        (Some("offset"), _) | (None, StockShape::Offset) => StockShape::Offset,
+        (Some("box"), _) | (None, StockShape::Box { .. }) => {
+            let was = match &was.shape {
+                StockShape::Box { x, y, z } => Some([x.clone(), y.clone(), z.clone()]),
+                _ => None,
+            };
+            let [x, y, z] = match (v.get("size"), was) {
+                (Some(Value::Array(a)), _) if a.len() == 3 => {
+                    [size("size along X", &a[0])?, size("size along Y", &a[1])?, size("size along Z", &a[2])?]
+                }
+                (Some(_), _) => return Err(bad(cmd, "the stock's `size` must be [x, y, z], lengths along the setup's axes")),
+                (None, Some(was)) => was,
+                (None, None) => return Err(bad(cmd, "a box stock needs its `size`: [x, y, z]")),
+            };
+            StockShape::Box { x, y, z }
+        }
+        (Some("round"), _) | (None, StockShape::Round { .. }) => {
+            let diameter = match (v.get("diameter"), &was.shape) {
+                (Some(d), _) => size("diameter", d)?,
+                (None, StockShape::Round { diameter }) => diameter.clone(),
+                (None, _) => return Err(bad(cmd, "a round stock needs its `diameter`")),
+            };
+            StockShape::Round { diameter }
+        }
+        (Some(other), _) => return Err(bad(cmd, format!("unknown stock shape `{other}` (known: offset, box, round)"))),
+    };
+    Ok(StockDef { side: offset("side", &was.side)?, top: offset("top", &was.top)?, bottom: offset("bottom", &was.bottom)?, shape })
+}
+
+/// Most bodies a setup names as its part.
+const MAX_PART_BODIES: usize = 256;
+
+/// `bodies`: the bodies that are the part, each named as the design has it (`Some(empty)` for
+/// null or []: all of them); `None` when not given.
+fn bodies_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<Vec<String>>> {
+    let list = match p.get("bodies") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(Vec::new())),
+        Some(v) => v
+            .as_array()
+            .filter(|l| l.len() <= MAX_PART_BODIES)
+            .ok_or_else(|| bad(cmd, format!("`bodies` must be a list of at most {MAX_PART_BODIES} body names")))?,
+    };
+    let state = s.model.state();
+    let mut out: Vec<String> = Vec::new();
+    for name in list {
+        let name = name.as_str().ok_or_else(|| bad(cmd, "`bodies` must be body names"))?;
+        let body = state.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| bad(cmd, format!("no body `{name}`")))?;
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(&body.name)) {
+            out.push(body.name.clone());
+        }
+    }
+    Ok(Some(out))
 }
 
 /// A setup's work coordinates: origin and axes in the world.
@@ -1052,16 +1124,31 @@ pub(crate) struct Resolved {
     frame: Frame,
     part: Option<Box3>,
     stock: Option<Box3>,
+    /// A round stock's centre and radius across (its box is `stock`).
+    round: Option<(Vec2, f64)>,
+    /// The bodies that are the part (empty: every body).
+    bodies: Vec<String>,
     /// Where each copy of the part is, from the first (one at 0, 0 without copies).
     copies: Vec<(f64, f64)>,
+}
+
+impl Resolved {
+    /// Whether the body called `name` is part of the part.
+    fn is_part(&self, name: &str) -> bool {
+        self.bodies.is_empty() || self.bodies.iter().any(|b| b.eq_ignore_ascii_case(name))
+    }
 }
 
 fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> {
     let (x, y, z) = setup_axes(setup).ok_or("the setup's tool axis is not a direction, or its X direction runs along it")?;
     // The bodies' extent along the setup's axes, measured from the world origin.
     let state = s.model.state();
+    if let Some(gone) = setup.bodies.iter().find(|n| !state.bodies.iter().any(|b| b.name.eq_ignore_ascii_case(n))) {
+        return Err(format!("the setup's part names the body `{gone}`, which the design no longer has"));
+    }
+    let wanted = |name: &str| setup.bodies.is_empty() || setup.bodies.iter().any(|b| b.eq_ignore_ascii_case(name));
     let mut part: Option<Box3> = None;
-    for body in &state.bodies {
+    for body in state.bodies.iter().filter(|b| wanted(&b.name)) {
         for p in &body.mesh().positions {
             let q = Vec3::new(p.dot(x), p.dot(y), p.dot(z));
             part = Some(part.map_or((q, q), |(lo, hi)| (lo.min(q), hi.max(q))));
@@ -1069,7 +1156,31 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     }
     let offset = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| format!("the stock's {what} offset: {e}")).map(|d| d.max(0.0));
     let (side, top, bottom) = (offset("side", &setup.stock.side)?, offset("top", &setup.stock.top)?, offset("bottom", &setup.stock.bottom)?);
-    let stock = part.map(|(lo, hi)| (lo - Vec3::new(side, side, bottom), hi + Vec3::new(side, side, top)));
+    let size = |what: &str, e: &str| {
+        s.doc
+            .eval(e, Kind::Length)
+            .map_err(|e| format!("the stock's {what}: {e}"))
+            .and_then(|d| if d > 0.0 && d.is_finite() { Ok(d) } else { Err(format!("the stock's {what} must be above 0")) })
+    };
+    let mut round = None;
+    let stock = match (&setup.stock.shape, part) {
+        (_, None) => None,
+        (StockShape::Offset, Some((lo, hi))) => Some((lo - Vec3::new(side, side, bottom), hi + Vec3::new(side, side, top))),
+        // Centred on the part across; its top `top` above the part's.
+        (StockShape::Box { x: sx, y: sy, z: sz }, Some((lo, hi))) => {
+            let (sx, sy, sz) = (size("size along X", sx)?, size("size along Y", sy)?, size("size along Z", sz)?);
+            let (c, top) = ((lo + hi) * 0.5, hi.z + top);
+            Some((Vec3::new(c.x - sx * 0.5, c.y - sy * 0.5, top - sz), Vec3::new(c.x + sx * 0.5, c.y + sy * 0.5, top)))
+        }
+        (StockShape::Round { diameter }, Some((lo, hi))) => {
+            if setup.copies.is_some() {
+                return Err("a round stock holds one part: copies need a box stock".into());
+            }
+            let (c, r) = ((lo + hi) * 0.5, size("diameter", diameter)? * 0.5);
+            round = Some((Vec2::new(c.x, c.y), r));
+            Some((Vec3::new(c.x - r, c.y - r, lo.z - bottom), Vec3::new(c.x + r, c.y + r, hi.z + top)))
+        }
+    };
     let o = match &setup.origin {
         SetupOrigin::Point { at } => *at,
         SetupOrigin::Box { of, x: ax, y: ay, z: az } => {
@@ -1092,7 +1203,8 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     let copies = setup.copies.map_or_else(|| vec![(0.0, 0.0)], |c| c.offsets());
     let (far_x, far_y) = copies.iter().fold((0.0f64, 0.0f64), |m, c| (m.0.max(c.0), m.1.max(c.1)));
     let stock = stock.map(moved).map(|(lo, hi)| (lo, hi + Vec3::new(far_x, far_y, 0.0)));
-    Ok(Resolved { setup: setup.id, frame: Frame { o, x, y, z }, part: part.map(moved), stock, copies })
+    let round = round.map(|(c, r)| (c - Vec2::new(shift.x, shift.y), r));
+    Ok(Resolved { setup: setup.id, frame: Frame { o, x, y, z }, part: part.map(moved), stock, round, bodies: setup.bodies.clone(), copies })
 }
 
 /// How many tools a setup's program loads: one for its first operation, and one each time the
@@ -1375,7 +1487,11 @@ fn geometry(s: &Session, at: &Resolved, source: &CamGeometry) -> std::result::Re
     match source {
         CamGeometry::Stock | CamGeometry::Part => {
             let (lo, hi) = if *source == CamGeometry::Part { at.part } else { at.stock }.ok_or("there is no body to take the boundary from")?;
-            let outer = Loop2::polygon(&[Vec2::new(lo.x, lo.y), Vec2::new(hi.x, lo.y), Vec2::new(hi.x, hi.y), Vec2::new(lo.x, hi.y)]);
+            // A round bar's own circle: no cuts in the air round it.
+            let outer = match (source, at.round) {
+                (CamGeometry::Stock, Some((c, r))) => Loop2::circle(c, r),
+                _ => Loop2::polygon(&[Vec2::new(lo.x, lo.y), Vec2::new(hi.x, lo.y), Vec2::new(hi.x, hi.y), Vec2::new(lo.x, hi.y)]),
+            };
             Ok(Geometry {
                 regions: vec![Region2 { outer, holes: Vec::new() }],
                 // Either box is faced from the top of the stock.
@@ -1524,7 +1640,7 @@ fn setup_part(s: &Session, at: &Resolved) -> Option<cam::HeightField> {
 fn part_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
     let state = s.model.state();
     let mut triangles = Vec::new();
-    for body in &state.bodies {
+    for body in state.bodies.iter().filter(|b| at.is_part(&b.name)) {
         let mesh = body.mesh();
         for t in &mesh.triangles {
             let corner = |k: usize| t.get(k).and_then(|v| mesh.positions.get(*v as usize)).map(|p| at.frame.local(*p));
@@ -1750,7 +1866,9 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 None if *inside => 0.0,
                 None => tool.radius(),
             };
-            let params = cam::FaceParams { stepover: len("stepover", stepover)?, inside: *inside, margin };
+            // Facing a round bar's stock goes across its circle only.
+            let round = at.round.filter(|_| op.geometry == CamGeometry::Stock);
+            let params = cam::FaceParams { stepover: len("stepover", stepover)?, inside: *inside, margin, round };
             // The part seen from above round the area, so that passes below its top go round it.
             let reach = margin + tool.diameter;
             let around = Vec2::new(reach, reach);
@@ -3179,7 +3297,7 @@ fn list_now(s: &Session) -> Value {
                     v
                 })
                 .collect();
-            let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock,
+            let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock, "bodies": setup.bodies,
                 "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "x_axis": setup.x_axis, "stock_from": setup.stock_from, "clamps": setup.clamps, "copies": setup.copies, "tool_changes": tool_changes(setup), "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
@@ -3188,6 +3306,9 @@ fn list_now(s: &Session) -> Value {
                     v["frame"] = at.frame.json();
                     v["stock_box"] = json!(boxed(at.stock));
                     v["part_box"] = json!(boxed(at.part));
+                    if let Some((c, r)) = at.round {
+                        v["stock_round"] = json!({"centre": [c.x, c.y], "radius": r});
+                    }
                 }
                 Err(e) => v["error"] = json!(e),
             }
@@ -3309,7 +3430,19 @@ fn sim_block(p: &Value, cmd: &str, at: &Resolved) -> Result<(cam::HeightField, B
         }
         (None, None) => ((max.x - min.x).max(max.y - min.y) / 300.0).max(0.02),
     };
-    let stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
+    let mut stock = cam::HeightField::block(min, max, cell).map_err(|e| bad(cmd, e.to_string()))?;
+    // A round bar holds no material outside its circle.
+    if let (None, Some((c, r))) = (p.get("stock"), at.round) {
+        for j in 0..stock.ny {
+            for i in 0..stock.nx {
+                if stock.centre(i, j).dist(c) > r
+                    && let Some(z) = stock.z.get_mut(j * stock.nx + i)
+                {
+                    *z = stock.floor;
+                }
+            }
+        }
+    }
     Ok((stock, (min, max)))
 }
 
@@ -3367,7 +3500,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let at = resolve(s, setup).map_err(|e| bad(cmd, e))?;
     let state = s.model.state();
-    let meshes: Vec<_> = state.bodies.iter().map(|b| b.mesh()).collect();
+    let meshes: Vec<_> = state.bodies.iter().filter(|b| at.is_part(&b.name)).map(|b| b.mesh()).collect();
     let (mut stock, (min, max)) = start_stock(s, setup, &at, p, cmd)?;
     let cell = stock.cell;
     let (shown, first) = simulated_ops(setup, p, cmd)?;
@@ -3475,7 +3608,17 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
         if t == "-0" { "0".to_string() } else { t }
     };
     let mut notes = Vec::new();
-    if let Some((lo, hi)) = at.stock {
+    if let (Some((lo, hi)), Some((c, r))) = (at.stock, at.round) {
+        notes.push(format!(
+            "Stock round bar D{} x {} mm, centre X{} Y{}, top at Z{}, bottom at Z{}",
+            mm(2.0 * r),
+            mm(hi.z - lo.z),
+            mm(c.x),
+            mm(c.y),
+            mm(hi.z),
+            mm(lo.z)
+        ));
+    } else if let Some((lo, hi)) = at.stock {
         notes.push(format!(
             "Stock {} x {} x {} mm, top at Z{}, bottom at Z{}",
             mm(hi.x - lo.x),

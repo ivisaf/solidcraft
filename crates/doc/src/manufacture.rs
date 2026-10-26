@@ -56,6 +56,10 @@ pub struct Setup {
     /// What holds the stock that no tool may touch (clamps, vices), in the setup's work coordinates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clamps: Vec<Clamp>,
+    /// The bodies that are the part, by name (empty: every body). Others (fixtures, a modelled
+    /// stock) are neither cut round nor checked against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bodies: Vec<String>,
     /// Copies of the part side by side on the stock, each cut by every operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copies: Option<Copies>,
@@ -130,7 +134,8 @@ pub enum Anchor {
     Max,
 }
 
-/// The stock: the box around the bodies (in the setup's axes) grown by these offsets (length expressions).
+/// The stock, in the setup's axes: by its [`StockShape`], the box around the bodies grown by
+/// these offsets (length expressions), a box of a set size, or a round bar.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StockDef {
     /// Added on each of the four sides.
@@ -139,11 +144,34 @@ pub struct StockDef {
     pub top: Expr,
     /// Added below the part.
     pub bottom: Expr,
+    #[serde(default, skip_serializing_if = "StockShape::is_offset")]
+    pub shape: StockShape,
 }
 
 impl Default for StockDef {
     fn default() -> Self {
-        StockDef { side: "0 mm".into(), top: "0 mm".into(), bottom: "0 mm".into() }
+        StockDef { side: "0 mm".into(), top: "0 mm".into(), bottom: "0 mm".into(), shape: StockShape::Offset }
+    }
+}
+
+/// What shape a setup's stock has.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StockShape {
+    /// The box around the part grown by the offsets.
+    #[default]
+    Offset,
+    /// A box of this size along the setup's X, Y and Z (length expressions), centred on the part
+    /// across and its top `top` above the part's.
+    Box { x: Expr, y: Expr, z: Expr },
+    /// A round bar along the tool axis this wide (a length expression), centred on the part
+    /// across and reaching `top` above and `bottom` below it.
+    Round { diameter: Expr },
+}
+
+impl StockShape {
+    pub fn is_offset(&self) -> bool {
+        *self == StockShape::Offset
     }
 }
 

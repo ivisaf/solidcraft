@@ -978,6 +978,83 @@ fn plate_with_boss() -> Session {
 }
 
 #[test]
+fn a_stock_is_a_set_box_or_a_round_bar_and_the_part_is_the_bodies_named() {
+    let mut s = plate_with_boss();
+    // The part reaches 0..60 across X, 0..40 across Y and -10..12 up; its stock is 1 mm over it.
+    let boxes = |s: &mut Session| {
+        let listed = run(s, "cam.list", json!({}));
+        let setup = listed["setups"][0].clone();
+        // To a micron: the bodies' meshes are not exact.
+        let um = |v: f64| (v * 1e6).round() / 1e6;
+        let corner = |b: &str, k: &str| -> Vec<f64> { (0..3).map(|i| um(setup[b][k][i].as_f64().unwrap())).collect() };
+        let round = setup["stock_round"]
+            .as_object()
+            .map(|r| (um(r["centre"][0].as_f64().unwrap()), um(r["centre"][1].as_f64().unwrap()), um(r["radius"].as_f64().unwrap())));
+        ((corner("stock_box", "min"), corner("stock_box", "max")), corner("part_box", "max"), round)
+    };
+    // A box of a set size is centred on the part across, its top 1 mm over the part's.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"shape": "box", "size": [80, "50 mm", 30]}}));
+    let ((lo, hi), _, round) = boxes(&mut s);
+    assert_eq!((lo, hi, round), (vec![-10.0, -5.0, -17.0], vec![70.0, 45.0, 13.0], None));
+    // A round bar along the axis: 80 across, from the part's foot to 1 mm over its top.
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"shape": "round", "diameter": 80}}));
+    let ((lo, hi), _, round) = boxes(&mut s);
+    assert_eq!((lo, hi), (vec![-10.0, -20.0, -10.0], vec![70.0, 60.0, 13.0]));
+    assert_eq!(round, Some((30.0, 20.0, 40.0)));
+    // Facing off the 1 mm over the part takes the bar's circle, not the box round it: no cut runs
+    // further out than the bar and the tool's radius, so none goes through the air at its corners.
+    let square = run(&mut s, "cam.op.face", json!({"tool": 1, "bottom": 12, "stepover": 4}))["cut_minutes"].as_f64().unwrap();
+    let points = run(&mut s, "cam.toolpath", json!({}))["operations"][0]["points"].clone();
+    let furthest = points
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p[3].as_bool() == Some(true))
+        .map(|p| (p[0].as_f64().unwrap() - 30.0).hypot(p[1].as_f64().unwrap() - 20.0))
+        .fold(0.0, f64::max);
+    assert!(furthest <= 40.0 + 3.0 + 1e-6, "{furthest}");
+    // A box of the bar's size round it takes longer to face.
+    run(&mut s, "cam.op.remove", json!({"op": "Face1"}));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"shape": "box", "size": [80, 80, 23]}}));
+    let boxed = run(&mut s, "cam.op.face", json!({"tool": 1, "bottom": 12, "stepover": 4}))["cut_minutes"].as_f64().unwrap();
+    assert!(square < boxed * 0.9, "{square} {boxed}");
+    run(&mut s, "cam.op.remove", json!({"op": "Face1"}));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"shape": "round", "diameter": 80}}));
+    run(&mut s, "cam.op.face", json!({"tool": 1, "bottom": 12, "stepover": 4}));
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    let disc = std::f64::consts::PI * 40.0 * 40.0;
+    close(sim["removed_volume"].as_f64().unwrap(), disc, disc * 0.02);
+    let sheet = run(&mut s, "cam.sheet", json!({}))["text"].as_str().unwrap().to_string();
+    assert!(sheet.contains("Stock round bar D80 x 23 mm, centre X30 Y20"), "{sheet}");
+    // A round bar holds one part; a box can hold copies again.
+    assert!(
+        s.execute("cam.setup.edit", &json!({"setup": "Setup1", "copies": {"nx": 2, "dx": 70}}))
+            .unwrap_err()
+            .to_string()
+            .contains("copies need a box")
+    );
+    for bad in [json!({"shape": "box"}), json!({"shape": "round", "diameter": 0}), json!({"shape": "cone"}), json!({"shape": "box", "size": [1, 2]})]
+    {
+        assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "stock": bad})).is_err(), "{bad}");
+    }
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"shape": "offset"}}));
+
+    // A fixture modelled beside the part makes the stock reach over it, until the setup names its part.
+    run(&mut s, "solid.box", json!({"length": 20, "width": 20, "height": 40, "corner": [100, 0, -10], "body_name": "Fixture"}));
+    let plate = s.model.state().bodies.iter().map(|b| b.name.clone()).find(|n| n != "Fixture").unwrap();
+    assert_eq!(boxes(&mut s).1, vec![120.0, 40.0, 30.0]);
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "bodies": [plate.to_lowercase()]}));
+    assert_eq!(s.doc.manufacture.setups[0].bodies, vec![plate.clone()], "kept as the design names it");
+    assert_eq!(boxes(&mut s).1, vec![60.0, 40.0, 12.0]);
+    // The fixture is no part to check the program against: the facing above leaves it be.
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    close(sim["max_gouge"].as_f64().unwrap(), 0.0, 1e-9);
+    assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "bodies": ["Nope"]})).unwrap_err().to_string().contains("no body `Nope`"));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "bodies": null}));
+    assert!(s.doc.manufacture.setups[0].bodies.is_empty());
+}
+
+#[test]
 fn facing_below_the_part_s_top_goes_round_it_and_cuts_into_it_are_reported() {
     let mut s = plate_with_boss();
     // Facing the stock down to the plate: the boss stays, the plate round it is cut to its top.

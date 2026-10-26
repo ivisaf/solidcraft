@@ -587,6 +587,10 @@ pub struct FaceParams {
     pub inside: bool,
     /// How far inside or beyond the boundary (mm, 0 or more).
     pub margin: f64,
+    /// A round boundary inside the rectangle instead of the rectangle itself: its centre and
+    /// radius (a round bar's top). Each pass then runs only across the circle, with `inside` and
+    /// `margin` as for the rectangle.
+    pub round: Option<(Vec2, f64)>,
 }
 
 /// Faces the rectangle `min`–`max` with passes along X. Over the boundary, the area out to the
@@ -597,11 +601,16 @@ pub fn face(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -
     let rows = face_rows(min, max, tool, params, cut)?;
     let mut b = Builder::new(cut);
     for z in cut.levels()? {
-        b.travel_to(Vec2::new(rows.x0, rows.y(0)))?;
-        b.plunge_to(z)?;
+        let mut down = false;
         for k in 0..rows.count {
+            let Some((x0, x1)) = rows.span(k) else { continue };
             let y = rows.y(k);
-            let (from, to) = if k % 2 == 0 { (rows.x0, rows.x1) } else { (rows.x1, rows.x0) };
+            let (from, to) = if k % 2 == 0 { (x0, x1) } else { (x1, x0) };
+            if !down {
+                b.travel_to(Vec2::new(from, y))?;
+                b.plunge_to(z)?;
+                down = true;
+            }
             b.cut_to(Vec2::new(from, y), z)?;
             b.cut_to(Vec2::new(to, y), z)?;
         }
@@ -610,18 +619,34 @@ pub fn face(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) -
     b.finish()
 }
 
-/// Where a facing operation's passes run: along X from `x0` to `x1`, `count` rows from `y0` up.
+/// Where a facing operation's passes run: along X from `x0` to `x1`, `count` rows from `y0` up;
+/// across a circle, only where it is (`round`: its centre and the radius the tool's centre stays within).
 struct FaceRows {
     x0: f64,
     x1: f64,
     y0: f64,
     height: f64,
     count: usize,
+    round: Option<(Vec2, f64)>,
 }
 
 impl FaceRows {
     fn y(&self, k: usize) -> f64 {
         self.y0 + self.height * k as f64 / (self.count - 1).max(1) as f64
+    }
+    /// Where pass `k` runs along X, from `x0`'s end to `x1`'s; `None` where it misses the circle.
+    fn span(&self, k: usize) -> Option<(f64, f64)> {
+        let Some((c, r)) = self.round else { return Some((self.x0, self.x1)) };
+        let dy = self.y(k) - c.y;
+        if dy.abs() > r {
+            return None;
+        }
+        let h = (r * r - dy * dy).max(0.0).sqrt();
+        let (lo, hi) = (self.x0.min(self.x1).max(c.x - h), self.x0.max(self.x1).min(c.x + h));
+        if lo > hi {
+            return None;
+        }
+        Some(if self.x0 <= self.x1 { (lo, hi) } else { (hi, lo) })
     }
 }
 
@@ -649,18 +674,19 @@ pub fn face_around(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: 
         let n = ((a.dist(b) / step).ceil()).clamp(1.0, 1.0e5) as usize;
         (0..=n).all(|k| clear(a.lerp(b, k as f64 / n as f64), z))
     };
-    let span = rows.x1 - rows.x0;
-    let samples = ((span.abs() / step).ceil()).clamp(1.0, 1.0e5) as usize;
     let mut b = Builder::new(cut);
     for z in cut.levels()? {
         let mut down = false;
         for k in 0..rows.count {
+            let Some((x0, x1)) = rows.span(k) else { continue };
+            let span = x1 - x0;
+            let samples = ((span.abs() / step).ceil()).clamp(1.0, 1.0e5) as usize;
             let y = rows.y(k);
             // The stretches of this pass the tool may cut, in the pass's direction.
             let mut stretches: Vec<(f64, f64)> = Vec::new();
             let mut open: Option<f64> = None;
             for n in 0..=samples {
-                let x = rows.x0 + span * n as f64 / samples as f64;
+                let x = x0 + span * n as f64 / samples as f64;
                 match (clear(Vec2::new(x, y), z), open) {
                     (true, None) => open = Some(x),
                     (false, Some(start)) => {
@@ -675,7 +701,7 @@ pub fn face_around(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: 
                 }
             }
             if let Some(start) = open {
-                stretches.push((start, rows.x1));
+                stretches.push((start, x1));
             }
             if k % 2 == 1 {
                 stretches = stretches.into_iter().rev().map(|(start, end)| (end, start)).collect();
@@ -730,7 +756,19 @@ fn face_rows(min: Vec2, max: Vec2, tool: &Tool, params: &FaceParams, cut: &Cut) 
     if !(rows <= MAX_ROWS as f64) {
         return Err(CamError::TooLarge(format!("more than {MAX_ROWS} passes")));
     }
-    Ok(FaceRows { x0, x1, y0, height, count: rows as usize })
+    // Across a circle the tool's centre stays as far over or inside it as along the rectangle's ends.
+    let round = match params.round {
+        None => None,
+        Some((c, radius)) => {
+            check_point(c)?;
+            let reach = if params.inside { radius - params.margin - r } else { radius + params.margin };
+            if !(radius > 0.0 && radius.is_finite()) || (params.inside && !(reach > 0.0)) {
+                return invalid("the tool does not fit inside the round boundary");
+            }
+            Some((c, reach))
+        }
+    };
+    Ok(FaceRows { x0, x1, y0, height, count: rows as usize, round })
 }
 
 /// Follows the boundaries of `regions` on the chosen side, one loop after the other, each

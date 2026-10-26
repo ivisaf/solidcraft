@@ -294,6 +294,35 @@ fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
     let setup = &h.app.session.doc.manufacture.setups[0];
     assert_eq!((setup.stock.side.as_str(), setup.stock.top.as_str()), ("5 mm", "0"));
     h.frames(2);
+
+    // A round bar 80 across, and the part named: the stock is drawn as a cylinder, and the form
+    // opens on both again.
+    let body = h.app.session.model.state().bodies[0].name.clone();
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    (form.stock_shape, form.diameter, form.bodies) = (2, "80".into(), body.clone());
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let setup = &h.app.session.doc.manufacture.setups[0];
+    assert_eq!(
+        (&setup.stock.shape, &setup.bodies),
+        (&solidcraft_engine::doc::manufacture::StockShape::Round { diameter: "80".into() }, &vec![body.clone()])
+    );
+    let view = setup_views(&mut h.app).first().cloned().unwrap();
+    let (c, r) = view.round.expect("a round stock");
+    assert!((r - 40.0).abs() < 1e-9 && close(view.frame[0] + Vec3::new(c.x, -c.y, 0.0), [30.0, 20.0, 0.0]), "{view:?}");
+    assert_eq!(setup_lines(&view).0.len(), 2 * 64 + 4, "two circles and four lines along it");
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!((form.stock_shape, form.diameter.as_str(), form.bodies.as_str()), (2, "80", body.as_str()));
+    // Back to the box round every body.
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    (form.stock_shape, form.bodies) = (0, String::new());
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    let setup = &h.app.session.doc.manufacture.setups[0];
+    assert!(setup.stock.shape.is_offset() && setup.bodies.is_empty());
 }
 
 #[test]

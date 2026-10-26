@@ -557,7 +557,7 @@ fn facing_goes_round_what_rises_above_its_passes() {
         feeds: Feeds { cut: 800.0, plunge: 300.0 },
         stepdown: 5.0,
     };
-    let params = FaceParams { stepover: 4.0, inside: false, margin: 3.0 };
+    let params = FaceParams { stepover: 4.0, inside: false, margin: 3.0, round: None };
     let t = tool(6.0);
     // Facing alone runs through the boss; round it, the tool's edge stays off it.
     let straight = face(v(0.0, 0.0), v(60.0, 40.0), &t, &params, &c).unwrap();
@@ -590,7 +590,7 @@ fn face_cuts_over_the_boundary_or_stays_inside_it() {
     };
     // Over by the tool's radius: the centre runs from 10 before the 100 × 50 area to 10 past it,
     // in passes from Y 0 to Y 50: ceil(50/15) + 1 = 5 of them 12.5 apart, 120 long, and one 3 mm plunge.
-    let over = FaceParams { stepover: 15.0, inside: false, margin: 10.0 };
+    let over = FaceParams { stepover: 15.0, inside: false, margin: 10.0, round: None };
     let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &over, &c).unwrap();
     close(path.stats().cut_length, 5.0 * 120.0 + 4.0 * 12.5 + 3.0, 1e-9);
     assert_eq!((span(&path), path.stats().lowest_z), ((v(-10.0, 0.0), v(110.0, 50.0)), Some(0.0)));
@@ -598,7 +598,7 @@ fn face_cuts_over_the_boundary_or_stays_inside_it() {
     let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { margin: 0.0, ..over }, &c).unwrap();
     assert_eq!(span(&path), (v(0.0, 10.0), v(100.0, 40.0)));
     // Inside by 2: the tool's edge stays 2 from the boundary all round.
-    let inside = FaceParams { stepover: 15.0, inside: true, margin: 2.0 };
+    let inside = FaceParams { stepover: 15.0, inside: true, margin: 2.0, round: None };
     let path = face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &inside, &c).unwrap();
     assert_eq!(span(&path), (v(12.0, 12.0), v(88.0, 38.0)));
     // An area narrower than the tool is one pass down its middle; inside, the tool must fit.
@@ -607,6 +607,17 @@ fn face_cuts_over_the_boundary_or_stays_inside_it() {
     assert!(face(v(0.0, 0.0), v(100.0, 10.0), &tool(20.0), &inside, &c).is_err());
     assert!(face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { stepover: 25.0, ..over }, &c).is_err(), "stepover above the tool diameter");
     assert!(face(v(0.0, 0.0), v(100.0, 50.0), &tool(20.0), &FaceParams { margin: -1.0, ..over }, &c).is_err());
+    // A round boundary (a bar 80 across in its 80 × 80 box): each pass runs across the circle only,
+    // the tool's centre at most the margin beyond it, or the margin and its radius inside it.
+    let reach = |path: &Toolpath| cutting_points(path, 0.5).iter().map(|p| v(p.x, p.y).dist(v(50.0, 50.0))).fold(0.0, f64::max);
+    let round = FaceParams { round: Some((v(50.0, 50.0), 40.0)), ..over };
+    let path = face(v(10.0, 10.0), v(90.0, 90.0), &tool(20.0), &round, &c).unwrap();
+    let boxed = face(v(10.0, 10.0), v(90.0, 90.0), &tool(20.0), &over, &c).unwrap();
+    assert!(reach(&path) <= 50.0 + 1e-6 && reach(&boxed) > 60.0, "{} {}", reach(&path), reach(&boxed));
+    assert!(path.stats().cut_length < boxed.stats().cut_length);
+    let path = face(v(10.0, 10.0), v(90.0, 90.0), &tool(20.0), &FaceParams { round: Some((v(50.0, 50.0), 40.0)), ..inside }, &c).unwrap();
+    assert!(reach(&path) <= 28.0 + 1e-6, "{}", reach(&path));
+    assert!(face(v(10.0, 10.0), v(90.0, 90.0), &tool(20.0), &FaceParams { round: Some((v(50.0, 50.0), 11.0)), ..inside }, &c).is_err());
 }
 
 #[test]
@@ -1169,8 +1180,8 @@ fn hostile_values_are_errors_never_panics() {
                     &c,
                 );
                 let _ = contour(&regions, tl, &contour_params, &c);
-                let _ = face(v(0.0, b), v(b, 10.0), tl, &FaceParams { stepover: b, inside: false, margin: b }, &c);
-                let _ = face(v(0.0, 0.0), v(10.0, 10.0), tl, &FaceParams { stepover: 2.0, inside: true, margin: b }, &c);
+                let _ = face(v(0.0, b), v(b, 10.0), tl, &FaceParams { stepover: b, inside: false, margin: b, round: Some((v(b, b), b)) }, &c);
+                let _ = face(v(0.0, 0.0), v(10.0, 10.0), tl, &FaceParams { stepover: 2.0, inside: true, margin: b, round: None }, &c);
                 let _ = drill(&[v(b, 0.0)], tl, &DrillParams { peck: Some(b), dwell: b }, &c);
                 let _ = drill(&[v(1.0, 0.0)], tl, &DrillParams { peck: Some(b), dwell: 0.0 }, &c);
             }
