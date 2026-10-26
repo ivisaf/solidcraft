@@ -149,6 +149,13 @@ pub struct ToolForm {
     pub stepover: String,
     /// Feed per tooth (mm), kept in step with the feed: feed = speed × flutes × chip load.
     pub chip_load: String,
+    /// The speed at the cutting edge (m/min), kept in step with the spindle speed: speed =
+    /// surface speed × 1000 / (π × diameter).
+    pub surface_speed: String,
+    /// Which of each pair the tool keeps: the surface speed (else the spindle speed), the chip
+    /// load (else the feed); the other is worked out from it. The last one typed is kept.
+    pub by_surface_speed: bool,
+    pub by_chip_load: bool,
     /// The point (a V-bit's, a drill's: its included angle in degrees; a V-bit's flat in mm),
     /// and the shank's diameter and the length out of the holder (mm). Empty: the defaults.
     pub tip_angle: String,
@@ -178,12 +185,32 @@ pub struct CutText {
     pub stepdown: String,
     pub stepover: String,
     pub chip_load: String,
+    pub surface_speed: String,
+    /// As [`ToolForm::by_surface_speed`] and [`ToolForm::by_chip_load`].
+    pub by_surface_speed: bool,
+    pub by_chip_load: bool,
 }
 
 impl CutText {
     /// Whether nothing is typed in it.
     fn is_empty_text(&self) -> bool {
-        [&self.spindle_rpm, &self.feed, &self.plunge_feed, &self.stepdown, &self.stepover, &self.chip_load].iter().all(|v| v.trim().is_empty())
+        [&self.spindle_rpm, &self.feed, &self.plunge_feed, &self.stepdown, &self.stepover, &self.chip_load, &self.surface_speed]
+            .iter()
+            .all(|v| v.trim().is_empty())
+    }
+    /// What the command is sent for its speed and feed: of each pair, the one kept (an empty one
+    /// is sent as nothing).
+    fn rates(&self) -> [(&'static str, &'static str, &String); 2] {
+        [
+            match self.by_surface_speed {
+                true => ("surface_speed", "The surface speed", &self.surface_speed),
+                false => ("spindle_rpm", "The spindle speed", &self.spindle_rpm),
+            },
+            match self.by_chip_load {
+                true => ("chip_load", "The chip load", &self.chip_load),
+                false => ("feed", "The feed", &self.feed),
+            },
+        ]
     }
 }
 
@@ -197,6 +224,9 @@ impl ToolForm {
             stepdown: self.stepdown.clone(),
             stepover: self.stepover.clone(),
             chip_load: self.chip_load.clone(),
+            surface_speed: self.surface_speed.clone(),
+            by_surface_speed: self.by_surface_speed,
+            by_chip_load: self.by_chip_load,
         }
     }
     /// The cutting data kept for `material` ("": the tool's own).
@@ -218,9 +248,29 @@ impl ToolForm {
         let (name, c) =
             self.others.iter().find(|(m, _)| same_material(m, material)).cloned().unwrap_or_else(|| (material.to_string(), CutText::default()));
         self.others.retain(|(m, _)| !same_material(m, material));
+        self.show(c);
+        self.material = name;
+    }
+    /// Puts `c` in the rows.
+    fn show(&mut self, c: CutText) {
         (self.spindle_rpm, self.feed, self.plunge_feed) = (c.spindle_rpm, c.feed, c.plunge_feed);
         (self.stepdown, self.stepover, self.chip_load) = (c.stepdown, c.stepover, c.chip_load);
-        self.material = name;
+        (self.surface_speed, self.by_surface_speed, self.by_chip_load) = (c.surface_speed, c.by_surface_speed, c.by_chip_load);
+    }
+    /// Works out the speed and feed rows from the ones each kept data has, the tool's own shown.
+    fn work_out_rates(&mut self) {
+        let (diameter, flutes) = (self.diameter_mm(), parsed(&self.flutes));
+        let mut own = self.shown();
+        link_tool_rates(&mut own, Typed::default(), diameter, flutes, None);
+        let own_rpm = rpm_of(&own, diameter);
+        self.show(own);
+        for (_, c) in &mut self.others {
+            link_tool_rates(c, Typed::default(), diameter, flutes, own_rpm);
+        }
+    }
+    /// The diameter typed, in mm (none for an expression).
+    fn diameter_mm(&self) -> Option<f64> {
+        parsed(self.diameter.trim().trim_end_matches("mm"))
     }
     /// Every material's cutting data, as typed (the tool's own left out).
     fn by_material(&self) -> Vec<(String, CutText)> {
@@ -871,6 +921,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 stepdown: String::new(),
                 stepover: String::new(),
                 chip_load: String::new(),
+                surface_speed: String::new(),
+                by_surface_speed: false,
+                by_chip_load: false,
                 tip_angle: String::new(),
                 tip_diameter: String::new(),
                 corner_radius: String::new(),
@@ -965,9 +1018,10 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
             }
             // An emptied value is cleared on a tool being edited.
             let own = f.kept("");
+            let [speed, feed] = own.rates();
             for (k, what, text) in [
-                ("spindle_rpm", "The spindle speed", &own.spindle_rpm),
-                ("feed", "The feed", &own.feed),
+                speed,
+                feed,
                 ("plunge_feed", "The plunge feed", &own.plunge_feed),
                 ("stepdown", "The stepdown", &own.stepdown),
                 ("stepover", "The stepover", &own.stepover),
@@ -995,18 +1049,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     p.insert(k.into(), Value::Null);
                 }
             }
-            // A chip load without a feed: the engine works the feed out.
-            if own.feed.trim().is_empty() && !own.chip_load.trim().is_empty() {
-                p.insert("feed".into(), Value::Null);
-                p.insert("chip_load".into(), json!(number("The chip load", &own.chip_load)?));
-            }
             // The data in particular materials; a material with nothing typed is left out.
             let mut cutting = Vec::new();
             for (material, c) in f.by_material() {
                 let mut e = serde_json::Map::new();
+                let [speed, feed] = c.rates();
                 for (k, what, text) in [
-                    ("spindle_rpm", "The spindle speed", &c.spindle_rpm),
-                    ("feed", "The feed", &c.feed),
+                    speed,
+                    feed,
                     ("plunge_feed", "The plunge feed", &c.plunge_feed),
                     ("stepdown", "The stepdown", &c.stepdown),
                     ("stepover", "The stepover", &c.stepover),
@@ -1014,12 +1064,6 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                     if !text.trim().is_empty() {
                         e.insert(k.into(), json!(number(&tf("manufacture.in_material", &[("what", tm(what)), ("material", &material)]), text)?));
                     }
-                }
-                if c.feed.trim().is_empty() && !c.chip_load.trim().is_empty() {
-                    e.insert(
-                        "chip_load".into(),
-                        json!(number(&tf("manufacture.in_material", &[("what", tm("The chip load")), ("material", &material)]), &c.chip_load)?),
-                    );
                 }
                 if !e.is_empty() {
                     e.insert("material".into(), json!(material));
@@ -1386,7 +1430,7 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         "bull_nose" => 4,
         _ => 0,
     };
-    Some(Form::Tool(Box::new(ToolForm {
+    let mut form = ToolForm {
         editing: true,
         library,
         number: tool["number"].as_u64()?.to_string(),
@@ -1401,6 +1445,10 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         stepdown: number("stepdown"),
         stepover: number("stepover"),
         chip_load: tool["chip_load"].as_f64().map(|c| shown(c, 4)).unwrap_or_default(),
+        surface_speed: number("surface_speed"),
+        // The tool keeps a surface speed or chip load when it has one and not the speed or feed.
+        by_surface_speed: tool["surface_speed"].is_f64(),
+        by_chip_load: tool["chip_load"].is_f64() && !tool["feed"].is_f64(),
         tip_angle: number("tip_angle"),
         tip_diameter: number("tip_diameter"),
         corner_radius: number("corner_radius"),
@@ -1417,25 +1465,24 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
             .flatten()
             .filter_map(|c| {
                 let value = |k: &str| c[k].as_f64().map(|x| x.to_string()).unwrap_or_default();
-                // The chip load its feed makes at its speed (else the tool's own).
-                let rpm = c["spindle_rpm"].as_f64().or(tool["spindle_rpm"].as_f64());
-                let flutes = tool["flutes"].as_f64().filter(|z| *z >= 1.0);
-                let chip_load = match (c["feed"].as_f64(), rpm, flutes) {
-                    (Some(feed), Some(rpm), Some(z)) if rpm > 0.0 => shown(feed / (rpm * z), 4),
-                    _ => String::new(),
-                };
+                // The rows worked out from the ones kept follow when the form is shown.
                 let cut = CutText {
                     spindle_rpm: value("spindle_rpm"),
                     feed: value("feed"),
                     plunge_feed: value("plunge_feed"),
                     stepdown: value("stepdown"),
                     stepover: value("stepover"),
-                    chip_load,
+                    chip_load: c["chip_load"].as_f64().map(|v| shown(v, 4)).unwrap_or_default(),
+                    surface_speed: value("surface_speed"),
+                    by_surface_speed: c["surface_speed"].is_f64(),
+                    by_chip_load: c["chip_load"].is_f64(),
                 };
                 Some((c["material"].as_str()?.to_string(), cut))
             })
             .collect(),
-    })))
+    };
+    form.work_out_rates();
+    Some(Form::Tool(Box::new(form)))
 }
 
 /// A form filled in from a setup as `cam.list` reports it.
@@ -2838,6 +2885,61 @@ fn parsed(s: &str) -> Option<f64> {
     s.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
 }
 
+/// Which of a tool's speed and feed rows were typed in.
+#[derive(Clone, Copy, Debug, Default)]
+struct Typed {
+    speed: bool,
+    surface: bool,
+    chip: bool,
+    feed: bool,
+}
+
+/// The spindle speed cutting data gives a tool `diameter` mm across: its surface speed's, else its own.
+fn rpm_of(c: &CutText, diameter: Option<f64>) -> Option<f64> {
+    match (c.by_surface_speed, parsed(&c.surface_speed), diameter) {
+        (true, Some(v), Some(d)) => Some(solidcraft_engine::cam::rpm_from_surface_speed(v, d)),
+        (true, ..) => None,
+        (false, ..) => parsed(&c.spindle_rpm),
+    }
+}
+
+/// Keeps a tool's speed rows and feed rows in step: of each pair (spindle speed and surface speed,
+/// feed and chip load) the one typed last is kept, and the other worked out from it for the
+/// tool's `diameter` (mm) and `flutes`. `own_rpm`: the speed rows left empty cut at.
+fn link_tool_rates(c: &mut CutText, typed: Typed, diameter: Option<f64>, flutes: Option<f64>, own_rpm: Option<f64>) {
+    if typed.surface {
+        c.by_surface_speed = true;
+    } else if typed.speed {
+        c.by_surface_speed = false;
+    }
+    if typed.chip {
+        c.by_chip_load = true;
+    } else if typed.feed {
+        c.by_chip_load = false;
+    }
+    let diameter = diameter.filter(|d| *d > 0.0);
+    if c.by_surface_speed {
+        c.spindle_rpm = rpm_of(c, diameter).map(|r| shown(r, 0)).unwrap_or_default();
+    } else {
+        c.surface_speed = match (parsed(&c.spindle_rpm), diameter) {
+            (Some(r), Some(d)) => shown(solidcraft_engine::cam::surface_speed_from_rpm(r, d), 1),
+            _ => String::new(),
+        };
+    }
+    let (rpm, flutes) = (parsed(&c.spindle_rpm).or(own_rpm), flutes.filter(|z| *z >= 1.0));
+    if c.by_chip_load {
+        c.feed = match (parsed(&c.chip_load), rpm, flutes) {
+            (Some(chip), Some(r), Some(z)) => shown(r * z * chip, 1),
+            _ => String::new(),
+        };
+    } else {
+        c.chip_load = match (parsed(&c.feed), rpm, flutes) {
+            (Some(feed), Some(r), Some(z)) => shown(feed / (r * z), 4),
+            _ => String::new(),
+        };
+    }
+}
+
 /// Keeps feed and chip load in step: feed = speed × flutes × chip load. A changed chip load,
 /// speed or flute count works the feed out; a changed feed works the chip load out.
 fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut String, speed_changed: bool, feed_changed: bool, chip_changed: bool) {
@@ -2967,13 +3069,15 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             .as_deref()
             .and_then(|m| t["cutting"].as_array().into_iter().flatten().find(|c| c["material"].as_str().is_some_and(|n| same_material(n, m))));
         let value = |k: &str| cut.and_then(|c| c[k].as_f64()).or(t[k].as_f64());
+        let flutes = t["flutes"].as_u64().unwrap_or(0) as u32;
+        let (spindle_rpm, feed) = speeds(t, cut, app.preferences.cam_max_rpm);
         data.push((
             n,
             ToolData {
                 diameter,
-                flutes: t["flutes"].as_u64().unwrap_or(0) as u32,
-                spindle_rpm: value("spindle_rpm"),
-                feed: value("feed"),
+                flutes,
+                spindle_rpm,
+                feed,
                 plunge_feed: value("plunge_feed"),
                 stepdown: value("stepdown"),
                 stepover: value("stepover"),
@@ -2982,6 +3086,32 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
     }
     let setups = listed["setups"].as_array().into_iter().flatten().filter_map(|x| Some((x["id"].as_u64()?.to_string(), text(x, "name")))).collect();
     Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups }
+}
+
+/// The spindle speed (rev/min) and feed (mm/min) a listed tool cuts at: in a material, `cut`'s
+/// where it gives them; a surface speed worked out for the tool's diameter and cut down to the
+/// machine's `max_rpm` (0: no limit); a chip load fed at that speed. As the engine works them out.
+fn speeds(tool: &Value, cut: Option<&Value>, max_rpm: f32) -> (Option<f64>, Option<f64>) {
+    // Of each pair, the material's when it gives either.
+    let pair = |a: &str, b: &str| {
+        let from = cut.filter(|c| c[a].is_f64() || c[b].is_f64()).unwrap_or(tool);
+        (from[a].as_f64(), from[b].as_f64())
+    };
+    let (rpm, surface_speed) = pair("spindle_rpm", "surface_speed");
+    let (feed, chip_load) = pair("feed", "chip_load");
+    let rpm = match (surface_speed, tool["diameter"].as_f64()) {
+        (Some(v), Some(d)) if d > 0.0 => Some(solidcraft_engine::cam::rpm_from_surface_speed(v, d)),
+        (Some(_), _) => None,
+        (None, _) => rpm,
+    };
+    let rpm = rpm.map(|r| if max_rpm > 0.0 { r.min(f64::from(max_rpm)) } else { r });
+    // A listing reports the chip load a feed makes, so a feed given is the one kept.
+    let feed = match (feed, chip_load, rpm, tool["flutes"].as_f64()) {
+        (Some(f), ..) => Some(f),
+        (None, Some(c), Some(r), Some(z)) => Some((r * z * c * 10.0).round() / 10.0),
+        _ => None,
+    };
+    (rpm, feed)
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
@@ -3309,14 +3439,20 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                 let mut chosen = f.material.clone();
                 pick(ui, need, "sc_cam_tool_material", "Material", &mut chosen, &options);
                 f.show_material(&chosen);
-                // Speed, flutes, chip load and feed belong together: feed = speed × flutes × chip load.
-                let speed_changed = field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, &hint(&own.spindle_rpm, "none"));
-                let chip_changed = field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, &hint(&own.chip_load, "feed ÷ (speed × flutes)"));
-                let feed_changed = field(ui, need, "Feed (mm/min)", &mut f.feed, &hint(&own.feed, "speed × flutes × chip load"));
-                let flutes = parsed(&f.flutes);
+                // Speed and surface speed belong together through the diameter, and speed, flutes,
+                // chip load and feed through feed = speed × flutes × chip load.
+                let typed = Typed {
+                    speed: field(ui, need, "Spindle (rev/min)", &mut f.spindle_rpm, &hint(&own.spindle_rpm, "none")),
+                    surface: field(ui, need, "Surface speed (m/min)", &mut f.surface_speed, &hint(&own.surface_speed, "speed × π × diameter ÷ 1000")),
+                    chip: field(ui, need, "Chip load (mm/tooth)", &mut f.chip_load, &hint(&own.chip_load, "feed ÷ (speed × flutes)")),
+                    feed: field(ui, need, "Feed (mm/min)", &mut f.feed, &hint(&own.feed, "speed × flutes × chip load")),
+                };
+                let (diameter, flutes) = (f.diameter_mm(), parsed(&f.flutes));
                 // A material without a speed of its own cuts at the tool's.
-                let rpm = if f.spindle_rpm.trim().is_empty() { own.spindle_rpm.clone() } else { f.spindle_rpm.clone() };
-                link_chip_load(&rpm, flutes, &mut f.feed, &mut f.chip_load, speed_changed, feed_changed, chip_changed);
+                let own_rpm = rpm_of(&own, diameter);
+                let mut c = f.shown();
+                link_tool_rates(&mut c, typed, diameter, flutes, own_rpm.filter(|_| in_material));
+                f.show(c);
                 field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, &hint(&own.plunge_feed, "feed / 3"));
                 field(ui, need, "Stepdown (mm)", &mut f.stepdown, &hint(&own.stepdown, "half the diameter"));
                 field(ui, need, "Stepover (mm)", &mut f.stepover, &hint(&own.stepover, "by operation"));
@@ -4209,7 +4345,7 @@ fn steps(ui: &mut egui::Ui, cam: &CamUi, setups: &[Value], asked: &mut Asked) {
 }
 
 /// The tool table's columns.
-const TOOL_HEADS: [&str; 8] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Chip load", "Feed", "Design"];
+const TOOL_HEADS: [&str; 9] = ["Tool", "Kind", "Diameter", "Flutes", "Spindle", "Surface speed", "Chip load", "Feed", "Design"];
 
 /// A table of tools, each row picked by clicking its name. `library`: these are the machine library's tools.
 fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picked: &mut Option<(bool, u64)>) {
@@ -4238,9 +4374,17 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 ui.label(kind_name("tool_kind", &text(tool, "kind")));
                 cell(ui, data("diameter", 3).map(|d| format!("{d} mm")));
                 cell(ui, data("flutes", 0));
-                cell(ui, data("spindle_rpm", 0));
+                // Each pair as the tool gives it or as it works out (without the machine's limit).
+                let (rpm, feed) = speeds(tool, None, 0.0);
+                let surface_speed = match (tool["surface_speed"].as_f64(), rpm, tool["diameter"].as_f64()) {
+                    (Some(v), ..) => Some(v),
+                    (None, Some(r), Some(d)) => Some(solidcraft_engine::cam::surface_speed_from_rpm(r, d)),
+                    _ => None,
+                };
+                cell(ui, rpm.map(|r| shown(r, 0)));
+                cell(ui, surface_speed.map(|v| shown(v, 1)));
                 cell(ui, data("chip_load", 4));
-                cell(ui, data("feed", 1));
+                cell(ui, feed.map(|f| shown(f, 1)));
                 // How this design's copy of a library tool stands.
                 match tool["design"].as_str() {
                     Some("same") => {
@@ -4990,6 +5134,8 @@ pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
         choice(ui, "pref_cam_leftover", "Leftover shown from", &mut prefs.cam_leftover_shown, &LEFTOVER_SHOWN.map(|l| l.0));
         crate::ui_kit::row(ui, tm("Rapid rate"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_rapid_rate, 100.0..=100_000.0, 50.0, " mm/min"))
             .on_hover_text(help("Rapid rate").map(tm).unwrap_or_default());
+        crate::ui_kit::row(ui, tm("Spindle maximum"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_max_rpm, 0.0..=200_000.0, 100.0, " rev/min"))
+            .on_hover_text(tm("The fastest this machine's spindle turns: a speed worked out from a tool's surface speed is cut down to it, and its chip load then feeds slower. 0: no limit"));
         crate::ui_kit::row(ui, tm("Spindle spin-up"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_spindle_delay, 0.0..=60.0, 0.5, " s"))
             .on_hover_text(tm("How long programs wait after the spindle starts or changes speed, so that it is up to speed before it cuts (a G4 after M3). 0: no wait"));
     });

@@ -171,6 +171,8 @@ fn from_rp23cnc(tools: &[Value], materials: Option<&Value>, presets: Option<&Val
                 material: String::new(),
                 spindle_rpm: positive("SpindleRpm"),
                 feed: positive("FeedMmMin"),
+                surface_speed: None,
+                chip_load: None,
                 plunge_feed: positive("PlungeMmMin"),
                 stepdown: positive("DepthOfCutMm"),
                 stepover: positive("StepoverPercent").map(|pc| (pc / 100.0 * diameter).min(diameter)),

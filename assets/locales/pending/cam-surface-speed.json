@@ -1,0 +1,34 @@
+{
+  "en": {
+    "manufacture.speed_pi_diameter_1000": "speed × π × diameter ÷ 1000",
+    "manufacture.spindle_maximum": "Spindle maximum",
+    "manufacture.spindle_maximum_help": "The fastest this machine's spindle turns: a speed worked out from a tool's surface speed is cut down to it, and its chip load then feeds slower. 0: no limit",
+    "manufacture.surface_speed": "Surface speed",
+    "manufacture.surface_speed_m_min": "Surface speed (m/min)",
+    "manufacture.the_surface_speed": "The surface speed"
+  },
+  "de": {
+    "manufacture.speed_pi_diameter_1000": "Drehzahl × π × Durchmesser ÷ 1000",
+    "manufacture.spindle_maximum": "Höchstdrehzahl der Spindel",
+    "manufacture.spindle_maximum_help": "Die höchste Drehzahl der Spindel dieser Maschine: eine aus der Schnittgeschwindigkeit eines Werkzeugs berechnete Drehzahl wird darauf begrenzt, und sein Zahnvorschub ergibt dann einen langsameren Vorschub. 0: keine Grenze",
+    "manufacture.surface_speed": "Schnittgeschwindigkeit",
+    "manufacture.surface_speed_m_min": "Schnittgeschwindigkeit (m/min)",
+    "manufacture.the_surface_speed": "Die Schnittgeschwindigkeit"
+  },
+  "ja": {
+    "manufacture.speed_pi_diameter_1000": "回転数 × π × 直径 ÷ 1000",
+    "manufacture.spindle_maximum": "主軸の最高回転数",
+    "manufacture.spindle_maximum_help": "この機械の主軸の最高回転数です。工具の切削速度から求めた回転数はこれに抑えられ、1 刃送りから求める送りもそれに合わせて遅くなります。0: 制限なし",
+    "manufacture.surface_speed": "切削速度",
+    "manufacture.surface_speed_m_min": "切削速度 (m/min)",
+    "manufacture.the_surface_speed": "切削速度"
+  },
+  "zh": {
+    "manufacture.speed_pi_diameter_1000": "转速 × π × 直径 ÷ 1000",
+    "manufacture.spindle_maximum": "主轴最高转速",
+    "manufacture.spindle_maximum_help": "这台机床主轴的最高转速：由刀具切削速度算出的转速不会超过它，每齿进给算出的进给也随之降低。0：不限制",
+    "manufacture.surface_speed": "切削速度",
+    "manufacture.surface_speed_m_min": "切削速度 (m/min)",
+    "manufacture.the_surface_speed": "切削速度"
+  }
+}

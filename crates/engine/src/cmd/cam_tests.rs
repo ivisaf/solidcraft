@@ -555,28 +555,26 @@ fn tools_carry_cutting_data_and_libraries_move_between_designs() {
     run(&mut s, "cam.tool.define", json!({"number": 5, "kind": "flat", "diameter": 6, "feed": 1200, "plunge_feed": null}));
     let t = s.doc.manufacture.tool(5).unwrap().clone();
     assert_eq!((t.flutes, t.spindle_rpm, t.feed, t.plunge_feed), (3, Some(18000.0), Some(1200.0), None));
-    // Chip load ties feed to speed and flutes: 18000 rev/min × 3 flutes × 0.02 mm = 1080 mm/min.
+    // A chip load is kept as given: operations feed at speed × flutes × chip load, 18000 × 3 × 0.02 = 1080 mm/min.
     let made =
         run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "flutes": 3, "spindle_rpm": 18000, "chip_load": 0.02}));
-    close(made["tool"]["feed"].as_f64().unwrap(), 1080.0, 1e-6);
-    close(made["tool"]["chip_load"].as_f64().unwrap(), 0.02, 1e-9);
+    assert_eq!((made["tool"]["chip_load"].as_f64(), made["tool"].get("feed")), (Some(0.02), None));
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 8, "bottom": -2}));
+    close(s.doc.manufacture.setups[0].operations[2].cut_feed, 1080.0, 1e-9);
+    run(&mut s, "cam.op.remove", json!({"op": "Pocket3"}));
     // A listing works it out from what the tool has: tool 5 runs 1200 mm/min at 18000 with 3 flutes.
     let listed = run(&mut s, "cam.list", json!({}));
     let five = listed["tools"].as_array().unwrap().iter().find(|t| t["number"] == 5).unwrap();
     close(five["chip_load"].as_f64().unwrap(), 1200.0 / 54000.0, 1e-12);
     assert!(listed["tools"][0].get("chip_load").is_none(), "tool 1 has no speed or feed");
-    // More flutes at the same chip load feed faster; a feed that contradicts the chip load is refused.
-    let made = run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "flutes": 4, "chip_load": 0.02}));
-    close(made["tool"]["feed"].as_f64().unwrap(), 1440.0, 1e-6);
+    // Naming one of a pair clears the other; naming both is refused.
+    let made = run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "feed": 1440}));
+    assert_eq!((made["tool"]["feed"].as_f64(), made["tool"]["chip_load"].as_f64()), (Some(1440.0), Some(1440.0 / 54000.0)));
+    assert!(s.doc.manufacture.tool(8).unwrap().chip_load.is_none());
     let p = json!({"number": 8, "kind": "flat", "diameter": 6, "chip_load": 0.02, "feed": 900});
-    assert!(s.execute("cam.tool.define", &p).unwrap_err().to_string().contains("disagree"));
-    run(&mut s, "cam.tool.define", json!({"number": 8, "kind": "flat", "diameter": 6, "chip_load": 0.02, "feed": 1440}));
-    assert!(
-        s.execute("cam.tool.define", &json!({"number": 9, "kind": "flat", "diameter": 6, "chip_load": 0.02}))
-            .unwrap_err()
-            .to_string()
-            .contains("needs a `spindle_rpm`")
-    );
+    assert!(s.execute("cam.tool.define", &p).unwrap_err().to_string().contains("give `feed` or `chip_load`, not both"));
+    let p = json!({"number": 8, "kind": "flat", "diameter": 6, "surface_speed": 300, "spindle_rpm": 900});
+    assert!(s.execute("cam.tool.define", &p).unwrap_err().to_string().contains("give `spindle_rpm` or `surface_speed`, not both"));
     run(&mut s, "cam.tool.remove", json!({"number": 8}));
     for bad in [
         json!({"flutes": 0}),
@@ -584,6 +582,11 @@ fn tools_carry_cutting_data_and_libraries_move_between_designs() {
         json!({"feed": -1}),
         json!({"spindle_rpm": "fast"}),
         json!({"chip_load": 0, "spindle_rpm": 1000}),
+        json!({"chip_load": 101}),
+        json!({"surface_speed": -5}),
+        json!({"surface_speed": 20000}),
+        json!({"cutting": [{"material": "MDF", "surface_speed": 0}]}),
+        json!({"cutting": [{"material": "MDF", "feed": 900, "chip_load": 0.02}]}),
     ] {
         let mut p = json!({"number": 6, "kind": "flat", "diameter": 6});
         for (k, v) in bad.as_object().unwrap() {
@@ -1818,10 +1821,10 @@ fn operations_take_the_cutting_data_for_their_setups_material() {
     ]);
     let tool =
         run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 900, "cutting": cutting}));
-    // The feed in MDF is worked out from its chip load at its own speed; a material given nothing is left out.
+    // The chip load in MDF is kept (its feed is worked out at its own speed); a material given nothing is left out.
     assert_eq!(
         tool["tool"]["cutting"],
-        json!([{"material": "mdf", "spindle_rpm": 18000.0, "feed": 1800.0, "stepdown": 4.0}, {"material": "Aluminium", "feed": 300.0}])
+        json!([{"material": "mdf", "spindle_rpm": 18000.0, "chip_load": 0.05, "stepdown": 4.0}, {"material": "Aluminium", "feed": 300.0}])
     );
     let op = |s: &mut Session, setup: &str| {
         run(s, "cam.op.pocket", json!({"setup": setup, "sketch": "Pocket", "tool": 1, "bottom": -5}));
@@ -1885,6 +1888,39 @@ fn operations_take_the_cutting_data_for_their_setups_material() {
     assert!(s.execute("cam.material.remove", &json!({"library": lib, "name": "MDF"})).is_err());
     assert!(s.execute("cam.material.define", &json!({"library": lib, "name": "  "})).is_err());
     let _ = std::fs::remove_file(&lib);
+}
+
+#[test]
+fn a_surface_speed_and_chip_load_give_speed_and_feed_for_the_tools_size() {
+    let mut s = pocket_job(0.0, json!({"material": "Aluminium"}));
+    // 6 mm, 2 flutes, 150 m/min and 0.03 mm per tooth: 150000 / (π × 6) = 7958 rev/min, × 2 × 0.03 = 477.5 mm/min.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "surface_speed": 150, "chip_load": 0.03}));
+    let pocket = |s: &mut Session, extra: Value| {
+        let mut p = json!({"sketch": "Pocket", "tool": 1, "bottom": -2});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        run(s, "cam.op.pocket", p);
+        let op = s.doc.manufacture.setups[0].operations.last().unwrap();
+        (op.spindle_rpm, op.cut_feed)
+    };
+    assert_eq!(pocket(&mut s, json!({})), (7958.0, 477.5));
+    // A smaller tool at the same surface speed turns faster and, at the same chip load, feeds faster.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 3}));
+    assert_eq!(pocket(&mut s, json!({})), (15915.0, 954.9));
+    // The machine's spindle caps the speed, and the chip load then feeds at the capped speed.
+    assert_eq!(pocket(&mut s, json!({"max_spindle_rpm": 12000})), (12000.0, 720.0));
+    // A speed given for the operation is what the chip load feeds at; a given feed wins.
+    assert_eq!(pocket(&mut s, json!({"spindle_rpm": 10000})), (10000.0, 600.0));
+    assert_eq!(pocket(&mut s, json!({"feed": 500})), (15915.0, 500.0));
+    assert!(s.execute("cam.op.pocket", &json!({"sketch": "Pocket", "tool": 1, "bottom": -2, "max_spindle_rpm": 0})).is_err());
+    // A material's speed or feed replaces the tool's however each gives it: in aluminium this tool
+    // turns at 9000 and keeps its own chip load.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 3, "cutting": [{"material": "aluminium", "spindle_rpm": 9000}]}));
+    assert_eq!(pocket(&mut s, json!({})), (9000.0, 540.0));
+    // The design keeps the inputs, not what they work out to.
+    let saved = serde_json::to_value(s.doc.manufacture.tool(1).unwrap()).unwrap();
+    assert_eq!((saved["surface_speed"].as_f64(), saved["chip_load"].as_f64(), saved.get("spindle_rpm")), (Some(150.0), Some(0.03), None));
 }
 
 #[test]

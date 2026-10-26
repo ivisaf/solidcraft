@@ -435,15 +435,36 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     assert_eq!(chip, "0.01", "a typed feed gives the chip load");
     link_chip_load("", Some(4.0), &mut feed, &mut chip, false, true, false);
     assert_eq!((feed.as_str(), chip.as_str()), ("720", "0.01"), "nothing to work out without a speed");
-    // A new tool given a chip load and no feed gets its feed from the engine: 20000 × 2 × 0.015.
+    // A tool's spindle and surface speed move together through its diameter; of each pair the one
+    // typed last is kept and the other worked out.
+    let mut c = CutText { spindle_rpm: "18000".into(), ..CutText::default() };
+    link_tool_rates(&mut c, Typed::default(), Some(6.0), Some(2.0), None);
+    assert_eq!((c.surface_speed.as_str(), c.by_surface_speed), ("339.3", false));
+    c.surface_speed = "150".into();
+    link_tool_rates(&mut c, Typed { surface: true, ..Typed::default() }, Some(6.0), Some(2.0), None);
+    assert_eq!((c.spindle_rpm.as_str(), c.by_surface_speed), ("7958", true));
+    link_tool_rates(&mut c, Typed::default(), Some(3.0), Some(2.0), None);
+    assert_eq!(c.spindle_rpm, "15915", "a smaller tool at the kept surface speed turns faster");
+    c.chip_load = "0.03".into();
+    link_tool_rates(&mut c, Typed { chip: true, ..Typed::default() }, Some(3.0), Some(2.0), None);
+    assert_eq!((c.feed.as_str(), c.by_chip_load), ("954.9", true));
+    // The tool is sent what it keeps, not what that works out to.
+    assert_eq!(c.rates().map(|(k, _, v)| (k, v.clone())), [("surface_speed", "150".to_string()), ("chip_load", "0.03".to_string())]);
+    // An operation's speed is cut down to the machine's spindle, and the chip load then feeds slower;
+    // a material's speed replaces the tool's surface speed.
+    let cutter = json!({"diameter": 3.0, "flutes": 2, "surface_speed": 150.0, "chip_load": 0.03});
+    assert_eq!(speeds(&cutter, None, 12000.0), (Some(12000.0), Some(720.0)));
+    assert_eq!(speeds(&cutter, Some(&json!({"material": "MDF", "spindle_rpm": 9000.0})), 0.0), (Some(9000.0), Some(540.0)));
+    // A new tool given a chip load keeps it; operations feed at 20000 × 2 × 0.015 = 600 mm/min.
     fill(&mut h, "cam.tool.define", |f| {
         let Form::Tool(tool) = f else { panic!("not a tool form") };
         tool.number = "40".into();
         tool.spindle_rpm = "20000".into();
-        tool.chip_load = "0.015".into();
+        (tool.chip_load, tool.by_chip_load) = ("0.015".into(), true);
     });
     let library = library_listing(&mut h.app, true);
-    assert_eq!(library["tools"][1]["feed"], 600.0);
+    assert_eq!((&library["tools"][1]["chip_load"], &library["tools"][1]["feed"]), (&json!(0.015), &Value::Null));
+    assert_eq!(speeds(&library["tools"][1], None, 0.0), (Some(20000.0), Some(600.0)));
     run(&mut h.app, "cam.library.remove", json!({"number": 40})).unwrap();
 
     // An operation form shows the tool's speed, feeds, stepdown and stepover, to keep or change.

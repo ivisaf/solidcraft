@@ -600,6 +600,9 @@ preference_settings! {
     cam_panel_fade: usize = 1;
     /// How fast this machine's rapids move (mm/min), for the time a played program takes.
     cam_rapid_rate: f32 = 5000.0;
+    /// The fastest this machine's spindle turns (rev/min; 0: no limit): a speed worked out from a
+    /// surface speed is cut down to it.
+    cam_max_rpm: f32 = 0.0;
     /// How long programs wait after the spindle starts (s): a dwell after `M3`, so that it is up to speed before it cuts.
     cam_spindle_delay: f32 = 3.0;
     /// What new operations of each kind start with (by its command, `cam.op.pocket`…): form rows and their text.

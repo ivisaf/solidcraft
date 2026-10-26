@@ -38,7 +38,7 @@ macro_rules! op_doc {
         concat!(
             $own,
             "; library?: the machine's tool library file (default: this machine's); sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills) or round walls along Z (a hole's or a boss's: their circle, from the wall's top to its foot); tool: number, from this design or the machine's library (the design then keeps a copy); spindle_rpm?, feed?: mm/min, plunge_feed?: mm/min \
-             (defaults: the tool's data in the setup's material, else its own; plunge_feed else feed/3); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
+             (defaults: the tool's data in the setup's material, else its own, a surface speed and chip load worked out for its diameter and flutes; plunge_feed else feed/3); max_spindle_rpm?: the machine's spindle, which a worked-out speed is cut down to (a chip load then feeds slower); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
              retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default: the tool's, else half its diameter); passes?: how many depth passes instead (each the depth over this; null: by the stepdown); coolant?: bool; \
              setup?: id or name (default: the only setup); name? → operation: id, name, and its toolpath's cut_length, rapid_length, cut_minutes"
         )
@@ -61,7 +61,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .params(
             "number: 1–9999; kind: flat|ball|bull|drill|vbit (bull: a bull-nose end mill, its end rounded at the rim); diameter: expr; corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
-             from (null clears one); chip_load?: mm per tooth, instead of feed: feed = spindle_rpm × flutes × chip_load (listings report it); cutting?: [{material, spindle_rpm?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
+             from (null clears one); surface_speed?: m/min, instead of spindle_rpm: speed = surface_speed × 1000 / (π × diameter); chip_load?: mm per tooth, instead of feed: feed = speed × flutes × chip_load (giving one of a pair clears the other; listings report the chip load a feed makes); cutting?: [{material, spindle_rpm?, surface_speed?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
     CommandSpec::new("cam.tool.update", "Update Design Tools", tool_update).icon("update")
         .params("number?: one tool (default: every tool) — replaces this design's copy with the machine library's tool of that number where they differ; library? → updated: tool numbers"),
@@ -267,27 +267,12 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         None => was.map_or(2, |t| t.flutes),
         Some(v) => v.as_u64().filter(|n| (1..=100).contains(n)).ok_or_else(|| bad(cmd, "`flutes` must be 1 to 100"))? as u32,
     };
-    let spindle_rpm = data("spindle_rpm", was.and_then(|t| t.spindle_rpm))?;
-    let mut feed = data("feed", was.and_then(|t| t.feed))?;
-    // Chip load (feed per tooth) ties the feed to the speed and the flutes: feed = speed × flutes × chip load.
-    if p.get("chip_load").is_some_and(|v| !v.is_null()) {
-        let chip = num(p, "chip_load").filter(|c| *c > 0.0 && *c <= 100.0).ok_or_else(|| bad(cmd, "`chip_load` must be above 0 (mm per tooth)"))?;
-        let rpm = spindle_rpm.ok_or_else(|| bad(cmd, "`chip_load` needs a `spindle_rpm` to work the feed out from"))?;
-        let from_chip = (rpm * f64::from(flutes) * chip * 1e6).round() / 1e6;
-        match p.get("feed").filter(|v| !v.is_null()).and(feed) {
-            Some(given) if (given - from_chip).abs() > from_chip * 0.005 => {
-                return Err(bad(
-                    cmd,
-                    format!("`feed` {given} and `chip_load` {chip} disagree: at {rpm} rev/min with {flutes} flutes the chip load gives {from_chip}"),
-                ));
-            }
-            Some(_) => {}
-            None => feed = Some(from_chip),
-        }
-    }
+    // A speed is given as one of a pair, a feed as one of another: naming one clears the other.
+    let (spindle_rpm, surface_speed) = rate_pair(p, cmd, ("spindle_rpm", "surface_speed"), was.map(|t| (t.spindle_rpm, t.surface_speed)), "")?;
+    let (feed, chip_load) = rate_pair(p, cmd, ("feed", "chip_load"), was.map(|t| (t.feed, t.chip_load)), "")?;
     let cutting = match p.get("cutting") {
         None => was.map(|t| t.cutting.clone()).unwrap_or_default(),
-        Some(v) => cutting_param(v, cmd, flutes, spindle_rpm)?,
+        Some(v) => cutting_param(v, cmd)?,
     };
     let tool = Tool {
         number,
@@ -298,6 +283,8 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         flutes,
         spindle_rpm,
         feed,
+        surface_speed,
+        chip_load,
         plunge_feed: data("plunge_feed", was.and_then(|t| t.plunge_feed))?,
         stepdown: data("stepdown", was.and_then(|t| t.stepdown))?,
         stepover: data("stepover", was.and_then(|t| t.stepover))?,
@@ -323,9 +310,8 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
     Ok(tool)
 }
 
-/// `cutting`: a tool's data in particular materials (null: none). A chip load gives the feed
-/// from the material's spindle speed, else the tool's own; a material given nothing is left out.
-fn cutting_param(v: &Value, cmd: &str, flutes: u32, own_rpm: Option<f64>) -> Result<Vec<CuttingData>> {
+/// `cutting`: a tool's data in particular materials (null: none); a material given nothing is left out.
+fn cutting_param(v: &Value, cmd: &str) -> Result<Vec<CuttingData>> {
     if v.is_null() {
         return Ok(Vec::new());
     }
@@ -347,18 +333,19 @@ fn cutting_param(v: &Value, cmd: &str, flutes: u32, own_rpm: Option<f64>) -> Res
                 .map(Some)
                 .ok_or_else(|| bad(cmd, format!("cutting in {material}: `{k}` must be above 0"))),
         };
-        let mut data = CuttingData {
+        let place = format!("cutting in {material}: ");
+        let (spindle_rpm, surface_speed) = rate_pair(e, cmd, ("spindle_rpm", "surface_speed"), None, &place)?;
+        let (feed, chip_load) = rate_pair(e, cmd, ("feed", "chip_load"), None, &place)?;
+        let data = CuttingData {
             material: material.clone(),
-            spindle_rpm: value("spindle_rpm")?,
-            feed: value("feed")?,
+            spindle_rpm,
+            feed,
+            surface_speed,
+            chip_load,
             plunge_feed: value("plunge_feed")?,
             stepdown: value("stepdown")?,
             stepover: value("stepover")?,
         };
-        if let Some(chip) = value("chip_load")?.filter(|_| data.feed.is_none()) {
-            let rpm = data.spindle_rpm.or(own_rpm).ok_or_else(|| bad(cmd, format!("cutting in {material}: `chip_load` needs a spindle speed")))?;
-            data.feed = Some((rpm * f64::from(flutes) * chip * 1e6).round() / 1e6);
-        }
         if !data.is_empty() {
             out.push(data);
         }
@@ -393,10 +380,43 @@ fn material_param(p: &Value, cmd: &str) -> Result<Option<Option<String>>> {
 /// A tool for a listing: itself, and its chip load (mm per tooth) when its speed and feed say what it is.
 fn tool_json(tool: &Tool) -> Value {
     let mut v = json!(tool);
-    if let (Some(rpm), Some(feed)) = (tool.spindle_rpm, tool.feed) {
+    if let (None, Some(rpm), Some(feed)) = (tool.chip_load, tool.spindle_rpm, tool.feed) {
         v["chip_load"] = json!(feed / (rpm * f64::from(tool.flutes)));
     }
     v
+}
+
+/// A pair of inputs that give one value two ways (a spindle speed or a surface speed, a feed or
+/// a chip load): naming one clears the other, null clears it, and what is not named stays as `was`.
+/// `place` starts its messages (where in the input the pair is).
+fn rate_pair(p: &Value, cmd: &str, (a, b): (&str, &str), was: Option<(Option<f64>, Option<f64>)>, place: &str) -> Result<(Option<f64>, Option<f64>)> {
+    let named = |k: &str| p.get(k).is_some_and(|v| !v.is_null());
+    if named(a) && named(b) {
+        return Err(bad(cmd, format!("{place}give `{a}` or `{b}`, not both")));
+    }
+    let limit = |k: &str| match k {
+        "surface_speed" => (cam::MAX_SURFACE_SPEED, " (m/min)"),
+        "chip_load" => (cam::MAX_CHIP_LOAD, " (mm per tooth)"),
+        _ => (1.0e6, ""),
+    };
+    let value = |k: &str, was: Option<f64>| match p.get(k) {
+        None => Ok(was),
+        Some(Value::Null) => Ok(None),
+        Some(_) => {
+            let (max, unit) = limit(k);
+            num(p, k)
+                .filter(|v| *v > 0.0 && *v <= max)
+                .map(Some)
+                .ok_or_else(|| bad(cmd, format!("{place}`{k}` must be above 0 and at most {max}{unit}")))
+        }
+    };
+    let (was_a, was_b) = was.unwrap_or_default();
+    let (va, vb) = (value(a, was_a)?, value(b, was_b)?);
+    Ok(match (named(a), named(b)) {
+        (true, _) => (va, None),
+        (_, true) => (None, vb),
+        _ => (va, vb),
+    })
 }
 
 fn tool_define(s: &mut Session, p: &Value) -> Result<Value> {
@@ -2313,9 +2333,18 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
     let from_library = own.is_none();
     let stored =
         own.or_else(|| library_tool(p, number)).ok_or_else(|| bad(cmd, format!("no tool {number} (define it in the tool library first)")))?;
-    // Its cutting data in the stock's material, where it has some.
-    let tool = stored.in_material(setup.material.as_deref());
     let positive = |k: &str| num(p, k).filter(|v| *v > 0.0 && *v <= 1.0e6);
+    // Its cutting data in the stock's material, where it has some; a speed given here is the one a
+    // chip load feeds at. A surface speed's speed stays within the machine's spindle.
+    let mut cutting = stored.in_material(setup.material.as_deref());
+    if let Some(rpm) = positive("spindle_rpm") {
+        (cutting.spindle_rpm, cutting.surface_speed) = (Some(rpm), None);
+    }
+    let max_rpm = match p.get("max_spindle_rpm") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(positive("max_spindle_rpm").ok_or_else(|| bad(cmd, "`max_spindle_rpm` must be above 0"))?),
+    };
+    let tool = cutting.with_speeds(max_rpm);
     let none = match &setup.material {
         Some(m) => format!("none for {m} and none of its own"),
         None => "none of its own".to_string(),
