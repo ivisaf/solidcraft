@@ -26,7 +26,7 @@ pub(super) fn paint_box(ui: &Ui, square: Rect, response: &Response, on: bool, mi
     let fill = if t.borders.bevel.is_some() {
         t.input_fill()
     } else if selected {
-        t.form_primary
+        t.form_primary_fill
     } else if response.hovered() {
         t.hover
     } else {

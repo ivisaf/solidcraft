@@ -20,6 +20,17 @@ Everything about it is on one page: **Preferences → AI**.
 - **Show Assistant button in application bar** (on by default): the **Assistant** icon in the application bar
   row, which stays there however wide the window is. Turn it off to keep only the shortcut and
   the menu entry.
+- **Connect the last-used agent when SolidCraft starts** (off by default): each launch starts
+  the agent you connected last (the default one if you never connected), in the background,
+  once SolidCraft has looked for the installed agents. The panel's header shows **Starting…**,
+  then **Ready**, or **Connection failed** with **Retry** in place of **Connect** (the agent is
+  missing, could not start, or ended while starting); the conversation says why. A design
+  opened in place of the empty one SolidCraft starts with keeps the agent connected, as long
+  as nothing was asked in that empty design's chat.
+- **Open the Assistant panel when SolidCraft starts** (off by default): the panel (or its own
+  window) is shown at each launch.
+
+Neither applies when SolidCraft is started with `--control` for automation.
 
 With AI features on, the panel opens from:
 
@@ -29,7 +40,7 @@ With AI features on, the panel opens from:
 
 Nothing runs until you need it: SolidCraft looks for installed agents (a quick `--version`
 each, in the background) when the panel or the AI page first opens, and starts an agent only
-when you send a message or press **Connect**.
+when you send a message or press **Connect** (or at launch, when you turned that on above).
 
 ## The panel
 
@@ -144,14 +155,18 @@ conversation starts with), its own permission setting, and **Remove** for the on
 SolidCraft looks for agents that speak the [Agent Client Protocol](https://agentclientprotocol.com)
 on your `PATH` and in the usual install folders a desktop app's `PATH` often misses (npm's
 global folder, nvm, Volta, bun, `~/.local/bin`, `~/.grok/bin`, Homebrew, `%APPDATA%\npm`). For each one it
-shows its **version** (from `--version`, given three seconds) and whether it looks **signed in**.
+shows its **version** (from `--version`, given three seconds) and whether a **login was found**.
 Version checks and agent sessions also use those folders on their `PATH`, so adapters can find
 runtimes such as Node when SolidCraft is opened from Finder or the Dock. Existing absolute
 `PATH` entries keep their order; no shell startup files are run.
 SolidCraft only checks whether the agent's own login file (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, …) or one of its key variables exists. It never
 reads the file and never starts the agent to find out. On macOS Claude Code keeps its login in
-the keychain, so SolidCraft doesn't guess there.
+the keychain, so SolidCraft doesn't guess there. A found login file may be expired: **Test** or a
+chat connection verifies it. A successful ACP connection shows **signed in**; an authentication
+rejection shows **not signed in**. These results apply to that agent until a newer connection
+result or **Refresh**, which checks the installed agents again. An unrelated connection error
+doesn't change the last known login state.
 
 | Agent | What to install |
 |---|---|

@@ -1,5 +1,7 @@
 # Contributing to SolidCraft
 
+Agents: start from the router in [AGENTS.md](AGENTS.md), which points to a short skill in [`skills/`](skills/README.md) for each kind of work. This page stays the full human guide.
+
 SolidCraft is an open-source parametric 3D CAD app written in pure Rust.
 You sketch on a plane, constrain the sketch, turn profiles into solids, and
 change a parameter to watch the timeline rebuild. It runs as a desktop app (Windows, macOS, Linux), in
@@ -192,9 +194,11 @@ in the PR. `cargo xtask test` builds the tests with it and then runs every test 
 shared bound on top-level test/side commands for `cargo xtask test` and `cargo xtask ci`.
 For example, `SOLIDCRAFT_TEST_JOBS=2` allows two commands at once; the sequential wasm/doc
 worker consumes one of those slots. Every binary and side check still runs after failures.
-Without the variable the existing concurrency is unchanged. `RUST_TEST_THREADS`,
-`ACTION_MATRIX_JOBS` and Cargo's build-job setting remain independent caller overrides;
-this limit does not choose their values or change test filters, timeouts or baselines.
+Without the variable the existing concurrency is unchanged. With it set, each test binary
+inherits `RUST_TEST_THREADS` and `ACTION_MATRIX_JOBS` of `max(1, cpus / jobs)` — the machine's
+parallelism shared between the binaries in flight — unless you set either one explicitly;
+explicit caller overrides always win. Cargo's build-job setting remains an independent caller
+override; this limit does not change test filters, timeouts or baselines.
 Tests run beside each other on a busy machine, so a test must not depend on wall-clock timing.
 
 **Ready pull requests test what they touch.** CI maps changed files to workspace packages and

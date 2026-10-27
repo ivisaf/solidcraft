@@ -1,6 +1,6 @@
 //! Shape creation and its typed driving dimensions form one command and one undo step.
 use serde_json::{Value, json};
-use solidcraft_doc::expr::Kind;
+use solidcraft_doc::expr::{Kind, definition};
 
 use crate::{
     Result, Session,
@@ -11,7 +11,7 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "sketch.draw.dimensioned";
     let create = str_(p, "command").ok_or_else(|| bad(cmd, "`command` must name a supported sketch creator"))?;
     let roles: &[&str] = match create {
-        "sketch.line" => &["length", "angle"],
+        "sketch.line" | "sketch.line.midpoint" => &["length", "angle"],
         "sketch.rectangle.two_point" | "sketch.rectangle.center" | "sketch.rectangle.three_point" | "sketch.rectangle.rounded" => {
             &["width", "height"]
         }
@@ -38,7 +38,14 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
             .filter(|e| e.len() <= 4096)
             .ok_or_else(|| bad(cmd, "dimension values must be bounded expressions or finite numbers"))?;
         let kind = if role == "angle" || role == "sweep" { Kind::Angle } else { Kind::Length };
-        let evaluated = s.doc.eval(&e, kind)?;
+        // `name = expression` is checked by its right-hand side, read as the user parameter
+        // `sketch.dimension` defines will hold it (a bare number in the design's unit) (#7567).
+        let rhs = match definition(&e) {
+            Some((name, "")) => return Err(bad(cmd, format!("{role}: `{name} =` needs a value after the `=`"))),
+            Some((_, rhs)) => rhs,
+            None => e.as_str(),
+        };
+        let evaluated = s.doc.eval(&s.doc.with_design_unit(rhs, kind), kind)?;
         if role == "length" {
             overall_length = Some(evaluated);
         }
@@ -85,10 +92,11 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
         curves.get(index).filter(|v| v.is_string()).cloned().ok_or_else(|| bad(cmd, "creator did not return the expected curve"))
     };
     let mut added = serde_json::Map::new();
+    let mut defined = Vec::new();
     for (role, value) in dimensions {
         let (entities, ty) = match (create, role.as_str()) {
-            ("sketch.line", "length") => (vec![curve(0)?], "length"),
-            ("sketch.line", "angle") => (vec![curve(0)?], "angle"),
+            ("sketch.line" | "sketch.line.midpoint", "length") => (vec![curve(0)?], "length"),
+            ("sketch.line" | "sketch.line.midpoint", "angle") => (vec![curve(0)?], "angle"),
             // A rounded rectangle's sides stop at the arcs: its size is between opposite sides.
             ("sketch.rectangle.rounded", "width" | "height") => {
                 let [a, b] = if role == "width" { ["left", "right"] } else { ["bottom", "top"] };
@@ -120,12 +128,18 @@ pub(super) fn draw(s: &mut Session, p: &Value) -> Result<Value> {
             dimension["sketch"] = sketch.clone();
         }
         let result = scratch.execute("sketch.dimension", &dimension)?;
+        if let Some(name) = result.get("defined").filter(|v| v.is_string()) {
+            defined.push(name.clone());
+        }
         added.insert(role.clone(), result);
     }
     // Session::execute records the wrapper's before snapshot. Nested history must not leak.
     scratch.undo.clear();
     s.accept_computed(scratch);
     out["dimensions"] = Value::Object(added);
+    if !defined.is_empty() {
+        out["defined"] = Value::Array(defined);
+    }
     Ok(out)
 }
 

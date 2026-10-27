@@ -41,7 +41,7 @@ mod features;
 mod features_more;
 pub(crate) use face::{FaceRefForm, face_ref_form};
 pub(crate) use features::profiles as feature_profiles;
-pub(crate) use features::{EdgeRefForm, edge_ref_form, sketch_key};
+pub(crate) use features::{EdgeRefForm, axis_dir_form, edge_ref_form, sketch_key};
 pub use features::{auto_operation, extrude_reach};
 pub use sketch_import::drawing_import_command;
 pub use sketch_modify::{extend_arc_preview, extend_preview, trim_piece};
@@ -50,6 +50,7 @@ pub use view_navigation::standard_view;
 mod component_link;
 pub use component_link::resolve_design_links;
 mod config;
+mod design_link;
 mod file;
 mod frame;
 pub(crate) mod inspect;
@@ -74,6 +75,7 @@ mod parameter_sweep;
 mod parameters;
 mod plastic;
 mod render;
+mod render_ui;
 #[cfg(test)]
 mod script_tests;
 mod sheet;
@@ -81,6 +83,7 @@ mod silhouette;
 mod sketch;
 pub(crate) use sketch::author_path_for_rebind;
 pub(crate) use sketch::created as sketch_created;
+mod canvas_sketch;
 mod sketch_3d;
 mod sketch_canvas;
 pub mod sketch_clipboard;
@@ -278,6 +281,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(sketch_inspect::COMMANDS.iter());
     v.extend(sketch_ends::COMMANDS.iter());
     v.extend(sketch_canvas::COMMANDS.iter());
+    v.extend(canvas_sketch::COMMANDS.iter());
     v.extend(sketch_3d::COMMANDS.iter());
     v.extend(surface_analysis::COMMANDS.iter());
     v.extend(surface_boundary::COMMANDS.iter());
@@ -322,6 +326,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(view_dxf::COMMANDS.iter());
     v.extend(diagnostics::COMMANDS.iter());
     v.extend(render::COMMANDS.iter());
+    v.extend(render_ui::COMMANDS.iter());
     v
 }
 

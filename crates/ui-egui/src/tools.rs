@@ -105,6 +105,7 @@ impl Tool {
             "sketch.circle.two_point" => ("sketch.circle.two_point", Kind::Draw(2)),
             "sketch.circle.three_point" => ("sketch.circle.three_point", Kind::Draw(3)),
             "sketch.arc.three_point" => ("sketch.arc.three_point", Kind::Draw(3)),
+            "sketch.arc3d" => ("sketch.arc3d", Kind::Draw(3)),
             "sketch.arc.center_point" => ("sketch.arc.center_point", Kind::Draw(3)),
             "sketch.polygon.inscribed" => ("sketch.polygon.inscribed", Kind::Draw(2)),
             "sketch.polygon.circumscribed" => ("sketch.polygon.circumscribed", Kind::Draw(2)),
@@ -150,6 +151,7 @@ pub fn hint(id: &str) -> String {
         "sketch.rectangle.three_point" => "3-point rectangle: click two points of one edge, then the width".into(),
         "sketch.circle.center" => "Circle: click the centre, then a point on the circle".into(),
         "sketch.arc.three_point" => "Arc: click start, end, then a point on the arc".into(),
+        "sketch.arc3d" => "3D Arc: click start, end, then a point on the arc (points may leave the sketch plane)".into(),
         "sketch.arc.center_point" => "Arc: click centre and start, then click end or type a signed sweep".into(),
         "sketch.dimension" => {
             "Dimension: pick one or two entities and type the value (or click to place it first); click a dimension to edit it; Enter applies".into()
@@ -282,11 +284,21 @@ pub fn on_click(app: &mut SolveApp, proj: &Proj, pos: Pos2, shift: bool) {
             // Symmetry's third pick may be an origin axis lying along the sketch's own x or y
             // (#1075); the command names those `x` / `y`.
             let axis_ok = tool.cmd == "sketch.constraint.symmetry" && tool.picks.len() == 2;
-            if let Some(id) = hits.iter().find_map(|h| match h {
+            let entity = hits.iter().find_map(|h| match h {
                 Hit::SketchPoint { id, .. } | Hit::SketchCurve { id, .. } => Some(id.clone()),
                 Hit::Axis { name } if axis_ok => sketch_axis_of(app, name).map(str::to_string),
                 _ => None,
-            }) {
+            });
+            // With nothing of the sketch there, a body's edge or vertex is picked (kept as its
+            // reference): the command projects it, so any body can be constrained to, a mirrored
+            // copy too (#6348). Projected geometry is already fixed, so Fix takes sketch entities.
+            let model = || {
+                hits.iter()
+                    .filter(|h| tool.cmd != "sketch.constraint.fix" && matches!(h, Hit::Edge { .. } | Hit::Vertex { .. }))
+                    .find_map(|h| crate::sketch_tools::model_ref(app, h))
+                    .map(|r| r.to_string())
+            };
+            if let Some(id) = entity.or_else(model) {
                 tool.picks.push(id);
             }
             if tool.picks.len() >= n {
@@ -496,6 +508,13 @@ pub(crate) fn draw(app: &mut SolveApp, t: &Tool, params: Value) -> Result<Value,
         let history = std::mem::take(&mut app.session.undo);
         crate::sketch_palette::apply_mode(app, t.cmd, &result);
         app.session.undo = history;
+        // A box typed `name = expression` defined the parameter `name` (#7567).
+        let defined: Vec<_> = result["defined"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|name| format!("`{name}`")).collect();
+        match defined.as_slice() {
+            [] => {}
+            [name] => app.set_status(format!("Parameter {name} defined"), false),
+            names => app.set_status(format!("Parameters {} defined", names.join(", ")), false),
+        }
         Ok(result)
     }
 }
@@ -512,8 +531,15 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
         }
         "sketch.rectangle.three_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "p2": xy(&p[2])}),
         "sketch.circle.center" => {
-            // A second click snapped to a point keeps the circle on that point (#3099).
-            let mut v = json!({"center": arg(&p[0]), "radius": d(0, 1)});
+            // A centre snapped to an existing point goes as its place, where `connect` ties
+            // them with a Coincident the sketch shows (#7299); a midpoint, on-curve, crossing or
+            // body-vertex snap goes as itself, so the centre is held there. A second click
+            // snapped to a point keeps the circle on that point (#3099).
+            let center = match &p[0].1 {
+                Some(id) if ["mid:", "on:", "vertex:", "x:"].iter().any(|k| id.starts_with(k)) => json!(id),
+                _ => xy(&p[0]),
+            };
+            let mut v = json!({"center": center, "radius": d(0, 1)});
             if p[1].1.is_some() {
                 v["through"] = arg(&p[1]);
             }
@@ -522,10 +548,19 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
         "sketch.circle.two_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1])}),
         "sketch.circle.three_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "p2": xy(&p[2])}),
         "sketch.arc.three_point" => json!({"start": arg(&p[0]), "end": arg(&p[1]), "through": arg(&p[2])}),
-        "sketch.arc.center_point" => match crate::sketch_dims::locked_value(app, t, "Sweep") {
-            Some(sweep) => json!({"center": arg(&p[0]), "start": arg(&p[1]), "sweep": sweep.to_degrees()}),
-            None => json!({"center": arg(&p[0]), "start": arg(&p[1]), "end": xy(&p[2])}),
-        },
+        "sketch.arc.center_point" => {
+            // A centre snapped to an existing point goes as its place, where `connect` ties
+            // them with a Coincident the sketch shows (#7299); a midpoint, on-curve, crossing or
+            // body-vertex snap goes as itself, so the centre is held there.
+            let center = match &p[0].1 {
+                Some(id) if ["mid:", "on:", "vertex:", "x:"].iter().any(|k| id.starts_with(k)) => json!(id),
+                _ => xy(&p[0]),
+            };
+            match crate::sketch_dims::locked_value(app, t, "Sweep") {
+                Some(sweep) => json!({"center": center, "start": arg(&p[1]), "sweep": sweep.to_degrees()}),
+                None => json!({"center": center, "start": arg(&p[1]), "end": xy(&p[2])}),
+            }
+        }
         "sketch.polygon.inscribed" | "sketch.polygon.circumscribed" => {
             let a = (p[1].0 - p[0].0).angle().to_degrees();
             json!({"center": xy(&p[0]), "radius": d(0, 1), "sides": sides, "angle": a})
@@ -710,17 +745,17 @@ fn symmetry_args(picks: &[Value], sketch: Option<&solidcraft_engine::sketch::Ske
 }
 
 fn run_pick(app: &mut SolveApp, t: &Tool) {
-    let k = &t.picks;
+    // An entity id, or a model edge's or vertex's reference.
+    let k: Vec<Value> = t.picks.iter().map(|pick| serde_json::from_str(pick).ok().filter(Value::is_object).unwrap_or_else(|| json!(pick))).collect();
     let params = match t.cmd {
         "sketch.constraint.fix" => json!({"entity": k[0]}),
         "sketch.constraint.coincident" => json!({"a": k[0], "b": k[1]}),
         // In pick order: a point and a line either way round, or two lines to centre.
         "sketch.constraint.midpoint" => json!({"a": k[0], "b": k[1]}),
         "sketch.constraint.symmetry" => {
-            let picks: Vec<Value> = k.iter().map(|pick| json!(pick)).collect();
             let params = {
                 let state = app.session.world_state();
-                symmetry_args(&picks, app.session.active_sketch.and_then(|id| state.sketch(id)).map(|ss| &ss.sketch))
+                symmetry_args(&k, app.session.active_sketch.and_then(|id| state.sketch(id)).map(|ss| &ss.sketch))
             };
             let Some(params) = params else {
                 app.set_status("Symmetry: pick two points or two curves and the line between them", true);

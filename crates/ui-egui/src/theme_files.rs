@@ -21,7 +21,7 @@ use crate::theme::{IconColors, Tokens};
 /// The `format` tag of a theme file.
 pub const FORMAT: &str = "solidcraft-theme/1";
 /// Hostile-input caps: file size, colours per file, name length, imported themes kept.
-const MAX_BYTES: usize = 256 * 1024;
+pub const MAX_BYTES: usize = 256 * 1024;
 pub const MAX_COLORS: usize = 512;
 const MAX_NAME: usize = 80;
 pub const MAX_CUSTOM: usize = 64;
@@ -313,7 +313,7 @@ theme_keys! {
         sketch_ink, sketch_soft, surface_fill, surface_ink, surface_soft, mesh_fill, mesh_ink, mesh_soft, form_fill, form_tab_ink, form_soft, sheet_fill, sheet_ink, sheet_soft, render_fill, render_ink, render_soft, tab_on_fill_dark,
         app_bar_separator, surface_accent, mesh_accent, form_accent, render_accent, on_accent, agent_ok, agent_busy, app_bar_hover_subtle,
         app_bar_hover_button, app_bar_hover_strong, app_bar_tab_active,
-        form_ink, form_dim, form_primary, form_error, form_error_fill, form_success, form_success_fill, dialog_body, dialog_footer, dialog_rule, control_fill, control_border, dialog_label, selected_ink, selected_bg,
+        form_ink, form_dim, form_primary, form_primary_fill, form_error, form_error_fill, form_success, form_success_fill, dialog_body, dialog_footer, dialog_rule, control_fill, control_border, dialog_label, selected_ink, selected_bg,
     ],
     many: [continuity, logo],
     icons: [highlight, agent, marker_halo],
@@ -487,6 +487,9 @@ pub fn resolve(theme: &ThemeFile) -> Tokens {
             s.copy_from_slice(&c);
         }
     }
+    if !theme.colors.contains_key("form_primary_fill") {
+        t.form_primary_fill = t.form_primary;
+    }
     for (key, value) in &theme.radii {
         if *value <= MAX_RADIUS
             && let Some(slot) = radius_slot(&mut t, key)
@@ -610,8 +613,8 @@ pub fn export(name: &str, base: Base, t: &Tokens) -> Value {
     json!({"format": FORMAT, "name": name, "base": base, "colors": colors, "radii": radii, "borders": borders, "icon_palette": icon_palette})
 }
 
-/// The theme files that come with SolidCraft (original files; Gruvbox, Tokyo Night, Solarized, Nord, Nosferatu and Catppuccin map open-source palettes, MIT; Okibi and Akari map the Okibi design system).
-const BUILTIN: [(&str, &str); 22] = [
+/// The theme files that come with SolidCraft (original files; Gruvbox, Tokyo Night, Solarized, Nord, Nosferatu and Catppuccin map open-source palettes, MIT; Okibi and Akari map the Okibi design system; Clay and Clay Dark are original warm paper and charcoal palettes; CGA keeps to the 16 colours of the IBM Color Graphics Adapter; 1-bit and 1-bit Dark are original black-and-white palettes).
+const BUILTIN: [(&str, &str); 27] = [
     ("gruvbox-dark", include_str!("../../../assets/styles/ui/themes/gruvbox-dark.json")),
     ("gruvbox-dark-hard", include_str!("../../../assets/styles/ui/themes/gruvbox-dark-hard.json")),
     ("gruvbox-dark-soft", include_str!("../../../assets/styles/ui/themes/gruvbox-dark-soft.json")),
@@ -619,6 +622,8 @@ const BUILTIN: [(&str, &str); 22] = [
     ("gruvbox-light-hard", include_str!("../../../assets/styles/ui/themes/gruvbox-light-hard.json")),
     ("gruvbox-light-soft", include_str!("../../../assets/styles/ui/themes/gruvbox-light-soft.json")),
     ("solidcraft-95", include_str!("../../../assets/styles/ui/themes/solidcraft-95.json")),
+    ("1-bit", include_str!("../../../assets/styles/ui/themes/1-bit.json")),
+    ("1-bit-dark", include_str!("../../../assets/styles/ui/themes/1-bit-dark.json")),
     ("platinum-9", include_str!("../../../assets/styles/ui/themes/platinum-9.json")),
     ("cupertino", include_str!("../../../assets/styles/ui/themes/cupertino.json")),
     ("green-phosphor", include_str!("../../../assets/styles/ui/themes/green-phosphor.json")),
@@ -634,7 +639,17 @@ const BUILTIN: [(&str, &str); 22] = [
     ("catppuccin-mocha", include_str!("../../../assets/styles/ui/themes/catppuccin-mocha.json")),
     ("okibi", include_str!("../../../assets/styles/ui/themes/okibi.json")),
     ("akari", include_str!("../../../assets/styles/ui/themes/akari.json")),
+    ("clay", include_str!("../../../assets/styles/ui/themes/clay.json")),
+    ("clay-dark", include_str!("../../../assets/styles/ui/themes/clay-dark.json")),
+    ("cga", include_str!("../../../assets/styles/ui/themes/cga.json")),
 ];
+
+/// The two-colour built-in themes (1-bit and 1-bit Dark): pure black and white, so a few looks
+/// other themes tell apart by colour are told apart by text or shape instead.
+#[cfg(test)]
+pub(crate) fn is_two_colour(id: &str) -> bool {
+    matches!(id, "1-bit" | "1-bit-dark")
+}
 
 /// The built-in themes, read once (one that fails to read is left out; a test reads them all).
 pub fn builtin() -> &'static [ThemeFile] {
@@ -801,14 +816,97 @@ mod tests {
         for file in builtin() {
             let t = resolve(file);
             assert!(t.icon_palette.is_some(), "{} has no icon palette", file.id);
+            // A two-colour theme (1-bit, 1-bit Dark) can't give each workspace its own fill; it
+            // still has to keep every tab readable, below.
+            let two_colour = is_two_colour(&file.id);
             let mut fills = std::collections::HashSet::new();
             for tab in ["MODEL", "SURFACE", "MESH", "FORM", "SHEET METAL", "RENDER", "SKETCH"] {
                 let accent = TabAccent::for_tab(&t, tab);
-                assert!(fills.insert(accent.color), "{} repeats {tab}", file.id);
+                assert!(fills.insert(accent.color) || two_colour, "{} repeats {tab}", file.id);
                 assert!(contrast_ratio(accent.ink, accent.soft) >= 4.5, "{} {tab} soft text", file.id);
                 assert!(contrast_ratio(accent.on_fill(&t), accent.color) >= 4.5, "{} {tab} pill text", file.id);
             }
         }
+    }
+
+    #[test]
+    fn one_bit_themes_are_complete_opaque_black_and_white() {
+        for (id, name, base) in [("1-bit", "1-bit", Base::Light), ("1-bit-dark", "1-bit Dark", Base::Dark)] {
+            assert!(is_two_colour(id));
+            let file = find(id, &[]).unwrap();
+            assert_eq!(file.name, name);
+            assert_eq!(file.base, base);
+            one_bit_is_complete_opaque_black_and_white(file);
+        }
+    }
+
+    fn one_bit_is_complete_opaque_black_and_white(file: &ThemeFile) {
+        let t = resolve(file);
+        let exported = export(&file.name, file.base, &t);
+        let mut resolved = t;
+        for key in keys() {
+            for color in slot(&mut resolved, key).unwrap() {
+                let [r, g, b, _] = color.to_srgba_unmultiplied();
+                assert!(matches!([r, g, b], [0, 0, 0] | [255, 255, 255]), "{}: {key}: {color:?}", file.id);
+            }
+            assert!(file.colors.contains_key(key), "{}: missing {key}", file.id);
+        }
+        fn check(value: &Value) {
+            match value {
+                Value::String(color) if color.starts_with('#') => {
+                    assert!(matches!(color.as_str(), "#000000" | "#ffffff"), "{color}");
+                }
+                Value::Array(values) => values.iter().for_each(check),
+                Value::Object(values) => values.values().for_each(check),
+                _ => {}
+            }
+        }
+        check(&exported);
+        for role in crate::icon_svg::ROLE_NAMES.iter().filter(|role| **role != "gap") {
+            assert!(file.icon_palette.contains_key(*role), "{}: missing icon role {role}", file.id);
+        }
+        for ramp in std::iter::once("solid").chain(crate::icon_svg::ACCENT_NAMES.iter().copied()) {
+            assert!(file.icon_palette.contains_key(ramp), "{}: missing icon ramp {ramp}", file.id);
+        }
+        assert_eq!(radius_values(t), [0; 6]);
+    }
+
+    #[test]
+    fn one_bit_selection_and_viewport_tokens_have_full_contrast() {
+        for (id, paper, ink) in [("1-bit", Color32::WHITE, Color32::BLACK), ("1-bit-dark", Color32::BLACK, Color32::WHITE)] {
+            one_bit_has_full_contrast(&resolve(find(id, &[]).unwrap()), id, paper, ink);
+        }
+    }
+
+    /// `paper` is the theme's page (panels, viewport, bodies, hover); `ink` its text, and its selection.
+    fn one_bit_has_full_contrast(t: &Tokens, id: &str, paper: Color32, ink: Color32) {
+        assert_eq!((t.text, t.panel), (ink, paper), "{id}");
+        for (fg, bg) in [
+            (t.text, t.panel),
+            (t.text_dim, t.field),
+            (t.icon, t.toolbar),
+            (t.app_bar_text, t.app_bar_tab_active),
+            (t.selected_ink, t.selected_bg),
+            (t.text, t.hover),
+            (t.app_bar_text, t.app_bar_hover),
+            (t.body_edge, t.body),
+            (t.sel_edge, t.body_selected),
+            (t.dimension, t.viewport_top),
+            (t.sketch, t.viewport_bottom),
+            (t.glyph_text, t.glyph_bg),
+            (t.dialog_label, t.dialog_body),
+        ] {
+            assert_eq!(crate::theme::contrast_ratio(fg, bg), 21.0, "{id}: {fg:?} on {bg:?}");
+        }
+        assert_eq!((t.viewport_top, t.viewport_bottom, t.body), (paper, paper, paper), "{id}");
+        assert_eq!((t.selected_bg, t.body_selected), (ink, ink), "{id}");
+        // Hover fills are the paper, so a hovered row, card or tab never swallows its ink label.
+        for hover in [t.hover, t.app_bar_hover, t.app_bar_hover_subtle, t.app_bar_hover_button, t.app_bar_hover_strong] {
+            assert_eq!(hover, paper, "{id}: hover fill");
+        }
+        assert_eq!((t.body_edge, t.selected_ink), (ink, paper), "{id}");
+        // Thumbnails and other pictures keep their own pixels: the tint stays neutral white.
+        assert_eq!(t.file_image_tint, Color32::WHITE, "{id}");
     }
 
     #[test]
@@ -817,10 +915,39 @@ mod tests {
         for t in builtin() {
             let base = if t.base.is_dark() { Tokens::dark() } else { Tokens::light() };
             assert_ne!(resolve(t), base, "{}", t.id);
-            if t.id.starts_with("gruvbox-") {
+            if t.id.starts_with("gruvbox-") || is_two_colour(&t.id) {
                 assert_eq!(t.base.is_dark(), t.id.contains("dark"), "{}", t.id);
             }
         }
+    }
+
+    /// CGA uses only the 16 colours of the IBM Color Graphics Adapter (alpha only on translucent
+    /// tokens) and sets every colour, so nothing falls back to Dark's palette.
+    #[test]
+    fn cga_uses_only_the_sixteen_cga_colours() {
+        const CGA: [&str; 16] = [
+            "000000", "0000aa", "00aa00", "00aaaa", "aa0000", "aa00aa", "aa5500", "aaaaaa", "555555", "5555ff", "55ff55", "55ffff", "ff5555",
+            "ff55ff", "ffff55", "ffffff",
+        ];
+        fn colours<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+            match v {
+                Value::String(s) if s.starts_with('#') => out.push(s),
+                Value::Array(a) => a.iter().for_each(|v| colours(v, out)),
+                Value::Object(o) => o.values().for_each(|v| colours(v, out)),
+                _ => {}
+            }
+        }
+        let text = BUILTIN.iter().find(|(id, _)| *id == "cga").map(|(_, text)| *text).unwrap();
+        let file: Value = serde_json::from_str(text).unwrap();
+        let mut found = Vec::new();
+        colours(&file, &mut found);
+        assert!(found.len() > keys().len(), "CGA sets every colour and its icon palette");
+        for c in found {
+            let rgb = c.get(1..7).unwrap_or_default().to_ascii_lowercase();
+            assert!(CGA.contains(&rgb.as_str()) && parse_color(c).is_some(), "{c} is not a CGA colour");
+        }
+        let theme = find("cga", &[]).unwrap();
+        assert_eq!((theme.name.as_str(), theme.colors.len()), ("CGA", keys().len()), "CGA sets every colour");
     }
 
     /// #4868: a theme that sets none of the File view's colours (all the built-in ones) gets them
@@ -857,6 +984,19 @@ mod tests {
         let own = parse(r##"{"format":"solidcraft-theme/1","name":"Own rail","base":"dark","colors":{"accent":"#ff0000","file_rail":"#102030"}}"##)
             .unwrap();
         assert_eq!(resolve(&own).file_rail, Color32::from_rgb(0x10, 0x20, 0x30));
+    }
+
+    /// Okibi and Akari spend their ember on one or two marks a screen: the start page's rail is
+    /// one of their neutrals, not their accent.
+    #[test]
+    fn okibi_and_akari_rails_are_neutral() {
+        for id in ["okibi", "akari"] {
+            let t = resolve(builtin().iter().find(|t| t.id == id).unwrap());
+            for c in [t.file_rail, t.file_rail_hover] {
+                let [r, g, b, _] = c.to_array();
+                assert!(r.max(g).max(b) - r.min(g).min(b) <= 12, "{id}: {c:?} is tinted");
+            }
+        }
     }
 
     #[test]
@@ -1030,6 +1170,9 @@ mod tests {
         assert_eq!(values("solidcraft-95"), [3, 3, 4, 4, 3, 3]);
         assert_eq!(values("blueprint"), [4, 6, 8, 10, 6, 7]);
         assert_eq!(values("cupertino"), [6, 8, 12, 16, 8, 9]);
+        for id in ["clay", "clay-dark"] {
+            assert_eq!(values(id), [6, 9, 13, 18, 9, 10], "{id}");
+        }
         let defaults = radius_values(Tokens::dark());
         assert_eq!(defaults, radius_values(Tokens::light()));
         for suffix in ["", "-hard", "-soft"] {

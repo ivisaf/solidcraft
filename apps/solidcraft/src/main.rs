@@ -24,10 +24,13 @@ mod control_server;
 mod device_lost;
 #[cfg(target_os = "windows")]
 mod native_crash;
+#[cfg(target_os = "macos")]
+mod native_crash_macos;
 #[cfg(target_os = "windows")]
 mod native_frame;
 #[cfg(target_os = "macos")]
 mod native_menu;
+mod nav_bridge;
 #[cfg(target_os = "macos")]
 mod open_documents;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -87,6 +90,10 @@ struct App {
     space_mouse: space_mouse::SpaceMouse,
     #[cfg(target_os = "macos")]
     native_menu: Option<native_menu::NativeMenu>,
+    /// A device's own app moving the view (Preferences › Navigation, off by default).
+    nav_bridge: nav_bridge::NavBridge,
+    /// Where the next file dialog opens: it follows the open design (#7756).
+    dialog_folder: DialogFolder,
 }
 
 impl eframe::App for App {
@@ -117,6 +124,7 @@ impl eframe::App for App {
                 // Automation runs (a control port was asked for) leave the user's AI apps alone.
                 if !self.take_focus_unwanted {
                     solidcraft_ui_egui::ai_connect::begin(&mut self.solve);
+                    solidcraft_ui_egui::agent_chat::begin(&mut self.solve);
                 }
                 if let Some(dir) = self.starting.take() {
                     startup::started(&dir);
@@ -141,10 +149,13 @@ impl eframe::App for App {
             menu.tick(&mut self.solve, ctx);
         }
         self.solve.logic(ctx);
+        self.dialog_folder.design(self.solve.session.path.as_deref());
         #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
         if !self.solve.file_picker_busy() {
             self.space_mouse.tick(&mut self.solve, ctx);
         }
+        // Every frame, so switching the bridge off reaches the reader while a picker is open too.
+        self.nav_bridge.tick(&mut self.solve, ctx);
         if self.solve.quit_requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -233,6 +244,60 @@ impl App {
     }
 }
 
+/// Where the next file dialog opens (#7756): the folder of the file last chosen in one, or of the
+/// design last opened or saved, whichever came last. Linux dialogs otherwise open in the home
+/// folder every time; macOS and Windows remember a folder of their own, which this agrees with.
+#[derive(Clone, Default)]
+struct DialogFolder(std::sync::Arc<std::sync::Mutex<DialogFolderState>>);
+
+#[derive(Default)]
+struct DialogFolderState {
+    folder: Option<std::path::PathBuf>,
+    /// The open design's path when last looked at, to notice another design opened or saved.
+    design: Option<String>,
+}
+
+impl DialogFolder {
+    /// A file was chosen in a dialog: the next one opens in its folder.
+    fn chosen(&self, file: &std::path::Path) {
+        if let (Some(folder), Ok(mut state)) = (file.parent().filter(|f| !f.as_os_str().is_empty()), self.0.lock()) {
+            state.folder = Some(folder.to_path_buf());
+        }
+    }
+
+    /// The open design's path, every frame: a design opened or saved somewhere else moves the
+    /// next dialog to its folder; the same design again leaves a folder chosen since alone.
+    fn design(&self, path: Option<&str>) {
+        let Ok(mut state) = self.0.lock() else { return };
+        if state.design.as_deref() == path {
+            return;
+        }
+        state.design = path.map(str::to_string);
+        if let Some(folder) = path.and_then(|p| std::path::Path::new(p).parent()).filter(|f| !f.as_os_str().is_empty()) {
+            state.folder = Some(folder.to_path_buf());
+        }
+    }
+
+    /// A dialog's answer as a path, its folder remembered for the next dialog.
+    fn answer(&self, picked: Option<rfd::FileHandle>) -> Option<String> {
+        let picked = picked?;
+        self.chosen(picked.path());
+        Some(picked.path().to_string_lossy().into_owned())
+    }
+
+    fn folder(&self) -> Option<std::path::PathBuf> {
+        self.0.lock().ok().and_then(|state| state.folder.clone())
+    }
+
+    /// The dialog, opening in the remembered folder when there is one.
+    fn start(&self, dialog: rfd::AsyncFileDialog) -> rfd::AsyncFileDialog {
+        match self.folder() {
+            Some(folder) => dialog.set_directory(folder),
+            None => dialog,
+        }
+    }
+}
+
 /// Linux file dialogs match patterns by case, so each extension goes in as lower and upper
 /// case, plus FreeCAD's own mixed casing.
 fn case_variants(exts: &[&str]) -> Vec<String> {
@@ -282,15 +347,16 @@ fn fullscreen_content_insets(raw: &mut egui::RawInput, title_height: f32, zoom: 
     raw.safe_area_insets = Some(insets);
 }
 
-fn services(cc: &eframe::CreationContext<'_>) -> Services {
+fn services(cc: &eframe::CreationContext<'_>, folder: &DialogFolder) -> Services {
     let parent = rfd::AsyncFileDialog::new().set_parent(cc);
     let open_parent = parent.clone();
     let program_parent = parent.clone();
     let file_parent = parent.clone();
+    let (open_folder, file_folder, save_folder) = (folder.clone(), folder.clone(), folder.clone());
     Services {
         pick_open: Some(Box::new(move |first: &[&str]| {
             // The file type the command reads comes first, so the picker opens on it (#1801).
-            let mut dialog = open_parent.clone();
+            let mut dialog = open_folder.start(open_parent.clone());
             if !first.is_empty() {
                 let label = first.iter().map(|e| e.to_uppercase()).collect::<Vec<_>>().join(", ");
                 dialog = dialog.add_filter(label, &case_variants(first));
@@ -303,7 +369,8 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
                 dialog = dialog.add_filter(label, &case_variants(&exts));
             }
             let future = dialog.add_filter("All files", &["*"]).pick_file();
-            Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
+            let folder = open_folder.clone();
+            Box::pin(async move { folder.answer(future.await) })
         })),
         // One kind of file (the agent chat's attachments): only the types it names, as given and in
         // lower and upper case (Linux dialogs match case; macOS allows just the listed types).
@@ -318,8 +385,9 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
             }
             let all: Vec<&str> = all.iter().map(String::as_str).collect();
             // Any other file attaches by reference, so the list is not the only choice.
-            let future = file_parent.clone().add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
-            Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
+            let future = file_folder.start(file_parent.clone()).add_filter(label, &all).add_filter("All files", &["*"]).pick_file();
+            let folder = file_folder.clone();
+            Box::pin(async move { folder.answer(future.await) })
         })),
         pick_program: Some(Box::new(move || {
             let dialog = program_parent.clone().set_title("Choose your slicer");
@@ -328,7 +396,7 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
             Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
         })),
         pick_save: Some(Box::new(move |name: &str, exts: &[&str]| {
-            let dialog = parent.clone().set_file_name(name);
+            let dialog = save_folder.start(parent.clone()).set_file_name(name);
             let dialog = if exts == [io::DESIGN_EXT, "json"] {
                 if name.ends_with(".json") {
                     dialog.add_filter("Plain JSON design", &["json"]).add_filter("SolidCraft container", &[io::DESIGN_EXT])
@@ -339,7 +407,8 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
                 dialog.add_filter("File", exts)
             };
             let future = dialog.save_file();
-            Box::pin(async move { future.await.map(|p| p.path().to_string_lossy().into_owned()) })
+            let folder = save_folder.clone();
+            Box::pin(async move { folder.answer(future.await) })
         })),
         graphics_adapters: Vec::new(),
         graphics_path: graphics_path().map(|p| p.to_string_lossy().to_string()),
@@ -351,6 +420,7 @@ fn services(cc: &eframe::CreationContext<'_>) -> Services {
         can_restore: None,
         restore_file: None,
         download_design: None,
+        easyprint_upload: Some(std::sync::Arc::new(easyprint_upload)),
         browser_files: None,
         agent_http: Some(std::sync::Arc::new(agent_http)),
         secrets: Some(std::sync::Arc::new(Keychain)),
@@ -445,6 +515,24 @@ fn agent_http(r: &solidcraft_ui_egui::agent_chat::backend::HttpRequest) -> Resul
     let status = response.status().as_u16();
     let body = response.body_mut().with_config().limit(16 << 20).read_to_vec().map_err(|e| e.to_string())?;
     Ok((status, body))
+}
+
+/// Open with EasyPrint: upload the model to Printables' import endpoint on a worker and answer on
+/// `done` with the address to open. Through [`agent_http`]: no redirects, a timeout, no cookies.
+fn easyprint_upload(name: &str, bytes: Vec<u8>, done: std::sync::mpsc::Sender<Result<String, String>>) {
+    use solidcraft_engine::easyprint;
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let (content_type, body) = easyprint::multipart(&name, &bytes);
+        let request = solidcraft_ui_egui::agent_chat::backend::HttpRequest {
+            method: "POST",
+            url: easyprint::IMPORT_URL.into(),
+            headers: vec![("Content-Type".into(), content_type), ("Accept".into(), "application/json".into())],
+            body: Some(body),
+            timeout_s: 180,
+        };
+        let _ = done.send(agent_http(&request).and_then(|(status, body)| easyprint::parse_import_response(status, &body)));
+    });
 }
 
 /// API keys in the system keychain (service "SolidCraft agent chat", one entry per agent).
@@ -733,10 +821,12 @@ fn main() -> eframe::Result {
             solidcraft_engine::crash::install(dir, build)
         })
         .unwrap_or_default();
-    // A crash in native code (a graphics driver) says where it happened: the exception and the
-    // module on Windows, and on every system the startup step the app was in.
+    // A crash in native code (a graphics driver) says where it happened: the exception or signal
+    // and the module on Windows and macOS, and on every system the startup step the app was in.
     #[cfg(target_os = "windows")]
     native_crash::install();
+    #[cfg(target_os = "macos")]
+    native_crash_macos::install();
     // Windows with only OpenGL to start: the system title bar instead of ours (#2063).
     let started = match &wgpu_options.wgpu_setup {
         eframe::egui_wgpu::WgpuSetup::CreateNew(setup) => setup.instance_descriptor.backends,
@@ -812,7 +902,8 @@ fn main() -> eframe::Result {
             solidcraft_ui_egui::fonts::setup_bundled_fonts(&cc.egui_ctx);
             solidcraft_ui_egui::fonts::load_system_fonts_in_background(&cc.egui_ctx);
             mark("fonts");
-            let mut app = SolveApp::new(Session::default(), services(cc));
+            let dialog_folder = DialogFolder::default();
+            let mut app = SolveApp::new(Session::default(), services(cc, &dialog_folder));
             app.apply_off_thread = Some(solidcraft_ui_egui::dialogs::APPLY_AT_ONCE);
             app.custom_titlebar = custom_titlebar;
             #[cfg(target_os = "windows")]
@@ -905,6 +996,10 @@ fn main() -> eframe::Result {
                 open_documents::set_ui(&cc.egui_ctx);
                 [files, open_documents::take()].concat()
             };
+            // No design given: the designs open at the last quit, when the preference asks (#5542).
+            // Not when driven over the control channel, whose clients expect a fresh design.
+            let files =
+                if files.is_empty() && !sample && control_port.is_none() { solidcraft_ui_egui::documents::designs_to_reopen(&app) } else { files };
             for f in &files {
                 app.open_path_async(f);
             }
@@ -933,8 +1028,9 @@ fn main() -> eframe::Result {
             if !notes.is_empty() {
                 app.set_status(notes.join(" "), true);
             }
+            let nav_bridge = nav_bridge::NavBridge::start(&cc.egui_ctx);
             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-            let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
+            let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx, nav_bridge.claim());
             #[cfg(target_os = "macos")]
             let native_menu = match native_menu::NativeMenu::new(&app, &cc.egui_ctx) {
                 Ok(menu) => Some(menu),
@@ -959,6 +1055,8 @@ fn main() -> eframe::Result {
                 space_mouse,
                 #[cfg(target_os = "macos")]
                 native_menu,
+                nav_bridge,
+                dialog_folder,
             }))
         }),
     );
@@ -1134,6 +1232,40 @@ mod backend_tests {
         // Wayland chosen on GNOME keeps native Wayland; X11 chosen on niri goes through XWayland.
         assert!(!prefer_x11(true, true, Some("GNOME"), over(Some("wayland"))));
         assert!(prefer_x11(true, true, Some("niri"), over(Some("x11"))));
+    }
+}
+
+#[cfg(test)]
+mod dialog_folder_tests {
+    use super::DialogFolder;
+    use std::path::{Path, PathBuf};
+
+    /// #7756: a file dialog opens where the last one left off, not in the home folder.
+    #[test]
+    fn the_next_dialog_opens_in_the_folder_of_the_file_chosen_last() {
+        let folder = DialogFolder::default();
+        assert_eq!(folder.folder(), None, "before any choice the system decides");
+        folder.chosen(Path::new("/work/prints/bracket.stl"));
+        assert_eq!(folder.folder(), Some(PathBuf::from("/work/prints")));
+        // A bare file name has no folder to remember.
+        folder.chosen(Path::new("bracket.step"));
+        assert_eq!(folder.folder(), Some(PathBuf::from("/work/prints")));
+    }
+
+    /// Save As starts beside the open design (#7756), and a folder chosen since wins until another
+    /// design is opened or saved.
+    #[test]
+    fn the_open_design_moves_the_folder_only_when_it_changes() {
+        let folder = DialogFolder::default();
+        folder.design(Some("/work/lid/lid.solidcraft"));
+        assert_eq!(folder.folder(), Some(PathBuf::from("/work/lid")));
+        folder.chosen(Path::new("/exports/lid.3mf"));
+        folder.design(Some("/work/lid/lid.solidcraft"));
+        assert_eq!(folder.folder(), Some(PathBuf::from("/exports")), "the same design again leaves the export folder");
+        folder.design(None);
+        assert_eq!(folder.folder(), Some(PathBuf::from("/exports")), "a new, unsaved design has no folder of its own");
+        folder.design(Some("/work/base/base.solidcraft"));
+        assert_eq!(folder.folder(), Some(PathBuf::from("/work/base")));
     }
 }
 

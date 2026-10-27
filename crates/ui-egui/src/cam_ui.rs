@@ -625,11 +625,11 @@ pub fn stock_scene(app: &SolveApp, sc: &mut crate::gpu::GpuScene) {
     for (tri, mark) in stock_triangles(field, leftover) {
         let [a, b, c] = tri;
         let n = (b - a).cross(c - a).normalized().unwrap_or(Vec3::new(0.0, 0.0, 1.0)).to_f32();
-        let colour = rgba(match mark {
+        let colour = sc.color(rgba(match mark {
             StockMark::Fine => t.body,
             StockMark::Gouge => t.error,
             StockMark::Leftover => t.warning,
-        });
+        }));
         for p in tri {
             sc.tri(p.to_f32(), n, colour);
         }
