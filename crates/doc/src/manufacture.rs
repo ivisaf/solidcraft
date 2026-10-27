@@ -60,6 +60,10 @@ pub struct Setup {
     /// stock) are neither cut round nor checked against.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bodies: Vec<String>,
+    /// The bodies that hold the stock (a vise, its jaws, a plate), by name: never the part,
+    /// and no tool or holder may come into them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixtures: Vec<String>,
     /// Copies of the part side by side on the stock, each cut by every operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copies: Option<Copies>,

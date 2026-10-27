@@ -50,7 +50,9 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      stock?: {side?, top?, bottom?}: lengths added to the box around the bodies, seen along the axis (default 0), and shape?: offset (that box, the default) | \
      box, with size: [x, y, z] (lengths along the setup's axes; centred on the part across, its top `top` above the part's) | round, with diameter (a bar along \
      the axis, centred on the part across, from `bottom` below the part to `top` above it; no copies); bodies?: [names] the bodies that are the part \
-     (default, or null: all; others are neither cut round nor checked against); origin?: the work origin: \
+     (default, or null: all but the fixtures; others are neither cut round nor checked against); fixtures?: [names] the bodies that hold the \
+     stock (a vise, jaws, a plate; null: none): never the part, warned about when a tool or its holder comes into them, at feed or rapid, \
+     and kept 1 mm clear of by 3D operations; origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
      the object: the stock's top at its lowest X and Y; default without `origin`: the world origin), or {edge: [x, y, z] a point on a body's edge \
      or a vertex, body?, on?: vertex|middle|center (the end nearest the point, halfway along, or the centre of its circle; default: vertex at an \
@@ -102,7 +104,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .at("MANUFACTURE", "SETUP")
         .icon("cam_setup")
         .params(SETUP_DOC),
-    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, bodies, post, material, work_offset, stock_from, x_axis, clamps, copies as in cam.setup.create (what stock leaves out stays as it is)"),
+    CommandSpec::new("cam.setup.edit", "Edit Setup", setup_edit).icon("edit").params("setup: id or name; then any of name, axis, origin, stock, bodies, fixtures, post, material, work_offset, stock_from, x_axis, clamps, copies as in cam.setup.create (what stock leaves out stays as it is)"),
     CommandSpec::new("cam.sheet", "Setup Sheet", sheet).icon("cam_post").noundo().params(
         "setup?: id or name; path?: file to write → lines, and text (Markdown) when no path is given: the setup sheet to print for the machine: \
          the stock and the work zero, the tools, the operations in order with their speeds, feeds, depths and times, and the warnings",
@@ -805,6 +807,106 @@ fn clamp_hit(path: &cam::Toolpath, radius: f64, clamps: &[Clamp]) -> Option<Stri
     None
 }
 
+/// A setup's fixtures in its work coordinates, each by its name: its triangles and the box round them.
+struct Fixture {
+    name: String,
+    triangles: Vec<[Vec3; 3]>,
+    lo: Vec3,
+    hi: Vec3,
+}
+
+fn fixtures_of(s: &Session, at: &Resolved) -> Vec<Fixture> {
+    let state = s.model.state();
+    let mut out = Vec::new();
+    for body in state.bodies.iter().filter(|b| at.is_fixture(&b.name)) {
+        let mesh = body.mesh();
+        let triangles: Vec<[Vec3; 3]> = mesh
+            .triangles
+            .iter()
+            .filter_map(|t| {
+                let corner = |k: usize| t.get(k).and_then(|v| mesh.positions.get(*v as usize)).map(|p| at.frame.local(*p));
+                Some([corner(0)?, corner(1)?, corner(2)?])
+            })
+            .collect();
+        let Some((lo, hi)) =
+            triangles.iter().flatten().fold(None, |b: Option<(Vec3, Vec3)>, p| Some(b.map_or((*p, *p), |(l, h)| (l.min(*p), h.max(*p)))))
+        else {
+            continue;
+        };
+        out.push(Fixture { name: body.name.clone(), triangles, lo, hi });
+    }
+    out
+}
+
+/// How far a tool may come at a fixture before it counts as running into it (mm).
+const FIXTURE_TOUCH: f64 = 0.01;
+
+/// The first fixture a toolpath's `tool` comes into, at feed or at rapid: its tip below what the
+/// fixture, seen through the tool's shape (an end mill's own; any other as wide as it is all the
+/// way up), lets it go. Its name.
+fn fixture_hit(path: &cam::Toolpath, tool: &Tool, fixtures: &[Fixture]) -> Option<String> {
+    let points = path.points(0.05);
+    let (lo, hi) = points
+        .iter()
+        .fold((Vec3::new(f64::MAX, f64::MAX, f64::MAX), Vec3::new(f64::MIN, f64::MIN, f64::MIN)), |(l, h), (p, _)| (l.min(*p), h.max(*p)));
+    let r = tool.widest();
+    for f in fixtures {
+        // Nowhere near it, or always above it: nothing to look at closely.
+        if lo.z >= f.hi.z || hi.x < f.lo.x - r || hi.y < f.lo.y - r || lo.x > f.hi.x + r || lo.y > f.hi.y + r {
+            continue;
+        }
+        // Columns fine for the fixture, and no finer than a wide tool (a holder) needs.
+        let around = Vec2::new(r + 1.0, r + 1.0);
+        let cell = ((f.hi.x - f.lo.x).max(f.hi.y - f.lo.y) / 400.0).max(r / 25.0).max(0.05);
+        let Ok(field) = cam::HeightField::of_triangles(
+            Vec2::new(f.lo.x, f.lo.y) - around,
+            Vec2::new(f.hi.x, f.hi.y) + around,
+            cell,
+            f.lo.z - 1.0,
+            &f.triangles,
+            true,
+        ) else {
+            continue;
+        };
+        let reach = if tool.kind.is_end_mill() { cam::tool_floor(&field, tool, 0.0) } else { field.dilated(r) };
+        let Ok(reach) = reach else { continue };
+        let step = cell.min(tool.radius() * 0.5).max(0.02);
+        let mut samples = 0usize;
+        for w in points.windows(2) {
+            let (a, b) = (w[0].0, w[1].0);
+            let n = (((b - a).len() / step).ceil() as usize).clamp(1, 10_000);
+            for k in 0..=n {
+                samples += 1;
+                if samples > MAX_POINTS {
+                    break;
+                }
+                let q = a + (b - a) * (k as f64 / n as f64);
+                let p = Vec2::new(q.x, q.y);
+                let top = reach.at(p);
+                if reach.column(p).is_some() && top > field.floor + 1e-9 && q.z < top - FIXTURE_TOUCH {
+                    return Some(f.name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// What a toolpath runs into of a setup's fixtures, as warnings: the tool, else its holder
+/// (as wide as it is, from where the tool comes out of it up).
+fn fixture_warning(path: &cam::Toolpath, tool: &Tool, fixtures: &[Fixture]) -> Option<String> {
+    if fixtures.is_empty() {
+        return None;
+    }
+    if let Some(name) = fixture_hit(path, tool, fixtures) {
+        return Some(format!("runs into fixture {name}"));
+    }
+    let (d, reach) = tool.holder_diameter.zip(tool.length)?;
+    let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, reach))).collect() };
+    let holder = Tool::new(0, ToolKind::FlatEndmill, d, 1.0);
+    fixture_hit(&lifted, &holder, fixtures).map(|name| format!("the holder runs into fixture {name}"))
+}
+
 /// Whether two tool axes are the same (`Some(true)`) or turned over (`Some(false)`).
 fn facing(a: Vec3, b: Vec3) -> Option<bool> {
     let d = a.normalized()?.dot(b.normalized()?);
@@ -871,7 +973,8 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
     let x_axis = x_axis_param(p, cmd)?.flatten();
     let clamps = clamps_param(p, cmd)?.unwrap_or_default();
     let copies = copies_param(p, cmd)?.flatten();
-    let bodies = bodies_param(s, p, cmd)?.unwrap_or_default();
+    let bodies = bodies_param(s, p, cmd, "bodies")?.unwrap_or_default();
+    let fixtures = bodies_param(s, p, cmd, "fixtures")?.unwrap_or_default();
     let mut setup = Setup {
         id: 0,
         name: name.clone(),
@@ -879,6 +982,7 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
         origin,
         stock,
         bodies,
+        fixtures,
         material,
         post,
         work_offset,
@@ -919,8 +1023,11 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = p.get("stock") {
         setup.stock = stock_param(s, v, &setup.stock, cmd)?;
     }
-    if let Some(bodies) = bodies_param(s, p, cmd)? {
+    if let Some(bodies) = bodies_param(s, p, cmd, "bodies")? {
         setup.bodies = bodies;
+    }
+    if let Some(fixtures) = bodies_param(s, p, cmd, "fixtures")? {
+        setup.fixtures = fixtures;
     }
     if let Some(offset) = work_offset_param(p, cmd)? {
         setup.work_offset = offset;
@@ -1171,19 +1278,19 @@ const MAX_PART_BODIES: usize = 256;
 
 /// `bodies`: the bodies that are the part, each named as the design has it (`Some(empty)` for
 /// null or []: all of them); `None` when not given.
-fn bodies_param(s: &Session, p: &Value, cmd: &str) -> Result<Option<Vec<String>>> {
-    let list = match p.get("bodies") {
+fn bodies_param(s: &Session, p: &Value, cmd: &str, key: &str) -> Result<Option<Vec<String>>> {
+    let list = match p.get(key) {
         None => return Ok(None),
         Some(Value::Null) => return Ok(Some(Vec::new())),
         Some(v) => v
             .as_array()
             .filter(|l| l.len() <= MAX_PART_BODIES)
-            .ok_or_else(|| bad(cmd, format!("`bodies` must be a list of at most {MAX_PART_BODIES} body names")))?,
+            .ok_or_else(|| bad(cmd, format!("`{key}` must be a list of at most {MAX_PART_BODIES} body names")))?,
     };
     let state = s.model.state();
     let mut out: Vec<String> = Vec::new();
     for name in list {
-        let name = name.as_str().ok_or_else(|| bad(cmd, "`bodies` must be body names"))?;
+        let name = name.as_str().ok_or_else(|| bad(cmd, format!("`{key}` must be body names")))?;
         let body = state.bodies.iter().find(|b| b.name.eq_ignore_ascii_case(name.trim())).ok_or_else(|| bad(cmd, format!("no body `{name}`")))?;
         if !out.iter().any(|o| o.eq_ignore_ascii_case(&body.name)) {
             out.push(body.name.clone());
@@ -1253,8 +1360,10 @@ pub(crate) struct Resolved {
     stock: Option<Box3>,
     /// A round stock's centre and radius across (its box is `stock`).
     round: Option<(Vec2, f64)>,
-    /// The bodies that are the part (empty: every body).
+    /// The bodies that are the part (empty: every body but the fixtures).
     bodies: Vec<String>,
+    /// The bodies that hold the stock: never the part.
+    fixtures: Vec<String>,
     /// Where each copy of the part is, from the first (one at 0, 0 without copies).
     copies: Vec<(f64, f64)>,
 }
@@ -1262,7 +1371,11 @@ pub(crate) struct Resolved {
 impl Resolved {
     /// Whether the body called `name` is part of the part.
     fn is_part(&self, name: &str) -> bool {
-        self.bodies.is_empty() || self.bodies.iter().any(|b| b.eq_ignore_ascii_case(name))
+        !self.is_fixture(name) && (self.bodies.is_empty() || self.bodies.iter().any(|b| b.eq_ignore_ascii_case(name)))
+    }
+    /// Whether the body called `name` holds the stock.
+    fn is_fixture(&self, name: &str) -> bool {
+        self.fixtures.iter().any(|b| b.eq_ignore_ascii_case(name))
     }
 }
 
@@ -1273,7 +1386,14 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     if let Some(gone) = setup.bodies.iter().find(|n| !state.bodies.iter().any(|b| b.name.eq_ignore_ascii_case(n))) {
         return Err(format!("the setup's part names the body `{gone}`, which the design no longer has"));
     }
-    let wanted = |name: &str| setup.bodies.is_empty() || setup.bodies.iter().any(|b| b.eq_ignore_ascii_case(name));
+    if let Some(gone) = setup.fixtures.iter().find(|n| !state.bodies.iter().any(|b| b.name.eq_ignore_ascii_case(n))) {
+        return Err(format!("the setup's fixtures name the body `{gone}`, which the design no longer has"));
+    }
+    if let Some(both) = setup.fixtures.iter().find(|f| setup.bodies.iter().any(|b| b.eq_ignore_ascii_case(f))) {
+        return Err(format!("the body `{both}` is named as the part and as a fixture"));
+    }
+    let fixture = |name: &str| setup.fixtures.iter().any(|f| f.eq_ignore_ascii_case(name));
+    let wanted = |name: &str| !fixture(name) && (setup.bodies.is_empty() || setup.bodies.iter().any(|b| b.eq_ignore_ascii_case(name)));
     let mut part: Option<Box3> = None;
     for body in state.bodies.iter().filter(|b| wanted(&b.name)) {
         for p in &body.mesh().positions {
@@ -1350,7 +1470,16 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
     let (far_x, far_y) = copies.iter().fold((0.0f64, 0.0f64), |m, c| (m.0.max(c.0), m.1.max(c.1)));
     let stock = stock.map(moved).map(|(lo, hi)| (lo, hi + Vec3::new(far_x, far_y, 0.0)));
     let round = round.map(|(c, r)| (c - Vec2::new(shift.x, shift.y), r));
-    Ok(Resolved { setup: setup.id, frame: Frame { o, x, y, z }, part: part.map(moved), stock, round, bodies: setup.bodies.clone(), copies })
+    Ok(Resolved {
+        setup: setup.id,
+        frame: Frame { o, x, y, z },
+        part: part.map(moved),
+        stock,
+        round,
+        bodies: setup.bodies.clone(),
+        fixtures: setup.fixtures.clone(),
+        copies,
+    })
 }
 
 /// How many tools a setup's program loads: one for its first operation, and one each time the
@@ -1784,9 +1913,49 @@ fn setup_part(s: &Session, at: &Resolved) -> Option<cam::HeightField> {
 
 /// The bodies' triangles in a setup's work coordinates.
 fn part_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
+    triangles_of(s, at, |name| at.is_part(name))
+}
+
+/// How far 3D operations keep clear of a fixture, across and above (mm).
+const FIXTURE_CLEARANCE: f64 = 1.0;
+
+/// What 3D operations keep clear of for a setup's fixtures, in its work coordinates: each
+/// fixture seen from above, grown [`FIXTURE_CLEARANCE`] across and raised as much, as a
+/// square of two triangles over each column it covers.
+fn fixture_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
+    let mut out = Vec::new();
+    for f in fixtures_of(s, at) {
+        let around = Vec2::new(FIXTURE_CLEARANCE * 2.0, FIXTURE_CLEARANCE * 2.0);
+        let cell = ((f.hi.x - f.lo.x).max(f.hi.y - f.lo.y) / 150.0).max(0.25);
+        let field = cam::HeightField::of_triangles(
+            Vec2::new(f.lo.x, f.lo.y) - around,
+            Vec2::new(f.hi.x, f.hi.y) + around,
+            cell,
+            f.lo.z - 1.0,
+            &f.triangles,
+            true,
+        )
+        .and_then(|field| field.dilated(FIXTURE_CLEARANCE));
+        let Ok(field) = field else { continue };
+        for j in 0..field.ny {
+            for i in 0..field.nx {
+                let Some(h) = field.get(i, j).filter(|h| *h > field.floor) else { continue };
+                let (c, z) = (field.centre(i, j), h + FIXTURE_CLEARANCE);
+                let half = cell * 0.5;
+                let corner = |dx: f64, dy: f64| Vec3::new(c.x + dx * half, c.y + dy * half, z);
+                out.push([corner(-1.0, -1.0), corner(1.0, -1.0), corner(1.0, 1.0)]);
+                out.push([corner(-1.0, -1.0), corner(1.0, 1.0), corner(-1.0, 1.0)]);
+            }
+        }
+    }
+    out
+}
+
+/// The triangles of the bodies `wanted` takes, in a setup's work coordinates.
+fn triangles_of(s: &Session, at: &Resolved, wanted: impl Fn(&str) -> bool) -> Vec<[Vec3; 3]> {
     let state = s.model.state();
     let mut triangles = Vec::new();
-    for body in state.bodies.iter().filter(|b| at.is_part(&b.name)) {
+    for body in state.bodies.iter().filter(|b| wanted(&b.name)) {
         let mesh = body.mesh();
         for t in &mesh.triangles {
             let corner = |k: usize| t.get(k).and_then(|v| mesh.positions.get(*v as usize)).map(|p| at.frame.local(*p));
@@ -2112,8 +2281,12 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 }
                 let all_copies = matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part);
                 let shifts: &[(f64, f64)] = if all_copies { &at.copies } else { &[(0.0, 0.0)] };
-                let part: Vec<[Vec3; 3]> =
-                    shifts.iter().flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0)))).collect();
+                // The fixtures are kept clear of as the part is.
+                let part: Vec<[Vec3; 3]> = shifts
+                    .iter()
+                    .flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0))))
+                    .chain(fixture_triangles(s, at))
+                    .collect();
                 let step_up = match step_up {
                     Some(e) => len("step_up", e)?,
                     None => cut.stepdown * 0.25,
@@ -2168,7 +2341,11 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             // Over the whole box every copy of the part is in the way, as for roughing.
             let all_copies = matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part);
             let shifts: &[(f64, f64)] = if all_copies { &at.copies } else { &[(0.0, 0.0)] };
-            let part: Vec<[Vec3; 3]> = shifts.iter().flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0)))).collect();
+            let part: Vec<[Vec3; 3]> = shifts
+                .iter()
+                .flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0))))
+                .chain(fixture_triangles(s, at))
+                .collect();
             let key = rough_key(s, op);
             if let Some(path) = key.and_then(|k| s.cam_path_cache.lock().ok()?.get(&k).cloned()) {
                 Ok(path)
@@ -2204,7 +2381,11 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             }
             let all_copies = matches!(op.geometry, CamGeometry::Stock | CamGeometry::Part);
             let shifts: &[(f64, f64)] = if all_copies { &at.copies } else { &[(0.0, 0.0)] };
-            let part: Vec<[Vec3; 3]> = shifts.iter().flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0)))).collect();
+            let part: Vec<[Vec3; 3]> = shifts
+                .iter()
+                .flat_map(|&(dx, dy)| one.iter().map(move |t| t.map(|v| v + Vec3::new(dx, dy, 0.0))))
+                .chain(fixture_triangles(s, at))
+                .collect();
             let key = rough_key(s, op);
             if let Some(path) = key.and_then(|k| s.cam_path_cache.lock().ok()?.get(&k).cloned()) {
                 Ok(path)
@@ -3403,6 +3584,7 @@ fn list_now(s: &Session) -> Value {
             // to tell one that cuts through it.
             let resolved = resolve(s, setup).ok();
             let part = resolved.as_ref().and_then(|at| setup_part(s, at));
+            let fixtures = resolved.as_ref().map(|at| fixtures_of(s, at)).unwrap_or_default();
             let stock_bottom = resolved.as_ref().and_then(|at| at.stock).map(|(lo, _)| lo.z);
             let stock_top = resolved.as_ref().and_then(|at| at.stock).map(|(_, hi)| hi.z);
             let ops: Vec<Value> = setup
@@ -3431,6 +3613,9 @@ fn list_now(s: &Session) -> Value {
                                 warnings.push(THROUGH_WITHOUT_TABS.to_string());
                             }
                             if let Some(tool) = m.tool(op.tool) {
+                                if let Some(w) = fixture_warning(&path, tool, &fixtures) {
+                                    warnings.push(w);
+                                }
                                 if let Some(clamp) = clamp_hit(&path, tool.radius(), &setup.clamps) {
                                     warnings.push(format!("runs into clamp {clamp}"));
                                 } else if let (Some(d), Some(reach)) = (tool.holder_diameter, tool.length) {
@@ -3459,7 +3644,7 @@ fn list_now(s: &Session) -> Value {
                     v
                 })
                 .collect();
-            let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock, "bodies": setup.bodies,
+            let mut v = json!({"id": setup.id, "name": setup.name, "axis": setup.axis, "origin": setup.origin, "stock": setup.stock, "bodies": setup.bodies, "fixtures": setup.fixtures,
                 "material": setup.material, "post": setup.post, "work_offset": setup.work_offset, "x_axis": setup.x_axis, "stock_from": setup.stock_from, "clamps": setup.clamps, "copies": setup.copies, "tool_changes": tool_changes(setup), "operations": ops});
             // Worked out against the model: the work frame in the world, and the boxes in work coordinates.
             match resolve(s, setup) {
@@ -3666,6 +3851,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
     let (mut stock, (min, max)) = start_stock(s, setup, &at, p, cmd)?;
     let cell = stock.cell;
     let (shown, first) = simulated_ops(setup, p, cmd)?;
+    let fixtures = fixtures_of(s, &at);
     let mut ops = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut removed = 0.0;
@@ -3698,6 +3884,7 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
         if report.max_engagement > tool.flute_length + 1e-6 {
             own.push(format!("the tool is buried {:.2} mm deep but its flutes are {:.2} mm long", report.max_engagement, tool.flute_length));
         }
+        own.extend(fixture_warning(&path, tool, &fixtures));
         warnings.extend(own.iter().map(|w| format!("{}: {w}", op.name)));
         ops.push(json!({"id": op.id, "name": op.name, "removed_volume": report.removed_volume, "rapid_collisions": report.rapid_collisions,
             "max_engagement": report.max_engagement, "flute_length": tool.flute_length, "warnings": own}));
@@ -3831,6 +4018,9 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
     }
     if let Some(material) = &setup.material {
         notes.push(format!("Material: {material}"));
+    }
+    if !setup.fixtures.is_empty() {
+        notes.push(format!("Fixtures: {}", setup.fixtures.join(", ")));
     }
     let mut seen = Vec::new();
     for op in ops {

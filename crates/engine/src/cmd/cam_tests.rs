@@ -1772,6 +1772,66 @@ fn a_contour_leads_in_on_arcs_cuts_dogbones_and_leaves_an_onion_skin() {
 }
 
 #[test]
+fn fixtures_are_bodies_tools_and_holders_keep_clear_of() {
+    // A 60 × 40 plate, its top at Z 0, and a jaw 5 mm off its left side standing 5 mm over it.
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10, "corner": [0, 0, -10], "operation": "new", "body_name": "Plate"}));
+    run(&mut s, "solid.box", json!({"length": 10, "width": 40, "height": 15, "corner": [-15, 0, -10], "operation": "new", "body_name": "Jaw"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Outline"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 2, "spindle_rpm": 18000, "feed": 400}));
+    run(&mut s, "cam.setup.create", json!({"fixtures": ["jaw"]}));
+    // The jaw is not the part: the part's box is the plate's.
+    let setup = work_frame(&mut s);
+    assert_eq!(setup["fixtures"], json!(["Jaw"]));
+    assert!(near(xyz(&setup["part_box"]["min"]), [0.0, 0.0, -10.0]) && near(xyz(&setup["part_box"]["max"]), [60.0, 40.0, 0.0]), "{setup}");
+    // Round the plate with 6 mm the tool's edge comes 1 mm into the jaw; with 2 mm it stays 3 mm off.
+    let contour = |tool: u32, name: &str| json!({"sketch": "Outline", "tool": tool, "side": "outside", "bottom": -5, "name": name});
+    run(&mut s, "cam.op.contour", contour(1, "Wide"));
+    run(&mut s, "cam.op.contour", contour(2, "Narrow"));
+    let ops = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"].clone();
+    assert!(ops[0]["warning"].as_str().unwrap_or_default().contains("runs into fixture Jaw"), "{}", ops[0]);
+    assert!(ops[1]["warning"].is_null(), "{}", ops[1]);
+    // A holder 30 across, 8 mm over the 2 mm tool's tip, comes 2 mm into the jaw on the last pass (5 down).
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 2, "kind": "flat", "diameter": 2, "length": 8, "holder_diameter": 30, "spindle_rpm": 18000, "feed": 400}),
+    );
+    let ops = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"].clone();
+    assert!(ops[1]["warning"].as_str().unwrap_or_default().contains("the holder runs into fixture Jaw"), "{}", ops[1]);
+    // The simulation says so too, and the program names the fixture.
+    let sim = run(&mut s, "cam.simulate", json!({}));
+    assert!(sim["operations"][0]["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("fixture Jaw")), "{sim}");
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("(Fixtures: Jaw)"), "{gcode}");
+    // 3D finishing over stock reaching onto the jaw rides 1 mm over it, at feed or rapid.
+    run(&mut s, "cam.op.remove", json!({"op": "Wide"}));
+    run(&mut s, "cam.op.remove", json!({"op": "Narrow"}));
+    run(&mut s, "cam.tool.define", json!({"number": 3, "kind": "ball", "diameter": 4, "spindle_rpm": 15000, "feed": 800}));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"side": 10}}));
+    run(&mut s, "cam.op.parallel3d", json!({"tool": 3, "boundary": "stock", "stepover": 2, "name": "Finish"}));
+    let points = run(&mut s, "cam.toolpath", json!({"op": "Finish"}))["operations"][0]["points"].clone();
+    let over_jaw: Vec<f64> = points
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| (-10.0..=-6.0).contains(&p[0].as_f64().unwrap()) && (2.0..=38.0).contains(&p[1].as_f64().unwrap()))
+        .map(|p| p[2].as_f64().unwrap())
+        .collect();
+    assert!(!over_jaw.is_empty() && over_jaw.iter().all(|z| *z >= 6.0 - 1e-3), "{over_jaw:?}");
+    let finish = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0].clone();
+    assert!(finish["warning"].is_null(), "{}", finish["warning"]);
+    // A body is the part or a fixture, not both; a fixture must be a body.
+    assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "bodies": ["Jaw"]})).unwrap_err().to_string().contains("as a fixture"));
+    assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "fixtures": ["Vise"]})).is_err());
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "fixtures": null}));
+    assert!(s.doc.manufacture.setups[0].fixtures.is_empty());
+}
+
+#[test]
 fn clamps_in_the_way_and_a_tool_too_short_are_warned_about() {
     let mut s = Session::default();
     run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));

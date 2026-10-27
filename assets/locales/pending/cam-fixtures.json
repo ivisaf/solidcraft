@@ -1,0 +1,22 @@
+{
+  "en": {
+    "manufacture.fixtures": "Fixtures",
+    "manufacture.fixtures_help": "Which bodies hold the stock (a vise, its jaws, a plate), by name, apart by commas. They are never the part; operations are warned when a tool or its holder comes into one, and 3D operations keep 1 mm clear of them. Empty: none.",
+    "manufacture.fixtures_the_selected_bodies": "Hold with the {count} selected bodies"
+  },
+  "de": {
+    "manufacture.fixtures": "Spannmittel",
+    "manufacture.fixtures_help": "Welche Körper das Rohteil halten (ein Schraubstock, seine Backen, eine Platte), mit Namen, durch Kommas getrennt. Sie sind nie das Teil; Operationen werden gewarnt, wenn ein Werkzeug oder sein Halter hineinfährt, und 3D-Operationen halten 1 mm Abstand. Leer: keine.",
+    "manufacture.fixtures_the_selected_bodies": "Die {count} gewählten Körper spannen"
+  },
+  "ja": {
+    "manufacture.fixtures": "治具",
+    "manufacture.fixtures_help": "素材を保持するボディ（バイス、その口金、プレート）の名前をカンマ区切りで。部品にはなりません。工具やホルダーが入り込むとオペレーションに警告が出て、3D オペレーションは 1 mm 離れます。空欄：なし。",
+    "manufacture.fixtures_the_selected_bodies": "選択した {count} 個のボディで保持"
+  },
+  "zh": {
+    "manufacture.fixtures": "夹具",
+    "manufacture.fixtures_help": "夹持毛坯的实体（台钳、钳口、底板）的名称，用逗号分隔。它们从不属于零件；刀具或刀柄碰到它们时操作会发出警告，3D 操作与其保持 1 mm 距离。空：无。",
+    "manufacture.fixtures_the_selected_bodies": "用所选的 {count} 个实体夹持"
+  }
+}

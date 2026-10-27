@@ -361,6 +361,39 @@ fn the_work_origin_is_taken_from_a_picked_corner() {
 }
 
 #[test]
+fn a_setup_takes_its_fixtures_from_the_selected_bodies() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10, "operation": "new", "body_name": "Plate"})).unwrap();
+    h.app.run("solid.box", json!({"length": 10, "width": 40, "height": 15, "corner": [-15, 0, 0], "operation": "new", "body_name": "Jaw"})).unwrap();
+    h.app.start("cam.setup.create");
+    h.frames(2);
+    assert!(h.widget("Hold with the 1 selected bodies").is_none(), "nothing selected");
+    // The jaw picked in the Browser: taken as the fixture.
+    h.app.session.selection = vec![solidcraft_engine::Sel::Body { name: "Jaw".into() }];
+    h.frames(2);
+    h.step(&json!({"widget": "Hold with the 1 selected bodies"})).unwrap();
+    h.frames(1);
+    let Some(Form::Setup(f)) = &h.app.manufacture.form else { panic!("the form stays open") };
+    assert_eq!(f.fixtures, "Jaw");
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    assert_eq!(h.app.session.doc.manufacture.setups[0].fixtures, vec!["Jaw".to_string()]);
+    // It stays drawn beside a simulated stock; the plate is what the stock stands in for.
+    assert!(is_fixture(&h.app, "jaw") && !is_fixture(&h.app, "Plate"));
+    // The stock is round the plate alone; the form opens on the fixture, and emptied takes it off.
+    let view = setup_views(&mut h.app).first().cloned().unwrap();
+    let (lo, hi) = view.stock.unwrap();
+    assert!(lo.x.abs() < 1e-6 && (hi.x - 60.0).abs() < 1e-6, "{view:?}");
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!(form.fixtures, "Jaw");
+    form.fixtures = String::new();
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    assert!(h.app.session.doc.manufacture.setups[0].fixtures.is_empty());
+}
+
+#[test]
 fn facing_boundary_and_posting_one_operation_or_the_setup() {
     let mut h = lab();
     h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();

@@ -968,9 +968,16 @@ pub(crate) fn build_scene(app: &SolveApp) -> GpuScene {
     let mut made: std::collections::HashMap<u64, CachedBlock> = std::collections::HashMap::new();
     let mut run: Vec<BodyDraw> = Vec::new();
     let mut run_key = std::collections::hash_map::DefaultHasher::new();
-    // The simulated stock stands in for the bodies while it is shown.
-    let shown: Vec<&solidcraft_engine::doc::ModelBody> =
-        st.bodies.iter().filter(|b| !stock && app.session.body_visible(&b.name) && !app.preview.effective_replaced().contains(&b.name)).collect();
+    // The simulated stock stands in for the bodies while it is shown; what holds it stays.
+    let shown: Vec<&solidcraft_engine::doc::ModelBody> = st
+        .bodies
+        .iter()
+        .filter(|b| {
+            (!stock || crate::cam_ui::is_fixture(app, &b.name))
+                && app.session.body_visible(&b.name)
+                && !app.preview.effective_replaced().contains(&b.name)
+        })
+        .collect();
     // Bodies drawn from the same triangles more than once (a part placed by many occurrences)
     // are drawn as instances of them: one copy of the triangles on the GPU, and none moved on
     // the CPU.

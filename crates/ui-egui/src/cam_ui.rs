@@ -339,6 +339,8 @@ pub struct SetupForm {
     pub bottom: String,
     /// The bodies that are the part, as typed: names apart by commas (empty: every body).
     pub bodies: String,
+    /// The bodies that hold the stock, as typed: names apart by commas (empty: none).
+    pub fixtures: String,
     pub post: usize,
     /// What the stock is made of ("": not said).
     pub material: String,
@@ -552,6 +554,11 @@ pub enum StockMark {
 /// Whether the simulated stock is drawn (in place of the bodies).
 pub fn stock_shown(app: &SolveApp) -> bool {
     app.manufacture.open && app.manufacture.show_stock && app.manufacture.stock.is_some()
+}
+
+/// Whether the body called `name` holds the stock in a setup: it stays drawn beside a simulated stock.
+pub fn is_fixture(app: &SolveApp, name: &str) -> bool {
+    app.session.doc.manufacture.setups.iter().any(|s| s.fixtures.iter().any(|f| f.eq_ignore_ascii_case(name)))
 }
 
 /// Changes when what the viewport draws of the stock changes.
@@ -1000,6 +1007,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             top: String::new(),
             bottom: String::new(),
             bodies: String::new(),
+            fixtures: String::new(),
             post: 0,
             material: String::new(),
             work_offset: 0,
@@ -1179,6 +1187,10 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("stock".into(), Value::Object(stock));
             }
             // Every body when none is named.
+            let fixtures: Vec<&str> = f.fixtures.split(',').map(str::trim).filter(|b| !b.is_empty()).collect();
+            if !fixtures.is_empty() || f.editing.is_some() {
+                p.insert("fixtures".into(), if fixtures.is_empty() { Value::Null } else { json!(fixtures) });
+            }
             let bodies: Vec<&str> = f.bodies.split(',').map(str::trim).filter(|b| !b.is_empty()).collect();
             if !bodies.is_empty() || f.editing.is_some() {
                 p.insert("bodies".into(), if bodies.is_empty() { Value::Null } else { json!(bodies) });
@@ -1603,6 +1615,7 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
         top: offset("top"),
         bottom: offset("bottom"),
         bodies: setup["bodies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
+        fixtures: setup["fixtures"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join(", "),
         post: solidcraft_engine::cam::Post::BUILTIN.iter().position(|p| Some(*p) == setup["post"].as_str()).unwrap_or(0),
         material: text(setup, "material"),
         work_offset: setup["work_offset"]
@@ -2738,6 +2751,9 @@ fn help(label: &str) -> Option<&'static str> {
         }
         "Stock size X" | "Stock size Y" | "Stock size Z" => "How big the raw block is along the setup's X, Y and Z.",
         "Bar diameter" => "How thick the round bar is. It stands along the tool axis, centred on the part.",
+        "Fixtures" => {
+            "Which bodies hold the stock (a vise, its jaws, a plate), by name, apart by commas. They are never the part; operations are warned when a tool or its holder comes into one, and 3D operations keep 1 mm clear of them. Empty: none."
+        }
         "Part bodies" => {
             "Which bodies are the part, by name, apart by commas. Others (a fixture, a modelled stock) are neither cut round nor checked against. Empty: every body."
         }
@@ -3684,6 +3700,17 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 ui.label("");
                 if button(ui, tf("manufacture.part_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small).clicked() {
                     f.bodies = choices.bodies.join(", ");
+                }
+                ui.end_row();
+            }
+            // What holds the stock: bodies that are never the part, kept clear of.
+            field(ui, need, "Fixtures", &mut f.fixtures, "none");
+            if !choices.bodies.is_empty() && choices.bodies.join(", ") != f.fixtures {
+                ui.label("");
+                if button(ui, tf("manufacture.fixtures_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small)
+                    .clicked()
+                {
+                    f.fixtures = choices.bodies.join(", ");
                 }
                 ui.end_row();
             }
