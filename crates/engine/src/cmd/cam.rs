@@ -66,7 +66,7 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
-            "number: 1–9999; kind: flat|ball|bull|drill|vbit (bull: a bull-nose end mill, its end rounded at the rim); diameter: expr; corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); tip_angle?: degrees, the point's included angle (V-bit: default 90; drill: 118); tip_diameter?: mm, a V-bit's flat at its point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
+            "number: 1–9999; kind: flat|ball|bull|drill|vbit|chamfer|engraver (bull: a bull-nose end mill, its end rounded at the rim; chamfer: a chamfer mill and engraver: an engraving tool, both pointed as a V-bit); diameter: expr (a tapered end mill's at its end); corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); taper_angle?: degrees each side, a flat, ball or bull nose widening up its flutes (0 or null: straight; under 45); tip_angle?: degrees, the point's included angle (V-bit and chamfer mill: default 90; engraver: 30; drill: 118); tip_diameter?: mm, the flat at a V-bit's, chamfer mill's or engraver's point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); surface_speed?: m/min, instead of spindle_rpm: speed = surface_speed × 1000 / (π × diameter); chip_load?: mm per tooth, instead of feed: feed = speed × flutes × chip_load (giving one of a pair clears the other; listings report the chip load a feed makes); cutting?: [{material, spindle_rpm?, surface_speed?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
@@ -242,7 +242,9 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         Some("bull" | "bull_nose" | "bull-nose" | "bullnose") => ToolKind::BullNose,
         Some("drill") => ToolKind::Drill,
         Some("vbit" | "v_bit" | "v-bit") => ToolKind::VBit,
-        _ => return Err(bad(cmd, "`kind` must be flat, ball, bull, drill or vbit")),
+        Some("chamfer" | "chamfer_mill" | "chamfermill") => ToolKind::ChamferMill,
+        Some("engraver" | "engraving" | "engraving_tool") => ToolKind::Engraver,
+        _ => return Err(bad(cmd, "`kind` must be flat, ball, bull, drill, vbit, chamfer or engraver")),
     };
     let diameter = length(s, cmd, "diameter", &req_expr(cmd, p, "diameter")?)?;
     // What is not named stays as the tool had it.
@@ -251,8 +253,9 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         None => was.map_or_else(
             || match kind {
                 // A V-bit cuts with its cone: as long as the cone is high.
-                ToolKind::VBit => {
-                    let angle = num(p, "tip_angle").filter(|a| *a > 0.0 && *a < 180.0).unwrap_or(90.0);
+                kind if kind.is_cone() => {
+                    let default = if kind == ToolKind::Engraver { 30.0 } else { 90.0 };
+                    let angle = num(p, "tip_angle").filter(|a| *a > 0.0 && *a < 180.0).unwrap_or(default);
                     let tip = num(p, "tip_diameter").filter(|t| *t >= 0.0 && *t < diameter).unwrap_or(0.0);
                     ((diameter - tip) * 0.5 / (angle * 0.5).to_radians().tan()).max(0.01)
                 }
@@ -307,6 +310,14 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         },
         // A bull nose's corner radius; another kind has none.
         corner_radius: data("corner_radius", was.and_then(|t| t.corner_radius))?.filter(|_| kind == ToolKind::BullNose),
+        // An end mill's taper (0 or null: straight); another kind has none.
+        taper_angle: match p.get("taper_angle") {
+            None => was.and_then(|t| t.taper_angle),
+            Some(Value::Null) => None,
+            Some(_) => Some(num(p, "taper_angle").filter(|a| a.is_finite()).ok_or_else(|| bad(cmd, "`taper_angle` must be a number of degrees"))?)
+                .filter(|a| *a != 0.0),
+        }
+        .filter(|_| kind.is_end_mill()),
         shank_diameter: data("shank_diameter", was.and_then(|t| t.shank_diameter))?,
         length: data("length", was.and_then(|t| t.length))?,
         holder_diameter: data("holder_diameter", was.and_then(|t| t.holder_diameter))?,
@@ -1955,9 +1966,9 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
     let tool = s.doc.manufacture.tool(op.tool).ok_or_else(|| fail(format!("there is no tool {} in the library", op.tool)))?;
     let len = |what: &str, e: &str| s.doc.eval(e, Kind::Length).map_err(|e| fail(format!("{what}: {e}")));
     let angle = |e: &str| s.doc.eval(e, Kind::Angle).map_err(|e| fail(format!("ramp_angle: {e}")));
-    // A V-bit cuts wider the deeper it goes: it engraves on a line or spots a hole; pockets,
-    // facing and contours beside a line assume a tool as wide all the way down.
-    if tool.kind == ToolKind::VBit {
+    // A V-bit (a chamfer mill, an engraver) cuts wider the deeper it goes: it engraves on a line
+    // or spots a hole; pockets, facing and contours beside a line assume a tool as wide all the way down.
+    if tool.kind.is_cone() {
         match &op.kind {
             CamOperationKind::Contour { side: Side::On, .. }
             | CamOperationKind::Drill { .. }
@@ -3827,7 +3838,7 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
             seen.push(op.tool.number);
             let t = &op.tool;
             let about = if t.description.trim().is_empty() { String::new() } else { format!(" {}", t.description.trim()) };
-            notes.push(format!("T{}: D{} {}{about}", t.number, mm(t.diameter), t.kind.label()));
+            notes.push(format!("T{}: D{} {}{about}", t.number, mm(t.diameter), t.kind_label()));
         }
     }
     let mut last = None;
@@ -3893,7 +3904,7 @@ fn sheet(s: &mut Session, p: &Value) -> Result<Value> {
             out.push(format!(
                 "| T{} | {} | {} mm | {} | {} mm | {length} | {} |",
                 t.number,
-                t.kind.label(),
+                t.kind_label(),
                 mm(t.diameter),
                 t.flutes,
                 mm(t.flute_length),

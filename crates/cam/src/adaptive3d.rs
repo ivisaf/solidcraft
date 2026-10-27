@@ -90,7 +90,7 @@ pub fn adaptive_3d(job: &Rough3d, tool: &Tool, params: &AdaptiveParams, cut: &Cu
     for (a, b) in shape.loops().iter().flatten().map(Piece::bounds) {
         (lo, hi) = (Vec2::new(lo.x.min(a.x), lo.y.min(a.y)), Vec2::new(hi.x.max(b.x), hi.y.max(b.y)));
     }
-    let around = Vec2::new(r + s, r + s);
+    let around = Vec2::new(tool.widest() + s, tool.widest() + s);
     let (lo, hi) = (lo - around, hi + around);
     let cell = (r / 10.0).max(0.01);
     if !lo.is_finite() || !hi.is_finite() || !(((hi.x - lo.x) / cell).ceil() * ((hi.y - lo.y) / cell).ceil() <= MAX_GRID as f64) {

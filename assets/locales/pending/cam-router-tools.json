@@ -1,0 +1,42 @@
+{
+  "en": {
+    "manufacture.tool_kind_chamfer_mill": "chamfer mill",
+    "manufacture.tool_kind_engraver": "engraving tool",
+    "manufacture.chamfer_mill": "Chamfer mill",
+    "manufacture.engraving_tool": "Engraving tool",
+    "manufacture.taper_angle_b": "Taper angle (β)",
+    "manufacture.taper_angle_help": "How much a tapered end mill widens up its flutes, each side, in degrees (as catalogues give it). The diameter is at its end. Empty or 0: straight.",
+    "manufacture.0_straight": "0° (straight)",
+    "manufacture.kind_with_taper": "{kind}, {angle}° taper"
+  },
+  "de": {
+    "manufacture.tool_kind_chamfer_mill": "Fasenfräser",
+    "manufacture.tool_kind_engraver": "Gravierstichel",
+    "manufacture.chamfer_mill": "Fasenfräser",
+    "manufacture.engraving_tool": "Gravierstichel",
+    "manufacture.taper_angle_b": "Konuswinkel (β)",
+    "manufacture.taper_angle_help": "Wie stark ein konischer Fräser über die Schneidenlänge breiter wird, je Seite in Grad (wie im Katalog angegeben). Der Durchmesser gilt an der Spitze. Leer oder 0: gerade.",
+    "manufacture.0_straight": "0° (gerade)",
+    "manufacture.kind_with_taper": "{kind}, {angle}° konisch"
+  },
+  "ja": {
+    "manufacture.tool_kind_chamfer_mill": "面取りカッター",
+    "manufacture.tool_kind_engraver": "彫刻工具",
+    "manufacture.chamfer_mill": "面取りカッター",
+    "manufacture.engraving_tool": "彫刻工具",
+    "manufacture.taper_angle_b": "テーパー角 (β)",
+    "manufacture.taper_angle_help": "テーパーエンドミルが刃長に沿って広がる片側の角度（度、カタログの表記どおり）。直径は先端での値です。空欄または 0：ストレート。",
+    "manufacture.0_straight": "0°（ストレート）",
+    "manufacture.kind_with_taper": "{kind}、テーパー {angle}°"
+  },
+  "zh": {
+    "manufacture.tool_kind_chamfer_mill": "倒角刀",
+    "manufacture.tool_kind_engraver": "雕刻刀",
+    "manufacture.chamfer_mill": "倒角刀",
+    "manufacture.engraving_tool": "雕刻刀",
+    "manufacture.taper_angle_b": "锥度角 (β)",
+    "manufacture.taper_angle_help": "锥度立铣刀沿刃长每侧变宽的角度（度，按样本标注）。直径为刀尖处的直径。空或 0：直刃。",
+    "manufacture.0_straight": "0°（直刃）",
+    "manufacture.kind_with_taper": "{kind}，锥度 {angle}°"
+  }
+}

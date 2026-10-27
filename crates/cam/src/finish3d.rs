@@ -83,7 +83,7 @@ pub fn parallel_3d(job: &Finish3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
     }
     // The part round the area as far as the tool reaches, on columns fine enough for the tolerance.
     let s = job.stock_to_leave;
-    let reach = r + s;
+    let reach = tool.widest() + s;
     let cell = (r / 20.0).clamp(0.05, 0.5);
     let (flo, fhi) = (lo - Vec2::new(reach + cell, reach + cell), hi + Vec2::new(reach + cell, reach + cell));
     if !(((fhi.x - flo.x) / cell).ceil() * ((fhi.y - flo.y) / cell).ceil() <= MAX_GRID as f64) {
@@ -102,14 +102,16 @@ pub fn parallel_3d(job: &Finish3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
         for di in -span..=span {
             let d = ((di * di + dj * dj) as f64).sqrt() * cell;
             if d <= reach + cell * 0.5 {
-                disc.push((di, dj, sim::rounded(reach, corner, d.min(reach))));
+                let up = if tool.taper() > 0.0 { sim::grown_rise(tool, s, d.min(reach)) } else { sim::rounded(reach, corner, d.min(reach)) };
+                disc.push((di, dj, up));
             }
         }
     }
     // A ball or a flat end mill is dropped onto the triangles themselves: exact, nothing kept
     // back for between columns (a flat one grown by the allowance taken as its full width that
-    // much higher).
-    let dropped = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
+    // much higher). A tapered one is seen through its cone on the columns instead.
+    let exact = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill) && tool.taper() <= 0.0;
+    let dropped = exact.then(|| BallDrop::new(job.part, r + s)).flatten();
     // The lowest the tip may go over `p`: the part under the tool, less its rise, plus the allowance.
     let tip = |p: Vec2| -> f64 {
         if let Some(d) = &dropped {
@@ -338,7 +340,7 @@ pub fn zlevel_3d(job: &ZLevel3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
     // part taken as high as each column's neighbours (nothing between centres missed).
     let s = job.stock_to_leave;
     let cell = (r / 20.0).clamp(0.05, 0.5);
-    let margin = Vec2::new(r + s + cell * 2.0, r + s + cell * 2.0);
+    let margin = Vec2::new(tool.widest() + s + cell * 2.0, tool.widest() + s + cell * 2.0);
     let (flo, fhi) = (lo - margin, hi + margin);
     if !(((fhi.x - flo.x) / cell).ceil() * ((fhi.y - flo.y) / cell).ceil() <= MAX_GRID as f64) {
         return Err(CamError::TooLarge("the area is too large to finish this finely".into()));
@@ -350,8 +352,10 @@ pub fn zlevel_3d(job: &ZLevel3d, tool: &Tool, cut: &Cut) -> Result<Toolpath> {
     let (nx, ny) = (reach.nx, reach.ny);
     let at = |i: usize, j: usize| reach.get(i, j).unwrap_or(bottom - 1.0);
     // A ball's or a flat end mill's contours are found on the columns, then put exactly where it
-    // touches the part at the level: along the way up the slope, by halving.
-    let dropped = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill).then(|| BallDrop::new(job.part, r + s)).flatten();
+    // touches the part at the level: along the way up the slope, by halving (a tapered one stays
+    // on the columns).
+    let exact = matches!(tool.kind, ToolKind::BallEndmill | ToolKind::FlatEndmill) && tool.taper() <= 0.0;
+    let dropped = exact.then(|| BallDrop::new(job.part, r + s)).flatten();
     let exact = |p: Vec2| {
         dropped.as_ref().map(|d| {
             let low = if tool.kind == ToolKind::BallEndmill { d.centre(p).map(|c| c - r) } else { d.highest_within(p).map(|h| h + s) };
@@ -590,8 +594,8 @@ fn split_inside(run: &[Vec2], shape: &Shape, near: &impl Fn(Vec2) -> bool) -> Ve
 /// the stock: a column under it standing that much over both the tool's surface there and the
 /// part (`part`, on `left`'s columns) with its `allowance` (what stands no higher is the part).
 fn bites(left: &HeightField, part: &HeightField, tool: &Tool, p: Vec2, z: f64, allowance: f64) -> bool {
-    let (r, corner) = (tool.radius(), tool.corner());
-    let over = |d: f64, q: Vec2| left.at(q) - (z + sim::rounded(r, corner, d)).max(part.at(q) + allowance) > REST_MIN;
+    let r = tool.widest();
+    let over = |d: f64, q: Vec2| left.at(q) - (z + tool.rise(d).unwrap_or(f64::INFINITY)).max(part.at(q) + allowance) > REST_MIN;
     if over(0.0, p) {
         return true;
     }
@@ -669,13 +673,13 @@ fn approach(b: &mut Builder, left: Option<&HeightField>, p: Vec2, z: f64, tool: 
 /// stock: each column less how far the tool's end rises at its distance, its width more for
 /// rounding.
 fn clear_of(left: &HeightField, p: Vec2, tool: &Tool) -> f64 {
-    let (r, corner) = (tool.radius(), tool.corner());
+    let r = tool.widest();
     let mut high = left.at(p);
     for ring in 1..=4 {
         let d = r * f64::from(ring) / 4.0;
         for k in 0..16 {
             let q = p + Vec2::from_angle(std::f64::consts::TAU * f64::from(k) / 16.0) * d;
-            high = high.max(left.at(q) - sim::rounded(r, corner, d));
+            high = high.max(left.at(q) - tool.rise(d).unwrap_or(f64::INFINITY));
         }
     }
     high + APPROACH_GAP + left.cell

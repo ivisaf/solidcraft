@@ -225,11 +225,14 @@ impl HeightField {
 pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
     let r = (tool.radius() - part.cell * 2.5).max(0.0);
     // A rounded end clears a wall its tip goes below: the part seen through the tool's shape.
-    let reach = if tool.corner() > 0.0 && r > 0.0 {
+    // A tapered side reaches past the end too: the part seen through it.
+    let reach = if (tool.corner() > 0.0 || tool.taper() > 0.0) && r > 0.0 {
         let corner = (tool.corner() - part.cell * 2.5).max(0.0);
         let slim = match tool.kind {
             ToolKind::BullNose if corner > 0.0 => Tool { diameter: r * 2.0, corner_radius: Some(corner.min(r)), ..tool.clone() },
-            ToolKind::BullNose => Tool { diameter: r * 2.0, ..Tool::new(tool.number, ToolKind::FlatEndmill, r * 2.0, tool.flute_length) },
+            ToolKind::BullNose => {
+                Tool { diameter: r * 2.0, taper_angle: tool.taper_angle, ..Tool::new(tool.number, ToolKind::FlatEndmill, r * 2.0, tool.flute_length) }
+            }
             _ => Tool { diameter: r * 2.0, ..tool.clone() },
         };
         tool_floor(part, &slim, 0.0)
@@ -257,10 +260,10 @@ pub fn gouge(path: &Toolpath, tool: &Tool, part: &HeightField) -> f64 {
     deepest
 }
 
-/// The lowest the tip of `tool` (a flat, ball or bull-nose end mill) may go over each column of
-/// the `part` and stay `allowance` clear of it: the part's top seen through the tool's shape,
-/// the tool grown by the allowance all round (its corner too). Columns without part get the
-/// part's floor.
+/// The lowest the tip of `tool` (a flat, ball or bull-nose end mill, tapered or not) may go over
+/// each column of the `part` and stay `allowance` clear of it: the part's top seen through the
+/// tool's shape, the tool grown by the allowance all round (its corner and its cone too).
+/// Columns without part get the part's floor.
 pub fn tool_floor(part: &HeightField, tool: &Tool, allowance: f64) -> Result<HeightField> {
     let radius = tool.radius();
     if !(radius > 0.0 && radius.is_finite()) || !(allowance >= 0.0 && allowance.is_finite()) {
@@ -268,15 +271,18 @@ pub fn tool_floor(part: &HeightField, tool: &Tool, allowance: f64) -> Result<Hei
     }
     let (kind, r) = (tool.kind, radius + allowance);
     let corner = tool.corner() + allowance;
+    let tapered = tool.taper() > 0.0;
     // How far above its tip the grown tool's surface is at `d` from its axis.
     let rise = |d: f64| match kind {
+        _ if tapered => grown_rise(tool, allowance, d),
         ToolKind::BallEndmill | ToolKind::BullNose => rounded(r, corner, d),
         _ => 0.0,
     };
-    if !matches!(kind, ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose) {
+    if !kind.is_end_mill() {
         return Err(CamError::Unsupported("following a part in 3D takes a flat, ball or bull-nose end mill".into()));
     }
-    if kind == ToolKind::FlatEndmill {
+    let r = if tapered { tool.widest() + allowance } else { r };
+    if kind == ToolKind::FlatEndmill && !tapered {
         let mut out = part.dilated(r)?;
         out.z.iter_mut().for_each(|z| *z += allowance);
         return Ok(out);
@@ -316,6 +322,20 @@ pub fn tool_floor(part: &HeightField, tool: &Tool, allowance: f64) -> Result<Hei
     Ok(out)
 }
 
+/// How far above its tip `tool` grown by `allowance` all round is at `d` from its axis: its end
+/// grown as a straight tool's is, then its cone moved out square to itself, the two meeting
+/// where the cone is tangent to the end.
+pub(crate) fn grown_rise(tool: &Tool, allowance: f64, d: f64) -> f64 {
+    let (a, s) = (tool.taper(), allowance.max(0.0));
+    let (start, height) = tool.taper_start();
+    let joint = start + s * a.cos();
+    if a <= 0.0 || d <= joint {
+        let r = tool.radius() + s;
+        return rounded(r, tool.corner() + s, d.min(r));
+    }
+    height + (d - joint) / a.tan() + s * (1.0 - a.sin())
+}
+
 /// What one toolpath did to the stock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CutReport {
@@ -330,19 +350,12 @@ pub struct CutReport {
 /// How far above its tip a rounded end `corner` round, on a tool `r` in radius, is at distance
 /// `d` from its axis: flat out to `r - corner`, then round (a ball: `corner` = `r`).
 pub(crate) fn rounded(r: f64, corner: f64, d: f64) -> f64 {
-    let flat = r - corner;
-    if d <= flat { 0.0 } else { corner - (corner * corner - (d - flat).powi(2)).max(0.0).sqrt() }
+    crate::tool::rounded_end(r, corner, d)
 }
 
-/// How far above its tip the tool's surface is at distance `d` from its axis.
+/// How far above its tip the tool's surface is at distance `d` from its axis (out to its widest).
 fn profile(tool: &Tool, d: f64) -> f64 {
-    let r = tool.radius();
-    match tool.kind {
-        ToolKind::FlatEndmill => 0.0,
-        ToolKind::BallEndmill | ToolKind::BullNose => rounded(r, tool.corner(), d),
-        ToolKind::Drill => d / (tool.point_angle() * 0.5).to_radians().tan(),
-        ToolKind::VBit => (d - tool.tip() * 0.5).max(0.0) / (tool.point_angle() * 0.5).to_radians().tan(),
-    }
+    tool.rise(d).unwrap_or(f64::INFINITY)
 }
 
 /// Runs `path` with `tool` through the stock.
@@ -365,7 +378,8 @@ fn sweep(field: &mut HeightField, a: Vec3, to: Vec3, cutting: bool, tool: &Tool,
     if !a.is_finite() || !to.is_finite() {
         return Err(CamError::Unsafe("a coordinate is not a finite number".into()));
     }
-    let r = tool.radius();
+    // A tapered tool cuts with its cone too: out to its widest.
+    let r = tool.widest();
     let (a2, b2) = (Vec2::new(a.x, a.y), Vec2::new(to.x, to.y));
     let lo = Vec2::new(a2.x.min(b2.x) - r, a2.y.min(b2.y) - r);
     let hi = Vec2::new(a2.x.max(b2.x) + r, a2.y.max(b2.y) + r);

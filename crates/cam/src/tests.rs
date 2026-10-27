@@ -1391,6 +1391,51 @@ fn a_playback_cuts_the_stock_as_far_as_the_program_has_got() {
 }
 
 #[test]
+fn tapered_end_mills_widen_up_their_flutes() {
+    // A ball 2 mm across tapered 5° each side: its cone is tangent to the ball at 5° below the
+    // equator, cos 5° out and 1 − sin 5° up, and reaches its widest at the top of 20 mm of flutes.
+    let ball = Tool { taper_angle: Some(5.0), ..Tool::new(1, ToolKind::BallEndmill, 2.0, 20.0) };
+    let a = 5f64.to_radians();
+    let (d, h) = (a.cos(), 1.0 - a.sin());
+    close(ball.rise(0.0).unwrap(), 0.0, 1e-12);
+    close(ball.rise(d).unwrap(), h, 1e-9);
+    close(ball.rise(d + 1.0).unwrap(), h + 1.0 / a.tan(), 1e-9);
+    close(ball.widest(), d + (20.0 - h) * a.tan(), 1e-9);
+    close(ball.rise(ball.widest()).unwrap(), 20.0, 1e-9);
+    assert!(ball.rise(ball.widest() + 0.01).is_none());
+    // Straight tools are as before: as wide as their radius, a ball round to its equator.
+    let straight = Tool::new(1, ToolKind::BallEndmill, 2.0, 20.0);
+    close(straight.widest(), 1.0, 1e-12);
+    close(straight.rise(1.0).unwrap(), 1.0, 1e-12);
+    // A bull nose's cone starts on its corner; a flat one's at its rim.
+    let bull = Tool { corner_radius: Some(1.0), taper_angle: Some(10.0), ..Tool::new(1, ToolKind::BullNose, 6.0, 20.0) };
+    let b = 10f64.to_radians();
+    close(bull.rise(2.0 + b.cos()).unwrap(), 1.0 - b.sin(), 1e-9);
+    let flat = Tool { taper_angle: Some(10.0), ..Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0) };
+    close(flat.rise(3.0).unwrap(), 0.0, 1e-12);
+    close(flat.rise(4.0).unwrap(), 1.0 / b.tan(), 1e-9);
+    // Grown by an allowance all round: its cone moves out square to itself.
+    let s = 0.5;
+    for d in [5.0, 6.0] {
+        let along = (d - s * b.cos() - 3.0) / b.tan() - s * b.sin() + s;
+        close(crate::sim::grown_rise(&flat, s, d), along, 1e-3);
+    }
+    close(crate::sim::grown_rise(&flat, s, 0.0), 0.0, 1e-9);
+    // Only end mills taper, less than 45° each side.
+    for bad in [
+        Tool { taper_angle: Some(45.0), ..flat.clone() },
+        Tool { taper_angle: Some(-1.0), ..flat.clone() },
+        Tool { taper_angle: Some(5.0), ..Tool::new(1, ToolKind::VBit, 6.0, 20.0) },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+    // Chamfer mills and engravers are pointed as V-bits, an engraver 30° unless told.
+    assert!(ToolKind::ChamferMill.is_cone() && ToolKind::Engraver.is_cone() && !ToolKind::Drill.is_cone());
+    close(Tool::new(1, ToolKind::Engraver, 3.0, 5.0).point_angle(), 30.0, 0.0);
+    close(Tool::new(1, ToolKind::ChamferMill, 10.0, 5.0).point_angle(), 90.0, 0.0);
+}
+
+#[test]
 fn simulation_knows_tool_shapes_and_rapids_through_material() {
     let block = || HeightField::block(Vec3::new(-10.0, -10.0, -20.0), Vec3::new(10.0, 10.0, 0.0), 0.1).unwrap();
     let down =
@@ -1417,6 +1462,19 @@ fn simulation_knows_tool_shapes_and_rapids_through_material() {
         .map(|rho| 2.0 * PI * rho * (1.0 - (1.0 - (rho - 2.0).powi(2)).max(0.0).sqrt()) / n as f64)
         .sum();
     close(cut_bull, cylinder - gap, cylinder * 0.01);
+    // A flat end mill tapered 10° each side, 8 mm down: a cone frustum from its 3 mm tip radius
+    // to 3 + 8 tan 10° at the top. Chamfer mills and engravers cut as V-bits.
+    let mut stock = block();
+    let tapered = Tool { taper_angle: Some(10.0), ..Tool::new(1, ToolKind::FlatEndmill, 6.0, 20.0) };
+    let (r1, r2) = (3.0, 3.0 + 8.0 * 10f64.to_radians().tan());
+    let frustum = PI * 8.0 / 3.0 * (r1 * r1 + r1 * r2 + r2 * r2);
+    close(simulate(&mut stock, &down(-8.0), &tapered).unwrap().removed_volume, frustum, frustum * 0.01);
+    let cone = |kind: ToolKind| {
+        let mut stock = block();
+        simulate(&mut stock, &down(-2.0), &Tool { tip_angle: Some(90.0), ..Tool::new(1, kind, 6.0, 20.0) }).unwrap().removed_volume
+    };
+    close(cone(ToolKind::ChamferMill), cone(ToolKind::VBit), 1e-9);
+    close(cone(ToolKind::Engraver), PI * 4.0 * 2.0 / 3.0, PI * 4.0 * 2.0 / 3.0 * 0.03);
     // A rapid across the top of the block is fine; one below the top is a collision and cuts nothing.
     let across = |z: f64| Toolpath { moves: vec![Move::Rapid { to: Vec3::new(-20.0, 0.0, z) }, Move::Rapid { to: Vec3::new(20.0, 0.0, z) }] };
     let mut stock = block();

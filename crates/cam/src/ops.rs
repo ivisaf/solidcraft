@@ -208,8 +208,8 @@ pub fn vcarve(regions: &[Region2], tool: &Tool, params: &VCarveParams, cut: &Cut
     tool.validate()?;
     cut.heights.validate()?;
     cut.feeds.validate()?;
-    if tool.kind != crate::tool::ToolKind::VBit {
-        return invalid("a V-carve is cut with a V-bit");
+    if !tool.kind.is_cone() {
+        return invalid("a V-carve is cut with a V-bit, a chamfer mill or an engraving tool");
     }
     if !(params.stepover > 0.0 && params.stepover <= tool.diameter) {
         return invalid("the stepover must be above 0 and at most the tool diameter");
@@ -282,8 +282,8 @@ pub fn chamfer(regions: &[Region2], tool: &Tool, params: &ChamferParams, cut: &C
     cut.heights.validate()?;
     cut.feeds.validate()?;
     check_ramp(params.ramp_angle)?;
-    if !matches!(tool.kind, crate::tool::ToolKind::VBit | crate::tool::ToolKind::Drill) {
-        return invalid("a chamfer is cut with a pointed tool: a V-bit or a drill");
+    if !(tool.kind.is_cone() || tool.kind == crate::tool::ToolKind::Drill) {
+        return invalid("a chamfer is cut with a pointed tool: a V-bit, a chamfer mill, an engraving tool or a drill");
     }
     if params.side == Side::On {
         return invalid("a chamfer is on the outside or the inside of an edge");

@@ -1148,6 +1148,49 @@ fn the_tool_assistant_makes_a_bull_nose() {
 }
 
 #[test]
+fn the_tool_assistant_makes_a_tapered_ball_and_an_engraver() {
+    let mut h = lab();
+    h.app.start("cam.tool.define");
+    h.frames(3);
+    h.step(&json!({"widget": "Ball end mill"})).unwrap();
+    h.frames(2);
+    // An end mill offers a taper; a point's rows are not there.
+    assert!(h.widget("Taper angle (β)").is_some() && h.widget("Point angle (α)").is_none());
+    if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+        // A decimal comma is a decimal point, whatever the language.
+        (f.number, f.diameter, f.flute_length, f.taper_angle) = ("7".into(), "2 mm".into(), "20 mm".into(), "3,5".into());
+        // The picture widens to the top of its flutes: 1 + 19 tan 3.5° from the axis, near enough.
+        let widest = ToolShape::of(f).tool().widest();
+        assert!((widest - (3.5f64.to_radians().cos() + (19.0 + 3.5f64.to_radians().sin()) * 3.5f64.to_radians().tan())).abs() < 1e-9, "{widest}");
+    }
+    h.frames(1);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let library = library_listing(&mut h.app, true);
+    let tool = library["tools"].as_array().unwrap().iter().find(|t| t["number"] == 7).cloned().unwrap();
+    assert_eq!((tool["kind"].as_str(), tool["taper_angle"].as_f64()), (Some("ball_endmill"), Some(3.5)));
+    let Some(Form::Tool(again)) = tool_form(&tool, true) else { panic!("no form") };
+    assert_eq!((again.kind, again.taper_angle.as_str()), (1, "3.5"));
+    // An engraving tool: pointed, 30° unless told, and no taper.
+    h.app.start("cam.tool.define");
+    h.frames(3);
+    h.step(&json!({"widget": "Engraving tool"})).unwrap();
+    h.frames(2);
+    assert!(h.widget("Point angle (α)").is_some() && h.widget("Tip diameter (d)").is_some() && h.widget("Taper angle (β)").is_none());
+    if let Some(Form::Tool(f)) = &mut h.app.manufacture.form {
+        (f.number, f.diameter, f.tip_diameter) = ("8".into(), "3 mm".into(), "0.2".into());
+    }
+    h.frames(1);
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let library = library_listing(&mut h.app, true);
+    let tool = library["tools"].as_array().unwrap().iter().find(|t| t["number"] == 8).cloned().unwrap();
+    assert_eq!((tool["kind"].as_str(), tool["tip_diameter"].as_f64()), (Some("engraver"), Some(0.2)));
+    let Some(Form::Tool(again)) = tool_form(&tool, true) else { panic!("no form") };
+    assert_eq!(again.kind, 6);
+}
+
+#[test]
 fn a_tool_s_data_in_a_material_fills_the_operations_of_a_setup_of_it() {
     let mut h = sketched();
     // A material is added in the Tool Library window.

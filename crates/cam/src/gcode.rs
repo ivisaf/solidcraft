@@ -279,7 +279,7 @@ pub fn emit(program: &Program, post: &Post) -> Result<String> {
         if safety.optional_stops && k > 0 {
             w.block("M1");
         }
-        w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind.label()));
+        w.comment(&format!("{}: T{} D{} {}", op.name, op.tool.number, number(op.tool.diameter, 3), op.tool.kind_label()));
         if tool != Some(op.tool.number) {
             if tool.is_some() || post.tool_change_first {
                 w.template(&post.tool_change, &values)?;

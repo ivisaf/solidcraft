@@ -2053,6 +2053,51 @@ fn a_surface_speed_and_chip_load_give_speed_and_feed_for_the_tools_size() {
 }
 
 #[test]
+fn router_tools_chamfer_mills_engravers_and_tapered_end_mills() {
+    let mut s = Session::default();
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [30, 20]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": 5, "direction": "negative"}));
+    run(&mut s, "cam.setup.create", json!({}));
+    let tool = |s: &Session, n: u32| s.doc.manufacture.tools.iter().find(|t| t.number == n).unwrap().clone();
+    // A chamfer mill is 90° unless told; an engraver 30°, its flutes as long as its cone.
+    run(&mut s, "cam.tool.define", json!({"number": 1, "kind": "chamfer", "diameter": 12, "tip_diameter": 2, "spindle_rpm": 18000, "feed": 800}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "engraver", "diameter": 3, "tip_diameter": 0.2, "spindle_rpm": 20000, "feed": 400}));
+    let (chamfer, engraver) = (tool(&s, 1), tool(&s, 2));
+    assert_eq!((chamfer.kind, chamfer.point_angle(), chamfer.tip()), (solidcraft_cam::ToolKind::ChamferMill, 90.0, 2.0));
+    assert_eq!((engraver.kind, engraver.point_angle()), (solidcraft_cam::ToolKind::Engraver, 30.0));
+    close(engraver.flute_length, 1.4 / 15f64.to_radians().tan(), 1e-9);
+    // A ball end mill 2 mm across, tapered 3.5° each side; a V-bit has no taper to give.
+    run(
+        &mut s,
+        "cam.tool.define",
+        json!({"number": 3, "kind": "ball", "diameter": 2, "flute_length": 20, "taper_angle": 3.5, "spindle_rpm": 18000, "feed": 900}),
+    );
+    run(&mut s, "cam.tool.define", json!({"number": 4, "kind": "vbit", "diameter": 6, "taper_angle": 3.5, "spindle_rpm": 18000, "feed": 900}));
+    assert_eq!((tool(&s, 3).taper_angle, tool(&s, 4).taper_angle), (Some(3.5), None));
+    let listed = run(&mut s, "cam.list", json!({}));
+    let ball = listed["tools"].as_array().unwrap().iter().find(|t| t["number"] == 3).unwrap();
+    assert_eq!((ball["kind"].as_str(), ball["taper_angle"].as_f64()), (Some("ball_endmill"), Some(3.5)), "{ball}");
+    // Null or 0 makes it straight again; 45° or more is no taper.
+    run(&mut s, "cam.tool.define", json!({"number": 5, "kind": "flat", "diameter": 6, "taper_angle": 0, "spindle_rpm": 18000, "feed": 900}));
+    assert_eq!(tool(&s, 5).taper_angle, None);
+    for bad in [json!(45), json!(-2), json!("steep")] {
+        assert!(s.execute("cam.tool.define", &json!({"number": 6, "kind": "flat", "diameter": 6, "taper_angle": bad})).is_err(), "{bad}");
+    }
+    // The engraver engraves on a line as a V-bit does, and is refused a pocket.
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Line"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [2, 2], "p1": [12, 8]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.op.contour", json!({"sketch": "Line", "tool": 2, "side": "on", "top": 0, "bottom": -0.3, "name": "Engrave"}));
+    assert!(s.execute("cam.op.pocket", &json!({"sketch": "Line", "tool": 2, "top": 0, "bottom": -1})).unwrap_err().to_string().contains("V-bit"));
+    // The tapered ball is said so in the program.
+    run(&mut s, "cam.op.contour", json!({"sketch": "Line", "tool": 3, "side": "inside", "top": 0, "bottom": -1, "name": "Ball"}));
+    let gcode = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(gcode.contains("(T3: D2 ball end mill, 3.5 deg taper)") && gcode.contains("(T2: D3 engraving tool)"), "{gcode}");
+}
+
+#[test]
 fn a_v_bit_engraves_on_a_line_and_its_groove_is_a_v() {
     // A flat plate, its top at 0 and the stock's too.
     let mut s = Session::default();

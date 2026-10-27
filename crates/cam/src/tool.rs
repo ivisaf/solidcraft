@@ -27,6 +27,10 @@ pub enum ToolKind {
     Drill,
     /// A cone to a point (or a small flat), for engraving along a line.
     VBit,
+    /// A cone with a flat at its point, for chamfering edges: shaped as a V-bit.
+    ChamferMill,
+    /// A slender cone to a small flat, for engraving fine lines: shaped as a V-bit.
+    Engraver,
 }
 
 impl ToolKind {
@@ -37,7 +41,17 @@ impl ToolKind {
             ToolKind::BullNose => "bull-nose end mill",
             ToolKind::Drill => "drill",
             ToolKind::VBit => "V-bit",
+            ToolKind::ChamferMill => "chamfer mill",
+            ToolKind::Engraver => "engraving tool",
         }
+    }
+    /// Whether it is a cone to its point (or a flat at it): a V-bit, a chamfer mill or an engraver.
+    pub fn is_cone(self) -> bool {
+        matches!(self, ToolKind::VBit | ToolKind::ChamferMill | ToolKind::Engraver)
+    }
+    /// Whether it is an end mill: flat, ball or bull nose (which may be tapered).
+    pub fn is_end_mill(self) -> bool {
+        matches!(self, ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose)
     }
 }
 
@@ -82,6 +96,10 @@ pub struct Tool {
     /// A bull-nose end mill's corner radius, where its end rounds into its side (mm).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corner_radius: Option<f64>,
+    /// A tapered end mill's side angle (degrees, each side): from its end, `diameter` across,
+    /// it widens up its flutes (none: straight).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taper_angle: Option<f64>,
     /// The shank's diameter and the tool's length out of the holder (mm): what its picture shows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shank_diameter: Option<f64>,
@@ -173,6 +191,7 @@ impl Tool {
             tip_angle: None,
             tip_diameter: None,
             corner_radius: None,
+            taper_angle: None,
             shank_diameter: None,
             holder_diameter: None,
             holder_length: None,
@@ -231,10 +250,59 @@ impl Tool {
     /// The point's included angle (degrees): 180 for a flat or ball end.
     pub fn point_angle(&self) -> f64 {
         match self.kind {
-            ToolKind::VBit => self.tip_angle.unwrap_or(90.0),
+            ToolKind::VBit | ToolKind::ChamferMill => self.tip_angle.unwrap_or(90.0),
+            ToolKind::Engraver => self.tip_angle.unwrap_or(30.0),
             ToolKind::Drill => self.tip_angle.unwrap_or(118.0),
             ToolKind::FlatEndmill | ToolKind::BallEndmill | ToolKind::BullNose => 180.0,
         }
+    }
+    /// What kind of tool it is, in words: its kind, and a tapered end mill's angle each side.
+    pub fn kind_label(&self) -> String {
+        match self.taper_angle.filter(|_| self.taper() > 0.0) {
+            Some(a) => format!("{}, {} deg taper", self.kind.label(), (a * 100.0).round() / 100.0),
+            None => self.kind.label().to_string(),
+        }
+    }
+    /// A tapered end mill's side angle (radians; 0: straight, and for every other kind).
+    pub fn taper(&self) -> f64 {
+        match self.taper_angle {
+            Some(a) if self.kind.is_end_mill() && a > 0.0 => a.to_radians(),
+            _ => 0.0,
+        }
+    }
+    /// Where a tapered end mill's end meets its cone: how far from its axis and how far above
+    /// its tip (the end's own edge for a straight one). The cone is tangent to a rounded end.
+    pub(crate) fn taper_start(&self) -> (f64, f64) {
+        let (r, c, a) = (self.radius(), self.corner(), self.taper());
+        (r - c + c * a.cos(), c * (1.0 - a.sin()))
+    }
+    /// The farthest the cutting edges reach from the axis (mm): the radius, or a tapered end
+    /// mill's at the top of its flutes.
+    pub fn widest(&self) -> f64 {
+        let a = self.taper();
+        if a <= 0.0 {
+            return self.radius();
+        }
+        let (d, h) = self.taper_start();
+        d + (self.flute_length - h).max(0.0) * a.tan()
+    }
+    /// How far above its tip the tool's cutting surface is at `d` from its axis (mm), out to
+    /// [`Tool::widest`]; `None` beyond it.
+    pub fn rise(&self, d: f64) -> Option<f64> {
+        let d = d.abs();
+        if !(d <= self.widest() + 1e-12) {
+            return None;
+        }
+        let r = self.radius();
+        Some(match self.kind {
+            ToolKind::Drill => d / (self.point_angle() * 0.5).to_radians().tan(),
+            kind if kind.is_cone() => (d - self.tip() * 0.5).max(0.0) / (self.point_angle() * 0.5).to_radians().tan(),
+            _ => {
+                let a = self.taper();
+                let (start, height) = self.taper_start();
+                if a > 0.0 && d > start { height + (d - start) / a.tan() } else { rounded_end(r, self.corner(), d.min(r)) }
+            }
+        })
     }
     /// How far the end rounds into the side (mm): a ball's radius, a bull nose's corner radius,
     /// nothing for the rest.
@@ -248,7 +316,7 @@ impl Tool {
     /// A V-bit's flat at its point (mm).
     pub fn tip(&self) -> f64 {
         match self.kind {
-            ToolKind::VBit => self.tip_diameter.unwrap_or(0.0),
+            kind if kind.is_cone() => self.tip_diameter.unwrap_or(0.0),
             _ => 0.0,
         }
     }
@@ -277,6 +345,12 @@ impl Tool {
         }
         if self.tip_diameter.is_some_and(|d| !(0.0..self.diameter).contains(&d)) {
             return invalid("a V-bit's tip diameter must be 0 or more and less than its diameter");
+        }
+        if self.taper_angle.is_some_and(|a| !(0.0..45.0).contains(&a)) {
+            return invalid("a taper angle must be 0 or more and less than 45 degrees (each side)");
+        }
+        if self.taper_angle.is_some_and(|a| a > 0.0) && !self.kind.is_end_mill() {
+            return invalid("only a flat, ball or bull-nose end mill is tapered");
         }
         if self.kind == ToolKind::BullNose && !self.corner_radius.is_some_and(|c| c > 0.0 && c <= self.radius()) {
             return invalid("a bull-nose end mill's corner radius must be above 0 and at most half its diameter");
@@ -308,6 +382,13 @@ impl Tool {
         }
         Ok(())
     }
+}
+
+/// How far above its tip a rounded end `corner` round, on a tool `r` in radius, is at distance
+/// `d` from its axis: flat out to `r - corner`, then round (a ball: `corner` = `r`).
+pub(crate) fn rounded_end(r: f64, corner: f64, d: f64) -> f64 {
+    let flat = r - corner;
+    if d <= flat { 0.0 } else { corner - (corner * corner - (d - flat).powi(2)).max(0.0).sqrt() }
 }
 
 /// A surface speed and chip load, checked: above 0 and at most [`MAX_SURFACE_SPEED`] and [`MAX_CHIP_LOAD`].

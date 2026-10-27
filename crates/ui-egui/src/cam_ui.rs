@@ -15,9 +15,23 @@ use crate::i18n::{format as tf, tr_manufacture as tm};
 use crate::theme::Tokens;
 use crate::viewport::Proj;
 
-const TOOL_KINDS: [&str; 5] = ["flat", "ball", "drill", "vbit", "bull"];
+const TOOL_KINDS: [&str; 7] = ["flat", "ball", "drill", "vbit", "bull", "chamfer", "engraver"];
 /// What each of [`TOOL_KINDS`] is called in the tool assistant.
-const TOOL_KIND_NAMES: [&str; 5] = ["Flat end mill", "Ball end mill", "Drill", "V-bit", "Bull-nose end mill"];
+const TOOL_KIND_NAMES: [&str; 7] = ["Flat end mill", "Ball end mill", "Drill", "V-bit", "Bull-nose end mill", "Chamfer mill", "Engraving tool"];
+
+/// The kind of tool [`TOOL_KINDS`]`[index]` is.
+fn tool_kind(index: usize) -> solidcraft_engine::cam::ToolKind {
+    use solidcraft_engine::cam::ToolKind;
+    match index {
+        1 => ToolKind::BallEndmill,
+        2 => ToolKind::Drill,
+        3 => ToolKind::VBit,
+        4 => ToolKind::BullNose,
+        5 => ToolKind::ChamferMill,
+        6 => ToolKind::Engraver,
+        _ => ToolKind::FlatEndmill,
+    }
+}
 const SIDES: [&str; 3] = ["outside", "inside", "on"];
 /// What a facing operation's boundary is, when no faces are picked.
 const FACE_BOUNDS: [&str; 3] = ["stock", "part", "sketch"];
@@ -172,6 +186,8 @@ pub struct ToolForm {
     pub tip_diameter: String,
     /// A bull nose's corner radius (mm).
     pub corner_radius: String,
+    /// An end mill's taper, each side (degrees). Empty: straight.
+    pub taper_angle: String,
     pub shank_diameter: String,
     pub length: String,
     /// The holder above the tool (mm): its diameter and length. Empty: not known.
@@ -956,6 +972,7 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 tip_angle: String::new(),
                 tip_diameter: String::new(),
                 corner_radius: String::new(),
+                taper_angle: String::new(),
                 shank_diameter: String::new(),
                 length: String::new(),
                 holder_diameter: String::new(),
@@ -1032,9 +1049,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
 
 /// The command a form stands for. Fields left empty are left to the command's defaults.
 pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
-    let number = |what: &str, s: &str| {
-        s.trim().parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| tf("manufacture.must_be_a_number", &[("what", tm(what))]))
-    };
+    // A decimal point or a decimal comma, whatever the language (#1347).
+    let number = |what: &str, s: &str| crate::prefs::parse_number(s).ok_or_else(|| tf("manufacture.must_be_a_number", &[("what", tm(what))]));
     let mut p = serde_json::Map::new();
     fn optional(p: &mut serde_json::Map<String, Value>, k: &str, s: &str) {
         if !s.trim().is_empty() {
@@ -1073,6 +1089,7 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 ("tip_angle", "The point angle", &f.tip_angle),
                 ("tip_diameter", "The tip diameter", &f.tip_diameter),
                 ("corner_radius", "The corner radius", &f.corner_radius),
+                ("taper_angle", "The taper angle", &f.taper_angle),
                 ("shank_diameter", "The shank diameter", &f.shank_diameter),
                 ("length", "The length", &f.length),
                 ("holder_diameter", "The holder's diameter", &f.holder_diameter),
@@ -1491,6 +1508,8 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         "drill" => 2,
         "v_bit" => 3,
         "bull_nose" => 4,
+        "chamfer_mill" => 5,
+        "engraver" => 6,
         _ => 0,
     };
     let mut form = ToolForm {
@@ -1515,6 +1534,7 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         tip_angle: number("tip_angle"),
         tip_diameter: number("tip_diameter"),
         corner_radius: number("corner_radius"),
+        taper_angle: number("taper_angle"),
         shank_diameter: number("shank_diameter"),
         length: number("length"),
         holder_diameter: number("holder_diameter"),
@@ -2591,31 +2611,14 @@ pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
 /// The tool at `tip` (work coordinates in `frame`): its cutting part and its shank, each drawn
 /// as the outline of its rings round the setup's Z.
 fn draw_tool(painter: &egui::Painter, proj: &Proj, frame: [Vec3; 4], tip: Vec3, tool: &solidcraft_engine::cam::Tool) {
-    use solidcraft_engine::cam::ToolKind;
     let t = Tokens::get();
     let [o, x, y, z] = frame;
-    let r = tool.radius();
     let flute = tool.flute_length;
     let length = tool.length.unwrap_or(flute + 2.0 * tool.diameter).max(flute);
     let shank = tool.shank_diameter.unwrap_or(tool.diameter) * 0.5;
     // Rings as (height over the tip, radius).
-    let cutting: Vec<(f64, f64)> = match tool.kind {
-        ToolKind::FlatEndmill => vec![(0.0, r), (flute, r)],
-        // A rounded end: flat out to its corner, then round (a ball: round all the way).
-        ToolKind::BallEndmill | ToolKind::BullNose => {
-            let c = tool.corner();
-            (0..=6)
-                .map(|k| f64::from(k) / 6.0 * std::f64::consts::FRAC_PI_2)
-                .map(|a| (c - c * a.cos(), r - c + c * a.sin()))
-                .chain([(flute, r)])
-                .collect()
-        }
-        ToolKind::Drill | ToolKind::VBit => {
-            let point = tool.tip() * 0.5;
-            let cone = ((r - point) / (tool.point_angle() * 0.5).to_radians().tan()).min(flute);
-            vec![(0.0, point), (cone, r), (flute, r)]
-        }
-    };
+    // As it is shaped: its end, cone or round, a tapered side widening up.
+    let cutting: Vec<(f64, f64)> = tool_side(tool).into_iter().step_by(4).chain([(0.0, 0.0)]).map(|(d, h)| (h, d)).collect();
     let outline = |rings: &[(f64, f64)]| -> Vec<egui::Pos2> {
         let mut pts = Vec::new();
         for &(h, radius) in rings {
@@ -2687,6 +2690,9 @@ fn help(label: &str) -> Option<&'static str> {
         "Shank diameter" => "How thick the part the holder grips is. Empty: as thick as the tool cuts.",
         "Point angle" => "The angle between the point's two flanks: a V-bit's (often 60° or 90°) or a drill's (118°).",
         "Tip diameter" => "A V-bit's small flat at its point. Empty: a sharp point.",
+        "Taper angle" => {
+            "How much a tapered end mill widens up its flutes, each side, in degrees (as catalogues give it). The diameter is at its end. Empty or 0: straight."
+        }
         "Corner radius" => "How far a bull nose's flat end rounds into its side: at most half the diameter (all the way round is a ball).",
         "Flute length" => "How deep the cutting edges reach. Deeper cuts need a longer tool.",
         "Flutes" => "How many cutting edges the tool has. Together with the speed it sets the feed.",
@@ -3019,7 +3025,7 @@ fn shown(v: f64, decimals: usize) -> String {
 }
 
 fn parsed(s: &str) -> Option<f64> {
-    s.trim().parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+    crate::prefs::parse_number(s).filter(|v| *v > 0.0)
 }
 
 /// Which of a tool's speed and feed rows were typed in.
@@ -3302,6 +3308,7 @@ enum Dim {
     Angle,
     Tip,
     Corner,
+    Taper,
 }
 
 /// A tool's shape for its picture: from a form's text (what is not typed takes its default).
@@ -3316,20 +3323,14 @@ struct ToolShape {
     tip: f64,
     /// A bull nose's corner radius.
     corner: f64,
+    /// An end mill's taper each side (degrees; 0: straight).
+    taper: f64,
 }
 
 impl ToolShape {
     fn of(f: &ToolForm) -> ToolShape {
-        let mm = |s: &str| {
-            s.trim()
-                .trim_end_matches("mm")
-                .trim_end_matches("deg")
-                .trim_end_matches('°')
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|v| v.is_finite() && *v > 0.0)
-        };
+        let mm =
+            |s: &str| crate::prefs::parse_number(s.trim().trim_end_matches("mm").trim_end_matches("deg").trim_end_matches('°')).filter(|v| *v > 0.0);
         let shape = ToolShape::with(
             f.kind,
             mm(&f.diameter),
@@ -3339,6 +3340,7 @@ impl ToolShape {
             mm(&f.tip_angle),
             mm(&f.tip_diameter),
         );
+        let shape = ToolShape { taper: mm(&f.taper_angle).filter(|a| *a < 45.0).unwrap_or(0.0), ..shape };
         match mm(&f.corner_radius) {
             Some(c) => ToolShape { corner: c.min(shape.diameter * 0.5), ..shape },
             None => shape,
@@ -3347,11 +3349,15 @@ impl ToolShape {
     /// A shape with `kind`'s defaults wherever a value is left out (or makes no tool).
     fn with(kind: usize, d: Option<f64>, f: Option<f64>, s: Option<f64>, l: Option<f64>, a: Option<f64>, tip: Option<f64>) -> ToolShape {
         let diameter = d.unwrap_or(6.0).min(1000.0);
-        let angle = a.filter(|a| *a < 179.0).unwrap_or(if kind == 2 { 118.0 } else { 90.0 });
+        let angle = a.filter(|a| *a < 179.0).unwrap_or(match kind {
+            2 => 118.0,
+            6 => 30.0,
+            _ => 90.0,
+        });
         let tip_d = tip.filter(|t| *t < diameter).unwrap_or(0.0);
         // A V-bit cuts with its cone (as the engine takes it when left out).
         let cone = ((diameter - tip_d) * 0.5 / (angle * 0.5).to_radians().tan()).max(0.01);
-        let flute_length = f.unwrap_or(if kind == 3 { cone } else { diameter * 3.0 }).min(10_000.0);
+        let flute_length = f.unwrap_or(if tool_kind(kind).is_cone() { cone } else { diameter * 3.0 }).min(10_000.0);
         ToolShape {
             kind,
             diameter,
@@ -3362,8 +3368,35 @@ impl ToolShape {
             tip: tip_d,
             // A bull nose's corner: a sixth of the diameter when not given.
             corner: diameter / 6.0,
+            taper: 0.0,
         }
     }
+    /// The tool it draws, for its outline.
+    fn tool(&self) -> solidcraft_engine::cam::Tool {
+        let kind = tool_kind(self.kind);
+        solidcraft_engine::cam::Tool {
+            tip_angle: Some(self.angle),
+            tip_diameter: Some(self.tip),
+            corner_radius: Some(self.corner),
+            taper_angle: Some(self.taper),
+            ..solidcraft_engine::cam::Tool::new(0, kind, self.diameter, self.flute_length)
+        }
+    }
+}
+
+/// One side of a tool's cutting part, from the top of its flutes down to its tip: points as
+/// (distance from the axis, height over the tip), from its shape.
+fn tool_side(tool: &solidcraft_engine::cam::Tool) -> Vec<(f64, f64)> {
+    let (widest, flute) = (tool.widest(), tool.flute_length);
+    const STEPS: u32 = 48;
+    let mut side = vec![(widest, flute)];
+    for k in (0..=STEPS).rev() {
+        let d = widest * f64::from(k) / f64::from(STEPS);
+        if let Some(h) = tool.rise(d) {
+            side.push((d, h.min(flute)));
+        }
+    }
+    side
 }
 
 /// A tool drawn upright, its point down, in `size`: shank, cutting part and point, and with
@@ -3374,7 +3407,8 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
     let painter = ui.painter_at(rect);
     let room = if dims { egui::vec2(40.0, 38.0) } else { egui::vec2(8.0, 8.0) };
     let inner = rect.shrink2(room);
-    let widest = shape.diameter.max(shape.shank);
+    // A tapered tool is widest at the top of its flutes.
+    let widest = (shape.tool().widest() * 2.0).max(shape.shank);
     let scale = (f64::from(inner.height()) / shape.length).min(f64::from(inner.width()) / widest) as f32;
     let (cx, top) = (inner.center().x, inner.center().y - (shape.length as f32 * scale) * 0.5);
     let tip_y = top + shape.length as f32 * scale;
@@ -3388,42 +3422,9 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
         ink,
     ));
     let half_angle = (shape.angle * 0.5).to_radians();
-    // How tall a point is over `half_width` (both in points).
-    let point = |half_width: f32| (f64::from(half_width) / half_angle.tan()) as f32;
-    let mut side: Vec<egui::Pos2> = vec![egui::pos2(cx + r, cut_top)];
-    match shape.kind {
-        // Bull nose: down the side to the corner, round the corner, then the flat end.
-        4 => {
-            let c = (shape.corner as f32 * scale).min(r);
-            side.push(egui::pos2(cx + r, tip_y - c));
-            for k in 1..=12 {
-                let a = std::f32::consts::FRAC_PI_2 * k as f32 / 12.0;
-                side.push(egui::pos2(cx + r - c + c * a.cos(), tip_y - c + c * a.sin()));
-            }
-        }
-        // Ball: down the side to a radius above the end, round the end.
-        1 => {
-            side.push(egui::pos2(cx + r, tip_y - r));
-            for k in 1..=16 {
-                let a = std::f32::consts::FRAC_PI_2 * k as f32 / 16.0;
-                side.push(egui::pos2(cx + r * a.cos(), tip_y - r + r * a.sin()));
-            }
-        }
-        // Drill: down to the point's cone.
-        2 => {
-            let h = point(r).min(tip_y - cut_top);
-            side.push(egui::pos2(cx + r, tip_y - h));
-            side.push(egui::pos2(cx, tip_y));
-        }
-        // V-bit: the cone narrows to the tip's flat.
-        3 => {
-            let tip = (shape.tip * 0.5) as f32 * scale;
-            let h = point(r - tip).min(tip_y - cut_top);
-            side.push(egui::pos2(cx + r, tip_y - h));
-            side.push(egui::pos2(cx + tip, tip_y));
-        }
-        _ => side.push(egui::pos2(cx + r, tip_y)),
-    }
+    // Down one side as the tool is shaped: its cone or round end, a tapered side widening up.
+    let tool = shape.tool();
+    let side: Vec<egui::Pos2> = tool_side(&tool).into_iter().map(|(d, h)| egui::pos2(cx + d as f32 * scale, tip_y - h as f32 * scale)).collect();
     let mirrored: Vec<egui::Pos2> = side.iter().rev().map(|p| egui::pos2(2.0 * cx - p.x, p.y)).collect();
     let outline: Vec<egui::Pos2> = side.iter().copied().chain(mirrored).collect();
     painter.add(egui::Shape::convex_polygon(outline, t.accent.gamma_multiply(0.45), ink));
@@ -3451,7 +3452,8 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
     dim_line(egui::pos2(left, top), egui::pos2(left, tip_y), Dim::Length, "L", egui::pos2(left - 12.0, (top + tip_y) * 0.5));
     let right = cx + r.max(rs) + 16.0;
     dim_line(egui::pos2(right, cut_top), egui::pos2(right, tip_y), Dim::Flutes, "F", egui::pos2(right + 12.0, (cut_top + tip_y) * 0.5));
-    if matches!(shape.kind, 2 | 3) {
+    let pointed = shape.kind == 2 || tool_kind(shape.kind).is_cone();
+    if pointed {
         // The point's angle between its two flanks, below the point.
         let d = Dim::Angle;
         let stroke = Stroke::new(width(d), colour(d));
@@ -3476,7 +3478,15 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
         painter.circle_filled(centre, 1.5, colour(d));
         painter.text(centre + egui::vec2(-8.0, -6.0), egui::Align2::CENTER_CENTER, "r", font(d), colour(d));
     }
-    if shape.kind == 3 {
+    if shape.taper > 0.0 && tool_kind(shape.kind).is_end_mill() {
+        // The taper: its angle beside the widening side, from upright.
+        let d = Dim::Taper;
+        let stroke = Stroke::new(width(d), colour(d));
+        let (start, top_at) = (egui::pos2(cx + r, tip_y - r.min(12.0)), egui::pos2(cx + r, cut_top));
+        painter.add(egui::Shape::dashed_line(&[start, top_at], stroke, 3.0, 2.0));
+        painter.text(egui::pos2(cx + r + 8.0, (start.y + top_at.y) * 0.5), egui::Align2::LEFT_CENTER, "β", font(d), colour(d));
+    }
+    if tool_kind(shape.kind).is_cone() {
         let d = Dim::Tip;
         let tip = ((shape.tip * 0.5) as f32 * scale).max(2.0);
         dim_line(egui::pos2(cx - tip, tip_y + 5.0), egui::pos2(cx + tip, tip_y + 5.0), d, "d", egui::pos2(cx + tip + 12.0, tip_y + 5.0));
@@ -3498,12 +3508,26 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
             ui.horizontal_wrapped(|ui| {
                 for (k, name) in TOOL_KIND_NAMES.iter().enumerate() {
                     // Stubby, so that each kind's end shows: (diameter, cutting length, shank, length).
-                    let (d, fl, sh, l) =
-                        [(10.0, 14.0, 8.0, 24.0), (10.0, 14.0, 8.0, 24.0), (8.0, 18.0, 8.0, 26.0), (14.0, 7.0, 7.0, 22.0), (10.0, 14.0, 8.0, 24.0)]
-                            .get(k)
-                            .copied()
-                            .unwrap_or((10.0, 14.0, 8.0, 24.0));
-                    let shape = ToolShape::with(k, Some(d), Some(fl), Some(sh), Some(l), None, if k == 3 { Some(0.6) } else { None });
+                    let (d, fl, sh, l) = [
+                        (10.0, 14.0, 8.0, 24.0),
+                        (10.0, 14.0, 8.0, 24.0),
+                        (8.0, 18.0, 8.0, 26.0),
+                        (14.0, 7.0, 7.0, 22.0),
+                        (10.0, 14.0, 8.0, 24.0),
+                        (14.0, 5.0, 8.0, 22.0),
+                        (6.0, 11.0, 6.0, 24.0),
+                    ]
+                    .get(k)
+                    .copied()
+                    .unwrap_or((10.0, 14.0, 8.0, 24.0));
+                    // A V-bit with a small flat; a chamfer mill's flat is wider.
+                    let tip = match k {
+                        3 => Some(0.6),
+                        5 => Some(3.0),
+                        6 => Some(0.4),
+                        _ => None,
+                    };
+                    let shape = ToolShape::with(k, Some(d), Some(fl), Some(sh), Some(l), None, tip);
                     // A tile of its own size: the tool drawn, its name under it; the whole tile is the button.
                     let (rect, r) = ui.allocate_exact_size(egui::vec2(112.0, 132.0), egui::Sense::click());
                     let chosen = f.kind == k;
@@ -3544,17 +3568,26 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         }
                     };
                     row(ui, "Diameter (D)", &mut f.diameter, "6 mm", Dim::Diameter);
-                    row(ui, "Flute length (F)", &mut f.flute_length, if f.kind == 3 { "the cone's height" } else { "3 × D" }, Dim::Flutes);
+                    let cone = tool_kind(f.kind).is_cone();
+                    row(ui, "Flute length (F)", &mut f.flute_length, if cone { "the cone's height" } else { "3 × D" }, Dim::Flutes);
                     row(ui, "Length (L)", &mut f.length, "F + 2 × D", Dim::Length);
                     row(ui, "Shank diameter (S)", &mut f.shank_diameter, "D", Dim::Shank);
-                    if matches!(f.kind, 2 | 3) {
-                        row(ui, "Point angle (α)", &mut f.tip_angle, if f.kind == 2 { "118°" } else { "90°" }, Dim::Angle);
+                    if f.kind == 2 || cone {
+                        let hint = match f.kind {
+                            2 => "118°",
+                            6 => "30°",
+                            _ => "90°",
+                        };
+                        row(ui, "Point angle (α)", &mut f.tip_angle, hint, Dim::Angle);
                     }
-                    if f.kind == 3 {
+                    if cone {
                         row(ui, "Tip diameter (d)", &mut f.tip_diameter, "0 mm (a sharp point)", Dim::Tip);
                     }
                     if f.kind == 4 {
                         row(ui, "Corner radius (r)", &mut f.corner_radius, "1 mm", Dim::Corner);
+                    }
+                    if tool_kind(f.kind).is_end_mill() {
+                        row(ui, "Taper angle (β)", &mut f.taper_angle, "0° (straight)", Dim::Taper);
                     }
                     field(ui, need, "Flutes", &mut f.flutes, "2");
                     // The holder: checked against clamps, from where the tool comes out of it.
@@ -4589,7 +4622,12 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
                 if crate::ui_kit::list_picker(ui, &format!("cam_tool_{library}_{number}"), &label, *picked == Some((library, number))).clicked() {
                     *picked = if *picked == Some((library, number)) { None } else { Some((library, number)) };
                 }
-                ui.label(kind_name("tool_kind", &text(tool, "kind")));
+                // A tapered end mill says how much.
+                let kind = kind_name("tool_kind", &text(tool, "kind"));
+                ui.label(match tool["taper_angle"].as_f64() {
+                    Some(a) => tf("manufacture.kind_with_taper", &[("kind", &kind), ("angle", &shown(a, 2))]),
+                    None => kind,
+                });
                 cell(ui, data("diameter", 3).map(|d| format!("{d} mm")));
                 cell(ui, data("flutes", 0));
                 // Each pair as the tool gives it or as it works out (without the machine's limit).
