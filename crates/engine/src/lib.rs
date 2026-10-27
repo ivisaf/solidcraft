@@ -40,8 +40,8 @@ use solidcraft_doc::{Document, Model, ModelState};
 use solidcraft_geom::Vec3;
 
 pub use cmd::{
-    CamPlayback, CamPreview, CommandInfo, CommandSpec, PreviewHeights, auto_operation, cam_heights, cam_list_ready, cam_playback, cam_preview,
-    cam_selection_heights, cam_slow, command_specs, extrude_reach, find_command, resolve_design_links, standard_view,
+    CamPlayback, CamPreview, CommandInfo, CommandSpec, PreviewHeights, auto_operation, cam_heights, cam_list_ready, cam_origin_pick, cam_playback,
+    cam_preview, cam_selection_heights, cam_slow, command_specs, extrude_reach, find_command, resolve_design_links, standard_view,
 };
 pub use solidcraft_cam as cam;
 pub use solidcraft_doc as doc;

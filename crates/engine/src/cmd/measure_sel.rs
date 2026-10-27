@@ -126,6 +126,14 @@ fn edge_round(b: &solidcraft_doc::ModelBody, m: &Mesh, index: usize, whole: bool
     Some(Shape::Round { center, axis, radius, angle, planar: true, lo: 0.0, hi: 0.0 })
 }
 
+/// The centre of the circle or arc mesh edge `index` of body `b` lies on (`None` when it is not round).
+pub(crate) fn edge_centre(b: &solidcraft_doc::ModelBody, index: usize) -> Option<Vec3> {
+    match edge_round(b, &b.mesh(), index, false)? {
+        Shape::Round { center, .. } => Some(center),
+        _ => None,
+    }
+}
+
 /// Points along a circle or arc (`angle` from `start` about `axis`).
 fn arc_points(center: Vec3, axis: UnitVec3, start: Vec3, angle: f64) -> Vec<Vec3> {
     let x = start - center;

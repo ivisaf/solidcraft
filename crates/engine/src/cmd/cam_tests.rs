@@ -429,6 +429,58 @@ fn stock_offsets_and_an_origin_on_the_stock_or_part_box() {
 }
 
 #[test]
+fn an_origin_on_a_corner_an_edge_or_a_circle_of_the_model() {
+    let mut s = machined_plate();
+    let origin = |s: &mut Session, o: Value| {
+        run(s, "cam.setup.edit", json!({"setup": "Setup1", "origin": o}));
+        xyz(&work_frame(s)["frame"]["origin"])
+    };
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "stock": {"side": 5, "top": 2}}));
+    // A vertex picked: that corner across, the stock's top by default, or the corner's own height.
+    assert!(near(origin(&mut s, json!({"edge": [0, 0, 0]})), [0.0, 0.0, 2.0]));
+    let o = &work_frame(&mut s)["origin"];
+    assert_eq!((o["type"].as_str(), o["on"].as_str()), (Some("edge"), Some("vertex")), "{o}");
+    assert!(near(origin(&mut s, json!({"edge": [0, 0, 0], "z": "point"})), [0.0, 0.0, 0.0]));
+    assert!(near(origin(&mut s, json!({"edge": [60, 40, -10], "z": {"of": "part", "z": "min"}})), [60.0, 40.0, -10.0]));
+    // A point on the hole's rim: its centre; on a straight edge: its middle.
+    let rim = 2.0 * std::f64::consts::FRAC_1_SQRT_2;
+    assert!(near(origin(&mut s, json!({"edge": [5.0 + rim, 35.0 + rim, 0]})), [5.0, 35.0, 2.0]));
+    // Where its two halves meet (the seam down the hole's side ends there too) is a corner.
+    assert!(near(origin(&mut s, json!({"edge": [7, 35, 0], "z": "point"})), [7.0, 35.0, 0.0]));
+    assert!(near(origin(&mut s, json!({"edge": [20, 0, 0], "on": "middle", "z": "point"})), [30.0, 0.0, 0.0]));
+    run(&mut s, "cam.op.face", json!({"tool": 1, "spindle_rpm": 10000, "feed": 800, "stepover": 5, "stepdown": 1}));
+    let notes = run(&mut s, "cam.post", json!({}))["gcode"].as_str().unwrap().to_string();
+    assert!(notes.contains("(Work zero G54: the middle of an edge of Body1, Z there)"), "{notes}");
+    let before = s.doc.manufacture.clone();
+    for bad in [
+        json!({"edge": [30, 20, 5]}),
+        json!({"edge": [20, 0, 0], "on": "center"}),
+        json!({"edge": [0, 0, 0], "on": "side"}),
+        json!({"edge": [0, 0, 0], "z": "top"}),
+        json!({"edge": [0, 0, 0], "body": "Nope"}),
+        json!({"edge": [0, 0, 0], "x": "min"}),
+    ] {
+        assert!(s.execute("cam.setup.edit", &json!({"setup": "Setup1", "origin": bad})).is_err(), "{bad}");
+    }
+    assert_eq!(s.doc.manufacture, before);
+
+    // It follows the design: a thicker plate moves the bottom corner with it.
+    let mut s = Session::default();
+    run(&mut s, "parameters.add", json!({"name": "t", "expression": "10 mm"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Plate"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [60, 40]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Plate", "distance": "t", "direction": "negative"}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"edge": [60, 0, -10], "z": "point"}}));
+    assert!(near(xyz(&work_frame(&mut s)["frame"]["origin"]), [60.0, 0.0, -10.0]));
+    run(&mut s, "parameters.change", json!({"name": "t", "expression": "15 mm"}));
+    assert!(near(xyz(&work_frame(&mut s)["frame"]["origin"]), [60.0, 0.0, -15.0]), "{}", work_frame(&mut s));
+    // Saved and read back as it was.
+    let text = s.doc.to_json();
+    assert_eq!(solidcraft_doc::Document::from_json(&text).unwrap().manufacture, s.doc.manufacture);
+}
+
+#[test]
 fn tool_axis_turns_the_setup() {
     let mut s = machined_plate();
     let contour = |setup: &str, point: [f64; 3]| json!({"setup": setup, "faces": [{"point": point}], "tool": 1, "spindle_rpm": 10000, "feed": 600, "ramp_angle": 0});

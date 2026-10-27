@@ -27,7 +27,17 @@ const FACE_LIMITS: [&str; 2] = ["over", "inside"];
 const AXES: [&str; 7] = ["+z", "-z", "+x", "-x", "+y", "-y", "custom"];
 const ANCHORS: [&str; 3] = ["min", "center", "max"];
 /// What the work origin is on.
-const ORIGINS: [&str; 3] = ["stock box", "part box", "world point"];
+const ORIGINS: [&str; 4] = ["stock box", "part box", "world point", "point of the model"];
+/// Which point of a picked edge the work origin is at, as `origin`'s `on` names it, and as forms say it.
+const EDGE_POINTS: [(&str, &str); 3] = [("vertex", "corner"), ("middle", "middle of the edge"), ("center", "centre of the circle")];
+/// Where a work origin on the model is along the tool axis: on a box (`of`, `z`), or the point's own height.
+const ORIGIN_ZS: [(Option<(&str, &str)>, &str); 5] = [
+    (Some(("stock", "max")), "stock top"),
+    (Some(("stock", "min")), "stock bottom"),
+    (Some(("part", "max")), "part top"),
+    (Some(("part", "min")), "part bottom"),
+    (None, "the point"),
+];
 /// Toolpath line widths: a name and the cutting moves' width in points (rapids are thinner).
 const PATH_WIDTHS: [(&str, f32); 3] = [("thin", 1.0), ("normal", 1.5), ("thick", 2.5)];
 /// From how thick material left on the part is shown in the simulated stock (mm): finer than a
@@ -298,6 +308,11 @@ pub struct SetupForm {
     pub origin: usize,
     pub anchors: [usize; 3],
     pub point: [String; 3],
+    /// A work origin on the model: the body and the point its edge (or vertex) was picked at,
+    /// which point of the edge ([`EDGE_POINTS`]) and its height ([`ORIGIN_ZS`]).
+    pub edge: Option<(String, Vec3)>,
+    pub edge_on: usize,
+    pub edge_z: usize,
     /// Index into [`STOCK_SHAPES`]; a set box's size along X, Y and Z, and a round bar's diameter.
     pub stock_shape: usize,
     pub stock_size: [String; 3],
@@ -708,6 +723,8 @@ pub struct CamUi {
     heights: Option<(u64, &'static str, Value, Heights)>,
     /// How high the selection reaches, for the design revision and the setup and selection asked about.
     selection_heights: Option<(u64, Value, Option<(f64, f64)>)>,
+    /// The corner or edge a setup's origin can be put on, for the design revision and selection asked about.
+    origin_pick: Option<(u64, Value, Option<(String, Vec3, solidcraft_engine::doc::manufacture::EdgePoint)>)>,
 }
 
 /// A setup's program shown running: the tool moving along the toolpaths and the stock cut as
@@ -799,6 +816,7 @@ impl Default for CamUi {
             cache: None,
             heights: None,
             selection_heights: None,
+            origin_pick: None,
         }
     }
 }
@@ -955,6 +973,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             origin: if app.session.world_state().bodies.is_empty() { 2 } else { 0 },
             anchors: [0, 0, 2],
             point: ["0".into(), "0".into(), "0".into()],
+            edge: None,
+            edge_on: 0,
+            edge_z: 0,
             stock_shape: 0,
             stock_size: Default::default(),
             diameter: String::new(),
@@ -1096,6 +1117,15 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 p.insert("axis".into(), json!(axis));
             }
             let origin = match f.origin {
+                3 => {
+                    let (body, at) = f.edge.as_ref().ok_or("Pick a corner or an edge of the model for the work origin")?;
+                    let on = EDGE_POINTS.get(f.edge_on).map_or("vertex", |e| e.0);
+                    let z = match ORIGIN_ZS.get(f.edge_z).map_or(ORIGIN_ZS[0].0, |z| z.0) {
+                        Some((of, z)) => json!({"of": of, "z": z}),
+                        None => json!("point"),
+                    };
+                    json!({"edge": at, "body": body, "on": on, "z": z})
+                }
                 2 => {
                     let [x, y, z] = &f.point;
                     json!([number("The origin's X", x)?, number("The origin's Y", y)?, number("The origin's Z", z)?])
@@ -1534,10 +1564,18 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
         origin: match (origin["type"].as_str(), origin["of"].as_str()) {
             (Some("box"), Some("part")) => 1,
             (Some("box"), _) => 0,
+            (Some("edge"), _) => 3,
             _ => 2,
         },
         anchors: [anchor("x"), anchor("y"), anchor("z")],
         point: [at.x.to_string(), at.y.to_string(), at.z.to_string()],
+        edge: (origin["type"].as_str() == Some("edge")).then(|| (text(origin, "body"), at)),
+        edge_on: EDGE_POINTS.iter().position(|e| Some(e.0) == origin["on"].as_str()).unwrap_or(0),
+        edge_z: {
+            let z = &origin["z"];
+            let wanted = (z["type"].as_str() == Some("box")).then(|| (z["of"].as_str().unwrap_or("stock"), z["z"].as_str().unwrap_or("max")));
+            ORIGIN_ZS.iter().position(|o| o.0 == wanted).unwrap_or(0)
+        },
         stock_shape: STOCK_SHAPES.iter().position(|(k, _)| Some(*k) == setup["stock"]["shape"]["type"].as_str()).unwrap_or(0),
         stock_size: ["x", "y", "z"].map(|k| text(&setup["stock"]["shape"], k)),
         diameter: text(&setup["stock"]["shape"], "diameter"),
@@ -1877,6 +1915,26 @@ fn picked_heights(app: &mut SolveApp) -> Option<(f64, f64)> {
     let h = solidcraft_engine::cam_selection_heights(&app.session, &setup, &app.session.selection).ok().flatten();
     app.manufacture.selection_heights = Some((revision, key, h));
     h
+}
+
+/// The selected corner or edge a setup form can put the work origin on, worked out again when
+/// the design or the selection changes.
+fn origin_pick(app: &mut SolveApp) -> Option<(String, Vec3, solidcraft_engine::doc::manufacture::EdgePoint)> {
+    let Some(Form::Setup(f)) = &app.manufacture.form else { return None };
+    if f.origin != 3 || app.session.selection.is_empty() {
+        return None;
+    }
+    let key = json!(app.session.selection);
+    let revision = app.session.revision;
+    if let Some((r, k, pick)) = &app.manufacture.origin_pick
+        && *r == revision
+        && *k == key
+    {
+        return pick.clone();
+    }
+    let pick = solidcraft_engine::cam_origin_pick(&app.session, &app.session.selection);
+    app.manufacture.origin_pick = Some((revision, key, pick.clone()));
+    pick
 }
 
 /// Works out the open operation form's toolpath again when its command or the design changed;
@@ -2678,6 +2736,12 @@ fn help(label: &str) -> Option<&'static str> {
             "Which bodies are the part, by name, apart by commas. Others (a fixture, a modelled stock) are neither cut round nor checked against. Empty: every body."
         }
         "Origin on" => "What the work zero sits on: the raw block, the part, or a point you give.",
+        "Origin point" => {
+            "The corner or edge of the model the work zero is on. Click it in the view, then take it here. It moves with the model when the design changes."
+        }
+        "Origin at" => {
+            "Which point of the picked edge: its corner nearest where you clicked, its middle, or the centre of its circle (a hole, a round boss)."
+        }
         "Origin X" | "Origin Y" | "Origin Z" => "Where on it the work zero sits, the point the machine is zeroed on.",
         "Post" => "Which machine dialect the G-code is written in.",
         "X direction" => {
@@ -3094,6 +3158,8 @@ struct Choices {
     setups: Vec<(String, String)>,
     /// The bodies the selection is on, each once: what a setup can take as its part.
     bodies: Vec<String>,
+    /// The selected corner or edge a setup's work origin can be put on (see [`solidcraft_engine::cam_origin_pick`]).
+    origin_pick: Option<(String, Vec3, solidcraft_engine::doc::manufacture::EdgePoint)>,
 }
 
 type Heights = Result<(Option<f64>, Option<f64>), String>;
@@ -3171,7 +3237,7 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             bodies.push(name.clone());
         }
     }
-    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups, bodies }
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups, bodies, origin_pick: None }
 }
 
 /// The spindle speed (rev/min) and feed (mm/min) a listed tool cuts at: in a material, `cut`'s
@@ -3610,7 +3676,31 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                 }
             }
             choice(ui, need, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
-            if f.origin == 2 {
+            if f.origin == 3 {
+                // What was picked, and a button that takes what is selected now.
+                row_label(ui, "Origin point", needed(need, "Origin point"));
+                let shown = match &f.edge {
+                    Some((body, _)) => tf("manufacture.on_the_body", &[("body", body)]),
+                    None => tm("nothing picked yet").to_string(),
+                };
+                explained(ui.label(shown), "Origin point", needed(need, "Origin point"));
+                ui.end_row();
+                let now = choices.origin_pick.as_ref().map(|(body, at, _)| (body.clone(), *at));
+                if let Some((body, at, on)) = choices.origin_pick.as_ref().filter(|_| now != f.edge) {
+                    ui.label("");
+                    if button(ui, tm("Take the selected corner or edge"), Button::Small).clicked() {
+                        f.edge = Some((body.clone(), *at));
+                        f.edge_on = match on {
+                            solidcraft_engine::doc::manufacture::EdgePoint::Vertex => 0,
+                            solidcraft_engine::doc::manufacture::EdgePoint::Middle => 1,
+                            solidcraft_engine::doc::manufacture::EdgePoint::Center => 2,
+                        };
+                    }
+                    ui.end_row();
+                }
+                choice(ui, need, "sc_cam_setup_edge_on", "Origin at", &mut f.edge_on, &EDGE_POINTS.map(|e| e.1));
+                choice(ui, need, "sc_cam_setup_edge_z", "Origin Z", &mut f.edge_z, &ORIGIN_ZS.map(|z| z.1));
+            } else if f.origin == 2 {
                 let [x, y, z] = &mut f.point;
                 field(ui, need, "Origin X", x, "0");
                 field(ui, need, "Origin Y", y, "0");
@@ -3964,6 +4054,9 @@ fn missing(form: &Form, lists: &Choices) -> Vec<Need> {
             }
         }
         Form::Setup(f) => {
+            if f.origin == 3 && f.edge.is_none() {
+                want("Origin point", "a corner or an edge of the model: click it, then take it");
+            }
             if f.origin == 2 {
                 for (field, value) in [("Origin X", &f.point[0]), ("Origin Y", &f.point[1]), ("Origin Z", &f.point[2])] {
                     if empty(value) {
@@ -4762,6 +4855,7 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let mut lists = choices(app, &listed, &library);
     lists.heights = form_heights(app);
     lists.picked = picked_heights(app);
+    lists.origin_pick = origin_pick(app);
     update_preview(app, &lists);
     lists.cut_heights = match &app.manufacture.preview {
         Some((_, _, Ok(p))) => p.heights.clone(),

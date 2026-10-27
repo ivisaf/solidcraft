@@ -116,6 +116,45 @@ pub enum SetupOrigin {
     /// A point of the box around the stock or the part, in the setup's own axes: a corner, the
     /// middle of an edge or a face, or the centre. It follows the design.
     Box { of: BoxOf, x: Anchor, y: Anchor, z: Anchor },
+    /// A point of a body's edge: the end nearest `at`, its middle, or the centre of its circle,
+    /// across the tool axis; its height from `z`. It follows the design: the edge is found by
+    /// its persistent name `edge` on `body`, else as the piece of it nearest `at`.
+    Edge {
+        body: String,
+        edge: String,
+        at: Vec3,
+        on: EdgePoint,
+        #[serde(default)]
+        z: OriginZ,
+    },
+}
+
+/// Which point of an edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgePoint {
+    /// The end nearest the point it was picked at (a corner).
+    Vertex,
+    /// Halfway along it.
+    Middle,
+    /// The centre of the circle or arc it is.
+    Center,
+}
+
+/// Where a work origin on an edge is along the tool axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OriginZ {
+    /// The edge's point itself.
+    Point,
+    /// The bottom, middle or top of the box round the stock or the part.
+    Box { of: BoxOf, z: Anchor },
+}
+
+impl Default for OriginZ {
+    fn default() -> Self {
+        OriginZ::Box { of: BoxOf::Stock, z: Anchor::Max }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

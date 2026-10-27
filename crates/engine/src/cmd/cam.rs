@@ -10,7 +10,8 @@ use solidcraft_cam::{
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{
-    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, FaceRef, Setup, SetupOrigin, StockDef, StockShape, TabsDef,
+    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, EdgePoint, FaceRef, OriginZ, Setup, SetupOrigin, StockDef, StockShape,
+    TabsDef,
 };
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
@@ -51,7 +52,10 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
      the axis, centred on the part across, from `bottom` below the part to `top` above it; no copies); bodies?: [names] the bodies that are the part \
      (default, or null: all; others are neither cut round nor checked against); origin?: the work origin: \
      [x, y, z] in the world, or {of?: stock|part, x?, y?, z?: min|center|max} on the stock's or the part's box in the setup's axes (default of \
-     the object: the stock's top at its lowest X and Y; default without `origin`: the world origin); post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
+     the object: the stock's top at its lowest X and Y; default without `origin`: the world origin), or {edge: [x, y, z] a point on a body's edge \
+     or a vertex, body?, on?: vertex|middle|center (the end nearest the point, halfway along, or the centre of its circle; default: vertex at an \
+     end, else center on a round edge, else middle), z?: point | {of?: stock|part, z?: min|center|max} (default: the stock's top)}: across the \
+     tool axis at that point of the edge, which it follows as the design changes; post?: rs274|grbl|grblhal|lnc|lnc_atc (default \
      rs274); material?: what the stock is made of (operations take their tool's cutting data for it; null: none); work_offset?: G54 to G59 \
      (or 54 to 59; default G54), the work offset its programs run in; stock_from?: an earlier setup (id or name; null: none) whose result \
      is the stock, its tool axis the same or turned over (the part turned over about the world X axis for a setup from -z); x_axis?: the setup's X direction across its \
@@ -837,7 +841,7 @@ fn setup_create(s: &mut Session, p: &Value) -> Result<Value> {
         None => (setups.len() + 1..).map(|k| format!("Setup{k}")).find(|n| !setups.iter().any(|x| x.name == *n)).unwrap_or_default(),
     };
     let origin = match p.get("origin") {
-        Some(v) => origin_param(v, cmd)?,
+        Some(v) => origin_param(s, v, cmd)?,
         None => SetupOrigin::Point { at: Vec3::ZERO },
     };
     let axis = match p.get("axis") {
@@ -899,7 +903,7 @@ fn setup_edit(s: &mut Session, p: &Value) -> Result<Value> {
         setup.axis = axis_param(v, cmd)?;
     }
     if let Some(v) = p.get("origin") {
-        setup.origin = origin_param(v, cmd)?;
+        setup.origin = origin_param(s, v, cmd)?;
     }
     if let Some(v) = p.get("stock") {
         setup.stock = stock_param(s, v, &setup.stock, cmd)?;
@@ -957,30 +961,142 @@ fn axis_param(v: &Value, cmd: &str) -> Result<Vec3> {
     named.or_else(|| vec3(v).and_then(|d| d.normalized())).ok_or_else(|| bad(cmd, "`axis` must be +x, -x, +y, -y, +z, -z or a direction [x, y, z]"))
 }
 
-/// The work origin from a world point `[x, y, z]` or `{of?: stock|part, x?, y?, z?: min|center|max}`.
-fn origin_param(v: &Value, cmd: &str) -> Result<SetupOrigin> {
+/// The work origin from a world point `[x, y, z]`, `{of?: stock|part, x?, y?, z?: min|center|max}`
+/// or `{edge: [x, y, z], body?, on?: vertex|middle|center, z?: point | {of?, z?}}`.
+fn origin_param(s: &Session, v: &Value, cmd: &str) -> Result<SetupOrigin> {
     if let Some(at) = vec3(v).filter(|o| o.x.abs() <= 1e6 && o.y.abs() <= 1e6 && o.z.abs() <= 1e6) {
         return Ok(SetupOrigin::Point { at });
     }
-    let wrong =
-        || bad(cmd, "`origin` must be [x, y, z] or {of?: stock|part, x?, y?, z?: min|center|max} (default: the stock's top, at its lowest X and Y)");
+    let wrong = || {
+        bad(
+            cmd,
+            "`origin` must be [x, y, z], {of?: stock|part, x?, y?, z?: min|center|max} or {edge: [x, y, z], body?, on?: vertex|middle|center, \
+             z?: point | {of?: stock|part, z?: min|center|max}} (default: the stock's top, at its lowest X and Y)",
+        )
+    };
     let o = v.as_object().ok_or_else(wrong)?;
+    if o.contains_key("edge") {
+        return edge_origin_param(s, o, cmd);
+    }
     if o.keys().any(|k| !matches!(k.as_str(), "of" | "x" | "y" | "z")) {
         return Err(wrong());
     }
-    let of = match o.get("of").map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
-        None | Some("stock") => BoxOf::Stock,
-        Some("part") => BoxOf::Part,
-        _ => return Err(wrong()),
-    };
-    let anchor = |k: &str, default: Anchor| match o.get(k).map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
-        None => Ok(default),
-        Some("min") => Ok(Anchor::Min),
-        Some("center" | "centre" | "mid" | "middle") => Ok(Anchor::Center),
-        Some("max") => Ok(Anchor::Max),
-        _ => Err(wrong()),
-    };
+    let of = box_of(o.get("of")).ok_or_else(wrong)?;
+    let anchor = |k: &str, default: Anchor| anchor_param(o.get(k), default).ok_or_else(wrong);
     Ok(SetupOrigin::Box { of, x: anchor("x", Anchor::Min)?, y: anchor("y", Anchor::Min)?, z: anchor("z", Anchor::Max)? })
+}
+
+/// Which box, from `stock` or `part` (default: the stock's).
+fn box_of(v: Option<&Value>) -> Option<BoxOf> {
+    match v.map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
+        None | Some("stock") => Some(BoxOf::Stock),
+        Some("part") => Some(BoxOf::Part),
+        _ => None,
+    }
+}
+
+/// Where along a box's axis, from `min`, `center` or `max`.
+fn anchor_param(v: Option<&Value>, default: Anchor) -> Option<Anchor> {
+    match v.map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
+        None => Some(default),
+        Some("min") => Some(Anchor::Min),
+        Some("center" | "centre" | "mid" | "middle") => Some(Anchor::Center),
+        Some("max") => Some(Anchor::Max),
+        _ => None,
+    }
+}
+
+/// A work origin on the body edge nearest `edge` (a point on it or one of its ends).
+fn edge_origin_param(s: &Session, o: &serde_json::Map<String, Value>, cmd: &str) -> Result<SetupOrigin> {
+    let wrong = |what: &str| bad(cmd, format!("the origin's {what}"));
+    if o.keys().any(|k| !matches!(k.as_str(), "edge" | "body" | "on" | "z")) {
+        return Err(wrong("keys are edge, body, on and z"));
+    }
+    let at = o.get("edge").and_then(vec3).filter(|p| p.is_finite()).ok_or_else(|| wrong("`edge` must be [x, y, z], a point on the edge"))?;
+    let wanted = match o.get("body") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| wrong("`body` must be a body's name"))?),
+    };
+    let state = s.model.state();
+    // The edge nearest the point, of the bodies it may be on; of edges through it, one it lies
+    // along before one that ends there (a hole's rim, not the seam down its side).
+    let mut best: Option<((u8, f64), &solidcraft_doc::ModelBody, usize)> = None;
+    for b in state.bodies.iter().filter(|b| !b.body.is_mesh() && wanted.is_none_or(|w| b.name.eq_ignore_ascii_case(w))) {
+        let (m, tol) = (b.mesh(), (b.body.size() * 1e-3).max(1e-3));
+        for (i, e) in m.edges.iter().enumerate() {
+            let d = e.windows(2).map(|w| at.dist_to_segment(w[0], w[1])).fold(f64::MAX, f64::min);
+            let ends_there = [e.first(), e.last()].into_iter().flatten().any(|p| p.dist(at) <= tol);
+            let key = (u8::from(!(d <= tol && !ends_there)), d);
+            if best.as_ref().is_none_or(|(bk, ..)| key.0.cmp(&bk.0).then(key.1.total_cmp(&bk.1)).is_lt()) {
+                best = Some((key, b, i));
+            }
+        }
+    }
+    let ((_, d), body, index) = best.ok_or_else(|| wrong("edge: there is no body edge"))?;
+    let tol = (body.body.size() * 1e-3).max(1e-3);
+    if d > tol {
+        return Err(bad(cmd, format!("no body edge at [{}, {}, {}]", mm(at.x), mm(at.y), mm(at.z))));
+    }
+    let edge = solidcraft_doc::naming::edge_names(body).get(index).cloned().filter(|n| !n.is_empty()).ok_or_else(|| wrong("edge has no name"))?;
+    let on = match o.get("on").map(|x| x.as_str().unwrap_or_default().to_ascii_lowercase()).as_deref() {
+        Some("vertex" | "corner" | "end") => EdgePoint::Vertex,
+        Some("middle" | "mid") => EdgePoint::Middle,
+        Some("center" | "centre") => EdgePoint::Center,
+        None => {
+            let pts = body.mesh().edges.get(index).cloned().unwrap_or_default();
+            let at_end = [pts.first(), pts.last()].into_iter().flatten().any(|p| p.dist(at) <= tol);
+            if at_end {
+                EdgePoint::Vertex
+            } else if super::measure_sel::edge_centre(body, index).is_some() {
+                EdgePoint::Center
+            } else {
+                EdgePoint::Middle
+            }
+        }
+        Some(_) => return Err(wrong("`on` must be vertex, middle or center")),
+    };
+    if on == EdgePoint::Center && super::measure_sel::edge_centre(body, index).is_none() {
+        return Err(bad(cmd, "the origin's edge is not round: it has no centre (take its vertex or middle)"));
+    }
+    let z = match o.get("z") {
+        None => OriginZ::default(),
+        Some(Value::String(t)) if t.eq_ignore_ascii_case("point") => OriginZ::Point,
+        Some(Value::Object(z)) if z.keys().all(|k| matches!(k.as_str(), "of" | "z")) => OriginZ::Box {
+            of: box_of(z.get("of")).ok_or_else(|| wrong("z's `of` must be stock or part"))?,
+            z: anchor_param(z.get("z"), Anchor::Max).ok_or_else(|| wrong("z's `z` must be min, center or max"))?,
+        },
+        Some(_) => return Err(wrong("`z` must be point or {of?: stock|part, z?: min|center|max}")),
+    };
+    Ok(SetupOrigin::Edge { body: body.name.clone(), edge, at, on, z })
+}
+
+/// The point `on` of the edge `name` of `body` (found by name, else as the piece nearest `at`).
+fn edge_origin(body: &solidcraft_doc::ModelBody, name: &str, at: Vec3, on: EdgePoint) -> std::result::Result<Vec3, String> {
+    let hit = solidcraft_doc::naming::locate_edge(body, name, at).map_err(|e| format!("the setup's origin: {e}"))?;
+    let m = body.mesh();
+    let pts = m.edges.get(hit.edge).filter(|e| !e.is_empty()).ok_or("the setup's origin edge has no points")?;
+    match on {
+        EdgePoint::Vertex => [pts.first(), pts.last()]
+            .into_iter()
+            .flatten()
+            .min_by(|a, b| a.dist(at).total_cmp(&b.dist(at)))
+            .copied()
+            .ok_or_else(|| "the setup's origin edge has no ends".into()),
+        EdgePoint::Middle => {
+            let half = pts.windows(2).map(|w| w[0].dist(w[1])).sum::<f64>() * 0.5;
+            let mut gone = 0.0;
+            for w in pts.windows(2) {
+                let l = w[0].dist(w[1]);
+                if gone + l >= half && l > 0.0 {
+                    return Ok(w[0] + (w[1] - w[0]) * ((half - gone) / l));
+                }
+                gone += l;
+            }
+            pts.first().copied().ok_or_else(|| "the setup's origin edge has no points".into())
+        }
+        EdgePoint::Center => super::measure_sel::edge_centre(body, hit.edge)
+            .ok_or_else(|| format!("the setup's origin edge `{name}` is no longer round: it has no centre")),
+    }
 }
 
 /// Stock from `{side?, top?, bottom?, shape?, size?, diameter?}`; what is left out keeps its value in `was`.
@@ -1181,20 +1297,39 @@ fn resolve(s: &Session, setup: &Setup) -> std::result::Result<Resolved, String> 
             Some((Vec3::new(c.x - r, c.y - r, lo.z - bottom), Vec3::new(c.x + r, c.y + r, hi.z + top)))
         }
     };
+    let boxed = |of: &BoxOf| {
+        match of {
+            BoxOf::Stock => stock,
+            BoxOf::Part => part,
+        }
+        .ok_or("the setup's origin is on the box round the bodies, and there is no body")
+    };
+    let at = |a: &Anchor, lo: f64, hi: f64| match a {
+        Anchor::Min => lo,
+        Anchor::Center => (lo + hi) * 0.5,
+        Anchor::Max => hi,
+    };
     let o = match &setup.origin {
         SetupOrigin::Point { at } => *at,
         SetupOrigin::Box { of, x: ax, y: ay, z: az } => {
-            let (lo, hi) = match of {
-                BoxOf::Stock => stock,
-                BoxOf::Part => part,
-            }
-            .ok_or("the setup's origin is on the box round the bodies, and there is no body")?;
-            let at = |a: &Anchor, lo: f64, hi: f64| match a {
-                Anchor::Min => lo,
-                Anchor::Center => (lo + hi) * 0.5,
-                Anchor::Max => hi,
-            };
+            let (lo, hi) = boxed(of)?;
             x * at(ax, lo.x, hi.x) + y * at(ay, lo.y, hi.y) + z * at(az, lo.z, hi.z)
+        }
+        SetupOrigin::Edge { body, edge, at: near, on, z: oz } => {
+            let b = state
+                .bodies
+                .iter()
+                .find(|b| b.name.eq_ignore_ascii_case(body))
+                .ok_or_else(|| format!("the setup's origin is on the body `{body}`, which the design no longer has"))?;
+            let p = edge_origin(b, edge, *near, *on)?;
+            let height = match oz {
+                OriginZ::Point => p.dot(z),
+                OriginZ::Box { of, z: az } => {
+                    let (lo, hi) = boxed(of)?;
+                    at(az, lo.z, hi.z)
+                }
+            };
+            x * p.dot(x) + y * p.dot(y) + z * height
         }
     };
     let shift = Vec3::new(o.dot(x), o.dot(y), o.dot(z));
@@ -2437,6 +2572,22 @@ pub fn cam_selection_heights(s: &Session, p: &Value, selection: &[crate::Sel]) -
         .fold(None, |r: Option<(f64, f64)>, z| Some(r.map_or((z, z), |(lo, hi)| (lo.min(z), hi.max(z))))))
 }
 
+/// The work origin the selection offers: the first selected vertex or body edge, as `origin`'s
+/// `{edge, body}` takes it, and which of its points fits (a vertex's corner, a round edge's
+/// centre, else its middle).
+pub fn cam_origin_pick(s: &Session, selection: &[crate::Sel]) -> Option<(String, Vec3, EdgePoint)> {
+    let state = s.model.state();
+    selection.iter().take(MAX_SELECTED).find_map(|item| match item {
+        crate::Sel::Vertex { body, point } => Some((body.clone(), *point, EdgePoint::Vertex)),
+        crate::Sel::Edge { body, index, point } => {
+            let b = state.body(body).filter(|b| !b.body.is_mesh())?;
+            let round = super::measure_sel::edge_centre(b, *index).is_some();
+            Some((body.clone(), *point, if round { EdgePoint::Center } else { EdgePoint::Middle }))
+        }
+        _ => None,
+    })
+}
+
 /// Reads what every operation takes and adds the operation once its toolpath has been worked out.
 fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(&Tool) -> CamOperationKind) -> Result<Value> {
     let si = setup_index(s, p, cmd)?;
@@ -3640,6 +3791,18 @@ fn program_notes(setup: &Setup, at: &Resolved, ops: &[cam::Operation], minutes: 
             format!("Work zero G{}: {of} box, X {x}, Y {y}, Z {z}", setup.work_offset)
         }
         SetupOrigin::Point { at } => format!("Work zero G{}: the world point {}, {}, {}", setup.work_offset, mm(at.x), mm(at.y), mm(at.z)),
+        SetupOrigin::Edge { body, on, z, .. } => {
+            let on = match on {
+                EdgePoint::Vertex => "a corner",
+                EdgePoint::Middle => "the middle of an edge",
+                EdgePoint::Center => "the centre of a round edge",
+            };
+            let z = match z {
+                OriginZ::Point => "Z there".to_string(),
+                OriginZ::Box { of, z } => format!("Z on the {} {}", if *of == BoxOf::Stock { "stock" } else { "part" }, side(*z, "bottom", "top")),
+            };
+            format!("Work zero G{}: {on} of {body}, {z}", setup.work_offset)
+        }
     });
     // Seen from below: how the part is turned over for it.
     if setup.axis.z < -1.0 + 1e-9 {

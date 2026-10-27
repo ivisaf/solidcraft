@@ -326,6 +326,41 @@ fn setup_form_sets_stock_origin_and_axis_and_they_are_drawn() {
 }
 
 #[test]
+fn the_work_origin_is_taken_from_a_picked_corner() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    h.app.start("cam.setup.create");
+    let Some(Form::Setup(f)) = h.app.manufacture.form.as_mut() else { panic!("not a setup form") };
+    f.origin = 3;
+    h.frames(2);
+    assert!(h.widget("Take the selected corner or edge").is_none(), "nothing selected to take");
+    assert!(ok_enabled(&h) == Some(false), "OK waits for a picked point");
+    // The box's far top corner, clicked: the origin is on it, at the stock's top.
+    let corner = Vec3::new(60.0, 40.0, 10.0);
+    h.app.session.selection = vec![solidcraft_engine::Sel::Vertex { body: "Body1".into(), point: corner }];
+    h.frames(2);
+    h.step(&json!({"widget": "Take the selected corner or edge"})).unwrap();
+    h.frames(1);
+    let Some(Form::Setup(f)) = &h.app.manufacture.form else { panic!("the form stays open") };
+    assert_eq!((f.edge.clone(), f.edge_on, f.edge_z), (Some(("Body1".to_string(), corner)), 0, 0));
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let close = |a: Vec3, b: [f64; 3]| a.dist(Vec3::new(b[0], b[1], b[2])) < 1e-6;
+    let view = setup_views(&mut h.app).first().cloned().expect("a setup to draw");
+    assert!(close(view.frame[0], [60.0, 40.0, 10.0]), "{view:?}");
+    // Edit opens on it; Z at the part's bottom moves the origin down to the box's foot.
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Setup(mut form)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
+    assert_eq!((form.origin, form.edge.clone(), form.edge_on, form.edge_z), (3, Some(("Body1".to_string(), corner)), 0, 0));
+    form.edge_z = 3;
+    h.app.manufacture.form = Some(Form::Setup(form));
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let view = setup_views(&mut h.app).first().cloned().unwrap();
+    assert!(close(view.frame[0], [60.0, 40.0, 0.0]), "{view:?}");
+}
+
+#[test]
 fn facing_boundary_and_posting_one_operation_or_the_setup() {
     let mut h = lab();
     h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
