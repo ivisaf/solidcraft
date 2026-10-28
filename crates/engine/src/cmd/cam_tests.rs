@@ -2342,6 +2342,74 @@ fn adaptive_3d_roughs_the_stock_down_to_the_model() {
     assert!(sim["max_gouge"].as_f64().unwrap() < 0.05, "{sim}");
 }
 
+/// Faces of the part with a role in a 3D operation: one avoided is kept its clearance off, one
+/// with its own allowance keeps that, one ignored is cut through without a warning; the
+/// simulation does not count what is meant to be left.
+#[test]
+fn faces_ignored_avoided_or_left_material_on_in_3d_finishing() {
+    use solidcraft_doc::manufacture::Role;
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 40, "width": 30, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [10, 8], "p1": [30, 22]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.extrude", json!({"sketch": "Window", "distance": -4, "operation": "cut"}));
+    run(&mut s, "cam.tool.define", json!({"number": 2, "kind": "ball", "diameter": 4, "spindle_rpm": 15000, "feed": 800}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"of": "stock", "x": "min", "y": "min", "z": "max"}}));
+    let floor = json!([20, 15, 6]);
+    let finish = |s: &mut Session, roles: Value| {
+        let made = run(s, "cam.op.parallel3d", json!({"tool": 2, "stepover": 1, "face_roles": roles}));
+        let lowest = made["lowest_z"].as_f64().unwrap_or(f64::NAN);
+        let listed = run(s, "cam.list", json!({}));
+        let warning = listed["setups"][0]["operations"][0]["warning"].as_str().unwrap_or("").to_string();
+        let sim = run(s, "cam.simulate", json!({"columns": 200}));
+        run(s, "cam.op.remove", json!({"op": made["operation"]}));
+        (lowest, warning, sim["leftover_volume"].as_f64().unwrap_or(f64::NAN))
+    };
+    // The pocket's floor is 4 mm under the part's top, the work zero at the top.
+    let (plain, plain_warning, plain_left) = finish(&mut s, json!([]));
+    assert!((plain + 4.0).abs() < 0.05 && plain_warning.is_empty(), "{plain} {plain_warning}");
+    let (avoided, _, avoided_left) = finish(&mut s, json!([{"point": floor, "role": "avoid", "clearance": 2}]));
+    assert!((avoided + 2.0).abs() < 0.05, "kept 2 mm off the floor: {avoided}");
+    // 2 mm over the 20 × 14 mm floor is meant to be there: not counted as left over.
+    assert!(avoided_left < plain_left + 100.0, "{avoided_left} against {plain_left}");
+    let (left, _, _) = finish(&mut s, json!([{"point": floor, "role": "leave", "stock_to_leave": 0.5}]));
+    assert!((left + 3.5).abs() < 0.05, "0.5 mm left on the floor: {left}");
+    // The part's top ignored: the tool goes down through it to the bottom, unwarned.
+    let made = run(&mut s, "cam.op.parallel3d", json!({"tool": 2, "stepover": 2, "face_roles": [{"point": [2, 2, 10], "role": "ignore"}]}));
+    assert!(matches!(s.doc.manufacture.setups[0].operations[0].face_roles[0].role, Role::Ignore));
+    let path = run(&mut s, "cam.toolpath", json!({"op": made["operation"]}));
+    // Points in the world: the top at z 10.
+    let points = path["operations"][0]["points"].as_array().cloned().unwrap_or_default();
+    assert!(
+        points.iter().any(|q| q[0].as_f64().is_some_and(|x| x < 8.0) && q[2].as_f64().is_some_and(|z| z < 7.0)),
+        "through the top beside the pocket"
+    );
+    let warning = run(&mut s, "cam.list", json!({}))["setups"][0]["operations"][0]["warning"].clone();
+    assert!(warning.as_str().is_none_or(|w| !w.contains("into the part")), "{warning}");
+    // Edited away again; saved and opened with the design.
+    run(&mut s, "cam.op.edit", json!({"op": made["operation"], "face_roles": [{"point": floor, "role": "avoid"}]}));
+    assert!(matches!(s.doc.manufacture.setups[0].operations[0].face_roles[0].role, Role::Avoid { clearance } if clearance == 1.0));
+    let opened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(opened.manufacture.setups[0].operations[0].face_roles, s.doc.manufacture.setups[0].operations[0].face_roles);
+    run(&mut s, "cam.op.edit", json!({"op": made["operation"], "face_roles": null}));
+    assert!(s.doc.manufacture.setups[0].operations[0].face_roles.is_empty());
+    for bad in [
+        json!({"tool": 2, "face_roles": [{"point": floor, "role": "cut"}]}),
+        json!({"tool": 2, "face_roles": [{"point": floor, "role": "leave"}]}),
+        json!({"tool": 2, "face_roles": [{"point": floor, "role": "avoid", "clearance": -1}]}),
+        json!({"tool": 2, "face_roles": [{"point": [500, 500, 500], "role": "ignore"}]}),
+        json!({"tool": 2, "face_roles": "x"}),
+    ] {
+        assert!(s.execute("cam.op.parallel3d", &bad).is_err(), "{bad}");
+    }
+    // Only operations that follow the model take roles.
+    assert!(
+        s.execute("cam.op.pocket", &json!({"sketch": "Window", "tool": 2, "bottom": -2, "face_roles": [{"point": floor, "role": "ignore"}]}))
+            .is_err()
+    );
+}
+
 #[test]
 fn parallel_finishing_follows_the_model_after_roughing() {
     use solidcraft_doc::manufacture::{CamGeometry, CamOperationKind};

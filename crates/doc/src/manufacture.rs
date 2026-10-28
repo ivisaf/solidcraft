@@ -248,6 +248,27 @@ pub struct CamOperation {
     /// Where to cut.
     pub geometry: CamGeometry,
     pub kind: CamOperationKind,
+    /// What particular faces of the part are to a 3D operation; every other face is machined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub face_roles: Vec<FaceRole>,
+}
+
+/// A face of the part and what it is to an operation, other than machined.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceRole {
+    pub face: FaceRef,
+    pub role: Role,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum Role {
+    /// Left out of the part the operation sees: the tool may cut through it.
+    Ignore,
+    /// Kept at least `clearance` away from (mm).
+    Avoid { clearance: f64 },
+    /// This much left on it instead of the operation's own allowance (mm).
+    Leave { stock_to_leave: f64 },
 }
 
 /// What an operation's regions come from.

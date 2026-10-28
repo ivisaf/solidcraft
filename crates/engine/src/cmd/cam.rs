@@ -10,8 +10,8 @@ use solidcraft_cam::{
 use solidcraft_doc::Expr;
 use solidcraft_doc::expr::Kind;
 use solidcraft_doc::manufacture::{
-    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, EdgePoint, FaceRef, OriginZ, Setup, SetupOrigin, StockDef, StockShape,
-    TabsDef,
+    Anchor, BoxOf, CamGeometry, CamOperation, CamOperationKind, Clamp, Copies, EdgePoint, FaceRef, FaceRole, OriginZ, Role, Setup, SetupOrigin,
+    StockDef, StockShape, TabsDef,
 };
 use solidcraft_doc::sketch::{LinkGeom, LinkKind};
 use solidcraft_geom::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
@@ -41,6 +41,7 @@ macro_rules! op_doc {
             "; library?: the machine's tool library file (default: this machine's); sketch: id or name, with profiles?: as solid.extrude (default all) — or faces: [{body?, point: [x, y, z]}], planar faces square to Z (a pocket's floor, a part's top; their holes are islands, or what a drill drills) or round walls along Z (a hole's or a boss's: their circle, from the wall's top to its foot); tool: number, from this design or the machine's library (the design then keeps a copy); spindle_rpm?, feed?: mm/min, plunge_feed?: mm/min \
              (defaults: the tool's data in the setup's material, else its own, a surface speed and chip load worked out for its diameter and flutes; plunge_feed else feed/3); max_spindle_rpm?: the machine's spindle, which a worked-out speed is cut down to (a chip load then feeds slower); bottom?, top?: exprs in the setup's Z (a sketch gives the top and needs `bottom`; faces give both from the face and its body); \
              retract?: expr (default top + 2 mm); clearance?: expr (default 10 mm above the top and the body); stepdown?: expr (default: the tool's, else half its diameter); passes?: how many depth passes instead (each the depth over this; null: by the stepdown); coolant?: bool; \
+             face_roles?: (3D adaptive, 3D parallel and 3D Z-level) [{body?, point: [x, y, z], role: ignore|avoid|leave, clearance?: mm (avoid; default 1), stock_to_leave?: mm (leave)}] what particular faces of the part are to it, every other face being machined: ignore leaves the face out of the part it follows (the tool may cut through it; it is not warned about), avoid keeps the tool at least clearance off it, leave leaves that much on it instead of stock_to_leave (null or []: none); \
              setup?: id or name (default: the only setup); name? → operation: id, name, and its toolpath's cut_length, rapid_length, cut_minutes"
         )
     };
@@ -154,7 +155,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.op.drill", "Drill", op_drill).at("MANUFACTURE", "DRILLING").icon("cam_drill").params(op_doc!("peck?: expr (depth per peck; default one pass); dwell?: seconds at the bottom; drills at the centre of each profile at the plunge feed")),
     CommandSpec::new("cam.op.edit", "Edit Operation", op_edit).icon("edit").params(
         "op: id or name; setup?: id or name; then any input of the operation's own command to change it (name, tool, spindle_rpm, feed, \
-         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, stepover_percent, helix_angle, helix_max, helix_min, feed_up, pitch, width, tip_offset, peck, dwell); a height \
+         plunge_feed, coolant, stepdown, passes, sketch with profiles?, faces, face_roles, boundary, limit, margin, stepover, side, climb, stock_to_leave, ramp_angle, tabs, finish, rest_from, stepover_percent, helix_angle, helix_max, helix_min, feed_up, pitch, width, tip_offset, peck, dwell); a height \
          (top, bottom, retract, clearance) or peck given as null goes back to automatic → the operation's toolpath lengths and time",
     ),
     CommandSpec::new("cam.op.move", "Move Operation", op_move).icon("reorder")
@@ -2030,9 +2031,96 @@ fn setup_part(s: &Session, at: &Resolved) -> Option<cam::HeightField> {
     part_field_with(s, at, Vec2::new(lo.x, lo.y) - around, Vec2::new(hi.x, hi.y) + around, lo.z - 1.0, false)
 }
 
+/// [`setup_part`] as an operation sees the part: without the faces it ignores.
+fn op_part_field(s: &Session, at: &Resolved, op: &CamOperation) -> Option<cam::HeightField> {
+    let (lo, hi) = at.part?;
+    let reach = s.doc.manufacture.tools.iter().map(|t| t.diameter).fold(1.0, f64::max);
+    let (lo2, hi2) = (Vec2::new(lo.x - reach, lo.y - reach), Vec2::new(hi.x + reach, hi.y + reach));
+    let triangles = op_part(s, at, op, None);
+    let cell = ((hi2.x - lo2.x).max(hi2.y - lo2.y) / 300.0).max(0.05);
+    cam::HeightField::of_triangles(lo2, hi2, cell, lo.z - 1.0, &triangles, false).ok()
+}
+
 /// The bodies' triangles in a setup's work coordinates.
 fn part_triangles(s: &Session, at: &Resolved) -> Vec<[Vec3; 3]> {
     triangles_of(s, at, |name| at.is_part(name))
+}
+
+/// The part as an operation sees it, in a setup's work coordinates: the bodies' triangles less
+/// the faces it ignores. With `allowance` (the operation's own stock to leave), a face to avoid
+/// or to leave material on is there again as far out beyond the allowance as it asks (its
+/// triangles moved along their normals), or in its place as far in where it asks for less; the
+/// tool, grown by the allowance, then keeps that far off it. Without, those faces are as they are.
+fn op_part(s: &Session, at: &Resolved, op: &CamOperation, allowance: Option<f64>) -> Vec<[Vec3; 3]> {
+    if op.face_roles.is_empty() {
+        return part_triangles(s, at);
+    }
+    let state = s.model.state();
+    let mut out = Vec::new();
+    for body in state.bodies.iter().filter(|b| at.is_part(&b.name)) {
+        // Each face of this body with a role: its index, and how far off the tool keeps (none: left out).
+        let roles: Vec<(usize, Option<f64>)> = op
+            .face_roles
+            .iter()
+            .filter(|r| r.face.body == body.name)
+            .filter_map(|r| {
+                let (index, _, _) = solidcraft_doc::naming::face_on_body(body, &r.face.name, r.face.at)?;
+                let off = match r.role {
+                    Role::Ignore => None,
+                    Role::Avoid { clearance } => Some(clearance),
+                    Role::Leave { stock_to_leave } => Some(stock_to_leave),
+                };
+                Some((index, off))
+            })
+            .collect();
+        let mesh = body.mesh();
+        for (k, t) in mesh.triangles.iter().enumerate() {
+            let corner = |k: usize| t.get(k).and_then(|v| mesh.positions.get(*v as usize)).map(|p| at.frame.local(*p));
+            let (Some(a), Some(b), Some(c)) = (corner(0), corner(1), corner(2)) else { continue };
+            let tri = [a, b, c];
+            let face = mesh.tri_face.get(k).map(|f| *f as usize);
+            match (roles.iter().find(|(i, _)| Some(*i) == face).map(|(_, off)| *off), allowance) {
+                (None, _) => out.push(tri),
+                (Some(None), _) => {}
+                (Some(Some(_)), None) => out.push(tri),
+                (Some(Some(off)), Some(base)) => {
+                    let d = off - base;
+                    let normal = (b - a).cross(c - a).normalized();
+                    match normal {
+                        Some(n) if d.abs() > 1e-9 => {
+                            // Further out stands beside the face as it is; further in replaces it.
+                            if d > 0.0 {
+                                out.push(tri);
+                            }
+                            out.push(tri.map(|v| v + n * d));
+                        }
+                        _ => out.push(tri),
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The part with the faces a setup's operations avoid or leave material on standing out by
+/// the most any of them keeps off each; none when no operation gives a face such a role.
+fn kept_off(s: &Session, at: &Resolved, setup: &Setup) -> Option<Vec<[Vec3; 3]>> {
+    let mut roles: Vec<FaceRole> = Vec::new();
+    for r in setup.operations.iter().flat_map(|o| &o.face_roles) {
+        let off = match r.role {
+            Role::Ignore => continue,
+            Role::Avoid { clearance } => clearance,
+            Role::Leave { stock_to_leave } => stock_to_leave,
+        };
+        match roles.iter_mut().find(|k| k.face.body == r.face.body && k.face.name == r.face.name) {
+            Some(k) if matches!(k.role, Role::Leave { stock_to_leave } if stock_to_leave >= off) => {}
+            Some(k) => k.role = Role::Leave { stock_to_leave: off },
+            None => roles.push(FaceRole { face: r.face.clone(), role: Role::Leave { stock_to_leave: off } }),
+        }
+    }
+    let first = setup.operations.first()?;
+    (!roles.is_empty()).then(|| op_part(s, at, &CamOperation { face_roles: roles, ..first.clone() }, Some(0.0)))
 }
 
 /// How far 3D operations keep clear of a fixture, across and above (mm).
@@ -2394,7 +2482,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                 let stock = at.stock.ok_or_else(|| fail("there is no body to take the stock from".into()))?;
                 // Over the whole stock every copy of the part is in the way; inside a sketch the
                 // path is cut on each copy, as other operations are.
-                let one = part_triangles(s, at);
+                let one = op_part(s, at, op, Some(params.stock_to_leave));
                 if one.is_empty() {
                     return Err(fail("there is no model to rough down to".into()));
                 }
@@ -2446,7 +2534,8 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             cam::chamfer(regions, tool, &params, &cut)
         }
         CamOperationKind::Parallel3d { stepover, angle, stock_to_leave, zigzag, rest } => {
-            let one = part_triangles(s, at);
+            let stock_to_leave = len("stock_to_leave", stock_to_leave)?;
+            let one = op_part(s, at, op, Some(stock_to_leave));
             if one.is_empty() {
                 return Err(fail("there is no model to finish".into()));
             }
@@ -2473,7 +2562,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                     part: &part,
                     stepover: len("stepover", stepover)?,
                     angle: *angle,
-                    stock_to_leave: len("stock_to_leave", stock_to_leave)?,
+                    stock_to_leave,
                     tolerance: TOLERANCE,
                     zigzag: *zigzag,
                     left: left.as_ref(),
@@ -2487,7 +2576,8 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
             }
         }
         CamOperationKind::ZLevel3d { step, stock_to_leave, steep, climb, rest } => {
-            let one = part_triangles(s, at);
+            let stock_to_leave = len("stock_to_leave", stock_to_leave)?;
+            let one = op_part(s, at, op, Some(stock_to_leave));
             if one.is_empty() {
                 return Err(fail("there is no model to finish".into()));
             }
@@ -2512,7 +2602,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                     boundary: regions,
                     part: &part,
                     step: len("step", step)?,
-                    stock_to_leave: len("stock_to_leave", stock_to_leave)?,
+                    stock_to_leave,
                     tolerance: TOLERANCE,
                     steep: *steep,
                     climb: *climb,
@@ -2733,6 +2823,50 @@ fn faces_param(s: &Session, v: &Value, cmd: &str) -> Result<Vec<FaceRef>> {
     Ok(out)
 }
 
+const FACE_ROLES_3D: &str = "`face_roles` are for operations that follow the model: 3D adaptive, 3D parallel and 3D Z-level";
+
+/// Whether an operation follows the model's shape (3D roughing and finishing), so that its
+/// faces can have roles.
+fn follows_the_model(kind: &CamOperationKind) -> bool {
+    matches!(kind, CamOperationKind::Adaptive { model: true, .. } | CamOperationKind::Parallel3d { .. } | CamOperationKind::ZLevel3d { .. })
+}
+
+/// How far a face to avoid or leave material on may be kept off (mm).
+const MAX_FACE_OFFSET: f64 = 100.0;
+
+/// `face_roles`: [{body?, point, role: ignore|avoid|leave, clearance?: mm (avoid; default 1),
+/// stock_to_leave: mm (leave)}], each face the one holding its point; null or [] for none. A
+/// face named twice takes its last role.
+fn face_roles_param(s: &Session, v: &Value, cmd: &str) -> Result<Vec<FaceRole>> {
+    if v.is_null() {
+        return Ok(Vec::new());
+    }
+    let items = v
+        .as_array()
+        .filter(|a| a.len() <= 256)
+        .ok_or_else(|| bad(cmd, "`face_roles` must be a list of at most 256 {body?, point: [x, y, z], role: ignore|avoid|leave}"))?;
+    let mut out: Vec<FaceRole> = Vec::new();
+    for item in items {
+        let face = faces_param(s, &json!([item]), cmd)?.pop().ok_or_else(|| bad(cmd, "each face role needs `point`"))?;
+        let mm = |k: &str, default: Option<f64>| match item.get(k) {
+            None | Some(Value::Null) => default.ok_or_else(|| bad(cmd, format!("a face to leave material on needs `{k}` (mm)"))),
+            Some(x) => x
+                .as_f64()
+                .filter(|v| *v >= 0.0 && *v <= MAX_FACE_OFFSET)
+                .ok_or_else(|| bad(cmd, format!("a face role's `{k}` must be 0 to {MAX_FACE_OFFSET} mm"))),
+        };
+        let role = match item.get("role").and_then(Value::as_str).map(str::trim) {
+            Some("ignore") => Role::Ignore,
+            Some("avoid") => Role::Avoid { clearance: mm("clearance", Some(1.0))? },
+            Some("leave") => Role::Leave { stock_to_leave: mm("stock_to_leave", None)? },
+            _ => return Err(bad(cmd, "a face role's `role` is ignore, avoid or leave")),
+        };
+        out.retain(|r| !(r.face.body == face.body && r.face.name == face.name));
+        out.push(FaceRole { face, role });
+    }
+    Ok(out)
+}
+
 fn stats_json(path: &Toolpath) -> Value {
     let st = path.stats();
     json!({"cut_length": st.cut_length, "rapid_length": st.rapid_length, "cut_minutes": st.cut_minutes, "lowest_z": st.lowest_z, "moves": path.moves.len()})
@@ -2947,6 +3081,13 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
         None => (1..).map(|k| format!("{label}{k}")).find(|n| !setup.operations.iter().any(|o| o.name == *n)).unwrap_or_default(),
     };
     let kind = kind(&tool);
+    let face_roles = match p.get("face_roles") {
+        Some(v) => face_roles_param(s, v, cmd)?,
+        None => Vec::new(),
+    };
+    if !face_roles.is_empty() && !follows_the_model(&kind) {
+        return Err(bad(cmd, FACE_ROLES_3D));
+    }
     let mut op = CamOperation {
         id: 0,
         name,
@@ -2963,6 +3104,7 @@ fn add_op(s: &mut Session, p: &Value, cmd: &str, label: &str, kind: impl FnOnce(
         passes,
         geometry,
         kind,
+        face_roles,
     };
     // An operation that cannot be cut is not added.
     if from_library {
@@ -3433,6 +3575,12 @@ fn op_edit(s: &mut Session, p: &Value) -> Result<Value> {
             *slot = optional(k)?;
         }
     }
+    if let Some(v) = p.get("face_roles") {
+        op.face_roles = face_roles_param(s, v, cmd)?;
+        if !op.face_roles.is_empty() && !follows_the_model(&op.kind) {
+            return Err(bad(cmd, FACE_ROLES_3D));
+        }
+    }
     match (p.get("faces"), p.get("sketch")) {
         (Some(_), Some(_)) => return Err(bad(cmd, "give either `sketch` or `faces`, not both")),
         (Some(faces), None) => op.geometry = CamGeometry::Faces { faces: faces_param(s, faces, cmd)? },
@@ -3710,7 +3858,10 @@ fn list_now(s: &Session) -> Value {
                     match build(s, setup, op) {
                         Ok(path) => {
                             v["toolpath"] = stats_json(&path);
-                            let depth = match (&part, m.tool(op.tool)) {
+                            // Faces the operation ignores are not the part to it.
+                            let ignores = op.face_roles.iter().any(|r| r.role == Role::Ignore);
+                            let own = resolved.as_ref().filter(|_| ignores).and_then(|at| op_part_field(s, at, op));
+                            let depth = match (own.as_ref().or(part.as_ref()), m.tool(op.tool)) {
                                 (Some(part), Some(tool)) => cam::gouge(&path, tool, part),
                                 _ => 0.0,
                             };
@@ -4026,9 +4177,25 @@ fn simulate(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 out["max_gouge"] = json!(checked.max_gouge);
                 out["gouge_area"] = json!(checked.gouge_area);
-                out["max_leftover"] = json!(c.max_leftover);
-                out["leftover_volume"] = json!(c.leftover_volume);
+                // What is left on faces the operations avoid or leave material on, up to that much,
+                // is meant to be there: the part stands that far out on them for what is left over.
+                let kept = kept_off(s, &at, setup).and_then(|raised| {
+                    cam::HeightField::of_triangles(Vec2::new(min.x, min.y), Vec2::new(max.x, max.y), cell, min.z, &raised, false).ok()
+                });
+                let over = match &kept {
+                    Some(raised) => cam::compare(&stock, raised).map_err(cam_error)?,
+                    None => c,
+                };
+                out["max_leftover"] = json!(over.max_leftover);
+                out["leftover_volume"] = json!(over.leftover_volume);
                 let mut dev = cam::deviations(&stock, &part).map_err(cam_error)?;
+                if let Some(raised) = &kept {
+                    for (d, over) in dev.iter_mut().zip(cam::deviations(&stock, raised).map_err(cam_error)?) {
+                        if *d > 0.0 {
+                            *d = over.max(0.0);
+                        }
+                    }
+                }
                 // Where only a chamfer went below the part, it is the chamfer, not a fault.
                 if let Some(plain) = &plain {
                     let without = cam::deviations(plain, &part).map_err(cam_error)?;
