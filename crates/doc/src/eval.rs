@@ -1055,6 +1055,15 @@ impl EvalCache {
         EvalCache { budget: bytes, ..EvalCache::default() }
     }
 
+    /// Results stored.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     fn get(&mut self, key: u64) -> Option<CachedEval> {
         let r = self.map.get(&key).cloned();
         if r.is_some() {
@@ -2323,7 +2332,7 @@ impl Model {
                 }
                 Err(e) => Some(e.to_string().trim_start_matches("the operation failed: ").to_string()),
             };
-            if !self.no_cache {
+            if !self.no_cache && !watched.cancelled() {
                 let e = CachedEval {
                     error: error.clone(),
                     warning: warning.clone(),
@@ -2973,9 +2982,11 @@ fn apply_traced_with(
         v
     };
     // Bodies that take part besides the feature's own targets: the body a Join extrude runs to
-    // joins with the tool (#6424).
+    // joins with the tool (#6424), when it is in the feature's own component. A body of another
+    // component (the shell a connector's boss runs up to) joins only when the feature names it:
+    // an extent's end face never pulls a part across a component boundary.
     for name in extra {
-        if let Some(i) = state.bodies.iter().position(|b| &b.name == name)
+        if let Some(i) = state.bodies.iter().position(|b| &b.name == name && b.component == f.component)
             && !target_idx.contains(&i)
         {
             target_idx.push(i);
@@ -4457,17 +4468,24 @@ fn single_hole_position(
     Ok(ss.plane.to_world(p.pos))
 }
 
-/// A hole's reference edges (#37); none for any other feature.
+/// A hole's (#37) or a cylinder's (#6380) reference edges; none for any other feature.
 fn hole_references(f: &Feature) -> &[crate::HoleReference] {
     match &f.kind {
-        FeatureKind::Hole { references, .. } => references,
+        FeatureKind::Hole { references, .. } | FeatureKind::Cylinder { references, .. } => references,
         _ => &[],
     }
 }
 
-/// Where a Single hole with reference edges (#37) is drilled: at its distances from the edges'
-/// lines, in the plane of the face at `at` (on the surface), the edges found by their names, else
-/// their points. A hole without reference edges stays at `at`.
+/// Where a cylinder stands: its base, or with reference edges (#6380) at their distances in the
+/// plane of the flat face at its base, square to its axis.
+fn cylinder_base(vals: &BTreeMap<String, Value>, st: &ModelState, f: &Feature, base: &crate::PointExpr, axis: Vec3) -> Result<Vec3> {
+    let at = point(vals, base)?;
+    with_references(vals, st, f, at, -axis)
+}
+
+/// Where a Single hole (or a cylinder) with reference edges (#37) is placed: at its distances
+/// from the edges' lines, in the plane of the face at `at` (on the surface), the edges found by
+/// their names, else their points. A feature without reference edges stays at `at`.
 fn with_references(vals: &BTreeMap<String, Value>, st: &ModelState, f: &Feature, at: Vec3, dir: Vec3) -> Result<Vec3> {
     let references = hole_references(f);
     if references.is_empty() {
@@ -5774,7 +5792,7 @@ fn feature_tools_with_constructor(
             Ok(vec![crate::lineage::box_tool(kernel::box_solid(corner, corner + s)?)])
         }
         FeatureKind::Cylinder { base, axis, radius, height, .. } => Ok(vec![crate::lineage::cylinder_tool(kernel::cylinder(
-            point(vals, base)?,
+            cylinder_base(vals, st, f, base, axis.0)?,
             axis.0,
             val(vals, radius, Kind::Length)?,
             val(vals, height, Kind::Length)?,
@@ -7676,8 +7694,9 @@ fn eval_feature(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, st:
             }
             apply_traced(doc, st, f, tools, *operation, &[])
         }
-        FeatureKind::Cylinder { base, axis, radius, height, operation } => {
-            let (base, radius, height) = (point(vals, base)?, val(vals, radius, Kind::Length)?, val(vals, height, Kind::Length)?);
+        FeatureKind::Cylinder { base, axis, radius, height, operation, .. } => {
+            let base = cylinder_base(vals, st, f, base, axis.0)?;
+            let (radius, height) = (val(vals, radius, Kind::Length)?, val(vals, height, Kind::Length)?);
             let b = kernel::cylinder(base, axis.0, radius, height)?;
             let b = if matches!(operation, Operation::NewBody | Operation::Join) { b.with_cylinder_certificate(f.id)? } else { b };
             let prism = more::PrimitivePrism::Cylinder { base, axis: axis.0, radius, height };
@@ -8298,26 +8317,39 @@ impl PlacedBodies {
 /// Bodies [`state_in_frame_at`] moved into a feature's frame, by source body and matrix: a
 /// sketch on a face of a turned component is evaluated in that component's frame, and without
 /// this every edit of it moved (and so meshed again) every body placed differently from it.
-/// Held by the [`Model`] across evaluations; each `evaluate` starts a new generation, and an
-/// entry neither it nor the evaluation before it used is dropped, so the cache holds only the
-/// placements in use.
+/// Held by the [`Model`] across evaluations; each `evaluate` that moves a body starts a new
+/// generation, and an entry neither it nor the last such evaluation before it used is dropped,
+/// so the cache holds only the placements in use. An evaluation that moves nothing (every
+/// result reused, or taken from the cache: an undo, the refreshes a command makes after its
+/// edit) leaves the generations alone: counting it, two of them in a row dropped every moved
+/// body, and the next edit of the sketch moved and meshed them all again.
 #[derive(Debug, Default)]
 pub(crate) struct FrameBodies {
     now: PlacedBodies,
     before: PlacedBodies,
+    /// An evaluation began and has not used the cache yet: its first use starts the generation.
+    pending: bool,
 }
 
 impl FrameBodies {
     /// At most this many bodies are kept per generation.
     const CAP: usize = 4096;
 
+    /// An evaluation begins; its generation starts when it first moves a body.
     pub(crate) fn next_generation(&mut self) {
-        self.before = std::mem::take(&mut self.now);
+        self.pending = true;
+    }
+
+    fn begin(&mut self) {
+        if std::mem::take(&mut self.pending) {
+            self.before = std::mem::take(&mut self.now);
+        }
     }
 
     /// The moved body for `b` under `m`, when a call in this or the previous generation moved
     /// the same body by the same matrix.
     fn reused(&mut self, b: &ModelBody, m: &crate::Mat) -> Option<ModelBody> {
+        self.begin();
         if let Some(placed) = self.now.reused(b, m) {
             return Some(placed.clone());
         }
@@ -8332,6 +8364,7 @@ impl FrameBodies {
     }
 
     fn keep(&mut self, b: &ModelBody, m: &crate::Mat, moved: &ModelBody) {
+        self.begin();
         if self.now.by_source.len() < Self::CAP {
             self.now.by_source.insert(placed_key(b, m), (b.clone(), moved.clone()));
         }

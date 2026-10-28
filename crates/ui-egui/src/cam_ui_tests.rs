@@ -200,7 +200,7 @@ fn simulate_reports_in_the_window_until_the_design_changes() {
     h.frames(2);
     assert!(h.widget("Does not cut into the part").is_some() && h.widget("Simulate").is_some() && h.widget("Simulated stock").is_some());
     // Cutting inside the outline instead goes into the part, and says so.
-    h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "inside"})).unwrap();
+    run(&mut h.app, "cam.op.edit", json!({"op": "Contour1", "side": "inside"})).unwrap();
     h.frames(2);
     assert!(h.app.manufacture.simulation.is_none(), "the old result went with the change");
     assert!(h.app.manufacture.stock.is_none() && !stock_shown(&h.app), "and so did the drawn stock");
@@ -726,8 +726,8 @@ fn browser_lists_setups_and_operations_with_their_menus() {
 
     h.app.run("cam.tool.define", json!({"number": 1, "kind": "flat", "diameter": "6 mm", "spindle_rpm": 10000, "feed": 600})).unwrap();
     h.app.run("cam.setup.create", json!({"stock": {"top": 1}})).unwrap();
-    h.app.run("cam.op.face", json!({"tool": 1, "name": "Top"})).unwrap();
-    h.app.run("cam.op.face", json!({"tool": 1, "name": "Again"})).unwrap();
+    run(&mut h.app, "cam.op.face", json!({"tool": 1, "name": "Top"})).unwrap();
+    run(&mut h.app, "cam.op.face", json!({"tool": 1, "name": "Again"})).unwrap();
     h.frames(2);
     let drawn = rows(&h);
     let at = |name: &str| drawn.iter().position(|r| r == name).unwrap_or_else(|| panic!("no row {name}: {drawn:?}"));
@@ -1380,7 +1380,7 @@ fn a_simulated_program_plays_with_the_tool_cutting_the_stock() {
     // A change to the design stops it with the simulation.
     h.app.manufacture.play = None;
     h.step(&json!({"widget": "Play the program"})).unwrap();
-    h.app.run("cam.op.edit", json!({"op": "Contour1", "side": "outside"})).unwrap();
+    run(&mut h.app, "cam.op.edit", json!({"op": "Contour1", "side": "outside"})).unwrap();
     h.frames(2);
     assert!(h.app.manufacture.play.is_none());
 }
@@ -1453,7 +1453,7 @@ fn a_pocket_form_machines_the_rest_of_a_larger_tool() {
     define_tool(&mut h);
     h.app.run("cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 12, "spindle_rpm": 10000, "feed": 800})).unwrap();
     fill(&mut h, "cam.setup.create", |_| {});
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 2, "bottom": -4, "stepover": 5})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 2, "bottom": -4, "stepover": 5})).unwrap();
     h.app.start("cam.op.pocket");
     h.frames(2);
     assert!(h.widget("Rest of tool").is_some() && h.widget("none: the whole pocket").is_some());
@@ -1651,7 +1651,7 @@ fn browser_operations_show_their_time_and_are_dragged_into_order() {
     define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     for _ in 0..3 {
-        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+        run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
     }
     let order = |h: &Harness| h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.name.clone()).collect::<Vec<_>>();
     assert_eq!(order(&h), ["Pocket1", "Pocket2", "Pocket3"]);
@@ -1676,7 +1676,7 @@ fn the_manufacture_folder_menu_and_preferences_set_the_display() {
     let mut h = sketched();
     define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
     let showing = h.app.manufacture.show_setups;
     menu_action(&mut h.app, &json!({"do": "setups"}));
     assert_eq!(h.app.manufacture.show_setups, !showing);
@@ -1706,7 +1706,7 @@ fn a_click_in_the_browser_shows_that_operation_s_form() {
     define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     for bottom in [-3, -4] {
-        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
+        run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
     }
     h.frames(2);
     let click = |h: &mut Harness, name: &str| {
@@ -1749,7 +1749,7 @@ fn an_operation_simulates_on_what_the_ones_before_it_leave() {
     define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
     for bottom in [-2, -4] {
-        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
+        run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": bottom})).unwrap();
     }
     let ids: Vec<u64> = h.app.session.doc.manufacture.setups[0].operations.iter().map(|o| o.id).collect();
     let setup = h.app.session.doc.manufacture.setups[0].id;
@@ -1792,13 +1792,13 @@ fn rapids_into_material_are_confirmed_before_a_program_is_written() {
     h.app.run("sketch.finish", json!({})).unwrap();
     define_tool(&mut h);
     fill(&mut h, "cam.setup.create", |_| {});
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
     let setup = h.app.session.doc.manufacture.setups[0].id;
     menu_action(&mut h.app, &json!({"do": "post", "setup": setup}));
     assert!(h.app.manufacture.confirm_post.is_none() && h.app.file_picker.is_some(), "clean: no question, straight to where to write it");
     h.app.file_picker = None;
     // Started 6 mm down without the cut above it: its rapids at the retract height are in the material.
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "top": -6, "bottom": -8})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "top": -6, "bottom": -8})).unwrap();
     let late = h.app.session.doc.manufacture.setups[0].operations[1].id;
     menu_action(&mut h.app, &json!({"do": "post", "setup": setup, "op": late}));
     let asked = h.app.manufacture.confirm_post.clone().expect("the question");
@@ -1823,7 +1823,7 @@ fn a_setup_form_sets_the_work_offset_and_its_menu_offers_the_sheet() {
     let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
     let Some(Form::Setup(again)) = setup_form(&listed["setups"][0]) else { panic!("no form") };
     assert_eq!(again.work_offset, 2, "opened again it shows G56");
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
     let setup = h.app.session.doc.manufacture.setups[0].id;
     let sheet = menu_items(&h.app, setup, None).into_iter().find(|i| i.label == "Setup Sheet…").expect("the sheet in the menu");
     assert!(sheet.enabled);
@@ -1958,7 +1958,7 @@ fn clamps_are_set_in_the_setup_form_drawn_and_asked_about_before_posting() {
     let view = h.app.manufacture.cache.as_ref().and_then(|c| c.2.first().cloned()).expect("the setup's view");
     assert_eq!(clamp_lines(&view).len(), 12);
     // The pocket runs into it: asked before it is written.
-    h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
+    run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": 1, "bottom": -3})).unwrap();
     let setup = h.app.session.doc.manufacture.setups[0].id;
     menu_action(&mut h.app, &json!({"do": "post", "setup": setup}));
     let asked = h.app.manufacture.confirm_post.clone().expect("the question");
@@ -1973,7 +1973,7 @@ fn a_setup_s_menu_orders_its_operations_by_tool() {
     h.app.run("cam.tool.define", json!({"number": 2, "kind": "flat", "diameter": 3, "spindle_rpm": 15000, "feed": 500})).unwrap();
     fill(&mut h, "cam.setup.create", |_| {});
     for (tool, bottom) in [(1, -2), (2, -2), (1, -4)] {
-        h.app.run("cam.op.pocket", json!({"sketch": "Pocket", "tool": tool, "bottom": bottom})).unwrap();
+        run(&mut h.app, "cam.op.pocket", json!({"sketch": "Pocket", "tool": tool, "bottom": bottom})).unwrap();
     }
     let setup = h.app.session.doc.manufacture.setups[0].id;
     menu_action(&mut h.app, &json!({"do": "order", "setup": setup}));

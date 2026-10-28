@@ -1,6 +1,6 @@
 //! SolidCraft desktop app.
 //!
-//! Usage: `solidcraft [--control <port>] [--sample] [--crash-log] [--safe-mode] [design.solidcraft | part.step]`
+//! Usage: `solidcraft [--control <port>] [--sample] [--crash-log] [--safe-mode] [design.sc | part.step]`
 //!
 //! `--safe-mode` (or `SOLIDCRAFT_SAFE_MODE=1`) starts with default settings, no recovery offer and
 //! the software renderer; see `startup` and docs/book/src/guide/troubleshooting.md.
@@ -615,26 +615,26 @@ fn graphics_path() -> Option<std::path::PathBuf> {
 /// Compatibility shim (docs/compatibility.md): on the first launch after the rename, copy the
 /// settings of earlier releases into the new folder. They kept `graphics.json` (and, on Linux
 /// and macOS, the recovery folder) under the old product name, and eframe's `app.ron` under the
-/// window's old app id. In the Flatpak sandbox, releases before 0.8 kept everything under the
-/// old app id's `~/.var/app` folder; that copy comes first, as it is the newest. The old folders
+/// window's old app id. In the Flatpak sandbox, earlier releases kept everything under an
+/// old app id's `~/.var/app` folder; those copies come first, newest first. The old folders
 /// are never changed.
 fn adopt_legacy_settings() {
     let (Some(current), Some(legacy)) = (settings_dir().ok().flatten(), eframe::storage_dir("SolveCraft")) else { return };
     let legacy_eframe = eframe::storage_dir(solidcraft_engine::io::LEGACY_APP_ID);
-    let old_flatpak = solidcraft_engine::io::legacy_flatpak_path(&current);
-    if let Err(e) = adopt_settings(&current, old_flatpak.as_deref(), &legacy, legacy_eframe.as_deref()) {
+    let old_flatpak = solidcraft_engine::io::legacy_flatpak_paths(&current);
+    if let Err(e) = adopt_settings(&current, &old_flatpak, &legacy, legacy_eframe.as_deref()) {
         log::warn!("settings: could not copy the previous release's settings into {}: {e}", current.display());
     }
 }
 
 fn adopt_settings(
     current: &std::path::Path,
-    old_flatpak: Option<&std::path::Path>,
+    old_flatpak: &[std::path::PathBuf],
     legacy: &std::path::Path,
     legacy_eframe: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let fresh = !current.exists();
-    if let Some(old) = old_flatpak {
+    for old in old_flatpak {
         solidcraft_engine::io::adopt_legacy_dir(current, old)?;
     }
     solidcraft_engine::io::adopt_legacy_dir(current, legacy)?;
@@ -750,11 +750,14 @@ fn main() -> eframe::Result {
     let mut control_port: Option<u16> = solidcraft_engine::geom::env::var("CONTROL_PORT").and_then(|p| p.parse().ok());
     let mut files = Vec::new();
     let mut sample = false;
+    // `--theme-file PATH`: follow that theme file for this run without saving it (#7573).
+    let mut theme_file: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
             "--sample" => sample = true,
+            "--theme-file" => theme_file = args.next(),
             "--safe-mode" => safe_mode = true,
             "--version" | "-V" => {
                 println!("solidcraft {}", env!("CARGO_PKG_VERSION"));
@@ -774,7 +777,9 @@ fn main() -> eframe::Result {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("usage: solidcraft [--control PORT] [--sample] [--crash-log] [--safe-mode] [design.solidcraft | part.step]");
+                println!(
+                    "usage: solidcraft [--control PORT] [--sample] [--theme-file THEME.json] [--crash-log] [--safe-mode] [design.sc | part.step]"
+                );
                 return Ok(());
             }
             _ => files.push(a),
@@ -925,6 +930,11 @@ fn main() -> eframe::Result {
             app.graphics_fallback = fallback_note.clone();
             if let Some(p) = cc.storage.and_then(|s| solidcraft_ui_egui::prefs::stored(|k| s.get_string(k))).filter(|_| !safe_mode) {
                 app.load_prefs(&p);
+            }
+            if let Some(path) = &theme_file
+                && let Err(e) = solidcraft_ui_egui::prefs::follow_theme_file_for_run(&mut app, path)
+            {
+                app.set_status(format!("--theme-file: {e}"), true);
             }
             mark("app state and prefs");
             let gpu = cc.wgpu_render_state.as_ref().map(|rs| LostWatch {
@@ -1378,14 +1388,14 @@ mod msaa_tests {
         std::fs::create_dir_all(&legacy_eframe).unwrap();
         std::fs::write(legacy.join("graphics.json"), r#"{"msaa":8}"#).unwrap();
         std::fs::write(legacy_eframe.join("app.ron"), "(prefs)").unwrap();
-        super::adopt_settings(&current, None, &legacy, Some(&legacy_eframe)).unwrap();
+        super::adopt_settings(&current, &[], &legacy, Some(&legacy_eframe)).unwrap();
         assert_eq!(std::fs::read_to_string(current.join("graphics.json")).unwrap(), r#"{"msaa":8}"#);
         assert_eq!(std::fs::read_to_string(current.join("app.ron")).unwrap(), "(prefs)");
         assert!(legacy.join("graphics.json").is_file() && legacy_eframe.join("app.ron").is_file());
         // Later launches leave the current settings alone.
         std::fs::write(current.join("app.ron"), "(mine)").unwrap();
         std::fs::remove_file(current.join("graphics.json")).unwrap();
-        super::adopt_settings(&current, None, &legacy, Some(&legacy_eframe)).unwrap();
+        super::adopt_settings(&current, &[], &legacy, Some(&legacy_eframe)).unwrap();
         assert_eq!(std::fs::read_to_string(current.join("app.ron")).unwrap(), "(mine)");
         assert!(!current.join("graphics.json").exists());
         let _ = std::fs::remove_dir_all(&d);

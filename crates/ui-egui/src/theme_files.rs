@@ -298,6 +298,7 @@ macro_rules! theme_keys {
 
 theme_keys! {
     one: [
+        nav_hover, nav_press, nav_dim, nav_viewport, nav_tip, nav_tip_ink, nav_tip_key_border, nav_field,
         file_dim, file_recovery_well, file_background, file_surface, file_border, file_image_tint, file_rail, file_rail_ink, file_rail_hover,
         file_primary, file_primary_ink, file_primary_border, file_recovery, file_recovery_ink, file_recovery_border,
         app_bar, toolbar, panel, panel_header, border, text, text_dim, accent, accent_soft, sketch_accent, error, warning,
@@ -694,9 +695,159 @@ pub fn add(custom: &mut Vec<ThemeFile>, mut theme: ThemeFile) -> Result<String, 
     Ok(id)
 }
 
+/// Seconds between two looks at a followed file's modified time and size.
+pub const FOLLOW_INTERVAL: f64 = 1.0;
+/// Longest followed path accepted, in bytes (hostile input from the control channel).
+pub const MAX_FOLLOW_PATH: usize = 4096;
+
+/// A theme file the desktop app follows (#7573): another tool writes it, and the app reloads it
+/// when its modified time or size changes. Only a read that parses completely is applied; while
+/// the file is being written, broken, missing or too big, the last good theme stays on and
+/// [`Follow::error`] says why.
+#[derive(Clone, Debug, Default)]
+pub struct Follow {
+    /// The `--theme-file` launch flag's path: followed for this run in place of the preference,
+    /// never saved.
+    pub launch: Option<String>,
+    /// The path the state below belongs to.
+    path: String,
+    /// The file's modified time and size at the last read.
+    stamp: Option<(Option<std::time::SystemTime>, u64)>,
+    /// When (`egui` input time, seconds) the file was last looked at.
+    checked: Option<f64>,
+    /// The last theme that read completely.
+    theme: Option<ThemeFile>,
+    /// Why the last read was not applied.
+    error: Option<String>,
+    /// Whether the window had the focus last frame (gaining it re-reads the file).
+    pub focused: bool,
+}
+
+/// What a [`Follow::poll`] changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowChange {
+    /// Nothing new.
+    None,
+    /// The file read completely; its theme is on now.
+    Loaded(String),
+    /// A read failed for a new reason (reported once; the last good theme stays on).
+    Failed(String),
+}
+
+/// A followed path as given: trimmed, at most [`MAX_FOLLOW_PATH`] bytes, no control characters.
+pub fn follow_path(path: &str) -> Result<String, String> {
+    let path = path.trim();
+    if path.len() > MAX_FOLLOW_PATH || path.chars().any(char::is_control) {
+        return Err(format!("a followed theme file's path is at most {MAX_FOLLOW_PATH} bytes without control characters"));
+    }
+    Ok(path.to_string())
+}
+
+impl Follow {
+    /// The path followed now: the launch flag's, else the preference's (empty: none).
+    pub fn path<'a>(&'a self, preference: &'a str) -> &'a str {
+        match self.launch.as_deref().map(str::trim) {
+            Some(path) if !path.is_empty() => path,
+            _ => preference.trim(),
+        }
+    }
+
+    /// The theme the followed file gave last, if any read completely.
+    pub fn theme(&self) -> Option<&ThemeFile> {
+        self.theme.as_ref()
+    }
+
+    /// Why the followed file's last read was not applied.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Look at `path` (`now` in seconds): at most every [`FOLLOW_INTERVAL`] unless `force`, and
+    /// read it only when its modified time or size changed. An empty path stops following.
+    pub fn poll(&mut self, path: &str, now: f64, force: bool) -> FollowChange {
+        if path != self.path {
+            *self = Follow { launch: self.launch.take(), focused: self.focused, path: path.to_string(), ..Default::default() };
+        }
+        if path.is_empty() {
+            return FollowChange::None;
+        }
+        let due = self.checked.is_none_or(|t| now - t >= FOLLOW_INTERVAL || now < t);
+        if !force && !due {
+            return FollowChange::None;
+        }
+        self.checked = Some(now);
+        match self.read(force) {
+            Ok(None) => FollowChange::None,
+            Ok(Some(theme)) => {
+                let name = theme.name.clone();
+                self.theme = Some(theme);
+                self.error = None;
+                FollowChange::Loaded(name)
+            }
+            Err(e) if self.error.as_deref() == Some(e.as_str()) => FollowChange::None,
+            Err(e) => {
+                self.error = Some(e.clone());
+                FollowChange::Failed(e)
+            }
+        }
+    }
+
+    /// The file's theme when it changed since the last read (`Ok(None)`: unchanged).
+    fn read(&mut self, force: bool) -> Result<Option<ThemeFile>, String> {
+        use std::io::Read;
+        let path = std::path::Path::new(&self.path);
+        let meta = std::fs::metadata(path).map_err(|e| format!("can't read {}: {e}", self.path))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a file", self.path));
+        }
+        if meta.len() > MAX_BYTES as u64 {
+            return Err(format!("a theme file is at most {} KiB", MAX_BYTES / 1024));
+        }
+        let stamp = (meta.modified().ok(), meta.len());
+        if !force && self.stamp == Some(stamp) {
+            return Ok(None);
+        }
+        self.stamp = Some(stamp);
+        // Never more than the cap, whatever the size said a moment ago.
+        let mut text = String::new();
+        std::fs::File::open(path)
+            .and_then(|f| f.take(MAX_BYTES as u64 + 1).read_to_string(&mut text))
+            .map_err(|e| format!("can't read {}: {e}", self.path))?;
+        let theme = parse(&text)?;
+        Ok(Some(ThemeFile { id: format!("file-{}", theme.id), ..theme }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_board_colours_are_themeable_and_roundtrip_on_both_bases() {
+        for (base, tokens, colours) in [
+            ("light", Tokens::light(), ["#e9edf2", "#dce2ea", "#8895a7", "#eef1f5", "#1b2430", "#ffffff", "#ffffff"]),
+            ("dark", Tokens::dark(), ["#3a4150", "#464e60", "#7c879a", "#262b35", "#eef1f5", "#1b2430", "#2f343e"]),
+        ] {
+            for (actual, hex) in
+                [tokens.nav_hover, tokens.nav_press, tokens.nav_dim, tokens.nav_viewport, tokens.nav_tip, tokens.nav_tip_ink, tokens.nav_field]
+                    .into_iter()
+                    .zip(colours)
+            {
+                assert_eq!(actual, parse_color(hex).unwrap(), "{base}: {hex}");
+            }
+            let old = from_value(&json!({"format":FORMAT,"name":"Old","base":base})).unwrap();
+            assert_eq!(resolve(&old), tokens, "old themes retain the base's new navigation roles");
+            assert_eq!(resolve(&from_value(&export("Board", old.base, &tokens)).unwrap()), tokens);
+            let custom = from_value(&json!({"format":FORMAT,"name":"Custom","base":base,
+                "colors":{"nav_press":"#123456","nav_tip":"#abcdef","nav_tip_key_border":"#01020380"}}))
+            .unwrap();
+            let custom_tokens = resolve(&custom);
+            assert_eq!(custom_tokens.nav_press, parse_color("#123456").unwrap());
+            assert_eq!(custom_tokens.nav_tip, parse_color("#abcdef").unwrap());
+            assert_eq!(custom_tokens.nav_tip_key_border, parse_color("#01020380").unwrap());
+            assert_eq!(resolve(&from_value(&export("Custom", custom.base, &custom_tokens)).unwrap()), custom_tokens);
+        }
+    }
 
     #[test]
     fn border_roles_roundtrip_on_either_base_and_preserve_legacy_defaults() {
@@ -1182,5 +1333,64 @@ mod tests {
         for file in builtin().iter().filter(|file| file.radii.is_empty()) {
             assert_eq!(radius_values(resolve(file)), defaults, "{}", file.id);
         }
+    }
+
+    #[test]
+    fn a_followed_file_reloads_when_rewritten_and_keeps_the_last_good_theme() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-theme-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("live.json");
+        let path = file.to_string_lossy().to_string();
+        let write = |panel: &str, extra: &str| {
+            std::fs::write(&file, format!(r##"{{"format":"{FORMAT}","name":"Live","base":"dark","colors":{{"panel":"{panel}"{extra}}}}}"##)).unwrap();
+        };
+        let panel = |f: &Follow| f.theme().map(|t| resolve(t).panel);
+
+        // Off by default: nothing is followed or read.
+        let mut follow = Follow::default();
+        assert_eq!(follow.path(""), "");
+        assert_eq!(follow.poll("", 0.0, true), FollowChange::None);
+        assert!(follow.theme().is_none() && follow.error().is_none());
+
+        // A valid file applies; an unchanged one is not read again.
+        write("#102030", "");
+        assert_eq!(follow.poll(&path, 0.0, false), FollowChange::Loaded("Live".into()));
+        assert_eq!(panel(&follow), Some(Color32::from_rgb(0x10, 0x20, 0x30)));
+        assert_eq!(follow.poll(&path, 0.5, false), FollowChange::None, "polled at most every second");
+        assert_eq!(follow.poll(&path, 1.5, false), FollowChange::None, "unchanged");
+
+        // Rewritten (another size, so even a coarse modified time sees it): reloaded.
+        write("#405060", r##","accent":"#aa3300""##);
+        assert_eq!(follow.poll(&path, 1.6, false), FollowChange::None, "not due yet");
+        assert_eq!(follow.poll(&path, 2.6, false), FollowChange::Loaded("Live".into()));
+        assert_eq!(panel(&follow), Some(Color32::from_rgb(0x40, 0x50, 0x60)));
+
+        // Half written, broken, missing or too big: the last good theme stays, the reason once.
+        std::fs::write(&file, r#"{"format":"solidcraft-theme/1","name":"Li"#).unwrap();
+        assert!(matches!(follow.poll(&path, 4.0, false), FollowChange::Failed(e) if e.contains("not a theme file")));
+        assert_eq!(follow.poll(&path, 5.0, true), FollowChange::None, "the same reason is reported once");
+        assert_eq!(panel(&follow), Some(Color32::from_rgb(0x40, 0x50, 0x60)));
+        std::fs::write(&file, vec![b' '; MAX_BYTES + 1]).unwrap();
+        assert!(matches!(follow.poll(&path, 6.0, false), FollowChange::Failed(e) if e.contains("KiB")));
+        std::fs::remove_file(&file).unwrap();
+        assert!(matches!(follow.poll(&path, 7.0, false), FollowChange::Failed(e) if e.contains("can't read")));
+        assert_eq!(panel(&follow), Some(Color32::from_rgb(0x40, 0x50, 0x60)));
+        assert!(follow.error().is_some());
+        assert!(matches!(follow.poll(&dir.to_string_lossy(), 8.0, false), FollowChange::Failed(e) if e.contains("not a file")));
+
+        // Written again completely: back on, the error gone.
+        write("#708090", "");
+        assert_eq!(follow.poll(&path, 9.0, false), FollowChange::Loaded("Live".into()));
+        assert_eq!((panel(&follow), follow.error()), (Some(Color32::from_rgb(0x70, 0x80, 0x90)), None));
+
+        // The launch flag's path wins over the preference's; an empty path stops following.
+        follow.launch = Some(path.clone());
+        assert_eq!(follow.path("/elsewhere.json"), path);
+        follow.launch = None;
+        assert_eq!(follow.poll("", 10.0, false), FollowChange::None);
+        assert!(follow.theme().is_none());
+        assert!(follow_path(&"x".repeat(MAX_FOLLOW_PATH + 1)).is_err() && follow_path("a\nb").is_err());
+        assert!(follow_path("a\u{7}b").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

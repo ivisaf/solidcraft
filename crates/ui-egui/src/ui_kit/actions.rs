@@ -31,14 +31,27 @@ pub(crate) fn icon_button_at(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &
 
 /// Quiet secondary action: a small, muted glyph with the normal full-size hit target.
 pub(crate) fn quiet_icon_button_at(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &str) -> Response {
-    icon_button_presentation(ui, rect, icon, label, None, true)
+    icon_button_presentation(ui, rect, icon, label, None, true, false)
+}
+
+/// Directional counterpart of an existing master, with the same hit target and accessibility.
+pub(crate) fn mirrored_icon_button_at(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &str) -> Response {
+    icon_button_presentation(ui, rect, icon, label, None, false, true)
 }
 
 pub(super) fn icon_button_colored(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &str, ink: Option<egui::Color32>) -> Response {
-    icon_button_presentation(ui, rect, icon, label, ink, false)
+    icon_button_presentation(ui, rect, icon, label, ink, false, false)
 }
 
-fn icon_button_presentation(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &str, ink: Option<egui::Color32>, quiet: bool) -> Response {
+fn icon_button_presentation(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    icon: &str,
+    label: &str,
+    ink: Option<egui::Color32>,
+    quiet: bool,
+    mirrored: bool,
+) -> Response {
     let t = Tokens::get();
     let response = ui.interact(rect, ui.make_persistent_id(("icon_button", icon, label)), egui::Sense::click());
     if response.clicked() {
@@ -47,7 +60,8 @@ fn icon_button_presentation(ui: &mut Ui, rect: egui::Rect, icon: &str, label: &s
     if response.hovered() {
         ui.painter().rect_filled(rect, t.control_radius, t.hover);
     }
-    crate::icons::paint_ink(
+    let paint = if mirrored { crate::icons::paint_ink_mirrored } else { crate::icons::paint_ink };
+    paint(
         ui.painter(),
         if quiet { egui::Rect::from_center_size(rect.center(), vec2(t.space_12, t.space_12)) } else { rect.shrink(t.form_icon_inset) },
         icon,
@@ -423,6 +437,9 @@ fn button_widget(label: egui::WidgetText, options: Button) -> egui::Button<'stat
 pub fn button(ui: &mut Ui, label: impl Into<egui::WidgetText>, options: Button) -> Response {
     let label = label.into();
     let key = label.text().to_owned();
+    if crate::prefs_search::suppress_chrome(ui) && !crate::prefs_search::texts_hit(ui, &[&key]) {
+        return crate::prefs_search::hidden_response(ui);
+    }
     let response = match options {
         Button::Enabled(enabled) => ui.add_enabled_ui(enabled, |ui| ui.add(button_widget(crate::i18n::tr_label(&key).into(), options))).inner,
         _ => ui.add(button_widget(label, options)),

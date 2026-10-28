@@ -280,6 +280,7 @@ fn groups(t: &Tokens) -> Vec<Group> {
         group("card text", &[("form_ink", t.form_ink), ("form_error", t.form_error)], &[("dialog_body", t.dialog_body)]),
         group("card hints", &[("form_dim", t.form_dim)], &[("dialog_body", t.dialog_body)]),
         group("card primary", &[("form_primary", t.form_primary)], &[("dialog_body", t.dialog_body)]),
+        group("navigation status", &[("form_primary", t.form_primary), ("warning", t.warning)], &[("dialog_body", t.dialog_body)]),
         // Validation is identified by its words as well as colour. Measure both the
         // ink and badge surfaces against the corresponding failure states.
         group(
@@ -377,6 +378,14 @@ const SHADED: [&str; 2] = ["analysis.draft", "analysis.access"];
 /// Tokens no colour vision mode needs to keep apart, and why. A new token fails
 /// `every_token_is_measured_or_carries_no_meaning` until it is in a group above or here.
 const NO_MEANING: &[(&str, &str)] = &[
+    ("nav_hover", "neutral hover surface; placement and pointer feedback identify the control"),
+    ("nav_press", "neutral pressed/open surface; interaction and menu presence identify the state"),
+    ("nav_dim", "neutral secondary ink; the Later label identifies the unavailable option"),
+    ("nav_field", "neutral control surface, not a semantic category"),
+    ("nav_tip", "neutral tooltip surface, not a semantic category"),
+    ("nav_tip_ink", "neutral tooltip text; words identify the control and value"),
+    ("nav_tip_key_border", "neutral keycap outline; its key label carries the meaning"),
+    ("nav_viewport", "neutral preview-stage background, not model or status colour"),
     ("borders.primary", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
     ("borders.secondary", "structural chrome: hierarchy uses width, pattern and placement, not hue"),
     ("borders.secondary_dotted", "structural chrome: hierarchy uses width, pattern and placement, not hue"),

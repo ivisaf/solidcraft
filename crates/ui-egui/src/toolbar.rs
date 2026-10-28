@@ -2,7 +2,7 @@
 
 use crate::fonts::RichTextExt as _;
 use crate::icons::glyphs::pin_icon;
-use crate::ui_kit::{Container, Edge, Surface};
+use crate::ui_kit::{self, Container, Edge, Surface};
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -790,7 +790,7 @@ fn save_as_named(app: &mut SolveApp, name: &str, extension: &str) {
     });
 }
 
-/// File > Download design (browser build): the open design as a `.solidcraft` file download.
+/// File > Download design (browser build): the open design as a `.sc` file download.
 fn download_design(app: &mut SolveApp) {
     let name = format!("{}.{}", app.session.doc.name, solidcraft_engine::io::DESIGN_EXT);
     let result = app
@@ -1424,8 +1424,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 if let Some(d) = resp.dnd_hover_payload::<ToolbarDrag>()
                     && d.id != c.id
                 {
-                    painter
-                        .line_segment([pos2(br.left() - 1.0, br.top() + 2.0), pos2(br.left() - 1.0, br.bottom() - 2.0)], Stroke::new(2.0, t.accent));
+                    ui_kit::insertion_marker(&painter, br.left() - 1.0, br.top() + 2.0, br.bottom() - 2.0);
                 }
                 if let Some(d) = resp.dnd_release_payload::<ToolbarDrag>()
                     && d.id != c.id
@@ -1605,7 +1604,7 @@ pub fn toolbar(app: &mut SolveApp, ui: &mut egui::Ui) {
                 })
             });
             if !over_button && ui.rect_contains_pointer(panel_rect) && egui::DragAndDrop::payload::<ToolbarDrag>(ui.ctx()).is_some() {
-                painter.line_segment([pos2(px + width - 4.0, top + 4.0), pos2(px + width - 4.0, top + 38.0)], Stroke::new(2.0, t.accent));
+                ui_kit::insertion_marker(&painter, px + width - 4.0, top + 4.0, top + 38.0);
                 if ui.input(|input| input.pointer.any_released())
                     && let Some(d) = egui::DragAndDrop::take_payload::<ToolbarDrag>(ui.ctx())
                 {
@@ -2063,12 +2062,7 @@ fn sketch_menu_rows(
     }
 }
 
-/// A command being dragged: a toolbar button, or a row of a panel drop-down (`from_menu`).
-#[derive(Clone, Copy, Debug)]
-struct ToolbarDrag {
-    id: &'static str,
-    from_menu: bool,
-}
+type ToolbarDrag = ui_kit::ReorderPayload<&'static str>;
 
 /// The dragged command's icon under the pointer, crossed out when releasing removes it.
 fn drag_ghost(app: &SolveApp, ctx: &egui::Context, id: &str, at: egui::Pos2, removing: bool) {
@@ -2092,7 +2086,9 @@ fn drag_ghost(app: &SolveApp, ctx: &egui::Context, id: &str, at: egui::Pos2, rem
 pub(crate) fn selection_filter(app: &mut SolveApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     ui.label(egui::RichText::new(crate::i18n::tr_label("Selection filter")).color(t.text_dim).size(t.font_small));
-    crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Select bodies (a face picks its body)"), &mut app.ui.pick_bodies);
+    if crate::ui_kit::checkbox(ui, crate::i18n::tr_label("Select bodies (a face picks its body)"), &mut app.ui.pick_bodies).changed() {
+        app.ui.pick_components = false;
+    }
     for (k, label) in [
         ("faces", "Faces"),
         ("edges", "Edges"),
@@ -2424,6 +2420,49 @@ mod header_report_tests {
         assert!(FileAction::Export("step").enabled(&h.app));
     }
 
+    /// New designs are saved as `.sc`. A design opened from a `.solidcraft` file is saved back to
+    /// that file by Save (no rename behind the user's back); Save As offers `.sc` and leaves it.
+    #[test]
+    fn save_offers_sc_and_keeps_an_opened_solidcraft_file() {
+        let mut h = crate::scenario::Harness::new();
+        let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::<(String, Vec<String>)>::new()));
+        let (seen, dir) = (offered.clone(), h.dir.clone());
+        h.app.services.pick_save = Some(Box::new(move |name, extensions| {
+            seen.borrow_mut().push((name.to_string(), extensions.iter().map(|e| e.to_string()).collect()));
+            let path = dir.join(name).to_string_lossy().into_owned();
+            Box::pin(std::future::ready(Some(path)))
+        }));
+        h.app.run("solid.box", json!({"length":2,"width":3,"height":4})).unwrap();
+        h.app.session.doc_mut().name = "Bracket".into();
+        FileAction::Save.run(&mut h.app);
+        h.frames(3);
+        h.settle();
+        assert_eq!(offered.borrow().last().map(|(n, e)| (n.as_str(), e.clone())), Some(("Bracket.sc", vec!["sc".to_string(), "json".to_string()])));
+        assert!(h.dir.join("Bracket.sc").is_file(), "a new design is saved as .sc");
+
+        // A design from an earlier release.
+        let old = h.dir.join("Old.solidcraft");
+        std::fs::rename(h.dir.join("Bracket.sc"), &old).unwrap();
+        h.app.run("doc.open", json!({"path": old.to_string_lossy()})).unwrap();
+        h.app.run("solid.box", json!({"length":1,"width":1,"height":1})).unwrap();
+        let asked = offered.borrow().len();
+        FileAction::Save.run(&mut h.app);
+        h.frames(3);
+        h.settle();
+        assert_eq!(offered.borrow().len(), asked, "Save writes the opened file without asking");
+        assert_eq!(h.app.session.path.as_deref(), Some(old.to_string_lossy().as_ref()));
+        assert!(!h.app.session.is_dirty());
+        assert_eq!(solidcraft_engine::io::read_design(&std::fs::read(&old).unwrap()).unwrap().features.len(), 2);
+        assert!(!h.dir.join("Old.sc").exists() && !h.dir.join("Bracket.sc").exists(), "nothing renamed");
+
+        FileAction::SaveAs.run(&mut h.app);
+        h.frames(3);
+        h.settle();
+        let name = offered.borrow().last().map(|(n, _)| n.clone()).unwrap();
+        assert!(name.ends_with(".sc"), "Save As offers .sc: {name}");
+        assert!(h.dir.join(&name).is_file() && old.is_file(), "Save As leaves the .solidcraft file as it was");
+    }
+
     #[test]
     fn native_menu_actions_are_disabled_behind_an_open_issue_report() {
         let mut h = crate::scenario::Harness::new();
@@ -2559,7 +2598,7 @@ mod header_report_tests {
         h.step(&json!({"widget":"Download design"})).unwrap();
         let got = got.borrow();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, "Plate.solidcraft");
+        assert_eq!(got[0].0, "Plate.sc");
         assert!(solidcraft_engine::io::is_design_container(&got[0].1));
         assert!(h.app.session.path.is_none(), "a download is no save: the design keeps no file");
     }
@@ -2578,11 +2617,7 @@ mod header_report_tests {
         h.step(&json!({"key":"S","cmd":true,"shift":true})).unwrap();
         h.frames(3);
         h.settle();
-        assert_eq!(
-            h.app.session.path.as_deref(),
-            h.dir.join("Copy.solidcraft").to_str(),
-            "Ctrl+Shift+S must open Save As, not save over the current file"
-        );
+        assert_eq!(h.app.session.path.as_deref(), h.dir.join("Copy.sc").to_str(), "Ctrl+Shift+S must open Save As, not save over the current file");
         assert_eq!(std::fs::read(&source).unwrap(), bytes, "Save As keeps the file the design came from");
         // The File menu shows the shortcut of the command it runs.
         let spec = solidcraft_engine::find_command("file.save_as").expect("file.save_as is a command");

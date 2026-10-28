@@ -510,6 +510,16 @@ pub struct IconColors {
 /// other one's colours (#4146): a new colour drawn in the view goes in both.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tokens {
+    /// Navigation chrome from the approved Navbar boards.
+    pub nav_hover: Color32,
+    pub nav_press: Color32,
+    pub nav_dim: Color32,
+    pub nav_viewport: Color32,
+    pub nav_tip: Color32,
+    pub nav_tip_ink: Color32,
+    pub nav_tip_key_border: Color32,
+    pub nav_field: Color32,
+
     /// Optional structural/control strokes. None retains each surface’s legacy styling.
     pub borders: Borders,
     /// File/start presentation, with explicit foreground/background pairs.

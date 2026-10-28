@@ -44,7 +44,7 @@ records are reported. Unsupported destructive links refuse the entire copy. See
 
 **Extract to File** (`component.extract`, in a component's right-click menu) moves a component
 into a design of its own: its sketches, features, bodies, subcomponents and the joints among them
-go to the new `.solidcraft` file at its origin, with the parameters they use, and the component
+go to the new `.sc` file at its origin, with the parameters they use, and the component
 becomes linked to that file, as **Insert Design** makes it. Its placements and the joints to the
 rest of the assembly stay. Components whose own history builds the same bodies are offered to
 become placements of the new link too (`component.copies`, `component.replace_with_link`).
@@ -362,7 +362,7 @@ the part's bodies only: its timeline, parameters and sheet-metal data (flat patt
 table) stay in the part's own design.
 
 If a source file moves or is renamed, right-click its linked component or occurrence in the
-Browser and choose **Relink Source (All Instances)…**. Choose the saved `.solidcraft` design
+Browser and choose **Relink Source (All Instances)…**. Choose the saved `.sc` design
 to use. Relinking updates that component's stored path and solid bodies for **all its
 instances**, keeping their identities and placements. Cancelling or choosing a missing,
 invalid, empty or self-referencing design leaves the assembly unchanged. The operation is

@@ -33,8 +33,8 @@ pub(crate) struct NavCaps {
 impl NavCaps {
     /// The modelling viewport.
     pub const MODEL: NavCaps = NavCaps { orbit: true, pick: true };
-    /// The Render workspace's product preview: the same navigation, nothing to select.
-    pub const RENDER: NavCaps = NavCaps { orbit: true, pick: false };
+    /// The Render workspace's product preview: shared navigation and product picking.
+    pub const RENDER: NavCaps = NavCaps { orbit: true, pick: true };
 }
 
 /// Supplies the scroll phases browsers omit, before the shared navigation sees input.
@@ -290,7 +290,9 @@ pub(crate) fn modifier_motion(
         && app.viewport.point_drag.is_none()
         && app.viewport.text_drag.is_none()
         && app.viewport.boxsel.is_none()
-        && !(picking && hover.is_some_and(|p| app.viewport.rect.is_some_and(|rect| crate::canvas::owns_pointer(app, &projection(app, rect), p))))
+        && !(picking
+            && !crate::render_workspace::active(app)
+            && hover.is_some_and(|p| app.viewport.rect.is_some_and(|rect| crate::canvas::owns_pointer(app, &projection(app, rect), p))))
         && !hover.is_some_and(|p| app.viewport.layout.as_ref().is_some_and(|l| l.navigation.contains(p)));
     let next = crate::prefs::nav_preset(&app.preferences.nav).motion_mode(mods).zip(hover.filter(|p| owns && p.is_finite()));
     let previous = app.viewport.modifier_nav;
@@ -569,7 +571,8 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
                         return true;
                     }
                     let proj = projection(app, rect);
-                    pick(app, &proj, p).is_empty() && crate::dim_view::hit(p).is_none() && crate::sketch_tools::glyph_at(p).is_none()
+                    pick(app, &proj, p).is_empty()
+                        && (crate::render_workspace::active(app) || (crate::dim_view::hit(p).is_none() && crate::sketch_tools::glyph_at(p).is_none()))
                 })
         };
         let openscad_orbit =
@@ -976,10 +979,12 @@ pub(crate) fn orbit_about(app: &mut SolveApp, _rect: egui::Rect, dx: f64, dy: f6
 }
 
 fn orbit_camera(app: &mut SolveApp, dx: f64, dy: f64) {
-    if app.preferences.free_orbit {
-        app.cam.rotate_in_view(Vec3::new(-dy * 0.008, -dx * 0.008, 0.0));
-    } else {
+    if !app.preferences.free_orbit {
         app.cam.orbit(dx, dy);
+    } else if app.preferences.free_orbit_upright {
+        app.cam.orbit_unlimited(dx, dy);
+    } else {
+        app.cam.rotate_in_view(Vec3::new(-dy * 0.008, -dx * 0.008, 0.0));
     }
 }
 
@@ -1371,6 +1376,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Free orbit turning around the vertical axis: sideways drags keep the elevation and the
+    /// world's up axis on screen (no tumbling), and up/down drags go on over the top; past it,
+    /// sideways still turns about the vertical axis, the model following the cursor.
+    #[test]
+    fn free_orbit_upright_turns_about_the_vertical_axis_past_the_pole() {
+        use super::*;
+        for up in [solidcraft_engine::render::UpAxis::Z, solidcraft_engine::render::UpAxis::Y] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.preferences.free_orbit = true;
+            h.app.preferences.free_orbit_upright = true;
+            h.app.cam = Camera { yaw: 0.2, pitch: 0.6, up, ..Default::default() };
+            let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+            let height = |c: &Camera| c.back().dot(c.up_dir());
+            let before = h.app.cam;
+            for _ in 0..50 {
+                orbit_drag(&mut h.app, rect, 7.0, 0.0, None, false, false);
+                assert!((height(&h.app.cam) - height(&before)).abs() < 1e-9, "{up:?}: {:?}", h.app.cam);
+                assert!(h.app.cam.basis().0.dot(h.app.cam.up_dir()).abs() < 1e-9, "{up:?}: the horizon stays level");
+            }
+            assert!((h.app.cam.yaw - (before.yaw + 350.0 * 0.008)).rem_euclid(std::f64::consts::TAU) < 1e-9);
+            // Up over the top: 2 rad of tilt from 0.6 rad elevation passes straight down.
+            h.app.cam = Camera { yaw: 0.0, pitch: 0.6, up, ..Default::default() };
+            for _ in 0..100 {
+                orbit_drag(&mut h.app, rect, 0.0, 2.5, None, false, false);
+            }
+            let past = h.app.cam;
+            assert!((height(&past) - 2.6_f64.sin()).abs() < 1e-9, "{up:?}: {past:?}");
+            assert!(past.basis().1.dot(past.up_dir()) < 0.0, "{up:?}: upside down past the pole");
+            orbit_drag(&mut h.app, rect, 10.0, 0.0, None, false, false);
+            assert!((height(&h.app.cam) - height(&past)).abs() < 1e-9);
+            // Upright and upside down alike, a drag to the right moves the near side right.
+            let near = |c: &Camera| c.target + (c.back() - c.up_dir() * height(c)) * 10.0;
+            assert!(h.app.cam.frame_coords(near(&past)).x > 0.5, "{up:?}: {:?}", h.app.cam);
+            h.app.cam = before;
+            orbit_drag(&mut h.app, rect, 10.0, 0.0, None, false, false);
+            assert!(h.app.cam.frame_coords(near(&before)).x > 0.5, "{up:?}: {:?}", h.app.cam);
+        }
+        // Without the option, free orbit still turns about the screen's axes.
+        let mut h = crate::scenario::Harness::new();
+        h.app.preferences.free_orbit = true;
+        h.app.cam = Camera { yaw: 0.0, pitch: 0.6, ..Default::default() };
+        orbit_drag(&mut h.app, Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0)), 50.0, 0.0, None, false, false);
+        assert!((h.app.cam.back().z - 0.6_f64.sin()).abs() > 1e-3);
     }
 
     #[test]

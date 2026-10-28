@@ -547,7 +547,7 @@ pub fn crash_draft(report: &serde_json::Value) -> Draft {
         if recent.is_empty() { "(none recorded)".to_string() } else { recent.join(", ") },
         s("id"),
         match (report.get("design_path").is_some(), report.get("replay_path").is_some()) {
-            (true, true) => "the design as it was before the crash (design.solidcraft) and the commands that crash it (replay.json)",
+            (true, true) => "the design as it was before the crash (design.sc) and the commands that crash it (replay.json)",
             (false, true) => "the commands that crash it on a new design (replay.json)",
             _ => "no replay (see its notes)",
         },
@@ -1132,6 +1132,52 @@ mod tests {
         }
     }
 
+    /// Ctrl+Enter (⌘Enter on a Mac) continues on GitHub from a field, without a line break, and
+    /// asks for a description first like the button does (#7203). Holding it opens GitHub once.
+    #[test]
+    fn issue_report_ctrl_enter_continues_on_github() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.issue_report.draft = Some(draft_for(&h.app, None, None));
+        h.frames(8);
+        assert!(h.widget(form::shortcut_hint(h.ctx.os())).is_some(), "the dialog says so");
+        // As the platforms send it: ⌘ sets mac_cmd and command, Ctrl elsewhere ctrl and command.
+        // egui marks a press of a key it already holds down as a repeat.
+        let key = |pressed: bool| {
+            let modifiers = if h.ctx.os() == egui::os::OperatingSystem::Mac {
+                egui::Modifiers { mac_cmd: true, command: true, ..Default::default() }
+            } else {
+                egui::Modifiers { ctrl: true, command: true, ..Default::default() }
+            };
+            egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed, repeat: false, modifiers }
+        };
+        let (down, up) = (key(true), key(false));
+        // Held for `repeats` frames after the press, then released.
+        let press = |h: &mut crate::scenario::Harness, repeats: usize| {
+            let mut commands = Vec::new();
+            for _ in 0..=repeats {
+                h.frame_with(vec![down.clone()]);
+                commands.extend(h.output.commands.clone());
+            }
+            h.frame_with(vec![up.clone()]);
+            commands.extend(h.output.commands.clone());
+            h.frames(2);
+            commands.extend(h.output.commands.clone());
+            commands
+        };
+        let commands = press(&mut h, 0);
+        assert!(!commands.iter().any(|c| matches!(c, egui::OutputCommand::OpenUrl(_))));
+        assert!(h.app.issue_report.draft.as_ref().unwrap().missing_description, "an empty description is asked for");
+        h.frame_with(vec![egui::Event::Text("The preview disappeared".into())]);
+        // Held down, it continues on GitHub once: its repeats open nothing more.
+        let commands = press(&mut h, 3);
+        let opened = commands.iter().filter(|c| matches!(c, egui::OutputCommand::OpenUrl(url) if url.url.starts_with(ISSUE_URL))).count();
+        assert_eq!(opened, 1, "{commands:?}");
+        let draft = h.app.issue_report.draft.as_ref().unwrap();
+        assert_eq!(draft.description, "The preview disappeared", "no line break");
+        assert!(draft.opened_github);
+    }
+
     #[test]
     fn crash_draft_marks_later_detection_without_losing_native_evidence() {
         let message =
@@ -1411,6 +1457,9 @@ mod tests {
         draft.image = Some(Arc::new(ColorImage::new([4, 3], vec![egui::Color32::GREEN; 12])));
         h.app.issue_report.draft = Some(draft);
         h.frames(4);
+        // The screenshot's buttons sit low in the review's scroll area: scrolled into view first.
+        h.call("ui.scroll", json!({"x":800,"y":600,"delta":-1000}));
+        h.frames(2);
         for (path, saved) in [(h.dir.join("report.png"), true), (h.dir.join("missing").join("report.png"), false)] {
             let answer = path.to_string_lossy().to_string();
             h.app.services.pick_save = Some(Box::new(move |_, _| Box::pin(std::future::ready(Some(answer.clone())))));

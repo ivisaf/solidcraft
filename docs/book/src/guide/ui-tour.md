@@ -19,7 +19,12 @@
   hides an item, a component's radio button makes it the active component, and right-clicking any
   row gives that item's menu. Right-click the design or a component and choose **Expand All** or
   **Collapse All** to open or close every folder under that row (the design row stays visible
-  when the whole tree is collapsed). Rows drag into groups and other components.
+  when the whole tree is collapsed). Rows drag into groups and other components. **Preferences ›
+  Interface › Bodies folders** sets when a component's bodies sit in a Bodies folder of their own:
+  **Several bodies only** (the default) lists a component's body straight under it when it has
+  only one and no groups, **Never** lists every component's bodies and groups straight under it
+  (the folder's menu items are then on the component's menu), and **Always** keeps the folder.
+  The design's own Bodies folder, and a folder hidden with its eye, always stay.
 - **Viewport.** Click to select, Shift or Ctrl to add (Preferences › Selection), drag for a window or crossing box. While sketching, Ctrl/Cmd or Alt/Option suppress auto-snap by default; Shift prefers a midpoint; the pointer also snaps to where two curves cross. To
   reach something under something else (two lines drawn on top of each other, coincident points,
   an edge in front of a face, overlapping bodies), hold the left button still for half a second
@@ -44,7 +49,9 @@
   Enable **Preferences → Navigation → Free orbit** to rotate the mouse and 3D mouse continuously
   through both poles, preserving roll. During an orbit drag, Shift snaps the view direction and
   the picture rotation to the nearest quarter turn; releasing Shift resumes the unsnapped rotation.
-  Free orbit defaults to off for every mouse
+  Under it, **Turn around the vertical axis** makes sideways mouse drags spin the model around the
+  world's vertical axis instead of the screen's, while up and down drags still tilt over the top
+  without a limit. Both default to off for every mouse
   preset. With SolidWorks navigation, right-click a planar face and choose **Normal to Selection**
   to use Look At (also Ctrl+8); repeat to flip the side, preserving scale and projection.
 
@@ -92,6 +99,8 @@
   back, and drag features to reorder them. Preferences can put the timeline vertically at the
   far left of the viewport, beside the browser. Its seam handle switches between icon
   chips and compact feature names; the browser can collapse to a rail beside either width.
+  Docked under the browser, the two share the column: drag the seam between them to give either
+  more height, and the split is remembered.
   Previous, Play and Next sit at the top. Double-click Previous to roll to the start.
   Interface › **Sketches** › **Under their feature** lists a sketch in the vertical timeline one
   level in, under the first feature built from it, behind that feature's fold arrow. Dragging the
@@ -217,6 +226,20 @@ Command icons use the shared SVG palette.
 
 Imported themes are kept with your preferences, so they work in the browser app too. Colour
 vision modes still apply on top of any theme.
+
+#### Follow a theme file
+
+In the desktop app, **Follow a theme file** (under the themes) takes a theme file that another
+tool writes and keeps it as the theme: whenever the file changes, SolidCraft reloads it within
+about a second, and again when its window comes back to the front, without a restart. This suits
+tools that generate a colour scheme from your wallpaper or keep one scheme across your desktop
+and applications (pywal and matugen are two examples); have them write a `solidcraft-theme/1`
+file from a template. **Choose…** picks the file, **Stop following** (or choosing any theme)
+turns it off; it is off until you choose a file. Only a file that reads completely is applied:
+while it is being written, or if it is broken, missing or larger than 256 KiB, the last good
+theme stays on and the setting says why. `solidcraft --theme-file my-theme.json` follows a file
+for one run without changing your preferences. The browser app has no file to follow; import the
+theme there instead.
 
 Graphics › **Frame rate** shows frames per second in the view's bottom-right corner. Click it,
 or turn on **Frame rate details**, for the performance overlay:

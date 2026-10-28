@@ -27,6 +27,32 @@ macro_rules! element {
     };
 }
 
+fn navigation_sample(ui: &mut Ui, size: crate::navigation_bar::Size) {
+    let metrics = NavigationMetrics::for_size(size);
+    let inset = NAV_PADDING + NAV_BORDER;
+    let menu_width = metrics.icon + NAV_MENU_LEFT + NAV_MENU_RIGHT + NAV_MENU_GAP + NAV_CHEVRON;
+    let (rect, _) =
+        ui.allocate_exact_size(vec2(2.0 * metrics.button + menu_width + 2.0 * NAV_GAP + 2.0 * inset, metrics.height()), egui::Sense::hover());
+    navigation_surface(ui, rect, size, true);
+    let mut x = rect.left() + inset;
+    for (id, icon, kind, selected, width) in [
+        ("pan", "pan", crate::navigation_bar::Kind::Tool, true, metrics.button),
+        ("fit", "fit", crate::navigation_bar::Kind::Action, false, metrics.button),
+        ("visual_style", "style_shaded_edges", crate::navigation_bar::Kind::Menu, false, menu_width),
+    ] {
+        let bounds = egui::Rect::from_min_size(egui::pos2(x, rect.top() + inset), vec2(width, metrics.button));
+        navigation_button(
+            ui,
+            bounds,
+            NavigationButton { id, icon, label: id, kind, selected, labels: false, menu: kind == crate::navigation_bar::Kind::Menu },
+        );
+        if id == "fit" {
+            navigation_edit_outline(ui, bounds, true, false);
+        }
+        x += width + NAV_GAP;
+    }
+}
+
 // One entry per element/variant: names, rendering and geometry expectations stay together.
 const ELEMENTS: &[Element] = &[
     element!("sphere_thumbnail", |ui, _| {
@@ -58,6 +84,39 @@ const ELEMENTS: &[Element] = &[
     }),
     element!("look_chain_empty", |ui, _| {
         look_chain(ui, "gallery:empty-chain", ["Face", "Body", "Component", "Material"], [None; 4], LookStep::Face);
+    }),
+    element!("navigation_regular", |ui, _| navigation_sample(ui, crate::navigation_bar::Size::Regular)),
+    element!("navigation_compact", |ui, _| navigation_sample(ui, crate::navigation_bar::Size::Compact)),
+    element!("navigation_popup", |ui, _| {
+        navigation_menu(ui, NAV_POPUP_WIDTH, |ui| {
+            navigation_menu_heading(ui, "Visual style");
+            let mut row = NavigationMenuRow::new("shaded", "Shaded", "style_shaded");
+            row.selected = true;
+            row.show(ui);
+            navigation_menu_separator(ui);
+            NavigationMenuRow::new("fit", "Fit", "fit").show(ui);
+            let mut later = NavigationMenuRow::new("translucent", "Translucent", "style_translucent");
+            later.enabled = false;
+            later.detail = Some("Later");
+            later.show(ui);
+        });
+    }),
+    element!("navigation_settings", |ui, state| {
+        settings_section(ui, "gallery_navigation", "Navigation bar", |ui| {
+            text(ui, "Choose the controls on the bar at the bottom of the 3D view.", Text::Hint("gallery_navigation"));
+            let width = ui.available_width();
+            navigation_stage(ui, width);
+            settings_card(ui, |ui| {
+                text(ui, "Fit", Text::NameCell(true));
+                text(ui, "Action · Runs once and never stays lit.", Text::Hint("gallery_navigation_action"));
+            });
+            navigation_tile(ui, "grid", "Grid", "style", false);
+            row(ui, "Position", |ui| {
+                segmented(ui, &mut state.selected, &["Left", "Centre", "Right"], Default::default());
+            });
+            checkbox(ui, "Show navigation bar", &mut state.checked);
+            button(ui, "Reset to default", Button::Normal);
+        });
     }),
     element!("settings_form", |ui, state| {
         settings_form(ui, Tokens::get().form_label_width, |ui| {
@@ -308,7 +367,7 @@ const ELEMENTS: &[Element] = &[
             super::file_view::RecoveryMessage {
                 title: "1 design was recovered",
                 before_filename: " after SolidCraft closed unexpectedly: ",
-                filename: "enclosure-lid.solidcraft",
+                filename: "enclosure-lid.sc",
                 after_filename: ", 2 minutes ago.",
             },
             "Recover",
@@ -326,7 +385,7 @@ const ELEMENTS: &[Element] = &[
                     id,
                     RecentRow {
                         title: "Sample Plate",
-                        path: "Designs/sample-plate.solidcraft",
+                        path: "Designs/sample-plate.sc",
                         when: "Open now",
                         workspace: "Design",
                         thumbnail: None,
@@ -342,7 +401,7 @@ const ELEMENTS: &[Element] = &[
             "gallery:file:recent",
             RecentRow {
                 title: "Sample Plate",
-                path: "Designs/sample-plate.solidcraft",
+                path: "Designs/sample-plate.sc",
                 when: "Open now",
                 workspace: "Design",
                 thumbnail: None,
@@ -1036,6 +1095,10 @@ const ELEMENTS: &[Element] = &[
         let (rect, _) = ui.allocate_exact_size(vec2(row_height(), row_height()), egui::Sense::hover());
         icon_button_at(ui, rect, "close", "Close");
     }),
+    element!("mirrored_icon_button_at", |ui, _| {
+        let (rect, _) = ui.allocate_exact_size(vec2(row_height(), row_height()), egui::Sense::hover());
+        mirrored_icon_button_at(ui, rect, "chevron_right", "Move left");
+    }),
     element!("quiet_icon_button_at", |ui, _| {
         let (rect, _) = ui.allocate_exact_size(vec2(row_height(), row_height()), egui::Sense::hover());
         quiet_icon_button_at(ui, rect, "plus", "Add shortcut");
@@ -1092,6 +1155,9 @@ const ELEMENTS: &[Element] = &[
     element!("section", "dialog:section:Advanced", Some("dialog:section:Advanced"), |ui, _| {
         section(ui, "gallery", "Advanced", false, |_| {});
     }),
+    element!("search_fold", "prefs:search:shortcuts", Some("prefs:search:shortcuts"), |ui, _| {
+        search_fold(ui, "Shortcuts", 3, |_| {});
+    }),
     element!("divider", "dialog:divider:gallery", None, |ui, _| {
         divider(ui, "gallery");
     }),
@@ -1113,7 +1179,10 @@ const ELEMENTS: &[Element] = &[
 fn example(ui: &mut Ui, element: &Element) -> (&'static str, Option<&'static str>) {
     let mut sample = Sample { value: "12 mm".into(), second: "25 mm".into(), selected: 0, checked: true };
     let rect = ui.scope(|ui| (element.draw)(ui, &mut sample)).response.rect;
-    if matches!(element.name, "menu" | "menu_submenu" | "rename_menu" | "workspace_menu" | "command_search" | "history_icons" | "history_names") {
+    if matches!(
+        element.name,
+        "menu" | "menu_submenu" | "rename_menu" | "workspace_menu" | "command_search" | "history_icons" | "history_names" | "navigation_popup"
+    ) {
         // A popup's elevation is painted outside its layout rectangle. Reserve those
         // actual shadow bounds as part of the gallery sample, keeping the paint guard strict.
         ui.expand_to_include_rect(rect + Menu::frame().shadow.margin());
@@ -1952,7 +2021,7 @@ fn file_view_application_evidence_in_both_themes_and_widths() {
     std::fs::create_dir_all(&output_dir).unwrap();
     let fixture_dir = std::env::temp_dir().join(format!("solidcraft-file-evidence-{}", std::process::id()));
     std::fs::create_dir_all(&fixture_dir).unwrap();
-    let path = fixture_dir.join("sample-plate.solidcraft");
+    let path = fixture_dir.join("sample-plate.sc");
     let fixture = path.to_string_lossy().to_string();
     let mut sample = crate::test_support::sample_app();
     sample.session.execute("file.save_as", &serde_json::json!({"path":fixture})).unwrap();
@@ -1971,7 +2040,7 @@ fn file_view_application_evidence_in_both_themes_and_widths() {
             app.ui.dark = dark;
             app.recoverable.push(solidcraft_engine::recovery::Entry {
                 id: "public-evidence".into(),
-                path: Some("enclosure-lid.solidcraft".into()),
+                path: Some("enclosure-lid.sc".into()),
                 name: "Enclosure lid".into(),
                 saved_at: web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs().saturating_sub(120),
                 features: 14,

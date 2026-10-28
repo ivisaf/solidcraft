@@ -121,9 +121,9 @@ pub(crate) fn animate_folds(app: &mut SolveApp, ctx: &egui::Context) {
     }
 }
 
-/// Shared bounds keep browser and history at exactly the same width. Their split is half
-/// the available height. One folded header gives the other the remainder; two folded
-/// headers sit together at the top.
+/// Shared bounds keep browser and history at exactly the same width. Their split is the
+/// remembered share of the available height (half until the seam is dragged, #7371). One folded
+/// header gives the other the remainder; two folded headers sit together at the top.
 pub(crate) fn stacked_rects(app: &SolveApp, available: Rect) -> (Rect, Rect) {
     let progress = app
         .shell
@@ -148,13 +148,57 @@ fn column_rects_at(app: &SolveApp, available: Rect, browser_fold: f32, history_f
     }
     let budget = (column.height() - gap).max(0.0);
     let header = header_outer_height().min(budget / 2.0);
-    let expanded_browser = egui::lerp(budget / 2.0..=(budget - header).max(0.0), history_fold);
+    let expanded_browser = egui::lerp(browser_split(app.preferences.browser_share, budget, header)..=(budget - header).max(0.0), history_fold);
     let browser_height = egui::lerp(expanded_browser..=header, browser_fold);
     let browser = Rect::from_min_size(column.min, vec2(column.width(), browser_height));
     let history_top = (browser.bottom() + gap).min(column.bottom());
     let history_height = egui::lerp((column.bottom() - history_top).max(0.0)..=header, history_fold);
     let history = Rect::from_min_size(pos2(column.left(), history_top), vec2(column.width(), history_height));
     (browser, history)
+}
+
+/// The expanded browser's height in a column of `budget` (both cards, without the gap): the
+/// remembered share, kept to at least a header and two rows for either card.
+pub(crate) fn browser_split(share: f32, budget: f32, header: f32) -> f32 {
+    let share = if share.is_finite() { share } else { crate::prefs::DEFAULT_BROWSER_SHARE };
+    let least = (header + 2.0 * crate::ui_kit::TREE_ROW_HEIGHT).min(budget / 2.0).max(0.0);
+    (budget * share).clamp(least, (budget - least).max(least))
+}
+
+/// How tall a grip the seam between the stacked browser and History offers, around the gap.
+const SPLIT_RAIL: f32 = 6.0;
+
+/// Dragging the seam between the expanded browser and History moves their split (#7371), as the
+/// column's right edge moves its width.
+fn split_handle(app: &mut SolveApp, ui: &egui::Ui, available: Rect) {
+    if !app.ui.show_browser
+        || app.preferences.timeline_left_browser_collapsed
+        || app.preferences.timeline_collapsed
+        || app.shell.history_folding.is_some_and(|p| p != [0.0, 0.0])
+    {
+        return;
+    }
+    let (browser, history) = stacked_rects(app, available);
+    let budget = history.bottom() - browser.top() - (history.top() - browser.bottom());
+    if !browser.is_positive() || !history.is_positive() || budget <= 0.0 {
+        return;
+    }
+    let rail = Rect::from_x_y_ranges(browser.x_range(), browser.bottom() - SPLIT_RAIL / 2.0..=history.top() + SPLIT_RAIL / 2.0);
+    Container::new(ui.ctx(), Surface::Canvas).area(egui::Id::new("sc_column_split")).order(egui::Order::Foreground).fixed_pos(rail.min).show(
+        ui.ctx(),
+        |ui| {
+            ui.set_min_size(rail.size());
+            let response = ui.interact(rail, egui::Id::new("sc_column_split_rail"), Sense::drag()).on_hover_cursor(egui::CursorIcon::ResizeVertical);
+            if response.dragged() {
+                let delta = ui.input(|input| input.pointer.delta().y);
+                if delta.is_finite() {
+                    let header = header_outer_height().min(budget / 2.0);
+                    app.preferences.browser_share = browser_split((browser.height() + delta) / budget, budget, header) / budget;
+                }
+            }
+        },
+    );
+    crate::scenario::publish_handle("left-column-split", rail.center());
 }
 
 pub(crate) fn floating_rect(app: &SolveApp, available: Rect) -> Rect {
@@ -211,6 +255,7 @@ pub fn left_panel(app: &mut SolveApp, ui: &mut egui::Ui) {
                 if stacked(app) {
                     let width = crate::browser::browser_width(app.preferences.browser_width);
                     crate::browser::resize_column(app, ui, response.response.rect, width, "left-history-rail");
+                    split_handle(app, ui, available);
                 }
             });
         app.shell.history = Some(card.response.rect);
@@ -1880,6 +1925,57 @@ mod tests {
         harness.step(&json!({"drag": [[rail.x, rail.y], [rail.x - 40.0, rail.y]]})).unwrap();
         let narrower = harness.app.preferences.browser_width;
         assert!(narrower < wider - 20.0, "dragging it left should narrow it again: {wider} -> {narrower}");
+    }
+
+    #[test]
+    fn the_seam_between_browser_and_history_drags_their_split_and_is_remembered() {
+        // #7371: under the browser, History took exactly half the column; the seam now moves it.
+        for mode in [crate::shell::LayoutMode::Floating, crate::shell::LayoutMode::Docked] {
+            let mut h = Harness::new();
+            h.app.home.open = false;
+            h.app.ui.layout = mode;
+            h.call("ui.resize", json!({"width":1400,"height":900}));
+            h.app.run("view.history_layout", json!({"dock":"under_browser"})).unwrap();
+            h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+            h.settle();
+            let (browser, history) = (h.app.shell.browser.unwrap(), h.app.shell.history.unwrap());
+            assert!((browser.height() - history.height()).abs() < 1.0, "{mode:?}: an equal split by default: {browser:?} {history:?}");
+            let seam = handle_at("left-column-split").expect("the seam between the cards is a grip");
+            h.step(&json!({"drag": [[seam.x, seam.y], [seam.x, seam.y + 120.0]]})).unwrap();
+            h.settle();
+            let (taller, shorter) = (h.app.shell.browser.unwrap(), h.app.shell.history.unwrap());
+            assert!((taller.height() - browser.height() - 120.0).abs() < 2.0, "{mode:?}: {browser:?} -> {taller:?}");
+            assert!((history.height() - shorter.height() - 120.0).abs() < 2.0, "{mode:?}: {history:?} -> {shorter:?}");
+            assert!((shorter.bottom() - history.bottom()).abs() < 1.0 && (taller.top() - browser.top()).abs() < 1.0);
+            let share = h.app.preferences.browser_share;
+            assert!(share > 0.6 && share < 0.7, "{mode:?}: {share}");
+            let mut restored = SolveApp::new(Default::default(), Default::default());
+            restored.load_prefs(&h.app.prefs());
+            assert_eq!(restored.preferences.browser_share, share);
+            // Either card keeps its header and two rows however far the seam goes.
+            let least = header_outer_height() + 2.0 * crate::ui_kit::TREE_ROW_HEIGHT - 1.0;
+            for dy in [2000.0, -2000.0] {
+                let seam = handle_at("left-column-split").unwrap();
+                h.step(&json!({"drag": [[seam.x, seam.y], [seam.x, seam.y + dy]]})).unwrap();
+                h.settle();
+                let (browser, history) = (h.app.shell.browser.unwrap(), h.app.shell.history.unwrap());
+                assert!(browser.height() >= least && history.height() >= least, "{mode:?}, {dy}: {browser:?} {history:?}");
+            }
+            // Folding History still gives the browser the rest, and unfolding brings the split back.
+            let split = h.app.shell.browser.unwrap().height();
+            h.app.preferences.timeline_collapsed = true;
+            h.frames(12);
+            assert!(h.app.shell.history.unwrap().height() <= header_outer_height() + 1.0);
+            assert!(handle_at("left-column-split").is_none(), "no grip while a card is folded");
+            h.app.preferences.timeline_collapsed = false;
+            h.frames(12);
+            assert!((h.app.shell.browser.unwrap().height() - split).abs() < 1.0);
+        }
+        // A hostile preference falls back to the equal split; a tiny column still fits both headers.
+        assert_eq!(browser_split(f32::NAN, 600.0, 40.0), 300.0);
+        assert_eq!(browser_split(f32::INFINITY, 600.0, 40.0), 300.0);
+        assert_eq!(browser_split(-3.0, 600.0, 40.0), 40.0 + 2.0 * crate::ui_kit::TREE_ROW_HEIGHT);
+        assert_eq!(browser_split(0.9, 60.0, 30.0), 30.0);
     }
 
     #[test]

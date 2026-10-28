@@ -1780,11 +1780,16 @@ pub fn imported(app: &mut SolveApp, result: Result<Value, String>) {
     }
 }
 
-/// Runs a command with this window's tool library, if it has one of its own.
-fn run(app: &mut SolveApp, id: &str, mut p: Value) -> Result<Value, String> {
-    if let (Some(library), Some(o)) = (&app.manufacture.library, p.as_object_mut()) {
+/// Gives `p` this window's tool library, if it has one of its own.
+fn with_library(library: &Option<String>, p: &mut Value) {
+    if let (Some(library), Some(o)) = (library, p.as_object_mut()) {
         o.insert("library".into(), json!(library));
     }
+}
+
+/// Runs a command with this window's tool library, if it has one of its own.
+fn run(app: &mut SolveApp, id: &str, mut p: Value) -> Result<Value, String> {
+    with_library(&app.manufacture.library, &mut p);
     app.manufacture.listing = None;
     app.run(id, p)
 }
@@ -1974,7 +1979,10 @@ fn origin_pick(app: &mut SolveApp) -> Option<(String, Vec3, solidcraft_engine::d
 /// none while the form still misses something.
 fn update_preview(app: &mut SolveApp, lists: &Choices) {
     let wanted = match &app.manufacture.form {
-        Some(form @ Form::Op(_)) if missing(form, lists).is_empty() => command(form).ok().map(|(id, p)| (id, json!({ "command": id, "params": p }))),
+        Some(form @ Form::Op(_)) if missing(form, lists).is_empty() => command(form).ok().map(|(id, mut p)| {
+            with_library(&app.manufacture.library, &mut p);
+            (id, json!({ "command": id, "params": p }))
+        }),
         _ => None,
     };
     let Some((id, key)) = wanted else {

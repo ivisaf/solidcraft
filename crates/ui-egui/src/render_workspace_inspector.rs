@@ -226,7 +226,14 @@ pub(super) fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
     let icon = app.render_workspace.view.inspector.page.icon();
     let content = ui_kit::Panel::workspace(
         ui,
-        ui_kit::WorkspaceOptions { id: "render:inspector", title: &title, icon, bounds, fill_height: true },
+        ui_kit::WorkspaceOptions {
+            id: "render:inspector",
+            title: &title,
+            icon,
+            bounds,
+            fill_height: true,
+            compact: crate::render_ui::compact(app, bounds.width()),
+        },
         &mut side,
         &mut width,
         |ui| {
@@ -276,10 +283,14 @@ pub(super) fn panel(app: &mut SolveApp, ui: &mut egui::Ui) {
         },
     );
     app.preferences.render_inspector_width = width;
-    if app.preferences.render_inspector_side != side {
-        app.preferences.render_browser_side = if side == "left" { "right" } else { "left" }.into();
+    let requested = content
+        .as_ref()
+        .and_then(|c| c.inner.1)
+        .map(str::to_string)
+        .or_else(|| (app.preferences.render_inspector_side != side).then(|| side.clone()));
+    if let Some(side) = requested {
+        let _ = app.run("view.render_dock", serde_json::json!({"panel":"inspector","side":side}));
     }
-    app.preferences.render_inspector_side = side.clone();
     let rect = content.map(|c| c.response.rect);
     crate::shell::register_panel(app, "render:inspector", rect, Some(if side == "left" { ui_kit::Edge::Left } else { ui_kit::Edge::Right }));
     if let Some(rect) = rect {
@@ -674,7 +685,7 @@ fn camera_controls(app: &mut SolveApp, ui: &mut egui::Ui) {
         if ui_kit::button(ui, app.tr("render.result_fit"), ui_kit::Button::Normal).clicked() {
             super::fit_result(app);
         }
-        if ui_kit::button(ui, "100%", ui_kit::Button::Enabled(!super::reduced_display(app))).clicked() {
+        if ui_kit::button(ui, crate::i18n::tr("render.result_actual_size"), ui_kit::Button::Enabled(!super::reduced_display(app))).clicked() {
             app.render_workspace.view.result_scale = super::ResultScale::Actual;
         }
     }
@@ -725,7 +736,11 @@ fn output_controls(app: &mut SolveApp, ui: &mut egui::Ui) {
         ui_kit::text(ui, app.tr("render.output_ratio_refused"), ui_kit::Text::Error("render.output_ratio_refused"));
     }
     ui.horizontal_wrapped(|ui| {
-        for (label, width, height) in [("HD", 1280, 720), ("Full HD", 1920, 1080), ("4K UHD", 3840, 2160)] {
+        for (label, width, height) in [
+            (crate::i18n::tr("render.size_hd"), 1280, 720),
+            (crate::i18n::tr("render.size_full_hd"), 1920, 1080),
+            (crate::i18n::tr("render.size_4k_uhd"), 3840, 2160),
+        ] {
             if ui_kit::button(ui, label, ui_kit::Button::Normal).clicked() {
                 app.render_workspace.view.draft.width = width;
                 app.render_workspace.view.draft.height = height;
@@ -853,10 +868,10 @@ pub(super) fn quality_resource(app: &mut SolveApp, ui: &mut egui::Ui, id: &str) 
 }
 fn apply_quality(app: &mut SolveApp, plan: &Value) -> Result<(), String> {
     if app.render_workspace.view.method != ImageMethod::GpuRaytrace || plan["variant"] != "fixed_samples_png" {
-        return Err("quality projection requires the same explicit GPU method".into());
+        return Err(crate::i18n::tr("render.error_quality_method").into());
     }
     let u32_at = |section: &str, key: &str| {
-        plan[section][key].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| "invalid native quality projection".to_string())
+        plan[section][key].as_u64().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| crate::i18n::tr("render.error_quality_projection").to_string())
     };
     let (width, height, samples, depth, seed) = (
         u32_at("settings", "width")?,
@@ -865,13 +880,13 @@ fn apply_quality(app: &mut SolveApp, plan: &Value) -> Result<(), String> {
         u32_at("gpu_options", "max_depth")?,
         u32_at("gpu_options", "seed")?,
     );
-    let denoise = plan["gpu_options"]["denoise"].as_bool().ok_or("invalid native denoise setting")?;
+    let denoise = plan["gpu_options"]["denoise"].as_bool().ok_or(crate::i18n::tr("render.error_denoise_setting"))?;
     if !(1..=4096).contains(&samples)
         || !(1..=16).contains(&depth)
         || solidcraft_engine::render::job::GPU_PATH_LIMITS.fit(u64::from(width), u64::from(height), None)
             != Some((u64::from(width), u64::from(height)))
     {
-        return Err("quality projection exceeds native bounds".into());
+        return Err(crate::i18n::tr("render.error_quality_bounds").into());
     }
     let view = &mut app.render_workspace.view;
     view.draft.width = width;

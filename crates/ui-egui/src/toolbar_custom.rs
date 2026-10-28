@@ -348,9 +348,9 @@ pub fn run(app: &mut SolveApp, action: &str, p: &Value) {
     }
 }
 
-/// Shortcut keys, S box favourites and the toolbar as one file (Keyboard Shortcuts › Export).
+/// Shortcut keys, S box favourites, toolbar and navigation bar as one file (Keyboard Shortcuts › Export).
 pub fn export(app: &SolveApp) -> Value {
-    json!({ "format": "solidcraft-shortcuts/1", "shortcuts": app.keymap.prefs(), "favourites": app.sbox.pinned, "toolbar": app.toolbar_custom.prefs() })
+    json!({ "format": "solidcraft-shortcuts/1", "shortcuts": app.keymap.prefs(), "favourites": app.sbox.pinned, "toolbar": app.toolbar_custom.prefs(), "navigation_bar": app.preferences.navigation_bar })
 }
 
 /// The largest shortcuts file Import… reads (hostile input; an export is a few tens of KiB).
@@ -360,6 +360,16 @@ pub fn import(app: &mut SolveApp, v: &Value) -> Result<(), String> {
     // "solvecraft-shortcuts/1": files exported before the rename (compatibility shim).
     if !matches!(v.get("format").and_then(Value::as_str), Some("solidcraft-shortcuts/1" | "solvecraft-shortcuts/1")) {
         return Err("not a SolidCraft shortcuts file".into());
+    }
+    let navigation_bar = v
+        .get("navigation_bar")
+        .map(|value| {
+            crate::navigation_bar::validate(value)?;
+            serde_json::from_value::<crate::navigation_bar::NavigationBar>(value.clone()).map_err(|e| e.to_string())
+        })
+        .transpose()?;
+    if let Some(bar) = navigation_bar {
+        app.preferences.navigation_bar = bar;
     }
     if let Some(s) = v.get("shortcuts") {
         app.keymap.load(s);

@@ -323,6 +323,14 @@ pub fn tr_label(label: &str) -> &str {
 pub fn tr_manufacture(label: &str) -> &str {
     CURRENT.with(|current| current.get().manufacture_label(label))
 }
+
+/// Every English catalog entry `(id, text)`, for Preferences search to match a translation
+/// back to the words it was written in.
+pub(crate) fn each_english_message(mut f: impl FnMut(&str, &str)) {
+    for (id, text) in ENGLISH.messages() {
+        f(id, text);
+    }
+}
 pub fn format(id: &str, args: &[(&str, &str)]) -> String {
     CURRENT.with(|current| current.get().format(id, args))
 }
@@ -463,6 +471,27 @@ mod tests {
     /// nothing in the complete catalogs may regress.
     const COMPLETE: &[&str] = &["ar", "he", "ja", "vi", "zh"];
 
+    /// Complete catalogs that show the Manufacture (CAM) workspace in English until it is
+    /// finished; its texts change too often to keep these in step. Japanese and Chinese have it.
+    const CAM_IN_ENGLISH: &[&str] = &["ar", "he", "vi"];
+
+    /// A message only the Manufacture workspace shows.
+    fn is_cam_message(id: &str) -> bool {
+        id.starts_with("manufacture.")
+            || id.starts_with("cmd.cam_")
+            || matches!(
+                id,
+                "ui.heading_actions"
+                    | "ui.heading_drilling"
+                    | "ui.heading_manufacture"
+                    | "ui.heading_milling"
+                    | "ui.move_down"
+                    | "ui.move_up"
+                    | "ui.workspace_manufacture_cam_description"
+                    | "ui.workspace_manufacture_tabs"
+            )
+    }
+
     /// `text()` falls back to English silently, so a message a complete locale never received is
     /// shown in English inside an otherwise translated UI, with nothing in the build to say so.
     /// This is the guard against that: adding a key to `en.json` and forgetting a complete
@@ -472,7 +501,9 @@ mod tests {
         let english: Messages = serde_json::from_str(ENGLISH.source).unwrap();
         for catalog in LOCALES.iter().filter(|c| COMPLETE.contains(&c.id)) {
             let messages: Messages = serde_json::from_str(catalog.source).unwrap();
-            let missing: Vec<&str> = english.keys().filter(|id| !messages.contains_key(*id)).map(String::as_str).collect();
+            let cam_in_english = CAM_IN_ENGLISH.contains(&catalog.id);
+            let missing: Vec<&str> =
+                english.keys().filter(|id| !messages.contains_key(*id) && !(cam_in_english && is_cam_message(id))).map(String::as_str).collect();
             assert!(missing.is_empty(), "{} is missing {} English message(s): {}", catalog.id, missing.len(), missing.join(", "));
         }
     }
@@ -701,7 +732,6 @@ mod tests {
                 "Strip",
                 "Pick",
                 "Component",
-                "Product picking is not supported yet.",
                 "The live preview shows direct light only and no shadows.",
             ] {
                 assert_ne!(locale.label(label), label, "{language}: {label}");
@@ -711,6 +741,9 @@ mod tests {
             // rather than requiring its spelling to differ from English.
             assert!(locale.0.messages().contains_key("toolbar.render_studio"));
             assert_eq!(locale.label("STUDIO"), locale.text("toolbar.render_studio"));
+            for id in ["render.pick_label", "render.pick_body", "render.pick_face", "render.pick_component", "render.pick_help"] {
+                assert_ne!(locale.text(id), Locale::for_language("en").text(id), "{language}: {id}");
+            }
             let session = solidcraft_engine::Session::default();
             for command in solidcraft_engine::command_specs().into_iter().filter(|c| c.planned.is_some() && crate::workspace::render_tab(c.tab)) {
                 assert_ne!(locale.label(command.label), command.label, "{language}: {}", command.id);

@@ -27,7 +27,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("open")
         .key("Ctrl+O")
         .noundo()
-        .params("path: .solidcraft design, .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh)"),
+        .params("path: .sc design (or a .solidcraft design from an earlier release), .dxf/.svg drawing (opens as a new, unsaved design with an XY sketch, using sketch.insert_dxf/sketch.insert_svg units and defaults), or a .step/.stp/.igs/.fcstd/.3dm/.3mf/.stl/.obj/.glb/.gltf file (STEP, IGES, FreeCAD, Rhino, 3MF, STL, OBJ or glTF; opens as a new design holding the file as a component named after it, as file.insert_step and file.insert_mesh make); up?: z|y for a STEP, IGES, FreeCAD, Rhino or glTF file (see file.insert_step and file.insert_mesh); names?: auto|solid|product|instance for a STEP, IGES, FreeCAD or Rhino file (see file.insert_step); read_only?: bool (a design: saving to its own file is refused, file.save_as keeps the changes elsewhere) → open_elsewhere: {host, user, app, opened} when another SolidCraft has the design open (its lock file is fresh)"),
     CommandSpec::new("file.insert_step", "Insert STEP", insert_step)
         .at("SOLID", "INSERT")
         .icon("import")
@@ -340,7 +340,7 @@ fn open(s: &mut Session, p: &Value) -> Result<Value> {
 /// The name a design never given one by its user is shown under.
 const DEFAULT_NAME: &str = "Untitled";
 
-/// A design still under the default name takes its file's name (`bracket.solidcraft` →
+/// A design still under the default name takes its file's name (`bracket.sc` →
 /// "bracket"); a name the user chose is kept. `None` when nothing changes.
 fn default_name_for(name: &str, path: &str) -> Option<String> {
     let name = name.trim();
@@ -950,6 +950,39 @@ mod tests {
             s.execute("edit.undo", &json!({})).unwrap();
             assert!(!s.is_dirty(), "hide {hide}: back to what the file holds");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.solidcraft` design from an earlier release opens, takes its file's name, and `file.save`
+    /// writes it back to that same file (container format), never to a new `.sc` beside it.
+    #[test]
+    fn saving_an_opened_legacy_design_keeps_its_name() {
+        let dir = std::env::temp_dir().join(format!("solidcraft-legacy-ext-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("Bracket.solidcraft");
+        let mut first = Session::default();
+        first.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        first.execute("file.save_as", &json!({"path": old.to_string_lossy()})).unwrap();
+        let mut s = Session::default();
+        s.execute("doc.open", &json!({"path": old.to_string_lossy()})).unwrap();
+        assert_eq!(s.doc.name, "Bracket");
+        s.execute("solid.box", &json!({"length": 5, "width": 5, "height": 5})).unwrap();
+        s.execute("file.save", &json!({})).unwrap();
+        assert_eq!(s.path.as_deref(), old.to_str());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.ends_with(".bak") && !n.ends_with(".lock"))
+            .collect();
+        assert_eq!(names, ["Bracket.solidcraft"]);
+        let bytes = std::fs::read(&old).unwrap();
+        assert!(solidcraft_io::is_design_container(&bytes));
+        assert_eq!(solidcraft_io::read_design(&bytes).unwrap().features.len(), 2);
+        // Save As to the new extension leaves the old file as it was.
+        s.execute("file.save_as", &json!({"path": dir.join("Bracket.sc").to_string_lossy()})).unwrap();
+        assert!(old.is_file() && dir.join("Bracket.sc").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

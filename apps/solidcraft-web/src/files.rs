@@ -24,11 +24,13 @@ pub const OPFS: &str = disk::OPFS_PREFIX;
 pub const DOWNLOADS: &str = disk::DOWNLOADS_PREFIX;
 /// Files brought in from the computer.
 pub const UPLOAD: &str = "/upload/";
-/// The autosave of unsaved work (in OPFS: `recovery.solidcraft` and `recovery.json`).
-const RECOVERY: &str = "recovery.solidcraft";
-/// The autosave earlier releases kept (compatibility shim, docs/compatibility.md): recovered
-/// when there is no current one.
-const LEGACY_RECOVERY: &str = "recovery.solvecraft";
+/// The autosave of unsaved work (in OPFS: `recovery.sc` and `recovery.json`), named with
+/// `solidcraft_engine::io::DESIGN_EXT`.
+const RECOVERY: &str = "recovery.sc";
+/// The autosaves earlier releases kept, newest first, one per entry of
+/// `solidcraft_engine::io::LEGACY_DESIGN_EXTS` (compatibility shim, docs/compatibility.md): the
+/// newest is recovered when there is no current one.
+const LEGACY_RECOVERY: [&str; 2] = ["recovery.solidcraft", "recovery.solvecraft"];
 const RECOVERY_META: &str = "recovery.json";
 
 /// What to do with a file brought in from the computer.
@@ -282,9 +284,10 @@ pub fn start(files: &Rc<Files>) {
                 }
                 let mut entries = Vec::new();
                 let has_recovery = all.iter().any(|(n, _, _)| n == RECOVERY);
+                let legacy = (!has_recovery).then(|| LEGACY_RECOVERY.into_iter().find(|l| all.iter().any(|(n, _, _)| n == l))).flatten();
                 for (name, bytes, modified) in all {
-                    if name == LEGACY_RECOVERY {
-                        if !has_recovery {
+                    if LEGACY_RECOVERY.contains(&name.as_str()) {
+                        if legacy == Some(name.as_str()) {
                             vfs::insert(&format!("{OPFS}{RECOVERY}"), bytes);
                         }
                         continue;
@@ -424,7 +427,9 @@ pub fn autosave(files: &Rc<Files>, doc: Option<(&solidcraft_engine::doc::Documen
         }
         None => spawn_local(async move {
             let _ = remove_file(RECOVERY).await;
-            let _ = remove_file(LEGACY_RECOVERY).await;
+            for legacy in LEGACY_RECOVERY {
+                let _ = remove_file(legacy).await;
+            }
             let _ = remove_file(RECOVERY_META).await;
         }),
     }

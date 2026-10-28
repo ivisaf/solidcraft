@@ -394,6 +394,7 @@ pub struct Session {
     /// Manufacture panel asks for it every frame, and it builds every toolpath.
     cam_list_cache: std::sync::Mutex<Option<(u64, Arc<solidcraft_doc::Document>, serde_json::Value)>>,
     occurrence_bodies_cache: std::sync::Mutex<Option<occurrences::OccurrenceBodiesCache>>,
+    placement_index_cache: std::sync::Mutex<Option<occurrences::PlacementIndex>>,
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
     /// scratch copies): a body that did not change or move is not measured again.
     clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
@@ -587,6 +588,7 @@ impl Session {
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
+            placement_index_cache: Default::default(),
             clearance_cache: Default::default(),
             cam_path_cache: Default::default(),
             body_renames: Vec::new(),
@@ -734,6 +736,12 @@ impl Session {
 
     /// Mutable document (copy-on-write).
     pub fn doc_mut(&mut self) -> &mut Document {
+        // The placement index keeps the document alive with its answers; let it go before an
+        // in-place edit, so the edit stays in place (a shared handle would clone the document
+        // to a new address behind the crash journal's back, #7502) and no stale lookup outlives it.
+        if let Ok(mut index) = self.placement_index_cache.lock() {
+            *index = None;
+        }
         Arc::make_mut(&mut self.doc)
     }
 
@@ -1119,6 +1127,9 @@ impl Session {
         }
         // Checked first: storing makes the document unique (a copy when the undo step shares it).
         if self.model.edited_sketches(&self.doc).next().is_some() {
+            if let Ok(mut index) = self.placement_index_cache.lock() {
+                *index = None;
+            }
             self.model.adopt_solved_sketches(Arc::make_mut(&mut self.doc));
         }
         Ok(())
@@ -1371,6 +1382,7 @@ impl Session {
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
+            placement_index_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             cam_path_cache: self.cam_path_cache.clone(),
             body_renames: self.body_renames.clone(),

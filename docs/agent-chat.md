@@ -188,7 +188,7 @@ through nvm or `~/.local/bin` can therefore work in a terminal while SolidCraft 
 that no agent was found. For Claude Code and its ACP adapter, run:
 
 ```sh
-flatpak override --user ai.storyteller.solidcraft --filesystem=~/.nvm:ro --filesystem=~/.local/bin:ro --filesystem=~/.local/share/claude:ro --filesystem=~/.claude --filesystem=~/.claude.json --share=network
+flatpak override --user io.tangencylabs.solidcraft --filesystem=~/.nvm:ro --filesystem=~/.local/bin:ro --filesystem=~/.local/share/claude:ro --filesystem=~/.claude --filesystem=~/.claude.json --share=network
 ```
 
 These permissions apply to SolidCraft for your user account:
