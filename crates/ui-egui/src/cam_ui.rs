@@ -193,6 +193,10 @@ pub struct ToolForm {
     /// The holder above the tool (mm): its diameter and length. Empty: not known.
     pub holder_diameter: String,
     pub holder_length: String,
+    /// The holder by its shape: one of the library's by name ("": the plain one above), and the
+    /// one the tool sat in when the form opened (its copy is kept unless another is picked).
+    pub holder: String,
+    pub holder_was: String,
     /// The assistant's step: 0 the kind, 1 the shape, 2 the cutting data.
     pub step: usize,
     /// The material whose cutting data the rows show ("": the tool's own, for every other material).
@@ -676,6 +680,8 @@ pub struct CamUi {
     pub library: Option<String>,
     /// A material's name as typed in the Tool Library window, to add to the library.
     pub new_material: String,
+    /// A holder as typed in the Tool Library window, to add to the library or change there.
+    pub new_holder: HolderDraft,
     /// The machine library as last listed, and how many frames ago.
     listing: Option<(u32, Value)>,
     /// Whether setups' stock boxes and work origins are drawn.
@@ -805,6 +811,7 @@ impl Default for CamUi {
             browser_listing: None,
             selected_tool: None,
             new_material: String::new(),
+            new_holder: HolderDraft::default(),
             library: None,
             listing: None,
             show_setups: true,
@@ -984,6 +991,8 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
                 length: String::new(),
                 holder_diameter: String::new(),
                 holder_length: String::new(),
+                holder: String::new(),
+                holder_was: String::new(),
                 step: 0,
                 material: String::new(),
                 others: Vec::new(),
@@ -1109,6 +1118,10 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 } else if f.editing {
                     p.insert(k.into(), Value::Null);
                 }
+            }
+            // The holder by its shape: named only when another was picked, so the tool keeps its copy.
+            if f.holder != f.holder_was {
+                p.insert("holder".into(), if f.holder.is_empty() { Value::Null } else { json!(f.holder) });
             }
             // The data in particular materials; a material with nothing typed is left out.
             let mut cutting = Vec::new();
@@ -1551,6 +1564,8 @@ pub fn tool_form(tool: &Value, library: bool) -> Option<Form> {
         length: number("length"),
         holder_diameter: number("holder_diameter"),
         holder_length: number("holder_length"),
+        holder: text(&tool["holder"], "name"),
+        holder_was: text(&tool["holder"], "name"),
         // A tool that exists opens on its shape.
         step: 1,
         material: String::new(),
@@ -3182,6 +3197,8 @@ struct Choices {
     cut_heights: Option<solidcraft_engine::PreviewHeights>,
     /// The materials stock is made of: the machine library's, then those only this design names.
     materials: Vec<String>,
+    /// The machine library's holders, by name.
+    holders: Vec<String>,
     /// The material of the setup an operation form adds to (its tools' data is for it).
     material: Option<String>,
     /// The design's setups in order, by id and name: what a setup can take its stock from.
@@ -3267,7 +3284,8 @@ fn choices(app: &SolveApp, listed: &Value, library: &Value) -> Choices {
             bodies.push(name.clone());
         }
     }
-    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, material, setups, bodies, origin_pick: None }
+    let holders = library["holders"].as_array().into_iter().flatten().filter_map(|h| h["name"].as_str()).map(str::to_string).collect();
+    Choices { sketches, tools, data, heights: None, picked: None, cut_heights: None, materials, holders, material, setups, bodies, origin_pick: None }
 }
 
 /// The spindle speed (rev/min) and feed (mm/min) a listed tool cuts at: in a material, `cut`'s
@@ -3300,7 +3318,7 @@ fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choi
     // A form's labels stay on one line each.
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     if let Form::Tool(f) = form {
-        tool_assistant(ui, f, need, &choices.materials);
+        tool_assistant(ui, f, need, &choices.materials, &choices.holders);
         return;
     }
     // An operation form's heights, as a picture left of their rows' labels.
@@ -3519,7 +3537,7 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
 }
 
 /// The tool assistant: the kind (tiles), the shape (with its dimensioned picture), the cutting data.
-fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials: &[String]) {
+fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials: &[String], holders: &[String]) {
     let t = Tokens::get();
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     // Where it is: three steps, each a button back to it.
@@ -3614,9 +3632,19 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         row(ui, "Taper angle (β)", &mut f.taper_angle, "0° (straight)", Dim::Taper);
                     }
                     field(ui, need, "Flutes", &mut f.flutes, "2");
-                    // The holder: checked against clamps, from where the tool comes out of it.
-                    field(ui, need, "Holder diameter", &mut f.holder_diameter, "not known");
-                    field(ui, need, "Holder length", &mut f.holder_length, "not known");
+                    // The holder: checked against clamps and fixtures, from where the tool comes out
+                    // of it. One of the library's by its shape, else a plain one.
+                    let mut options: Vec<(String, String)> = vec![(String::new(), tm("Plain (diameter and length)").into())];
+                    for h in holders.iter().chain([&f.holder_was, &f.holder]) {
+                        if !h.is_empty() && !options.iter().any(|(n, _)| n.eq_ignore_ascii_case(h)) {
+                            options.push((h.clone(), h.clone()));
+                        }
+                    }
+                    pick(ui, need, "sc_cam_tool_holder", "Holder", &mut f.holder, &options);
+                    if f.holder.is_empty() {
+                        field(ui, need, "Holder diameter", &mut f.holder_diameter, "not known");
+                        field(ui, need, "Holder length", &mut f.holder_length, "not known");
+                    }
                 });
                 ui.add_space(12.0);
                 tool_picture(ui, &ToolShape::of(f), lit, egui::vec2(170.0, 250.0), true);
@@ -4787,6 +4815,8 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             }
             ui.add_space(6.0);
             materials_block(ui, cam, library, asked);
+            ui.add_space(6.0);
+            holders_block(ui, cam, library, asked);
         }
     });
     cam.tools_folded = folded;
@@ -5027,6 +5057,145 @@ fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &
             if (button(ui, tm("Add material"), ui_kit::Button::Enabled(named)).clicked() || enter) && named {
                 asked.run.push(("cam.material.define", json!({ "name": cam.new_material.trim() })));
                 cam.new_material.clear();
+            }
+        });
+    });
+}
+
+/// A holder as typed in the Tool Library window: its name, and its sections from where the tool
+/// comes out of it upward, each its length, its diameter and its diameter at its top (empty: the same).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HolderDraft {
+    pub name: String,
+    pub sections: Vec<[String; 3]>,
+}
+
+impl HolderDraft {
+    /// One of the library's holders, to change.
+    fn of(holder: &Value) -> HolderDraft {
+        let mm = |v: &Value| v.as_f64().map(|x| shown(x, 3)).unwrap_or_default();
+        let sections = holder["sections"].as_array().into_iter().flatten();
+        HolderDraft {
+            name: text(holder, "name"),
+            sections: sections.map(|s| [mm(&s["length"]), mm(&s["diameter"]), mm(&s["top_diameter"])]).collect(),
+        }
+    }
+    /// What `cam.holder.define` takes, once it has a name and every section its length and diameter.
+    fn command(&self) -> Option<Value> {
+        let name = self.name.trim();
+        if name.is_empty() || self.sections.is_empty() {
+            return None;
+        }
+        // A unit typed after a number is dropped.
+        let mm = |s: &str| parsed(s.trim().trim_end_matches("mm").trim());
+        let mut sections = Vec::new();
+        for [length, diameter, top] in &self.sections {
+            let mut s = json!({ "length": mm(length)?, "diameter": mm(diameter)? });
+            if !top.trim().is_empty() {
+                s["top_diameter"] = json!(mm(top)?);
+            }
+            sections.push(s);
+        }
+        Some(json!({ "name": name, "sections": sections }))
+    }
+}
+
+/// The machine library's holders by their shape, each with buttons to change or remove it, and
+/// rows to type one in: its name and its sections.
+fn holders_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mut Asked) {
+    let t = Tokens::get();
+    let holders = library["holders"].as_array().cloned().unwrap_or_default();
+    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tm("Holders")).strong());
+            ui.label(RichText::new(tm("what tools sit in, by their shape: checked against clamps and fixtures")).color(t.text_dim));
+        });
+        ui.add_space(4.0);
+        if holders.is_empty() {
+            ui.label(RichText::new(tm("None yet. Type one in below, then pick it in a tool's shape.")).color(t.text_dim));
+        }
+        for h in &holders {
+            let name = text(h, "name");
+            let sections = h["sections"].as_array().cloned().unwrap_or_default();
+            let long: f64 = sections.iter().filter_map(|s| s["length"].as_f64()).sum();
+            let wide = sections.iter().flat_map(|s| [s["diameter"].as_f64(), s["top_diameter"].as_f64()]).flatten().fold(0.0, f64::max);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&name).strong());
+                let summary = tf(
+                    "manufacture.holder_summary",
+                    &[("sections", &sections.len().to_string()), ("length", &shown(long, 1)), ("diameter", &shown(wide, 1))],
+                );
+                ui.label(RichText::new(summary).color(t.text_dim));
+                if button(ui, tm("Change"), Button::Normal).clicked() {
+                    cam.new_holder = HolderDraft::of(h);
+                }
+                if ui_kit::compact_button(ui, "×", &tf("manufacture.remove_holder", &[("holder", &name)]), true, false)
+                    .on_hover_text(tm("Tools keep their copy of its shape"))
+                    .clicked()
+                {
+                    asked.run.push(("cam.holder.remove", json!({ "name": name })));
+                }
+            });
+        }
+        ui.add_space(6.0);
+        let d = &mut cam.new_holder;
+        if d.sections.is_empty() {
+            d.sections.push(Default::default());
+        }
+        ui.horizontal(|ui| {
+            ui.label(tm("Name"));
+            ui.scope(|ui| {
+                ui.set_max_width(180.0);
+                ui_kit::text_field(ui, &mut d.name, tm("ER20 collet chuck…"));
+            });
+        });
+        egui::Grid::new("sc_cam_holder_sections").num_columns(5).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label("");
+            for heading in ["Length", "Diameter", "Top diameter"] {
+                ui.label(RichText::new(tm(heading)).color(t.text_dim));
+            }
+            ui.label("");
+            ui.end_row();
+            let (many, mut gone) = (d.sections.len() > 1, None);
+            for (k, row) in d.sections.iter_mut().enumerate() {
+                ui.label((k + 1).to_string());
+                for (cell, hint) in row.iter_mut().zip(["20 mm", "35 mm", tm("the same")]) {
+                    ui.scope(|ui| {
+                        ui.set_max_width(70.0);
+                        ui_kit::text_field(ui, cell, hint);
+                    });
+                }
+                if many && ui_kit::compact_button(ui, "×", tm("Remove this section"), true, false).clicked() {
+                    gone = Some(k);
+                } else if !many {
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+            if let Some(k) = gone {
+                d.sections.remove(k);
+            }
+        });
+        ui.label(
+            RichText::new(tm("Sections from where the tool comes out of the holder, upward. A top diameter makes a cone, as a collet nut is."))
+                .color(t.text_dim),
+        );
+        ui.horizontal(|ui| {
+            if button(ui, tm("Add section"), ui_kit::Button::Enabled(d.sections.len() < solidcraft_engine::cam::MAX_HOLDER_SECTIONS)).clicked() {
+                d.sections.push(Default::default());
+            }
+            let command = d.command();
+            let known = holders.iter().any(|h| text(h, "name").trim().eq_ignore_ascii_case(d.name.trim()));
+            let label = if known { tm("Save holder") } else { tm("Add holder") };
+            if button(ui, label, ui_kit::Button::Enabled(command.is_some())).clicked()
+                && let Some(p) = command
+            {
+                asked.run.push(("cam.holder.define", p));
+                *d = HolderDraft::default();
+            }
+            let typed = !d.name.trim().is_empty() || d.sections.len() > 1 || d.sections.iter().flatten().any(|c| !c.trim().is_empty());
+            if typed && button(ui, tm("Clear"), Button::Normal).clicked() {
+                *d = HolderDraft::default();
             }
         });
     });

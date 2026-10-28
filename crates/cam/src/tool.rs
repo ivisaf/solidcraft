@@ -16,6 +16,87 @@ pub const MAX_CHIP_LOAD: f64 = 100.0;
 pub const MAX_MATERIALS: usize = 100;
 /// Longest material name (characters).
 pub const MAX_MATERIAL_NAME: usize = 64;
+/// Most holders a tool library has.
+pub const MAX_HOLDERS: usize = 200;
+/// Most sections a holder's shape has.
+pub const MAX_HOLDER_SECTIONS: usize = 16;
+/// Longest holder name (characters).
+pub const MAX_HOLDER_NAME: usize = 64;
+
+/// A tool holder (a collet chuck, a shrink-fit chuck, a router's collet nut) by its shape: its
+/// sections from where the tool comes out of it upward, each as long as it says and as wide at
+/// its bottom as `diameter` and at its top as `top_diameter` (a cone where the two differ).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Holder {
+    pub name: String,
+    pub sections: Vec<HolderSection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HolderSection {
+    pub length: f64,
+    pub diameter: f64,
+    /// Its diameter at its top, where it is a cone (none: `diameter` all the way).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_diameter: Option<f64>,
+}
+
+impl Holder {
+    pub fn validate(&self) -> Result<()> {
+        holder_name(&self.name)?;
+        if self.sections.is_empty() || self.sections.len() > MAX_HOLDER_SECTIONS {
+            return invalid(format!("a holder has 1 to {MAX_HOLDER_SECTIONS} sections"));
+        }
+        for s in &self.sections {
+            if !(s.length > 0.0 && s.length <= 10.0 * MAX_TOOL_DIAMETER) {
+                return invalid("a holder section's length must be above 0");
+            }
+            if [Some(s.diameter), s.top_diameter].iter().flatten().any(|d| !(*d > 0.0 && *d <= MAX_TOOL_DIAMETER)) {
+                return invalid("a holder section's diameters must be above 0 and at most 1000 mm");
+            }
+        }
+        Ok(())
+    }
+    /// How long it is, all its sections (mm).
+    pub fn length(&self) -> f64 {
+        self.sections.iter().map(|s| s.length).sum()
+    }
+    /// Its widest (mm).
+    pub fn widest(&self) -> f64 {
+        self.sections.iter().map(|s| s.diameter.max(s.top_diameter.unwrap_or(s.diameter))).fold(0.0, f64::max)
+    }
+    /// Cylinders, each from a height above where the tool comes out of it upward, `(diameter,
+    /// height)`, that together hold the holder: one per section, a cone's in steps of 2 mm at most,
+    /// each as wide as the step's wider end. A cylinder stands on all the way up, so one no wider
+    /// than one below it is left out: what holds the holder may be larger than it (where it narrows
+    /// upward), never smaller.
+    pub fn cylinders(&self) -> Vec<(f64, f64)> {
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        let mut at = 0.0;
+        for s in &self.sections {
+            let top = s.top_diameter.unwrap_or(s.diameter);
+            let steps = if top == s.diameter { 1 } else { ((s.length / 2.0).ceil() as usize).clamp(1, 32) };
+            for k in 0..steps {
+                let (a, b) = (k as f64 / steps as f64, (k + 1) as f64 / steps as f64);
+                let wide = (s.diameter + (top - s.diameter) * a).max(s.diameter + (top - s.diameter) * b);
+                if out.iter().all(|(d, _)| wide > *d) {
+                    out.push((wide, at + s.length * a));
+                }
+            }
+            at += s.length;
+        }
+        out
+    }
+}
+
+/// A holder name as given, checked: not empty, at most [`MAX_HOLDER_NAME`] characters, no control characters.
+pub fn holder_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > MAX_HOLDER_NAME || name.chars().any(char::is_control) {
+        return invalid(format!("a holder name has 1 to {MAX_HOLDER_NAME} characters"));
+    }
+    Ok(name.to_string())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +192,10 @@ pub struct Tool {
     pub holder_diameter: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_length: Option<f64>,
+    /// The holder by its shape, a copy of one from the tool library: what is checked in place of
+    /// the plain holder above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<Holder>,
     /// Cutting data for particular materials; the data above is for every other one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cutting: Vec<CuttingData>,
@@ -195,6 +280,7 @@ impl Tool {
             shank_diameter: None,
             holder_diameter: None,
             holder_length: None,
+            holder: None,
             length: None,
             cutting: Vec::new(),
         }
@@ -323,6 +409,17 @@ impl Tool {
     pub fn radius(&self) -> f64 {
         self.diameter * 0.5
     }
+    /// The holder as cylinders standing above the tool's tip, `(diameter, height above the tip)`:
+    /// its shape where it has one, else the plain holder as one cylinder; none without the tool's
+    /// length out of its holder.
+    pub fn holder_cylinders(&self) -> Vec<(f64, f64)> {
+        let Some(out) = self.length else { return Vec::new() };
+        match (&self.holder, self.holder_diameter) {
+            (Some(h), _) => h.cylinders().into_iter().map(|(d, z)| (d, out + z)).collect(),
+            (None, Some(d)) => vec![(d, out)],
+            (None, None) => Vec::new(),
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         if self.number > MAX_TOOL_NUMBER {
             return invalid(format!("tool number {} is above {MAX_TOOL_NUMBER}", self.number));
@@ -366,6 +463,9 @@ impl Tool {
         }
         if self.length.is_some_and(|l| !(l >= self.flute_length && l <= 10.0 * MAX_TOOL_DIAMETER)) {
             return invalid("a tool's length must be at least its flute length");
+        }
+        if let Some(h) = &self.holder {
+            h.validate()?;
         }
         if self.cutting.len() > MAX_MATERIALS {
             return invalid(format!("a tool has cutting data for at most {MAX_MATERIALS} materials"));

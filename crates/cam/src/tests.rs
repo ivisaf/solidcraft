@@ -1853,7 +1853,7 @@ fn slab_and_block() -> (Vec<[Vec3; 3]>, (Vec3, Vec3)) {
 }
 
 fn rough<'a>(part: &'a [[Vec3; 3]], stock: (Vec3, Vec3), boundary: &'a [Region2]) -> Rough3d<'a> {
-    Rough3d { boundary, part, stock, left: None, step_up: 0.0, holder: None }
+    Rough3d { boundary, part, stock, left: None, step_up: 0.0, holder: &[] }
 }
 
 /// The path cut on finer columns of the stock: how deep it cuts into the part (with no
@@ -1948,14 +1948,57 @@ fn the_holder_keeps_the_tool_up_beside_a_tall_block() {
     // A 20 mm holder, the tool 6 mm out of it: within 10 mm of the block (top -5) it goes no
     // lower than -11; further off it reaches the slab.
     let (d, out) = (20.0, 6.0);
-    let path = adaptive_3d(&Rough3d { holder: Some((d, out)), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).unwrap();
+    let path = adaptive_3d(&Rough3d { holder: &[(d, out)], ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).unwrap();
     let seen = HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), 0.25, -20.0, &part, true).unwrap().dilated(d * 0.5).unwrap();
     let points = cutting_points(&path, 1.0);
     for q in &points {
         assert!(seen.at(v(q.x, q.y)) <= q.z + out + 0.3, "the holder hits the part over {q:?}");
     }
     assert!(points.iter().any(|q| (q.z + 14.5).abs() < 1e-9), "the slab is reached away from the block");
-    assert!(adaptive_3d(&Rough3d { holder: Some((5.0, 6.0)), ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).is_err());
+    assert!(adaptive_3d(&Rough3d { holder: &[(5.0, 6.0)], ..rough(&part, stock, &area) }, &tool(6.0), &params, &cut(0.0, -15.0, 4.0)).is_err());
+}
+
+/// A holder by its shape: a slim nose lets the tool closer to the block than its wide body would.
+#[test]
+fn a_stepped_holder_keeps_each_section_clear() {
+    let (part, stock) = slab_and_block();
+    let area = [rect(0.0, 0.0, 60.0, 40.0)];
+    let params = AdaptiveParams { stock_to_leave: 0.5, ..adaptive_params() };
+    let holder = Holder {
+        name: "ER11".into(),
+        sections: vec![
+            HolderSection { length: 8.0, diameter: 12.0, top_diameter: Some(16.0) },
+            HolderSection { length: 30.0, diameter: 30.0, top_diameter: None },
+        ],
+    };
+    let mut t = tool(6.0);
+    (t.flute_length, t.length) = (6.0, Some(6.0));
+    t.holder = Some(holder);
+    let cylinders = t.holder_cylinders();
+    assert_eq!(cylinders.first(), Some(&(13.0, 6.0)), "the cone's first step, as wide as its wider end");
+    assert_eq!(cylinders.last(), Some(&(30.0, 14.0)), "the body, from the top of the nose");
+    assert!(cylinders.windows(2).all(|w| w[1].0 > w[0].0 && w[1].1 > w[0].1));
+    let path = adaptive_3d(&Rough3d { holder: &cylinders, ..rough(&part, stock, &area) }, &t, &params, &cut(0.0, -15.0, 4.0)).unwrap();
+    let field = HeightField::of_triangles(v(-15.0, -15.0), v(75.0, 55.0), 0.25, -20.0, &part, true).unwrap();
+    let points = cutting_points(&path, 1.0);
+    for (d, above) in &cylinders {
+        let seen = field.dilated(d * 0.5).unwrap();
+        for q in &points {
+            assert!(seen.at(v(q.x, q.y)) <= q.z + above + 0.3, "the holder ({d} mm, {above} mm up) hits the part over {q:?}");
+        }
+    }
+    // Only the body counts where it is wider than the nose: a nose narrower than what lies below
+    // it adds nothing.
+    let narrowing = Holder {
+        name: "narrowing".into(),
+        sections: vec![
+            HolderSection { length: 5.0, diameter: 20.0, top_diameter: None },
+            HolderSection { length: 5.0, diameter: 10.0, top_diameter: None },
+        ],
+    };
+    assert_eq!(narrowing.cylinders(), [(20.0, 0.0)]);
+    assert!(Holder { name: " ".into(), ..narrowing.clone() }.validate().is_err());
+    assert!(Holder { sections: Vec::new(), ..narrowing }.validate().is_err());
 }
 
 fn finish<'a>(part: &'a [[Vec3; 3]], boundary: &'a [Region2]) -> Finish3d<'a> {

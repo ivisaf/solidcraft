@@ -1,13 +1,14 @@
 //! The machine's tool library: the tools every design on this machine can use, with the
 //! cutting data operations start from, and the materials stock is made of. It is one JSON file in the per-user data folder
 //! (`tools.json`, beside the recovery folder), or wherever `SOLIDCRAFT_TOOLS` says. A design
-//! keeps its own copy of each tool it uses, so it opens the same on a machine without them.
+//! keeps its own copy of each tool it uses, so it opens the same on a machine without them; a
+//! tool keeps a copy of its holder's shape the same way.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
-use solidcraft_cam::{MAX_MATERIALS, Tool, material_name, same_material};
+use solidcraft_cam::{Holder, MAX_HOLDERS, MAX_MATERIALS, Tool, material_name, same_material};
 
 use crate::{EngineError, Result};
 
@@ -30,14 +31,20 @@ pub fn default_path() -> Option<PathBuf> {
     crate::recovery::default_dir()?.parent().map(|dir| dir.join("tools.json"))
 }
 
-/// A tool library: its tools, and the materials stock on this machine is made of.
+/// A tool library: its tools, the materials stock on this machine is made of, and the holders
+/// its tools sit in.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Library {
     pub tools: Vec<Tool>,
     pub materials: Vec<String>,
+    pub holders: Vec<Holder>,
 }
 
 impl Library {
+    /// The holder named `name` (in any case).
+    pub fn holder(&self, name: &str) -> Option<&Holder> {
+        self.holders.iter().find(|h| same_holder(&h.name, name))
+    }
     /// Adds `name` to the materials unless it is there already (in any case); `false` when the list is full.
     pub fn add_material(&mut self, name: &str) -> bool {
         if self.materials.iter().any(|m| same_material(m, name)) {
@@ -56,6 +63,11 @@ impl Library {
             self.add_material(&name);
         }
     }
+}
+
+/// Whether two holder names name the same holder (case and surrounding spaces aside).
+pub fn same_holder(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 fn fail(path: &Path, why: impl std::fmt::Display) -> EngineError {
@@ -86,7 +98,17 @@ pub fn parse(text: &[u8]) -> std::result::Result<Library, String> {
     if names.len() > MAX_MATERIALS {
         return Err(format!("more than {MAX_MATERIALS} materials"));
     }
-    let mut library = Library { tools, materials: Vec::new() };
+    let holders: Vec<Holder> = serde_json::from_value(file.get("holders").cloned().unwrap_or_else(|| json!([]))).map_err(|e| e.to_string())?;
+    if holders.len() > MAX_HOLDERS {
+        return Err(format!("more than {MAX_HOLDERS} holders"));
+    }
+    for (i, h) in holders.iter().enumerate() {
+        h.validate().map_err(|e| format!("holder `{}`: {e}", h.name.trim()))?;
+        if holders.iter().take(i).any(|g| same_holder(&g.name, &h.name)) {
+            return Err(format!("holder `{}` is named twice", h.name.trim()));
+        }
+    }
+    let mut library = Library { tools, materials: Vec::new(), holders };
     for name in names {
         library.add_material(&material_name(&name).map_err(|e| e.to_string())?);
     }
@@ -219,8 +241,12 @@ fn from_rp23cnc(tools: &[Value], materials: Option<&Value>, presets: Option<&Val
 
 /// A library as file text.
 pub fn text(library: &Library) -> Result<String> {
-    serde_json::to_string_pretty(&json!({"format": FORMAT, "tools": library.tools, "materials": library.materials}))
-        .map_err(|e| EngineError::Other(e.to_string()))
+    let mut file = json!({"format": FORMAT, "tools": library.tools, "materials": library.materials});
+    // Only a library with holders says so, so that one without reads as it did before.
+    if !library.holders.is_empty() {
+        file["holders"] = json!(library.holders);
+    }
+    serde_json::to_string_pretty(&file).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 /// The library file; a file that does not exist yet is an empty library.

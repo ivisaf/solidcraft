@@ -51,8 +51,9 @@ pub struct Rough3d<'a> {
     pub left: Option<&'a HeightField>,
     /// Levels in between on slopes, this far apart at most (mm; 0: none).
     pub step_up: f64,
-    /// The holder above the tool: its diameter, and how far the tool reaches out of it (mm).
-    pub holder: Option<(f64, f64)>,
+    /// The holder above the tool as cylinders, each its diameter and how high above the tool's
+    /// tip it starts (mm; [`Tool::holder_cylinders`]); none: not checked.
+    pub holder: &'a [(f64, f64)],
 }
 
 /// Roughs the material of `job`'s stock down to its part, inside its boundary.
@@ -73,9 +74,7 @@ pub fn adaptive_3d(job: &Rough3d, tool: &Tool, params: &AdaptiveParams, cut: &Cu
     if !(job.step_up >= 0.0 && job.step_up.is_finite()) {
         return invalid("the step-up must be 0 or more");
     }
-    if let Some((d, reach)) = job.holder
-        && !(d > tool.diameter && d.is_finite() && reach > 0.0 && reach.is_finite())
-    {
+    if job.holder.len() > 1024 || job.holder.iter().any(|(d, reach)| !(*d > tool.diameter && d.is_finite() && *reach > 0.0 && reach.is_finite())) {
         return invalid("the holder must be wider than the tool, and the tool reach out of it");
     }
     let (lo_s, hi_s) = job.stock;
@@ -172,7 +171,7 @@ struct Levels<'a> {
     part_top: HeightField,
     reach: HeightField,
     stock_top: HeightField,
-    holder: Option<(f64, f64)>,
+    holder: &'a [(f64, f64)],
     /// With a holder: the lowest the tool's tip may go over each column for the holder to stay
     /// clear of the part and the stock as it stands.
     clear: Option<HeightField>,
@@ -191,14 +190,29 @@ struct Planned {
 impl Levels<'_> {
     /// Where the holder lets the tool down, against the stock as it stands now.
     fn holder_clear(&mut self) -> Result<()> {
-        let Some((d, out)) = self.holder else { return Ok(()) };
+        if self.holder.is_empty() {
+            return Ok(());
+        }
         let mut high = self.stock_top.clone();
         for (h, p) in high.z.iter_mut().zip(&self.part_top.z) {
             *h = h.max(*p);
         }
-        let mut clear = high.dilated(d * 0.5)?;
-        clear.z.iter_mut().for_each(|z| *z -= out);
-        self.clear = Some(clear);
+        // Each cylinder of the holder, that far above the tip: the highest any of them asks for.
+        let mut clear: Option<HeightField> = None;
+        for &(d, out) in self.holder {
+            let mut one = high.dilated(d * 0.5)?;
+            one.z.iter_mut().for_each(|z| *z -= out);
+            clear = Some(match clear {
+                None => one,
+                Some(mut all) => {
+                    for (a, b) in all.z.iter_mut().zip(&one.z) {
+                        *a = a.max(*b);
+                    }
+                    all
+                }
+            });
+        }
+        self.clear = clear;
         Ok(())
     }
 

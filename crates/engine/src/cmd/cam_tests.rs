@@ -1878,6 +1878,68 @@ fn clamps_in_the_way_and_a_tool_too_short_are_warned_about() {
     }
 }
 
+/// Holders are defined once in the machine's library by their shape; a tool in one keeps a copy,
+/// and clamps are checked against each section of it.
+#[test]
+fn holders_by_their_shape_come_from_the_library_and_are_checked_section_by_section() {
+    let mut s = Session::default();
+    run(&mut s, "solid.box", json!({"length": 60, "width": 40, "height": 10}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "offset": 10, "name": "Window"}));
+    run(&mut s, "sketch.rectangle.two_point", json!({"p0": [15, 10], "p1": [45, 30]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "cam.setup.create", json!({"origin": {"of": "stock", "x": "min", "y": "min", "z": "max"}}));
+    let lib = library_file("holders");
+    let tool = |holder: Value| json!({"number": 1, "kind": "flat", "diameter": 6, "spindle_rpm": 12000, "feed": 600, "length": 20, "library": lib, "holder": holder});
+    // A slim nose 20 mm long, then a wide body: above a tall clamp beside the window.
+    let slim = json!({"library": lib, "name": "Slim", "sections": [{"length": 20, "diameter": 7}, {"length": 40, "diameter": 30}]});
+    let defined = run(&mut s, "cam.holder.define", slim);
+    assert_eq!(defined["holder"]["sections"][1]["diameter"], 30.0);
+    run(&mut s, "cam.holder.define", json!({"library": lib, "name": "ER20", "sections": [{"length": 5, "diameter": 7, "top_diameter": 30}]}));
+    let listed = run(&mut s, "cam.library.list", json!({"library": lib}));
+    assert_eq!(listed["holders"].as_array().map(Vec::len), Some(2), "{listed}");
+    run(&mut s, "cam.tool.define", tool(json!("slim")));
+    assert_eq!(s.doc.manufacture.tool(1).and_then(|t| t.holder.as_ref()).map(|h| h.name.as_str()), Some("Slim"), "a copy, found in any case");
+    run(&mut s, "cam.op.pocket", json!({"sketch": "Window", "tool": 1, "bottom": -3}));
+    run(&mut s, "cam.setup.edit", json!({"setup": "Setup1", "clamps": [{"name": "Tall", "min": [52, 0], "max": [60, 40], "top": 30}]}));
+    let warning = |s: &mut Session| run(s, "cam.list", json!({}))["setups"][0]["operations"][0]["warning"].as_str().unwrap_or("").to_string();
+    assert!(!warning(&mut s).contains("clamp"), "the body stays above the clamp: {}", warning(&mut s));
+    // A short cone widening at once: as wide low down as the plain holder.
+    run(&mut s, "cam.tool.define", tool(json!("ER20")));
+    assert!(warning(&mut s).contains("the holder runs into clamp Tall"), "{}", warning(&mut s));
+    // The shape given whole, and taken off again.
+    run(&mut s, "cam.tool.define", tool(json!({"name": "Own", "sections": [{"length": 60, "diameter": 7}]})));
+    assert!(!warning(&mut s).contains("clamp"), "{}", warning(&mut s));
+    run(&mut s, "cam.tool.define", tool(Value::Null));
+    assert!(s.doc.manufacture.tool(1).is_some_and(|t| t.holder.is_none()));
+    // Saved and opened again with the design.
+    run(&mut s, "cam.tool.define", tool(json!("Slim")));
+    let opened = solidcraft_doc::Document::from_json(&s.doc.to_json()).unwrap();
+    assert_eq!(opened.manufacture.tool(1).and_then(|t| t.holder.clone()), s.doc.manufacture.tool(1).and_then(|t| t.holder.clone()));
+    // A library tool in a holder takes its new shape; the design's copy then differs.
+    run(&mut s, "cam.library.add", json!({"library": lib, "number": 1}));
+    let changed = run(
+        &mut s,
+        "cam.holder.define",
+        json!({"library": lib, "name": "Slim", "sections": [{"length": 10, "diameter": 7}, {"length": 40, "diameter": 30}]}),
+    );
+    assert_eq!(changed["tools"], json!([1]));
+    assert_eq!(run(&mut s, "cam.library.list", json!({"library": lib}))["tools"][0]["design"], "differs");
+    let removed = run(&mut s, "cam.holder.remove", json!({"library": lib, "name": "SLIM"}));
+    assert_eq!(removed["tools"], json!([1]));
+    for bad in [
+        json!({"library": lib, "name": "", "sections": [{"length": 5, "diameter": 7}]}),
+        json!({"library": lib, "name": "X", "sections": []}),
+        json!({"library": lib, "name": "X", "sections": [{"length": 0, "diameter": 7}]}),
+        json!({"library": lib, "name": "X", "sections": [{"length": 5, "diameter": 7, "top_diameter": -1}]}),
+        json!({"library": lib, "name": "X", "sections": "x"}),
+    ] {
+        assert!(s.execute("cam.holder.define", &bad).is_err(), "{bad}");
+    }
+    assert!(s.execute("cam.holder.remove", &json!({"library": lib, "name": "Slim"})).is_err());
+    assert!(s.execute("cam.tool.define", &tool(json!("Nowhere"))).is_err());
+    let _ = std::fs::remove_file(&lib);
+}
+
 #[test]
 fn ordering_by_tool_loads_each_tool_once() {
     let mut s = pocket_job(0.0, json!({}));

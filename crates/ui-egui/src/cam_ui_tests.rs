@@ -2082,6 +2082,49 @@ fn a_tool_s_holder_is_set_in_its_shape() {
     assert!(h.widget("Holder diameter").is_some() && h.widget("Holder length").is_some());
 }
 
+/// A holder typed in the Tool Library window goes into the library by its shape; a tool picks it
+/// in its shape (the plain holder's rows then go), keeps a copy, and changes it only when another is picked.
+#[test]
+fn holders_are_typed_in_the_library_and_picked_in_a_tool_s_shape() {
+    let mut h = lab();
+    h.app.manufacture.tools_open = true;
+    h.frames(2);
+    assert!(h.widget("Add holder").is_some(), "the library window offers holders");
+    h.app.manufacture.new_holder =
+        HolderDraft { name: "ER20".into(), sections: vec![["20 mm".into(), "34".into(), "".into()], ["30".into(), "34".into(), "42".into()]] };
+    let p = h.app.manufacture.new_holder.command().expect("a whole holder");
+    assert_eq!(p["sections"][0], json!({"length": 20.0, "diameter": 34.0}), "{p}");
+    assert_eq!(p["sections"][1]["top_diameter"], 42.0, "{p}");
+    assert!(
+        HolderDraft { name: "X".into(), sections: vec![["".into(), "34".into(), "".into()]] }.command().is_none(),
+        "a section without its length"
+    );
+    run(&mut h.app, "cam.holder.define", p).unwrap();
+    let listed = library_listing(&mut h.app, true);
+    assert_eq!(listed["holders"][0]["name"], "ER20", "{listed}");
+    // A tool in it, from its shape's rows.
+    fill(&mut h, "cam.tool.define", |f| {
+        let Form::Tool(tool) = f else { panic!("not a tool form") };
+        (tool.number, tool.diameter, tool.length, tool.holder) = ("3".into(), "6".into(), "25".into(), "ER20".into());
+    });
+    let copy = |h: &mut Harness| {
+        library_listing(&mut h.app, true)["tools"].as_array().into_iter().flatten().find(|t| t["number"] == 3).cloned().unwrap_or_default()
+    };
+    assert_eq!(copy(&mut h)["holder"]["sections"][1]["top_diameter"], 42.0);
+    let tool = copy(&mut h);
+    let Some(Form::Tool(mut f)) = tool_form(&tool, true) else { panic!("no form for the tool") };
+    assert_eq!((f.holder.as_str(), f.holder_was.as_str()), ("ER20", "ER20"));
+    assert!(command(&Form::Tool(f.clone())).is_ok_and(|(_, p)| p.get("holder").is_none()), "an unchanged holder keeps the tool's copy");
+    f.holder.clear();
+    assert!(command(&Form::Tool(f.clone())).is_ok_and(|(_, p)| p["holder"].is_null()), "the plain holder again");
+    // The shape step shows the pick, and the plain rows only without a holder of the library's.
+    f.step = 1;
+    f.holder = "ER20".into();
+    h.app.manufacture.form = Some(Form::Tool(f));
+    h.frames(2);
+    assert!(h.widget("Holder diameter").is_none(), "a holder by its shape needs no plain rows");
+}
+
 /// Every text one frame paints, whole and in the parts a composed one is made of.
 fn painted_texts(h: &mut Harness) -> std::collections::BTreeSet<String> {
     fn walk(shape: &egui::Shape, out: &mut std::collections::BTreeSet<String>) {

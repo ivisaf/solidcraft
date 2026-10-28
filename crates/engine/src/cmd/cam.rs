@@ -68,7 +68,7 @@ const SETUP_DOC: &str = "name?; axis?: +x|-x|+y|-y|+z|-z or [x, y, z], the direc
 pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("cam.tool.define", "Define Tool", tool_define).icon("library")
         .params(
-            "number: 1–9999; kind: flat|ball|bull|drill|vbit|chamfer|engraver (bull: a bull-nose end mill, its end rounded at the rim; chamfer: a chamfer mill and engraver: an engraving tool, both pointed as a V-bit); diameter: expr (a tapered end mill's at its end); corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); taper_angle?: degrees each side, a flat, ball or bull nose widening up its flutes (0 or null: straight; under 45); tip_angle?: degrees, the point's included angle (V-bit and chamfer mill: default 90; engraver: 30; drill: 118); tip_diameter?: mm, the flat at a V-bit's, chamfer mill's or engraver's point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, the holder above it, checked against clamps (it needs length); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
+            "number: 1–9999; kind: flat|ball|bull|drill|vbit|chamfer|engraver (bull: a bull-nose end mill, its end rounded at the rim; chamfer: a chamfer mill and engraver: an engraving tool, both pointed as a V-bit); diameter: expr (a tapered end mill's at its end); corner_radius?: mm, a bull nose's corner radius (needed; at most half the diameter); taper_angle?: degrees each side, a flat, ball or bull nose widening up its flutes (0 or null: straight; under 45); tip_angle?: degrees, the point's included angle (V-bit and chamfer mill: default 90; engraver: 30; drill: 118); tip_diameter?: mm, the flat at a V-bit's, chamfer mill's or engraver's point; shank_diameter?, length?: mm, the shank and the length out of the holder (for its picture); holder_diameter?, holder_length?: mm, a plain holder above it, checked against clamps (it needs length); holder?: a holder of the machine's library by name (cam.holder.define), or {name, sections} as cam.holder.define takes: its shape, which the tool keeps a copy of and which is checked in place of the plain holder (null: none); flute_length?: expr (default 3 × diameter; a V-bit's, its cone's height); description?; flutes?: 1–100 \
              (default 2); spindle_rpm?, feed?, plunge_feed?: mm/min, stepdown?, stepover?: mm — the cutting data operations with this tool start \
              from (null clears one); surface_speed?: m/min, instead of spindle_rpm: speed = surface_speed × 1000 / (π × diameter); chip_load?: mm per tooth, instead of feed: feed = speed × flutes × chip_load (giving one of a pair clears the other; listings report the chip load a feed makes); cutting?: [{material, spindle_rpm?, surface_speed?, feed?, chip_load?, plunge_feed?, stepdown?, stepover?}], its data in particular materials, replacing its own where given (null: none) — adds the tool to this design or replaces its tool of that number (cam.library.define: the machine's library)",
         ),
@@ -96,6 +96,14 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("delete")
         .noundo()
         .params("name; library? — the library's tools lose their cutting data for it (designs keep theirs) → removed, tools: the numbers of those that had some"),
+    CommandSpec::new("cam.holder.define", "Define Holder", holder_define)
+        .icon("library")
+        .noundo()
+        .params("name: the holder's (a collet chuck, a shrink-fit chuck, a router's collet nut); sections: [{length, diameter, top_diameter?}] its shape from where the tool comes out of it upward, each section as wide at its bottom as diameter and at its top as top_diameter (a cone; default diameter), mm; library? — replaces a holder of that name, and the library's tools in it take the new shape (designs keep their copies until cam.tool.update) → holder, tools: the numbers whose shape changed"),
+    CommandSpec::new("cam.holder.remove", "Remove Holder", holder_remove)
+        .icon("delete")
+        .noundo()
+        .params("name; library? — tools keep their copies of its shape → removed, tools: the numbers of the library's tools in it"),
     CommandSpec::new("cam.tool.export", "Export Tools", tool_export).icon("export").noundo().params("path: a JSON file to write the tool library to"),
     CommandSpec::new("cam.tool.import", "Import Tools", tool_import).icon("import")
         .params("path: a tool library written by cam.tool.export; replace?: bool (default false: tools whose number is taken are skipped) → added, replaced, skipped: tool numbers"),
@@ -324,6 +332,11 @@ fn tool_param(s: &Session, p: &Value, cmd: &str, was: Option<&Tool>) -> Result<T
         length: data("length", was.and_then(|t| t.length))?,
         holder_diameter: data("holder_diameter", was.and_then(|t| t.holder_diameter))?,
         holder_length: data("holder_length", was.and_then(|t| t.holder_length))?,
+        holder: match p.get("holder") {
+            None => was.and_then(|t| t.holder.clone()),
+            Some(Value::Null) => None,
+            Some(_) => Some(tool_holder(p, cmd)?),
+        },
         cutting,
     };
     tool.validate().map_err(|e| bad(cmd, e.to_string()))?;
@@ -488,7 +501,7 @@ fn library_list(s: &mut Session, p: &Value) -> Result<Value> {
         .collect();
     let numbers: Vec<u32> = tools.iter().filter_map(|t| t["number"].as_u64()).map(|n| n as u32).collect();
     let only_in_design: Vec<Value> = s.doc.manufacture.tools.iter().filter(|t| !numbers.contains(&t.number)).map(tool_json).collect();
-    Ok(json!({"path": path, "tools": tools, "only_in_design": only_in_design, "materials": library.materials}))
+    Ok(json!({"path": path, "tools": tools, "only_in_design": only_in_design, "materials": library.materials, "holders": library.holders}))
 }
 
 fn library_define(s: &mut Session, p: &Value) -> Result<Value> {
@@ -544,8 +557,100 @@ fn library_add(s: &mut Session, p: &Value) -> Result<Value> {
     }
     tools.sort_by_key(|t| t.number);
     library.add_tool_materials();
+    add_tool_holders(&mut library);
     toollib::save(&path, &library)?;
     Ok(json!({ "added": chosen.iter().map(|t| t.number).collect::<Vec<_>>() }))
+}
+
+/// Names every holder a library's tools sit in among its holders as well, where there is room
+/// and the name is free.
+fn add_tool_holders(library: &mut toollib::Library) {
+    let held: Vec<cam::Holder> = library.tools.iter().filter_map(|t| t.holder.clone()).collect();
+    for h in held {
+        if library.holder(&h.name).is_none() && library.holders.len() < cam::MAX_HOLDERS {
+            library.holders.push(h);
+        }
+    }
+}
+
+/// A holder from a command's `sections`: `[{length, diameter, top_diameter?}]`, from where the
+/// tool comes out of it upward.
+fn holder_param(p: &Value, cmd: &str, name: &str) -> Result<cam::Holder> {
+    let name = cam::holder_name(name).map_err(|e| bad(cmd, e.to_string()))?;
+    let list =
+        p.get("sections").and_then(Value::as_array).ok_or_else(|| bad(cmd, "`sections` must be a list of {length, diameter, top_diameter?}"))?;
+    if list.is_empty() || list.len() > cam::MAX_HOLDER_SECTIONS {
+        return Err(bad(cmd, format!("a holder has 1 to {} sections", cam::MAX_HOLDER_SECTIONS)));
+    }
+    let mut sections = Vec::new();
+    for (i, v) in list.iter().enumerate() {
+        let n = |k: &str| v.get(k).and_then(Value::as_f64);
+        let (Some(length), Some(diameter)) = (n("length"), n("diameter")) else {
+            return Err(bad(cmd, format!("section {}: `length` and `diameter` are required", i + 1)));
+        };
+        let top_diameter = match v.get("top_diameter") {
+            None | Some(Value::Null) => None,
+            Some(_) => Some(n("top_diameter").ok_or_else(|| bad(cmd, format!("section {}: `top_diameter` must be a number", i + 1)))?),
+        };
+        sections.push(cam::HolderSection { length, diameter, top_diameter: top_diameter.filter(|t| *t != diameter) });
+    }
+    let holder = cam::Holder { name, sections };
+    holder.validate().map_err(|e| bad(cmd, e.to_string()))?;
+    Ok(holder)
+}
+
+/// The holder a tool's `holder` input names: one of the machine library's by name (its shape is
+/// copied), or one given whole as {name, sections}.
+fn tool_holder(p: &Value, cmd: &str) -> Result<cam::Holder> {
+    match p.get("holder") {
+        Some(Value::String(name)) => {
+            let library = toollib::load(&library_path(p, cmd)?)?;
+            library
+                .holder(name)
+                .cloned()
+                .ok_or_else(|| bad(cmd, format!("no holder `{}` in the tool library (cam.holder.define first)", name.trim())))
+        }
+        Some(h @ Value::Object(_)) => holder_param(h, cmd, h.get("name").and_then(Value::as_str).unwrap_or("")),
+        _ => Err(bad(cmd, "`holder` must be a holder's name, or {name, sections}")),
+    }
+}
+
+fn holder_define(_: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.holder.define";
+    let holder = holder_param(p, cmd, str_(p, "name").unwrap_or(""))?;
+    let path = library_path(p, cmd)?;
+    let mut library = toollib::load(&path)?;
+    let room = library.holders.len() < cam::MAX_HOLDERS;
+    match library.holders.iter_mut().find(|h| toollib::same_holder(&h.name, &holder.name)) {
+        Some(slot) => *slot = holder.clone(),
+        None if room => library.holders.push(holder.clone()),
+        None => return Err(bad(cmd, format!("the tool library has {} holders already", cam::MAX_HOLDERS))),
+    }
+    // The library's tools in it take its new shape; designs' copies then differ until updated.
+    let mut tools = Vec::new();
+    for tool in &mut library.tools {
+        if let Some(h) = tool.holder.as_mut().filter(|h| toollib::same_holder(&h.name, &holder.name) && **h != holder) {
+            *h = holder.clone();
+            tools.push(tool.number);
+        }
+    }
+    toollib::save(&path, &library)?;
+    Ok(json!({ "holder": holder, "tools": tools }))
+}
+
+fn holder_remove(_: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "cam.holder.remove";
+    let name = str_(p, "name").ok_or_else(|| bad(cmd, "`name` is required"))?;
+    let path = library_path(p, cmd)?;
+    let mut library = toollib::load(&path)?;
+    if library.holder(name).is_none() {
+        return Err(bad(cmd, format!("no holder `{}` in the library", name.trim())));
+    }
+    library.holders.retain(|h| !toollib::same_holder(&h.name, name));
+    let tools: Vec<u32> =
+        library.tools.iter().filter(|t| t.holder.as_ref().is_some_and(|h| toollib::same_holder(&h.name, name))).map(|t| t.number).collect();
+    toollib::save(&path, &library)?;
+    Ok(json!({ "removed": name.trim(), "tools": tools }))
 }
 
 /// Brings this design's copies of library tools up to date: `number`, or every copy that differs.
@@ -603,7 +708,8 @@ fn merge_tools(library: &mut Vec<Tool>, incoming: Vec<Tool>, replace: bool, cmd:
 fn tool_export(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "cam.tool.export";
     let path = str_(p, "path").ok_or_else(|| bad(cmd, "`path` is required"))?;
-    let library = toollib::Library { tools: s.doc.manufacture.tools.clone(), materials: design_materials(s) };
+    let mut library = toollib::Library { tools: s.doc.manufacture.tools.clone(), materials: design_materials(s), holders: Vec::new() };
+    add_tool_holders(&mut library);
     solidcraft_io::vfs::write(path, toollib::text(&library)?.as_bytes()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     Ok(json!({"path": path, "tools": library.tools.len()}))
 }
@@ -633,11 +739,23 @@ fn library_import(_: &mut Session, p: &Value) -> Result<Value> {
     let (incoming, notes) = read_library(path, cmd)?;
     let file = library_path(p, cmd)?;
     let mut library = toollib::load(&file)?;
-    let mut out = merge_tools(&mut library.tools, incoming.tools, bool_(p, "replace").unwrap_or(false), cmd)?;
+    let replace = bool_(p, "replace").unwrap_or(false);
+    let mut out = merge_tools(&mut library.tools, incoming.tools, replace, cmd)?;
     for name in &incoming.materials {
         library.add_material(name);
     }
     library.add_tool_materials();
+    // Holders as tools: one whose name is taken replaces it or is skipped.
+    for holder in incoming.holders {
+        let room = library.holders.len() < cam::MAX_HOLDERS;
+        match library.holders.iter_mut().find(|h| toollib::same_holder(&h.name, &holder.name)) {
+            Some(slot) if replace => *slot = holder,
+            Some(_) => {}
+            None if room => library.holders.push(holder),
+            None => return Err(bad(cmd, "the tool library would have too many holders")),
+        }
+    }
+    add_tool_holders(&mut library);
     toollib::save(&file, &library)?;
     out["notes"] = json!(notes);
     out["materials"] = json!(incoming.materials);
@@ -893,7 +1011,7 @@ fn fixture_hit(path: &cam::Toolpath, tool: &Tool, fixtures: &[Fixture]) -> Optio
 }
 
 /// What a toolpath runs into of a setup's fixtures, as warnings: the tool, else its holder
-/// (as wide as it is, from where the tool comes out of it up).
+/// (each of its cylinders as wide as it is, from where it starts up).
 fn fixture_warning(path: &cam::Toolpath, tool: &Tool, fixtures: &[Fixture]) -> Option<String> {
     if fixtures.is_empty() {
         return None;
@@ -901,10 +1019,11 @@ fn fixture_warning(path: &cam::Toolpath, tool: &Tool, fixtures: &[Fixture]) -> O
     if let Some(name) = fixture_hit(path, tool, fixtures) {
         return Some(format!("runs into fixture {name}"));
     }
-    let (d, reach) = tool.holder_diameter.zip(tool.length)?;
-    let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, reach))).collect() };
-    let holder = Tool::new(0, ToolKind::FlatEndmill, d, 1.0);
-    fixture_hit(&lifted, &holder, fixtures).map(|name| format!("the holder runs into fixture {name}"))
+    tool.holder_cylinders().into_iter().find_map(|(d, above)| {
+        let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, above))).collect() };
+        let holder = Tool::new(0, ToolKind::FlatEndmill, d, 1.0);
+        fixture_hit(&lifted, &holder, fixtures).map(|name| format!("the holder runs into fixture {name}"))
+    })
 }
 
 /// Whether two tool axes are the same (`Some(true)`) or turned over (`Some(false)`).
@@ -2296,14 +2415,7 @@ fn build_in(s: &Session, at: &Resolved, op: &CamOperation) -> Result<Toolpath> {
                     Ok(path)
                 } else {
                     let left = stock_before(s, at, op, tool);
-                    let job = cam::Rough3d {
-                        boundary: regions,
-                        part: &part,
-                        stock,
-                        left: left.as_ref(),
-                        step_up,
-                        holder: tool.holder_diameter.zip(tool.length),
-                    };
+                    let job = cam::Rough3d { boundary: regions, part: &part, stock, left: left.as_ref(), step_up, holder: &tool.holder_cylinders() };
                     let made = cam::adaptive_3d(&job, tool, &params, &cut);
                     if let (Some(k), Ok(path), Ok(mut cache)) = (key, &made, s.cam_path_cache.lock()) {
                         cache.insert(k, path.clone());
@@ -3618,16 +3730,19 @@ fn list_now(s: &Session) -> Value {
                                 }
                                 if let Some(clamp) = clamp_hit(&path, tool.radius(), &setup.clamps) {
                                     warnings.push(format!("runs into clamp {clamp}"));
-                                } else if let (Some(d), Some(reach)) = (tool.holder_diameter, tool.length) {
-                                    // The holder, from where the tool comes out of it up: as a tool that wide, that much higher.
-                                    let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, reach))).collect() };
-                                    if let Some(clamp) = clamp_hit(&lifted, d * 0.5, &setup.clamps) {
+                                } else {
+                                    // The holder, each of its cylinders from where it starts up: as a tool that wide, that much higher.
+                                    let hit = tool.holder_cylinders().into_iter().find_map(|(d, above)| {
+                                        let lifted = cam::Toolpath { moves: path.moves.iter().map(|m| m.lifted(Vec3::new(0.0, 0.0, above))).collect() };
+                                        clamp_hit(&lifted, d * 0.5, &setup.clamps)
+                                    });
+                                    if let Some(clamp) = hit {
                                         warnings.push(format!("the holder runs into clamp {clamp}"));
                                     }
                                 }
                                 // Deeper below the stock's top than the tool reaches out of its holder: the holder hits the
                                 // stock. 3D roughing with a holder given keeps it clear itself.
-                                let holder_kept = matches!(op.kind, CamOperationKind::Adaptive { model: true, .. }) && tool.holder_diameter.is_some();
+                                let holder_kept = matches!(op.kind, CamOperationKind::Adaptive { model: true, .. }) && !tool.holder_cylinders().is_empty();
                                 if let (Some(reach), Some(lowest), Some(top), false) = (tool.length, path.stats().lowest_z, stock_top, holder_kept) {
                                     let depth = top - lowest;
                                     if depth > reach + 1e-6 {
