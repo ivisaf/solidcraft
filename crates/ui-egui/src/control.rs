@@ -31,7 +31,7 @@
 //!   `ui.rename {text?, commit?}` finishes the rename box
 //! - `ui.window {action: minimize|maximize|restore|toggle|close}`: what the title bar's buttons do
 //! - `ui.confirm {accept?}`: the Delete confirmation (without `accept`: what it lists)
-//! - `ui.shortcut {command, key?, replace?}`: a command's key, or bind one ("" clears)
+//! - `ui.shortcut {command, key?, slot?, replace?}`: a command's keys, or bind one ("" clears)
 //! - `ui.help {item?: about|shortcuts|report}`: the Help menu; returns the version and diagnostics
 //! - `ui.prefs {...}`: the preferences (default_units, nav, zoom_reverse, orbit_around, msaa,
 //!   length_decimals, angle_decimals); returns them all
@@ -223,6 +223,10 @@ fn execute(app: &mut SolveApp, id: &str, params: Value) -> Result<Value, String>
         return crate::view_pick::pick_command(app, &params);
     }
     let r = app.run(id, params);
+    // Update Links in a part edited in place reads the assembly around it too, as its button does.
+    if r.is_ok() && is_command(Some(id), "component.update_links") && app.edit_in_place.active.is_some() {
+        crate::edit_in_place::refresh(app);
+    }
     if r.is_ok()
         && !matches!(
             id,
@@ -234,12 +238,16 @@ fn execute(app: &mut SolveApp, id: &str, params: Value) -> Result<Value, String>
                 | "view.grid"
                 | "view.ground_shadow"
                 | "view.navigation_bar"
+                | "view.next_tab"
+                | "view.previous_tab"
                 | "view.layout"
                 | "view.navigate"
                 | "view.ambient_occlusion"
                 | "view.perspective"
+                | "view.angle_readout"
                 | "view.graphics_preset"
                 | "view.history_layout"
+                | "timeline.play"
                 | "browser.expand_all"
                 | "browser.collapse_all"
         )
@@ -265,11 +273,28 @@ const MAX_BATCH: usize = 10_000;
 /// Commands that load a file: through `engine.execute` they go to the app's file loader
 /// (`file_load::control`: off the window thread, with progress and Cancel), which a batch would
 /// bypass.
-const LOADS_A_FILE: [&str; 3] = ["doc.open", "file.insert_step", "file.insert_mesh"];
+const LOADS_A_FILE: [&str; 4] = ["doc.open", "file.insert_step", "file.insert_mesh", "pointcloud.insert"];
 
-/// Why `engine.batch` refuses these steps before running any: a step loads a file (send such
-/// steps one by one).
+/// Edit in Place, Finish Edit and the next or previous tab go to another design's tab: a batch's
+/// rollback, or a script's later steps, would land in the wrong design.
+const SWITCHES_DESIGN: [&str; 4] = ["component.edit_in_place", "component.finish_edit", "view.next_tab", "view.previous_tab"];
+
+/// `command` names the command `id`, in any of the spellings the engine takes.
+fn is_command(command: Option<&str>, id: &str) -> bool {
+    command.and_then(solidcraft_engine::find_command).is_some_and(|spec| spec.id == id)
+}
+
+/// The command of `step` when it goes to another design's tab.
+fn switches_design(step: &Value) -> Option<&'static str> {
+    SWITCHES_DESIGN.into_iter().find(|id| is_command(command(step), id))
+}
+
+/// Why `engine.batch` refuses these steps before running any: a step loads a file or switches
+/// to another design (send such steps one by one).
 pub(crate) fn batch_refusal(steps: &[Value]) -> Option<String> {
+    if let Some((i, c)) = steps.iter().enumerate().find_map(|(i, step)| switches_design(step).map(|c| (i, c))) {
+        return Some(format!("engine.batch unavailable: step {i} ({c}) switches to another design"));
+    }
     let (i, c) = steps.iter().enumerate().find_map(|(i, step)| command(step).filter(|c| LOADS_A_FILE.contains(c)).map(|c| (i, c)))?;
     Some(format!("engine.batch unavailable: step {i} ({c}) loads a file"))
 }
@@ -366,12 +391,21 @@ fn with_timings(mut reply: Value, timed: bool, rows: Vec<Value>, total_ms: f64) 
 /// file the request reaches must lie inside them (docs/mcp.md). `None`: it names none.
 pub fn request_scope(app: &SolveApp, params: &Value) -> Result<Option<vfs::PathScope>, String> {
     let Some(allowed) = params.get("allow_paths") else { return Ok(None) };
-    let Some(roots) = allowed.as_array().and_then(|a| a.iter().map(|r| r.as_str().map(std::path::PathBuf::from)).collect::<Option<Vec<_>>>()) else {
+    let folders = |v: &Value| v.as_array().and_then(|a| a.iter().map(|r| r.as_str().map(std::path::PathBuf::from)).collect::<Option<Vec<_>>>());
+    let Some(roots) = folders(allowed) else {
         return Err("`allow_paths` must be a list of folders".into());
+    };
+    // The folders the agent opened or saved a design in (#7181), judged as the open design's is.
+    let designs = match params.get("design_folders") {
+        None => Vec::new(),
+        Some(v) => folders(v)
+            .filter(|d| d.len() <= vfs::MAX_DESIGN_FOLDERS)
+            .ok_or_else(|| format!("`design_folders` must be a list of at most {} folders", vfs::MAX_DESIGN_FOLDERS))?,
     };
     // Plus the app's own recovery folder and, when it is a safe one, the open design's folder.
     let roots = roots.into_iter().chain(solidcraft_engine::recovery::default_dir());
-    Ok(Some(vfs::PathScope::new(roots).with_design(app.session.path.as_deref())))
+    let scope = designs.iter().fold(vfs::PathScope::new(roots), |s, d| s.with_design_folder(d));
+    Ok(Some(scope.with_design(app.session.path.as_deref())))
 }
 
 /// What a picture of the view shows: the model as the window shows it (theme and colour vision
@@ -420,6 +454,7 @@ pub fn handle(app: &mut SolveApp, ctx: &egui::Context, req: &ControlRequest) -> 
     let mut p = req.params.clone();
     if let Some(o) = p.as_object_mut() {
         o.remove("allow_paths");
+        o.remove("design_folders");
     }
     vfs::scoped(Some(scope), || dispatch(app, ctx, &req.method, &p))
 }
@@ -430,6 +465,7 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
     let f = |k: &str| p.get(k).and_then(Value::as_f64).filter(|x| x.is_finite());
     let b = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
     match method {
+        "ui.status_fixture" => wrap(crate::viewport_status_fixture::control(app, p)),
         "ui.workspace" => {
             if let Some(workspace) = s("workspace") {
                 if !matches!(workspace, "design" | "render" | "manufacture") {
@@ -464,6 +500,9 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         }
         "engine.script" => {
             let steps = p.as_array().or_else(|| p.get("commands").and_then(Value::as_array));
+            if let Some(c) = steps.and_then(|steps| steps.iter().find_map(switches_design)) {
+                return err(format!("engine.script unavailable: {c} switches to another design (send it on its own)"));
+            }
             let mut replaced = false;
             let r = app
                 .session
@@ -476,6 +515,7 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
             // A successful replacement still happened if a later script step failed.
             if replaced {
                 crate::documents::reset_chat(app);
+                app.edit_in_place.active = None;
             }
             app.follow_view_request(false);
             wrap(r)
@@ -878,17 +918,40 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         }
         "ui.scroll" => {
             let (Some(x), Some(y)) = (f("x"), f("y")) else { return err("missing x/y") };
-            app.synthetic.push(egui::Event::PointerMoved(egui::pos2(x as f32, y as f32)));
             // Mouse-wheel semantics (lines): zooms regardless of the trackpad pan
             // preference, so scripts and agents keep working. Trackpads report points.
+            // `ctrl: true` replays a Ctrl+wheel pinch in points (#8480). An explicit `unit`
+            // overrides that choice; without ctrl the default remains a line wheel.
             let speed = ctx.options(|o| o.input_options.line_scroll_speed).max(1.0);
-            let lines = f("delta").unwrap_or(-100.0) / f64::from(speed);
-            app.synthetic.push(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, lines as f32),
-                modifiers: Default::default(),
-                phase: egui::TouchPhase::Move,
-            });
+            let points = f("delta").unwrap_or(-100.0);
+            let ctrl = b("ctrl");
+            let unit = match p.get("unit") {
+                Some(Value::String(unit)) if unit == "point" => egui::MouseWheelUnit::Point,
+                Some(Value::String(unit)) if unit == "line" => egui::MouseWheelUnit::Line,
+                Some(_) => return err("`unit` must be point or line"),
+                None if ctrl => egui::MouseWheelUnit::Point,
+                None => egui::MouseWheelUnit::Line,
+            };
+            let delta = match unit {
+                // A point wheel reaches the app as points; a line wheel is scaled up by the
+                // line scroll speed, so divide it out and both land on the same points.
+                egui::MouseWheelUnit::Line => points / f64::from(speed),
+                _ => points,
+            };
+            let (x, y, delta) = (x as f32, y as f32, delta as f32);
+            if !x.is_finite() || !y.is_finite() || !delta.is_finite() {
+                return err("x, y and delta must fit finite screen coordinates");
+            }
+            let modifiers = if ctrl { egui::Modifiers::CTRL } else { Default::default() };
+            let explicit = p.get("ctrl").is_some();
+            app.synthetic.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            if explicit {
+                app.synthetic.push(egui::Event::ModifiersChanged(modifiers));
+            }
+            app.synthetic.push(egui::Event::MouseWheel { unit, delta: egui::vec2(0.0, delta), modifiers, phase: egui::TouchPhase::Move });
+            if explicit {
+                app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+            }
             ok(Value::Null)
         }
         "ui.key" => {
@@ -959,12 +1022,14 @@ fn dispatch(app: &mut SolveApp, ctx: &egui::Context, method: &str, p: &Value) ->
         },
         "ui.shortcut" => {
             let Some(id) = s("command") else { return err("missing `command`") };
+            let slot = p.get("slot").and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+            let report = |app: &SolveApp| ok(json!({"command": id, "key": crate::keymap::effective(app, id), "keys": crate::keymap::keys(app, id)}));
             match s("key") {
-                Some(k) => match crate::keymap::bind(app, id, k, b("replace")) {
-                    Ok(()) => ok(json!({"command": id, "key": crate::keymap::effective(app, id)})),
+                Some(k) => match crate::keymap::bind_at(app, id, slot, k, b("replace")) {
+                    Ok(()) => report(app),
                     Err(e) => err(e),
                 },
-                None => ok(json!({"command": id, "key": crate::keymap::effective(app, id)})),
+                None => report(app),
             }
         }
         "ui.browser" => ok(json!({
@@ -1188,6 +1253,29 @@ mod tests {
     use crate::Services;
 
     #[test]
+    fn viewport_status_fixture_rejects_hostile_presets_without_mutating_the_session() {
+        let mut h = crate::scenario::Harness::new();
+        let revision = h.app.session.revision;
+        for params in [Value::Null, json!([]), json!({}), json!({"preset":false}), json!({"preset":[]}), json!({"preset":"unknown"})] {
+            let reply = h.call("ui.status_fixture", params);
+            assert_eq!(reply["ok"], false, "{reply}");
+            assert_eq!(h.app.session.revision, revision);
+        }
+        let reply = h.call("ui.status_fixture", json!({"preset":"mode"}));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(h.app.session.revision, revision);
+        assert!(h.app.session.analysis.is_none());
+        for preset in ["off", "mode"] {
+            h.call("ui.status_fixture", json!({"preset":preset}));
+            h.call("ui.resize", json!({"width":200,"height":600}));
+            h.frames(4);
+            assert_eq!(h.app.session.revision, revision);
+            h.call("ui.resize", json!({"width":1400,"height":900}));
+            h.frames(4);
+        }
+    }
+
+    #[test]
     fn touchpad_automation_moves_with_modifiers_and_releases_without_buttons() {
         let mut h = crate::scenario::Harness::new();
         h.app.preferences.nav = "touchpad".into();
@@ -1208,6 +1296,79 @@ mod tests {
         assert!(h.ctx.input(|i| i.modifiers.is_none()));
         assert!(h.app.session.selection.is_empty());
         assert!(h.app.viewport.boxsel.is_none());
+    }
+
+    /// #8480: `ui.scroll` with `ctrl: true` replays a Ctrl+wheel pinch in points. Without
+    /// `ctrl` the wheel stays a line wheel on the mouse path.
+    #[test]
+    fn scroll_sends_a_native_pinch_with_ctrl() {
+        let mut app = SolveApp::new(Session::default(), Services::default());
+        let ctx = crate::fonts::test_context();
+        let (req, _) = ControlRequest::new("ui.scroll", json!({"x":200,"y":300,"delta":40,"ctrl":true}));
+        assert!(matches!(handle(&mut app, &ctx, &req), Outcome::Done(_)));
+        // The pointer event is delivered a frame before the wheel (one pointer event per frame).
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let mut raw = egui::RawInput::default();
+            app.raw_input_hook(&mut raw);
+            events.extend(raw.events);
+        }
+        let wheels: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some((*unit, *delta, *modifiers)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wheels.len(), 1, "one wheel event: {wheels:?}");
+        let (unit, delta, modifiers) = wheels[0];
+        assert_eq!(unit, egui::MouseWheelUnit::Point, "the pinch replay uses points");
+        assert!((delta.y - 40.0).abs() < 1e-6, "points pass through: {delta:?}");
+        assert!(modifiers.matches_any(egui::Modifiers::COMMAND), "Ctrl is held: {modifiers:?}");
+        let changes: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::ModifiersChanged(m) => Some(*m),
+                _ => None,
+            })
+            .collect();
+        assert!(changes.iter().any(|m| m.matches_any(egui::Modifiers::COMMAND)), "Ctrl is set for the wheel: {changes:?}");
+        assert_eq!(changes.last().copied(), Some(egui::Modifiers::NONE), "Ctrl is released after it: {changes:?}");
+        app.synthetic.clear();
+
+        let (req, _) = ControlRequest::new("ui.scroll", json!({"x":200,"y":300,"delta":40}));
+        assert!(matches!(handle(&mut app, &ctx, &req), Outcome::Done(_)));
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let mut raw = egui::RawInput::default();
+            app.raw_input_hook(&mut raw);
+            events.extend(raw.events);
+        }
+        let wheel = events.iter().find_map(|e| match e {
+            egui::Event::MouseWheel { unit, delta, modifiers, .. } => Some((*unit, *delta, *modifiers)),
+            _ => None,
+        });
+        let (unit, delta, modifiers) = wheel.expect("a wheel event");
+        assert_eq!(unit, egui::MouseWheelUnit::Line, "without ctrl the wheel stays a mouse wheel");
+        assert!((delta.y * ctx.options(|o| o.input_options.line_scroll_speed) - 40.0).abs() < 1e-3, "lines land on the same points: {delta:?}");
+        assert!(!modifiers.matches_any(egui::Modifiers::COMMAND), "no modifier without ctrl");
+        assert!(app.synthetic.is_empty());
+    }
+
+    #[test]
+    fn scroll_rejects_invalid_input_without_queuing_events() {
+        let mut app = SolveApp::new(Session::default(), Services::default());
+        let ctx = crate::fonts::test_context();
+        for invalid in
+            [json!({"unit":"invalid"}), json!({"unit":42}), json!({"unit":null}), json!({"x":1e300}), json!({"y":-1e300}), json!({"delta":1e300})]
+        {
+            let mut params = json!({"x":200,"y":300,"delta":40,"ctrl":true});
+            params.as_object_mut().unwrap().extend(invalid.as_object().unwrap().clone());
+            let (req, _) = ControlRequest::new("ui.scroll", params.clone());
+            let Outcome::Done(reply) = handle(&mut app, &ctx, &req) else { panic!("not a scroll reply") };
+            assert_eq!(reply["ok"], false, "{params}: {reply}");
+            assert!(app.synthetic.is_empty(), "a rejected scroll must not queue input: {params}");
+        }
     }
 
     #[test]
@@ -1914,6 +2075,47 @@ mod tests {
         let reply = save_screenshot(&image, None);
         assert_eq!(reply, json!({"ok": true, "result": {"path": path.to_string_lossy(), "width": 4, "height": 3}}));
         assert!(path.is_file());
+    }
+
+    /// A request's `design_folders` (where its MCP agent opened or saved a design, #7181) count
+    /// as the open design's folder does: their files are reachable, their hidden files and the
+    /// folders beside them are not, and a list that is not one of at most
+    /// `vfs::MAX_DESIGN_FOLDERS` folders is refused.
+    #[test]
+    fn a_requests_design_folders_count_as_the_open_designs() {
+        let mut s = Session::default();
+        s.execute("solid.box", &json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        let mut app = SolveApp::new(s, Services::default());
+        let base = vfs::temp_dir().join(format!("solidcraft-control-design-folders-{}", std::process::id()));
+        let (root, proj, out) = (base.join("root"), base.join("proj"), base.join("out"));
+        for d in [&root, &proj.join(".git"), &out] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let at = |d: &std::path::Path, f: &str| d.join(f).to_string_lossy().to_string();
+        let mut call = |path: String, designs: Value| {
+            let params =
+                json!({"command": "file.export", "params": {"path": path}, "allow_paths": [root.to_string_lossy()], "design_folders": designs});
+            let (req, _rx) = ControlRequest::new("engine.execute", params);
+            match handle(&mut app, &crate::fonts::test_context(), &req) {
+                Outcome::Done(v) => v,
+                Outcome::Screenshot { path } => json!({"ok": true, "screenshot": path}),
+            }
+        };
+        let designs = json!([proj.to_string_lossy()]);
+        assert_eq!(call(at(&proj, "a.step"), designs.clone())["ok"], true);
+        for p in [at(&proj, ".secret.step"), at(&proj, ".git/a.step"), at(&out, "a.step")] {
+            let v = call(p.clone(), designs.clone());
+            assert!(v["ok"] == false && v.to_string().contains("outside the folders this agent may use"), "{p}: {v}");
+        }
+        assert!(!proj.join(".secret.step").exists() && !proj.join(".git/a.step").exists());
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written beside it");
+        let too_many = json!(vec![proj.to_string_lossy(); vfs::MAX_DESIGN_FOLDERS + 1]);
+        for bad in [json!(proj.to_string_lossy()), json!([1]), too_many] {
+            let v = call(at(&proj, "b.step"), bad);
+            assert!(v["error"].as_str().is_some_and(|e| e.contains("design_folders")), "{v}");
+        }
+        assert!(!proj.join("b.step").exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `ui.camera` reads the camera and sets it; its reply, passed back, sets the same view

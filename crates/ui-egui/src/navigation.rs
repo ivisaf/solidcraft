@@ -234,15 +234,34 @@ pub(crate) fn immediate_wheel(
 }
 
 /// Combined pinch-to-zoom factor for one frame (1 = no pinch input).
-pub(crate) fn pinch_factor(input: &egui::InputState) -> f32 {
-    input
-        .events
-        .iter()
-        .filter_map(|event| {
-            let egui::Event::Zoom(f) = event else { return None };
-            (*f).is_finite().then_some(*f).filter(|f| *f > 0.0)
-        })
-        .fold(1.0, |acc, f| acc * f)
+///
+/// Some input paths deliver pinch as a zoom-modified wheel instead of `Event::Zoom`.
+/// Read the raw movement that [`immediate_wheel`] leaves to the zoom modifier, without
+/// replaying egui's smoothed zoom delta on later frames. Gesture boundaries carry no movement.
+pub(crate) fn pinch_factor(input: &egui::InputState, options: egui::InputOptions, page_height: f32) -> f32 {
+    let mut factor = 1.0;
+    for event in &input.events {
+        match event {
+            egui::Event::Zoom(f) => {
+                if f.is_finite() && *f > 0.0 {
+                    factor *= f;
+                }
+            }
+            egui::Event::MouseWheel { unit, delta, modifiers, phase: egui::TouchPhase::Move } if modifiers.matches_any(options.zoom_modifier) => {
+                let points = match unit {
+                    egui::MouseWheelUnit::Point => *delta,
+                    egui::MouseWheelUnit::Line => *delta * options.line_scroll_speed,
+                    egui::MouseWheelUnit::Page => *delta * page_height,
+                };
+                let f = (options.scroll_zoom_speed * (points.x + points.y)).exp();
+                if f.is_finite() && f > 0.0 {
+                    factor *= f;
+                }
+            }
+            _ => {}
+        }
+    }
+    factor
 }
 
 /// Give this frame's wheel to the widget under the pointer that uses it itself (a value field
@@ -432,7 +451,6 @@ pub(crate) struct CameraInput {
     pub secondary_down: bool,
     pub primary_down: bool,
     pub primary_pressed: bool,
-    pub delta: egui::Vec2,
     /// The pointer is over this view (not a window, menu or the axis view above it).
     pub inside: bool,
     /// The axis view or navigation cube's rectangle.
@@ -471,11 +489,16 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     let secondary_down = secondary_down && app.viewport.context_menu.is_none();
     // The axis view handles its own clicks; the model underneath must not see them.
     let axes = if caps.orbit { axis_rect(app, rect) } else { Rect::NOTHING };
+    // So is the View angles readout under it (#6032).
+    let readout = crate::view_angles::readout_rect(ui.ctx(), rect).filter(|_| caps.orbit && app.preferences.show_view_angles);
     // Floating windows and menus own input over the model, including wheel navigation. egui's
     // hit test also counts the model as under the pointer a few points past its own edge and
     // inside a window's or a list's edge (#678), so the pointer must be in the viewport too,
     // with no window or menu above it.
-    let inside = ui.is_enabled() && resp.contains_pointer() && ui.rect_contains_pointer(rect) && hover.is_some_and(|p| !axes.contains(p));
+    let inside = ui.is_enabled()
+        && resp.contains_pointer()
+        && ui.rect_contains_pointer(rect)
+        && hover.is_some_and(|p| !axes.contains(p) && !readout.is_some_and(|r| r.contains(p)));
     app.viewport.mouse = hover.filter(|_| inside);
     // Sketch snap suppression is set once in `viewport::show` from preferences.
     middle_double_click(app, ui, inside);
@@ -507,13 +530,14 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     let mut pan =
         if trackpad_pan { raw.pan + if trackpad_orbit { egui::Vec2::ZERO } else { raw.shift_pan } } else { egui::Vec2::ZERO } + raw.mouse_pan;
     pan.x *= crate::prefs::pan_sign_x(app);
+    pan.y *= crate::prefs::pan_sign_y(app);
     let scroll = if app.viewport.wheel_zoom_raw_until_idle || (trackpad_pan && app.viewport.trackpad_until_idle) {
         raw.zoom + if trackpad_pan { 0.0 } else { raw.point_zoom }
     } else {
         scroll
     };
     // Pinch-to-zoom (trackpad): direct manipulation, never smoothed.
-    let pinch = ui.input(pinch_factor);
+    let pinch = ui.input(|i| pinch_factor(i, options, page_height));
     let h = rect.height().max(1.0) as f64;
     if inside && pinch != 1.0 {
         app.viewport.orbit_free = None;
@@ -559,7 +583,8 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     if inside && caps.orbit && trackpad_orbit && raw.shift_pan != egui::Vec2::ZERO {
         app.cancel_view_animation();
         app.viewport.orbit_free = None;
-        orbit(app, rect, f64::from(raw.shift_pan.x), f64::from(raw.shift_pan.y), hover);
+        let sign = crate::prefs::orbit_sign(app);
+        orbit(app, rect, sign * f64::from(raw.shift_pan.x), sign * f64::from(raw.shift_pan.y), hover);
     }
     // A left press with the preset's keys (Alias: Shift+Alt) navigates until the button is let
     // go (kept through the release frame, so the end of the drag doesn't select either).
@@ -602,9 +627,21 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
     }
     // The fixed navigation mode (navigation bar), a held Space, or the preset's left-button binding.
     let primary_nav = if space_pan { Some(NavMode::Pan) } else { app.viewport.nav.or(app.viewport.primary_nav) };
+    // The right button also clicks (the context menu), so it navigates only once the press can no
+    // longer be a click: a Magic Mouse moves the pointer a fraction of a point as it is clicked (#5517).
+    // On that frame the drag catches up with the whole way from the press, so none of it is lost.
+    let (right_drag, travel) = ui.input(|i| {
+        let drag = secondary_down && !i.pointer.could_any_button_be_click();
+        (drag, i.pointer.press_origin().zip(i.pointer.latest_pos()).map(|(from, to)| to - from))
+    });
+    let delta = match travel {
+        Some(travel) if right_drag && !app.viewport.right_drag && !middle && travel.is_finite() => travel,
+        _ => delta,
+    };
+    app.viewport.right_drag = right_drag;
     let button = if middle {
         Some(crate::prefs::NavButton::Middle)
-    } else if secondary_down {
+    } else if right_drag {
         Some(crate::prefs::NavButton::Right)
     } else {
         None
@@ -622,7 +659,9 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
             if dragging && app.viewport.axis_drag.is_none() {
                 match button {
                     Some(b) => crate::prefs::nav_mode(app, b, mods),
-                    None if primary_down => primary_nav,
+                    // A press held still that opened Select Other stays its own: egui calls it a
+                    // drag after 0.8 s, and moving to a row must not turn the view under the list.
+                    None if primary_down && !crate::select_other::is_open(app) => primary_nav,
                     None => None,
                 }
             } else {
@@ -711,7 +750,7 @@ pub(crate) fn handle(app: &mut SolveApp, ui: &mut egui::Ui, rect: Rect, resp: &e
         app.cam = Camera::default();
         app.fit_view();
     }
-    CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, delta, inside, axes, pinch, pan, primary_nav, mode }
+    CameraInput { hover, scroll, mods, middle, secondary_down, primary_down, primary_pressed, inside, axes, pinch, pan, primary_nav, mode }
 }
 
 /// The 3D mouse's motion this frame (#1336), on a page `rect` whose camera may do `caps`: the cap
@@ -1071,7 +1110,7 @@ mod tests {
         assert_eq!(events.last(), Some(&egui::Event::Zoom(1.1)));
         let mut input = egui::InputState::default();
         input.events = events;
-        assert!((super::pinch_factor(&input) - 1.1).abs() < 1e-6);
+        assert!((super::pinch_factor(&input, egui::InputOptions::default(), 600.0) - 1.1).abs() < 1e-6);
     }
 
     #[test]
@@ -1448,6 +1487,21 @@ mod tests {
     }
 
     #[test]
+    fn right_drag_orbits_off_leaves_the_camera_to_the_middle_button() {
+        use serde_json::json;
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        crate::prefs::choose_nav_preset(&mut h.app.preferences, crate::prefs::nav_preset("solidworks"));
+        let before = h.app.cam;
+        for shift in [false, true] {
+            h.call("ui.drag", json!({"x0":800,"y0":400,"x1":850,"y1":440,"button":"right","shift":shift,"steps":20}));
+            assert_eq!(h.app.cam.back(), before.back(), "shift {shift}: a right drag leaves the camera alone (#6492)");
+        }
+        h.call("ui.drag", json!({"x0":800,"y0":400,"x1":850,"y1":440,"button":"middle","steps":20}));
+        assert_ne!(h.app.cam.back(), before.back(), "the middle button still orbits");
+    }
+
+    #[test]
     fn solidworks_device_and_mouse_keep_turning_with_the_same_screen_axes() {
         use super::*;
         use crate::space_mouse::DeviceMotion;
@@ -1629,6 +1683,144 @@ mod tests {
             }
             assert_ne!(app.cam.distance, before.distance, "{preset}: the wheel zooms");
         }
+    }
+
+    /// A zoom-modified wheel must reach the camera even though the ordinary wheel path skips it.
+    #[test]
+    fn native_ctrl_wheel_pinch_zooms_the_view() {
+        use egui::{Event, Modifiers, MouseWheelUnit, TouchPhase, pos2, vec2};
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &serde_json::json!({"length":40,"width":30,"height":20})).unwrap();
+        let mut app = crate::SolveApp::new(s, crate::Services::default());
+        let ctx = crate::fonts::test_context();
+        let mut time = 0.0;
+        let at = pos2(200.0, 300.0);
+        let mut frame = |app: &mut crate::SolveApp, events: Vec<Event>| {
+            time += 1.0 / 60.0;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 600.0))),
+                time: Some(time),
+                focused: true,
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let rect = ui.max_rect();
+                app.viewport.rect = Some(rect);
+                let resp = ui.interact(rect, ui.id().with("native-pinch"), egui::Sense::click_and_drag());
+                super::handle(app, ui, rect, &resp, super::NavCaps::MODEL);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, vec![Event::PointerMoved(at)]);
+        let before = app.cam;
+        frame(
+            &mut app,
+            vec![
+                Event::ModifiersChanged(Modifiers::CTRL),
+                Event::PointerMoved(at),
+                Event::MouseWheel { unit: MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Modifiers::CTRL, phase: TouchPhase::Move },
+            ],
+        );
+        assert!(app.cam.distance < before.distance, "a positive Ctrl+wheel pinch zooms in: {} -> {}", before.distance, app.cam.distance);
+        // Pinch uses egui's zoom speed; the unmodified wheel still uses the wheel path.
+        let mut s = solidcraft_engine::Session::default();
+        s.execute("solid.box", &serde_json::json!({"length":40,"width":30,"height":20})).unwrap();
+        let mut plain = crate::SolveApp::new(s, crate::Services::default());
+        frame(&mut plain, vec![Event::PointerMoved(at)]);
+        let plain_before = plain.cam;
+        frame(
+            &mut plain,
+            vec![
+                Event::PointerMoved(at),
+                Event::MouseWheel { unit: MouseWheelUnit::Point, delta: vec2(0.0, 50.0), modifiers: Modifiers::NONE, phase: TouchPhase::Move },
+            ],
+        );
+        let pinched = before.distance / app.cam.distance;
+        let expected = (0.005f64 * 50.0).exp();
+        assert!((pinched / expected - 1.0).abs() < 0.02, "the pinch factor is exp(scroll_zoom_speed * delta) = {expected:.3}x, got {pinched:.3}x");
+        let wheeled = plain_before.distance / plain.cam.distance;
+        assert!(wheeled > 1.0, "the bare wheel still zooms in on its own path: {wheeled:.3}x");
+    }
+
+    #[test]
+    fn ctrl_wheel_replay_zooms_once_in_the_viewport() {
+        use serde_json::json;
+        for preset in ["fusion", "touchpad"] {
+            for smooth in [false, true] {
+                let mut h = crate::scenario::Harness::new();
+                h.app.preferences.nav = preset.into();
+                h.app.preferences.smooth_wheel_zoom = smooth;
+                h.app.preferences.zoom_to_cursor = false;
+                h.app.run("solid.box", json!({"length":40,"width":30,"height":20})).unwrap();
+                h.step(&json!({"call":"ui.camera", "params":{"target":[20,15,10],"distance":100}})).unwrap();
+                let at = h.app.viewport.rect.unwrap().center();
+                let before = h.app.cam;
+                if preset == "fusion" && !smooth {
+                    h.step(&json!({"shot":"initial"})).unwrap();
+                }
+                h.step(&json!({"call":"ui.scroll", "params":{"x":at.x,"y":at.y,"delta":80,"ctrl":true}})).unwrap();
+                if preset == "fusion" && !smooth {
+                    h.step(&json!({"shot":"pinch-result"})).unwrap();
+                }
+                let after = h.app.cam;
+                let expected = before.distance * (-0.4f64).exp();
+                assert!(
+                    (after.distance - expected).abs() < 1e-5,
+                    "{preset}, smooth={smooth}: {} -> {}, expected {expected}",
+                    before.distance,
+                    after.distance
+                );
+                assert_eq!(after.target, before.target, "a centred pinch must not pan");
+                assert_eq!(after.back(), before.back(), "a pinch must not orbit");
+                h.frames(90);
+                assert_eq!(h.app.cam, after, "a pinch must not replay egui's smoothing tail");
+                h.step(&json!({"call":"ui.scroll", "params":{"x":at.x,"y":at.y,"delta":-80,"ctrl":true}})).unwrap();
+                assert!((h.app.cam.distance - before.distance).abs() < 1e-5, "the opposite pinch restores the scale");
+                let restored = h.app.cam;
+                h.step(&json!({"call":"ui.scroll", "params":{"x":-20,"y":-20,"delta":80,"ctrl":true}})).unwrap();
+                assert_eq!(h.app.cam, restored, "a pinch outside the viewport must not zoom it");
+            }
+        }
+    }
+
+    #[test]
+    fn pinch_factor_ignores_wheel_phase_markers() {
+        for phase in [egui::TouchPhase::Start, egui::TouchPhase::End, egui::TouchPhase::Cancel] {
+            let mut input = egui::InputState::default();
+            input.events = vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, 40.0),
+                modifiers: egui::Modifiers::CTRL,
+                phase,
+            }];
+            assert_eq!(super::pinch_factor(&input, egui::InputOptions::default(), 600.0), 1.0, "{phase:?} is a gesture boundary, not movement");
+        }
+    }
+
+    /// The pinch factor reads native Ctrl+wheel pinches in every wheel unit, scaled the way egui
+    /// scales them, and leaves wheels without the zoom modifier to [`immediate_wheel`].
+    #[test]
+    fn pinch_factor_reads_native_ctrl_wheel_in_every_unit() {
+        use egui::{Event, Modifiers, MouseWheelUnit, TouchPhase, vec2};
+        let options = egui::InputOptions::default();
+        let factor = |events: Vec<Event>| {
+            let mut input = egui::InputState::default();
+            input.events = events;
+            super::pinch_factor(&input, options, 600.0)
+        };
+        let wheel = |unit, delta, modifiers| Event::MouseWheel { unit, delta, modifiers, phase: TouchPhase::Move };
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let point = factor(vec![wheel(MouseWheelUnit::Point, vec2(0.0, 40.0), Modifiers::CTRL)]);
+        assert!(close(point, (options.scroll_zoom_speed * 40.0).exp()), "point pinch {point}");
+        let line = factor(vec![wheel(MouseWheelUnit::Line, vec2(0.0, 1.0), Modifiers::CTRL)]);
+        assert!(close(line, (options.scroll_zoom_speed * options.line_scroll_speed).exp()), "line pinch {line}");
+        let page = factor(vec![wheel(MouseWheelUnit::Page, vec2(0.0, 0.5), Modifiers::CTRL)]);
+        assert!(close(page, (options.scroll_zoom_speed * 300.0).exp()), "page pinch {page}");
+        assert_eq!(factor(vec![wheel(MouseWheelUnit::Point, vec2(0.0, 40.0), Modifiers::NONE)]), 1.0, "a bare wheel belongs to the scroll path");
+        assert_eq!(factor(vec![Event::Zoom(1.25)]), 1.25);
+        let both = factor(vec![Event::Zoom(1.25), wheel(MouseWheelUnit::Point, vec2(0.0, 40.0), Modifiers::CTRL)]);
+        assert!(close(both, 1.25 * (options.scroll_zoom_speed * 40.0).exp()), "zoom events and pinch wheel combine {both}");
     }
 
     /// The 3D mouse pans and zooms a flat page with the cap and never turns it, as the mouse

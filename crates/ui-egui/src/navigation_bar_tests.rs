@@ -513,6 +513,34 @@ fn navigation_board_popup_width_includes_its_border_and_padding() {
     }
 }
 
+/// A label longer than its menu row (the Display menu's "Perspective while orbiting, ortho on
+/// faces", #8700) is cut with an ellipsis before the row's check, not drawn past the menu's edge;
+/// a short one is drawn whole.
+#[test]
+fn a_long_menu_row_label_ends_in_an_ellipsis_inside_its_row() {
+    use crate::ui_kit::*;
+    let ctx = crate::fonts::test_context();
+    for (label, selected, cut) in [
+        ("Perspective while orbiting, ortho on faces", false, true),
+        ("Perspective while orbiting, ortho on faces", true, true),
+        ("Show tool at cursor", true, false),
+    ] {
+        let mut row = Rect::NOTHING;
+        let output = crate::test_support::frame(&ctx, egui::RawInput::default(), |ui| {
+            navigation_menu(ui, NAV_POPUP_WIDTH, |ui| {
+                let mut item = NavigationMenuRow::new("row", label, "select");
+                item.selected = selected;
+                row = item.show(ui).rect;
+            });
+        });
+        let text = crate::test_support::text_shapes(&output).find(|t| t.galley.text() == label).unwrap_or_else(|| panic!("{label} is drawn"));
+        assert_eq!(text.galley.elided, cut, "{label}");
+        let end = row.right() - NAV_MENU_INSET - if selected { crate::theme::Tokens::get().space_14 } else { 0.0 };
+        let drawn = text.pos.x + text.galley.size().x;
+        assert!(drawn <= end, "{label}: ends at {drawn}, past {end}");
+    }
+}
+
 #[test]
 fn navigation_board_position_aliases_migrate_and_editor_alignment_follows_position() {
     use crate::navigation_bar_view::editor_layout;

@@ -59,22 +59,26 @@ impl<'a> NavigationMenuRow<'a> {
             icons::paint_ink(ui.painter(), icon, self.icon, if self.selected { ink } else { t.form_dim });
         }
         let font = if self.selected { crate::fonts::semibold(NAV_TEXT) } else { FontId::proportional(NAV_TEXT) };
-        ui.painter().text(
-            pos2(rect.left() + NAV_MENU_INSET + NAV_MENU_ICON + NAV_ROW_GAP, rect.center().y),
-            Align2::LEFT_CENTER,
-            self.label,
-            font,
-            ink,
-        );
+        // The label ends before the detail and the check or chevron: one that doesn't fit is cut
+        // with an ellipsis and shown whole on hover, as a long name in a list is (#8700).
+        let mut end = rect.right() - NAV_MENU_INSET - if self.selected || self.submenu { t.space_14 + t.space_4 } else { 0.0 };
         if let Some(detail) = self.detail {
-            ui.painter().text(
-                pos2(rect.right() - NAV_MENU_INSET - if self.submenu { NAV_CHEVRON + t.space_4 } else { 0.0 }, rect.center().y),
+            let at = rect.right() - NAV_MENU_INSET - if self.submenu { NAV_CHEVRON + t.space_4 } else { 0.0 };
+            let detail = ui.painter().text(
+                pos2(at, rect.center().y),
                 Align2::RIGHT_CENTER,
                 detail,
                 FontId::proportional(if self.enabled { t.font_body } else { t.font_small }),
                 if self.enabled { t.form_dim } else { t.nav_dim },
             );
+            end = end.min(detail.left() - t.space_8);
         }
+        let left = rect.left() + NAV_MENU_INSET + NAV_MENU_ICON + NAV_ROW_GAP;
+        let mut job = egui::text::LayoutJob::simple_singleline(self.label.to_owned(), font, ink);
+        job.wrap = egui::text::TextWrapping::truncate_at_width((end - left).max(0.0));
+        let galley = ui.painter().layout_job(job);
+        let cut = galley.elided;
+        ui.painter().galley(pos2(left, rect.center().y - galley.size().y / 2.0), galley, ink);
         let tail = Rect::from_center_size(pos2(rect.right() - NAV_MENU_INSET - t.space_14 / 2.0, rect.center().y), vec2(t.space_14, t.space_14));
         if self.selected {
             super::checks::paint_check_glyph(ui.painter(), tail, false, t.form_primary);
@@ -84,7 +88,7 @@ impl<'a> NavigationMenuRow<'a> {
             icons::paint_ink(ui.painter(), arrow, "chevron", t.form_dim);
         }
         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, self.enabled && ui.is_enabled(), self.selected, self.label));
-        response
+        if cut { response.on_hover_text(self.label) } else { response }
     }
 }
 

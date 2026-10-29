@@ -129,6 +129,24 @@ fn occurrence_second_row_selects_exact_path_and_menu_actions() {
 }
 
 #[test]
+fn turn_up_axis_follows_the_placement_right_clicked() {
+    // Whichever placement comes first, a grounded one can't turn and a free one can.
+    let (mut h, _, first, second) = fixture();
+    let turns = |h: &Harness, occurrence: u64| {
+        let items = context_menu::items(&h.app, &Target::Occurrence { path: vec![occurrence] });
+        let turn = items.into_iter().find(|i| i.id == "ui.turnUpAxis").unwrap();
+        let children: Vec<_> = turn.children.iter().map(|c| (c.enabled, c.params.as_ref().unwrap()["occurrence"].as_u64())).collect();
+        (turn.enabled, children)
+    };
+    for (grounded, free) in [(first, second), (second, first)] {
+        h.app.run("occurrence.ground", json!({"occurrence": grounded, "grounded": true})).unwrap();
+        h.app.run("occurrence.ground", json!({"occurrence": free, "grounded": false})).unwrap();
+        assert_eq!(turns(&h, free), (true, vec![(true, Some(free)); 2]), "free placement {free}");
+        assert_eq!(turns(&h, grounded), (false, vec![(false, Some(grounded)); 2]), "grounded placement {grounded}");
+    }
+}
+
+#[test]
 fn occurrence_eye_and_fold_are_independent_and_survive_rename() {
     let (mut h, component, first, second) = fixture();
     click(&mut h, &[second], "eye");
@@ -456,4 +474,45 @@ fn a_folded_folders_menu_items_move_to_the_placements_menu() {
     assert_eq!(made.items, ["Body1", "Second"]);
     h.app.preferences.browser_bodies_folders = BodiesFolders::Always;
     assert!(!has(&h, "component.from_bodies"), "Always: on the folder's own menu");
+}
+
+/// #5164: dragging a placement row onto another moves it into that component. The command
+/// underneath is `occurrence.reparent`, which keeps the placement's world position. Dragging it
+/// back onto the design row moves it out to the design.
+#[test]
+fn dragging_an_occurrence_row_onto_another_moves_it_into_that_component() {
+    let mut h = Harness::new();
+    // Component A with a body, at the design root.
+    let a = h.app.run("component.create", json!({"name":"A"})).unwrap();
+    let (_a_comp, a_occ) = (a["component"].as_u64().unwrap(), a["occurrence"].as_u64().unwrap());
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10})).unwrap();
+    // Back to the design root so B is a sibling of A, not a child of it.
+    h.app.run("component.activate", json!({"component":0})).unwrap();
+    // Component B with a body, at the design root.
+    let b = h.app.run("component.create", json!({"name":"B"})).unwrap();
+    let (b_comp, b_occ) = (b["component"].as_u64().unwrap(), b["occurrence"].as_u64().unwrap());
+    h.app.run("solid.box", json!({"length":10,"width":10,"height":10,"corner":[30,0,0]})).unwrap();
+    h.app.run("component.activate", json!({"component":0})).unwrap();
+    h.frames(3);
+
+    // Both rows sit at the root. Drag A's row onto B's row.
+    let from = crate::scenario::handle_at(&format!("row:occurrence:{a_occ}")).unwrap();
+    let to = crate::scenario::handle_at(&format!("row:occurrence:{b_occ}")).unwrap();
+    let drag = h.call("ui.drag", json!({"x0":from.x,"y0":from.y,"x1":to.x,"y1":to.y,"steps":12}));
+    assert_eq!(drag["ok"], true);
+    h.frames(2);
+
+    // A's occurrence is now a child of B's occurrence.
+    let o = h.app.session.doc.occurrences.iter().find(|o| o.id == a_occ).unwrap();
+    assert_eq!(o.parent, b_comp, "A's occurrence moved into component B");
+    assert_eq!(h.app.session.doc.occurrences.iter().find(|o| o.id == b_occ).unwrap().parent, 0, "B's occurrence stays at the design");
+
+    // Drag A's row, now under B, back onto the design row.
+    let design = crate::scenario::handle_at("row:Untitled").unwrap();
+    let from = crate::scenario::handle_at(&format!("row:occurrence:{b_occ}/{a_occ}")).unwrap();
+    let drag = h.call("ui.drag", json!({"x0":from.x,"y0":from.y,"x1":design.x,"y1":design.y,"steps":12}));
+    assert_eq!(drag["ok"], true);
+    h.frames(2);
+    let o = h.app.session.doc.occurrences.iter().find(|o| o.id == a_occ).unwrap();
+    assert_eq!(o.parent, 0, "A's occurrence moved back out to the design");
 }

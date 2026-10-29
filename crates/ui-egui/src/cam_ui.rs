@@ -5412,7 +5412,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                 label: &name,
                 name: true,
                 selected: app.manufacture.picked == Some((id, None)),
-                detail: &total,
+                secondary: &total,
                 ..Default::default()
             },
         );
@@ -5468,7 +5468,7 @@ pub fn browser_rows(app: &mut SolveApp, ui: &mut egui::Ui, depth: usize) {
                     name: true,
                     selected: app.manufacture.picked == Some((id, Some(op_id))),
                     color: if error.is_some() { Some(Tokens::get().error) } else { warning.map(|_| Tokens::get().warning) },
-                    detail: &minutes,
+                    secondary: &minutes,
                     ..Default::default()
                 },
             );

@@ -389,6 +389,9 @@ fn a_control_import_passes_up_and_names_on() {
     // The reply, the part's height and whether the offer is up, for an import by this window.
     let import = |params: serde_json::Value| {
         let mut w = Win::new();
+        // This test is about the caller's `up`, not the note's lying-on-its-back guess (#7717): every
+        // file from another program gets the offer, as before.
+        w.app.preferences.stand_up_unknown = crate::prefs::StandUpUnknown::Ask;
         let (tx, rx) = std::sync::mpsc::channel();
         w.app.control_rx = Some(rx);
         let (req, reply_rx) = crate::control::ControlRequest::new("engine.execute", json!({"command": "file.insert_step", "params": params.clone()}));

@@ -163,8 +163,9 @@ fn read_link(file: &Path, own: Option<&str>) -> Result<Vec<u8>> {
     }
     // A network location only when its server is allowed, a device never: judged from the text
     // before anything is read (on Windows, reading `\\host\share\x` connects to the host).
-    solidcraft_io::vfs::read_design_path(&shown, own, solidcraft_io::MAX_DESIGN_BYTES).map_err(|e| {
-        let e = e.to_string();
+    let design = solidcraft_io::limits::Kind::Design;
+    solidcraft_io::vfs::read_design_path(&shown, own, solidcraft_io::limits::max_design_bytes()).map_err(|e| {
+        let e = solidcraft_io::limits::explain(design, e).to_string();
         EngineError::Other(if e.starts_with(&shown) { e } else { format!("{shown}: {e}") })
     })
 }
