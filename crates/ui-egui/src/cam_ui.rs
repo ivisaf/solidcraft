@@ -4563,7 +4563,7 @@ fn kind_name(group: &str, kind: &str) -> String {
 }
 
 /// The operations the toolbar offers, by their command.
-const OPERATIONS: [&str; 12] = [
+const OPERATIONS: &[&str] = &[
     "cam.op.face",
     "cam.op.contour",
     "cam.op.pocket",
