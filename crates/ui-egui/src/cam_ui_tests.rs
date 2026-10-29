@@ -134,6 +134,40 @@ fn selected_faces_become_the_operation_s_geometry() {
     assert!(h.widget("1 picked").is_some() && h.widget("Use a sketch").is_some());
 }
 
+/// A 3D operation form gives the selected faces a role; the operation keeps them, an edit opens
+/// with them, and they are sent again only when changed.
+#[test]
+fn a_3d_form_gives_selected_faces_their_roles() {
+    let mut h = lab();
+    h.app.run("solid.box", json!({"length": 60, "width": 40, "height": 10})).unwrap();
+    define_tool(&mut h);
+    fill(&mut h, "cam.setup.create", |_| {});
+    h.app.start("cam.op.parallel3d");
+    let top = solidcraft_engine::geom::Vec3::new(30.0, 20.0, 10.0);
+    h.app.session.selection = crate::dialogs::face_sel(&h.app.session, top).into_iter().collect();
+    h.frames(2);
+    assert!(h.widget("none: every face is machined").is_some());
+    assert!(h.widget("Ignore the 1 selected").is_some() && h.widget("Avoid the 1 selected by").is_some(), "buttons for the selection");
+    // As the avoid button with 2 mm typed would.
+    let picked = selected_faces(&h.app);
+    if let (Some(Form::Op(f)), [(body, at)]) = (&mut h.app.manufacture.form, picked.as_slice()) {
+        assert!(f.faces.is_empty(), "the selection came after the form: it is not the geometry");
+        f.face_roles = vec![FaceRoleRow { body: body.clone(), at: *at, role: FaceRoleKind::Avoid, mm: 2.0 }];
+    }
+    h.frames(2);
+    assert!(h.widget("0 ignored, 1 avoided, 0 left material on").is_some(), "the summary");
+    apply(&mut h.app);
+    assert_eq!(h.app.manufacture.error, None);
+    let roles = &h.app.session.doc.manufacture.setups[0].operations[0].face_roles;
+    assert!(matches!(roles.as_slice(), [r] if r.role == solidcraft_engine::doc::manufacture::Role::Avoid { clearance: 2.0 }), "{roles:?}");
+    let listed = h.app.session.execute("cam.list", &json!({})).unwrap();
+    let Some(Form::Op(mut f)) = edit_form(&h.app, &listed["setups"][0], &listed["setups"][0]["operations"][0]) else { panic!("no form") };
+    assert_eq!(f.face_roles.len(), 1);
+    assert!(command(&Form::Op(f.clone())).is_ok_and(|(_, p)| p.get("face_roles").is_none()), "unchanged roles are not sent");
+    f.face_roles.clear();
+    assert!(command(&Form::Op(f)).is_ok_and(|(_, p)| p["face_roles"] == json!([])), "cleared: every face machined again");
+}
+
 #[test]
 fn edit_fills_the_form_from_the_operation_and_changes_it_in_place() {
     let mut h = sketched();

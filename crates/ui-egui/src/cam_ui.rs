@@ -111,6 +111,10 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    /// Whether it follows the model's shape in 3D, so that faces of the part can have roles in it.
+    fn follows_the_model(self) -> bool {
+        matches!(self, OpKind::Adaptive3d | OpKind::Parallel3d | OpKind::ZLevel3d)
+    }
     fn command(self) -> &'static str {
         match self {
             OpKind::Face => "cam.op.face",
@@ -378,6 +382,47 @@ pub struct Editing {
     pub boundary: usize,
     pub sketch: String,
     pub faces: Vec<(String, Vec3)>,
+    pub face_roles: Vec<FaceRoleRow>,
+}
+
+/// A face with a role in a 3D operation form: the face (its body and a point on it), and what it
+/// is to the operation, with how far the tool keeps off it (avoid) or what is left on it (leave), mm.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceRoleRow {
+    pub body: String,
+    pub at: Vec3,
+    pub role: FaceRoleKind,
+    pub mm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceRoleKind {
+    Ignore,
+    Avoid,
+    Leave,
+}
+
+impl FaceRoleRow {
+    /// As `face_roles` takes it.
+    fn json(&self) -> Value {
+        let mut v = json!({ "body": self.body, "point": [self.at.x, self.at.y, self.at.z] });
+        match self.role {
+            FaceRoleKind::Ignore => v["role"] = json!("ignore"),
+            FaceRoleKind::Avoid => (v["role"], v["clearance"]) = (json!("avoid"), json!(self.mm)),
+            FaceRoleKind::Leave => (v["role"], v["stock_to_leave"]) = (json!("leave"), json!(self.mm)),
+        }
+        v
+    }
+    /// One of an operation's `face_roles` as `cam.list` gives them.
+    fn of(v: &Value) -> Option<FaceRoleRow> {
+        let (role, mm) = match v["role"]["role"].as_str()? {
+            "ignore" => (FaceRoleKind::Ignore, 0.0),
+            "avoid" => (FaceRoleKind::Avoid, v["role"]["clearance"].as_f64()?),
+            "leave" => (FaceRoleKind::Leave, v["role"]["stock_to_leave"].as_f64()?),
+            _ => return None,
+        };
+        Some(FaceRoleRow { body: v["face"]["body"].as_str()?.to_string(), at: point(&v["face"]["at"])?, role, mm })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -398,6 +443,11 @@ pub struct OpForm {
     pub name: String,
     /// Picked faces (body, a point on the face); when there are any they are cut, not the sketch.
     pub faces: Vec<(String, Vec3)>,
+    /// 3D operations: faces of the part with a role other than being machined, and the clearance
+    /// and allowance the next ones given a role get (empty: 1 mm to avoid; none to leave yet).
+    pub face_roles: Vec<FaceRoleRow>,
+    pub role_clearance: String,
+    pub role_leave: String,
     pub sketch: String,
     pub tool: String,
     pub spindle_rpm: String,
@@ -912,6 +962,9 @@ pub fn start(app: &mut SolveApp, id: &str) -> bool {
             // With a body, heights come from it and the sketch; without one, a first depth to change.
             bottom: if faces.is_empty() && !has_bodies { "-5 mm".into() } else { String::new() },
             faces,
+            face_roles: Vec::new(),
+            role_clearance: String::new(),
+            role_leave: String::new(),
             sketch,
             tool: first_tool.clone(),
             spindle_rpm: String::new(),
@@ -1430,6 +1483,14 @@ pub fn command(form: &Form) -> Result<(&'static str, Value), String> {
                 let faces: Vec<Value> = f.faces.iter().map(|(body, at)| json!({"body": body, "point": [at.x, at.y, at.z]})).collect();
                 p.insert("faces".into(), json!(faces));
             }
+            // Face roles: a new operation's when it has any, an edited one's when they changed.
+            let changed = match &f.editing {
+                Some(e) => e.face_roles != f.face_roles,
+                None => !f.face_roles.is_empty(),
+            };
+            if changed && f.kind.follows_the_model() {
+                p.insert("face_roles".into(), Value::Array(f.face_roles.iter().map(FaceRoleRow::json).collect()));
+            }
             // A number of passes instead of the stepdown; on an edit an emptied one goes back to the stepdown.
             if !matches!(f.kind, OpKind::Drill | OpKind::Bore | OpKind::Chamfer | OpKind::VCarve | OpKind::Thread) {
                 match f.passes.trim().parse::<u64>() {
@@ -1696,6 +1757,7 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
     let sketch = op["geometry"]["sketch"].as_u64().and_then(|id| app.session.doc.feature(id)).map(|f| f.name.clone()).unwrap_or_default();
     let faces: Vec<(String, Vec3)> =
         op["geometry"]["faces"].as_array().into_iter().flatten().filter_map(|f| Some((f["body"].as_str()?.to_string(), point(&f["at"])?))).collect();
+    let face_roles: Vec<FaceRoleRow> = op["face_roles"].as_array().into_iter().flatten().filter_map(FaceRoleRow::of).collect();
     let inputs = &op["inputs"];
     let boundary = match op["geometry"]["type"].as_str() {
         Some("part") => 1,
@@ -1714,9 +1776,19 @@ pub fn edit_form(app: &SolveApp, setup: &Value, op: &Value) -> Option<Form> {
         boundary,
         limit: usize::from(inputs["inside"].as_bool().unwrap_or(false)),
         margin: text(inputs, "margin"),
-        editing: Some(Editing { setup: setup["id"].as_u64()?, op: op["id"].as_u64()?, boundary, sketch: sketch.clone(), faces: faces.clone() }),
+        editing: Some(Editing {
+            setup: setup["id"].as_u64()?,
+            op: op["id"].as_u64()?,
+            boundary,
+            sketch: sketch.clone(),
+            faces: faces.clone(),
+            face_roles: face_roles.clone(),
+        }),
         name: text(op, "name"),
         faces,
+        face_roles,
+        role_clearance: String::new(),
+        role_leave: String::new(),
         sketch,
         tool: op["tool"].as_u64()?.to_string(),
         spindle_rpm: number(&op["spindle_rpm"]),
@@ -2583,9 +2655,54 @@ pub fn segments(app: &SolveApp, proj: &Proj) -> Vec<(egui::Pos2, egui::Pos2, boo
     out
 }
 
+/// Most triangles tinted to show faces with roles.
+const MAX_TINTED: usize = 200_000;
+
+/// The faces an open 3D operation form gives roles, tinted over the model by role: ignored
+/// dimmed, avoided in the warning colour, those left material on in the accent colour.
+fn draw_face_roles(app: &SolveApp, painter: &egui::Painter, proj: &Proj, roles: &[FaceRoleRow]) {
+    use solidcraft_engine::doc::naming;
+    if roles.is_empty() {
+        return;
+    }
+    let t = Tokens::get();
+    let state = app.session.world_state();
+    let mut mesh = egui::Mesh::default();
+    for r in roles {
+        let colour = match r.role {
+            FaceRoleKind::Ignore => t.text_dim,
+            FaceRoleKind::Avoid => t.warning,
+            FaceRoleKind::Leave => t.accent,
+        }
+        .gamma_multiply(0.45);
+        let Some(body) = state.bodies.iter().find(|b| b.name == r.body) else { continue };
+        let Some((index, _, _)) = naming::face_name_at_body(body, r.at).and_then(|name| naming::face_on_body(body, &name, r.at)) else { continue };
+        let m = body.mesh();
+        for (k, tri) in m.triangles.iter().enumerate() {
+            if m.tri_face.get(k).map(|f| *f as usize) != Some(index) {
+                continue;
+            }
+            if mesh.vertices.len() >= MAX_TINTED * 3 {
+                break;
+            }
+            let corners: Option<Vec<egui::Pos2>> = tri.iter().map(|v| m.positions.get(*v as usize).and_then(|p| proj.to_screen(*p))).collect();
+            let Some(corners) = corners else { continue };
+            let first = mesh.vertices.len() as u32;
+            for p in corners {
+                mesh.colored_vertex(p, colour);
+            }
+            mesh.add_triangle(first, first + 1, first + 2);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 /// Draws the toolpaths over the model: cuts in the accent colour, rapids thin and dim.
 pub fn draw(app: &SolveApp, painter: &egui::Painter, proj: &Proj) {
     let t = Tokens::get();
+    if let Some(Form::Op(f)) = app.manufacture.form.as_ref().filter(|_| app.manufacture.open) {
+        draw_face_roles(app, painter, proj, &f.face_roles);
+    }
     if app.manufacture.open && app.manufacture.show_setups {
         for view in app.manufacture.cache.iter().flat_map(|(_, _, v)| v) {
             let (edges, arms) = setup_lines(view);
@@ -2719,6 +2836,10 @@ fn base(label: &str) -> &str {
 fn help(label: &str) -> Option<&'static str> {
     Some(match base(label) {
         "Number" => "The tool's number: the T word in the program and the pocket of a tool changer.",
+        "Face roles" => {
+            "What particular faces of the part are to this operation: ignored, kept clear of, or left material on. Every other face is machined. Select faces in the model, then press one of the buttons; the faces are tinted while the form is open."
+        }
+        "Holder" => "What the tool sits in: one of the library's holders by its shape, else a plain one by its diameter and length.",
         "Kind" => "Flat: a flat end mill. Ball: a rounded end. Drill: only plunges straight down.",
         "Diameter" => "How wide the tool cuts.",
         "Description" => "Your own words for the tool, shown in the lists.",
@@ -3722,6 +3843,79 @@ const SCHEME_W: f32 = 64.0;
 /// How wide a form's text boxes are, and its drop-downs at least.
 const FIELD_W: f32 = 140.0;
 
+/// A 3D operation form's face roles: what they are, a button to machine every face again, and
+/// buttons giving the selected faces a role.
+fn face_roles_rows(ui: &mut egui::Ui, f: &mut OpForm, selected: &[(String, Vec3)]) {
+    let t = Tokens::get();
+    row_label(ui, "Face roles", None);
+    ui.horizontal(|ui| {
+        if f.face_roles.is_empty() {
+            ui.label(RichText::new(tm("none: every face is machined")).color(t.text_dim));
+        } else {
+            let count = |k: FaceRoleKind| f.face_roles.iter().filter(|r| r.role == k).count().to_string();
+            let summary = tf(
+                "manufacture.face_roles_summary",
+                &[("ignored", &count(FaceRoleKind::Ignore)), ("avoided", &count(FaceRoleKind::Avoid)), ("left", &count(FaceRoleKind::Leave))],
+            );
+            ui.label(summary);
+            if ui_kit::compact_button(ui, "×", tm("Machine every face again"), true, false).clicked() {
+                f.face_roles.clear();
+            }
+        }
+    });
+    ui.end_row();
+    if selected.is_empty() {
+        return;
+    }
+    let given = |text: &str| crate::prefs::parse_number(text.trim().trim_end_matches("mm").trim()).filter(|v| *v >= 0.0 && *v <= 100.0);
+    let clearance = if f.role_clearance.trim().is_empty() { Some(1.0) } else { given(&f.role_clearance) };
+    let leave = given(&f.role_leave);
+    let mut chosen: Option<(FaceRoleKind, f64)> = None;
+    let n = selected.len().to_string();
+    // One role a line, so the form keeps its width with faces selected.
+    ui.label("");
+    ui.vertical(|ui| {
+        if button(ui, tf("manufacture.ignore_selected", &[("count", &n)]), Button::Small)
+            .on_hover_text(tm("Leave them out of the part this operation follows: the tool may cut through them"))
+            .clicked()
+        {
+            chosen = Some((FaceRoleKind::Ignore, 0.0));
+        }
+        ui.horizontal(|ui| {
+            if button(ui, tf("manufacture.avoid_selected", &[("count", &n)]), ui_kit::Button::Enabled(clearance.is_some()))
+                .on_hover_text(tm("Keep the tool at least this far off them"))
+                .clicked()
+                && let Some(c) = clearance
+            {
+                chosen = Some((FaceRoleKind::Avoid, c));
+            }
+            ui.scope(|ui| {
+                ui.set_max_width(60.0);
+                ui_kit::text_field(ui, &mut f.role_clearance, "1 mm");
+            });
+        });
+        ui.horizontal(|ui| {
+            if button(ui, tf("manufacture.leave_on_selected", &[("count", &n)]), ui_kit::Button::Enabled(leave.is_some()))
+                .on_hover_text(tm("Leave this much on them instead of the operation's own allowance"))
+                .clicked()
+                && let Some(l) = leave
+            {
+                chosen = Some((FaceRoleKind::Leave, l));
+            }
+            ui.scope(|ui| {
+                ui.set_max_width(60.0);
+                ui_kit::text_field(ui, &mut f.role_leave, "0.3 mm");
+            });
+        });
+    });
+    ui.end_row();
+    if let Some((role, mm)) = chosen {
+        // A face given a role again takes the new one.
+        f.face_roles.retain(|r| !selected.iter().any(|(body, at)| *body == r.body && *at == r.at));
+        f.face_roles.extend(selected.iter().map(|(body, at)| FaceRoleRow { body: body.clone(), at: *at, role, mm }));
+    }
+}
+
 /// The form's rows; an operation form leaves its heights in `picture` for beside them.
 fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need], picture: &mut Option<Picture>) {
     egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
@@ -3900,6 +4094,9 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     f.faces = selected.to_vec();
                 }
                 ui.end_row();
+            }
+            if f.kind.follows_the_model() {
+                face_roles_rows(ui, f, selected);
             }
             let from_faces = !f.faces.is_empty();
             pick(ui, need, "sc_cam_tool", "Tool", &mut f.tool, &choices.tools);

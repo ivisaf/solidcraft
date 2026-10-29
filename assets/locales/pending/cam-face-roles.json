@@ -1,0 +1,58 @@
+{
+  "en": {
+    "manufacture.face_roles": "Face roles",
+    "manufacture.face_roles_help": "What particular faces of the part are to this operation: ignored, kept clear of, or left material on. Every other face is machined. Select faces in the model, then press one of the buttons; the faces are tinted while the form is open.",
+    "manufacture.face_roles_none": "none: every face is machined",
+    "manufacture.face_roles_summary": "{ignored} ignored, {avoided} avoided, {left} left material on",
+    "manufacture.face_roles_clear": "Machine every face again",
+    "manufacture.ignore_selected": "Ignore the {count} selected",
+    "manufacture.ignore_selected_help": "Leave them out of the part this operation follows: the tool may cut through them",
+    "manufacture.avoid_selected": "Avoid the {count} selected by",
+    "manufacture.avoid_selected_help": "Keep the tool at least this far off them",
+    "manufacture.leave_on_selected": "Leave on the {count} selected",
+    "manufacture.leave_on_selected_help": "Leave this much on them instead of the operation's own allowance",
+    "manufacture.holder_help": "What the tool sits in: one of the library's holders by its shape, else a plain one by its diameter and length."
+  },
+  "de": {
+    "manufacture.face_roles": "Flächenrollen",
+    "manufacture.face_roles_help": "Was bestimmte Flächen des Teils für diese Operation sind: ignoriert, gemieden oder mit eigenem Aufmaß. Alle anderen Flächen werden bearbeitet. Flächen im Modell wählen, dann eine der Schaltflächen drücken; die Flächen sind eingefärbt, solange das Formular offen ist.",
+    "manufacture.face_roles_none": "keine: jede Fläche wird bearbeitet",
+    "manufacture.face_roles_summary": "{ignored} ignoriert, {avoided} gemieden, {left} mit eigenem Aufmaß",
+    "manufacture.face_roles_clear": "Wieder jede Fläche bearbeiten",
+    "manufacture.ignore_selected": "Die {count} gewählten ignorieren",
+    "manufacture.ignore_selected_help": "Aus dem Teil herausnehmen, dem diese Operation folgt: das Werkzeug darf durch sie hindurch",
+    "manufacture.avoid_selected": "Die {count} gewählten meiden um",
+    "manufacture.avoid_selected_help": "Das Werkzeug mindestens so weit von ihnen fernhalten",
+    "manufacture.leave_on_selected": "Auf den {count} gewählten stehen lassen",
+    "manufacture.leave_on_selected_help": "So viel auf ihnen stehen lassen statt des Aufmaßes der Operation",
+    "manufacture.holder_help": "Worin das Werkzeug sitzt: ein Halter der Bibliothek nach seiner Form, sonst ein einfacher mit Durchmesser und Länge."
+  },
+  "ja": {
+    "manufacture.face_roles": "面の役割",
+    "manufacture.face_roles_help": "部品の特定の面がこのオペレーションにとって何か：無視、回避、または独自の取り代。その他の面はすべて加工されます。モデルで面を選択し、いずれかのボタンを押してください。フォームが開いている間、面は色付けされます。",
+    "manufacture.face_roles_none": "なし：すべての面を加工",
+    "manufacture.face_roles_summary": "無視 {ignored}、回避 {avoided}、取り代 {left}",
+    "manufacture.face_roles_clear": "すべての面を再び加工",
+    "manufacture.ignore_selected": "選択した {count} 面を無視",
+    "manufacture.ignore_selected_help": "このオペレーションが追従する部品から除外します：工具はそれらを削り抜けることがあります",
+    "manufacture.avoid_selected": "選択した {count} 面を回避、距離",
+    "manufacture.avoid_selected_help": "工具を少なくともこの距離だけ離します",
+    "manufacture.leave_on_selected": "選択した {count} 面に残す",
+    "manufacture.leave_on_selected_help": "オペレーションの取り代の代わりに、この量を残します",
+    "manufacture.holder_help": "工具を保持するもの：ライブラリのホルダー（形状で）、または直径と長さによる簡易ホルダー。"
+  },
+  "zh": {
+    "manufacture.face_roles": "面角色",
+    "manufacture.face_roles_help": "零件的特定面对此操作的作用：忽略、避开或留自己的余量。其他所有面都会被加工。在模型中选择面，然后按其中一个按钮；表单打开时这些面会着色。",
+    "manufacture.face_roles_none": "无：每个面都加工",
+    "manufacture.face_roles_summary": "忽略 {ignored}，避开 {avoided}，留余量 {left}",
+    "manufacture.face_roles_clear": "重新加工所有面",
+    "manufacture.ignore_selected": "忽略所选的 {count} 个",
+    "manufacture.ignore_selected_help": "将它们从此操作所跟随的零件中去除：刀具可能会切穿它们",
+    "manufacture.avoid_selected": "避开所选的 {count} 个，距离",
+    "manufacture.avoid_selected_help": "让刀具至少离它们这么远",
+    "manufacture.leave_on_selected": "在所选的 {count} 个上留",
+    "manufacture.leave_on_selected_help": "在它们上面留这么多，代替操作自己的余量",
+    "manufacture.holder_help": "刀具所装的刀柄：按形状选择库中的刀柄，否则按直径和长度的简单刀柄。"
+  }
+}
