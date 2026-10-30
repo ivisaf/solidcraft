@@ -530,7 +530,7 @@ fn tool_library_is_the_machine_s_and_fills_operation_forms() {
     // The tool is the machine's, not this design's.
     assert!(h.app.session.doc.manufacture.tools.is_empty());
     h.frames(2);
-    assert!(h.widget("TOOL LIBRARY").is_some() && h.widget("T1  Rougher").is_some() && h.widget("18000").is_some() && h.widget("New Tool").is_some());
+    assert!(h.widget("Tool Library").is_some() && h.widget("T1  Rougher").is_some() && h.widget("18000").is_some() && h.widget("New Tool").is_some());
     // 1500 mm/min at 18000 rev/min with 3 flutes is 0.0278 mm a tooth; no form is open until one is asked for.
     assert!(h.widget("0.0278").is_some() && h.widget("Pick a tool to change or remove it").is_some());
     assert!(
@@ -712,10 +712,10 @@ fn manufacture_is_its_own_workspace() {
     assert!(!crate::workspace::visible_tabs(&h.app).contains(&"MANUFACTURE"));
 }
 
-/// The Manufacture and Tool Library panels move by their headers, each on its own and kept
-/// on screen; a double-click on a header docks the panel again.
+/// The Manufacture and Tool Library panels are cards as the app's managers are: they move by
+/// their headers, each on its own and kept on screen; Close in the footer closes one, Esc not.
 #[test]
-fn panels_move_by_their_headers_and_dock_again() {
+fn panels_move_by_their_headers_and_close_from_their_footers() {
     let mut h = lab();
     h.call("ui.resize", json!({"width": 1600.0, "height": 960.0}));
     h.app.manufacture.open = true;
@@ -740,10 +740,15 @@ fn panels_move_by_their_headers_and_dock_again() {
     let viewport = h.app.viewport.rect.expect("viewport");
     assert!(viewport.contains(rect(&h, "sc_cam_tools").min));
 
-    let title = crate::scenario::handle_at("sc_cam_window:title").expect("header");
-    h.call("ui.click", json!({"x": title.x, "y": title.y, "double": true}));
-    h.frames(4);
-    assert!((rect(&h, "sc_cam_window").min - panel.min).length() < 0.5, "double-click docks it again");
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(2);
+    assert!(h.app.manufacture.open && h.app.manufacture.tools_open, "Esc leaves the panels open");
+    h.app.manufacture.tools_open = false;
+    h.frames(2);
+    let close = crate::scenario::handle_at("dialog:Close").expect("Close in the footer");
+    h.call("ui.click", json!({"x": close.x, "y": close.y}));
+    h.frames(2);
+    assert!(!h.app.manufacture.open, "Close closes the panel");
 }
 
 /// The browser lists the setups and their operations under a Manufacture folder; its eye
@@ -808,6 +813,31 @@ fn browser_lists_setups_and_operations_with_their_menus() {
     run_item(&mut h.app, &remove, egui::Pos2::ZERO);
     h.frames(2);
     assert!(!rows(&h).iter().any(|r| r == "Manufacture"), "the folder goes with the last setup");
+}
+
+/// Whether the open form is drawn as a card titled `title`, as the app's command dialogs are.
+fn card_titled(h: &Harness, title: &str) -> bool {
+    h.app.manufacture.form.as_ref().is_some_and(|f| form_title(f).1 == title)
+        && crate::scenario::rect_of("dialog:header").is_some()
+        && h.widget(title).is_some()
+}
+
+/// A form is a card as the app's command dialogs are: OK and Cancel in its footer, in its header
+/// with Preferences › Interface › Dialog buttons at the top, and Esc cancels it.
+#[test]
+fn a_form_is_a_dialog_card_with_its_buttons_where_the_preference_puts_them() {
+    let mut h = sketched();
+    define_tool(&mut h);
+    h.app.start("cam.setup.create");
+    h.frames(2);
+    assert!(card_titled(&h, "New Setup"));
+    assert!(crate::scenario::rect_of("dialog:footer").is_some() && ok_enabled(&h) == Some(true), "OK and Cancel in the footer");
+    h.app.preferences.dialog_buttons = crate::ui_kit::DialogButtons::Top;
+    h.frames(2);
+    assert!(crate::scenario::rect_of("dialog:footer").is_none() && ok_enabled(&h) == Some(true), "OK and Cancel in the header");
+    h.step(&json!({"key": "Escape"})).unwrap();
+    h.frames(1);
+    assert!(h.app.manufacture.form.is_none(), "Esc cancels the form");
 }
 
 /// Whether the form's OK button is on (`None`: there is none).
@@ -1099,27 +1129,6 @@ fn an_import_says_what_it_took_and_left_out() {
     assert!(h.widget("Imported 2 tool(s)").is_some());
     assert!(h.widget("Left out tool 4 (Dovetail): a dovetail is not a kind of tool SolidCraft has yet").is_some());
     assert!(h.widget("T1  6 mm flat end mill").is_some(), "the tool is in the table");
-}
-
-#[test]
-fn panels_are_dragged_wider_and_keep_their_width() {
-    let mut h = sketched();
-    h.app.start("cam.list");
-    h.frames(3);
-    let usual = h.app.manufacture.panel.unwrap();
-    // The grip on the left edge drags the panel 150 wider; its right edge stays docked.
-    let y = usual.center().y as f64;
-    h.step(&json!({"drag": [[usual.left() as f64, y], [usual.left() as f64 - 150.0, y]], "steps": 6})).unwrap();
-    h.frames(3);
-    let wider = h.app.manufacture.panel.unwrap();
-    assert!((wider.width() - usual.width() - 150.0).abs() < 8.0, "{} → {}", usual.width(), wider.width());
-    assert!((wider.right() - usual.right()).abs() < 1.0);
-    assert!((h.app.preferences.cam_panel_width - wider.width()).abs() < 1.0, "kept with the preferences");
-    // A double-click on the grip gives it its usual width again.
-    h.step(&json!({"click": [wider.left() as f64, y], "double": true})).unwrap();
-    h.frames(3);
-    assert_eq!(h.app.preferences.cam_panel_width, 0.0);
-    assert!(h.app.manufacture.panel.unwrap().width() <= DIALOG_WIDE_MAX_W + 1.0);
 }
 
 #[test]
@@ -1439,7 +1448,7 @@ fn a_bore_form_mills_round_holes_on_a_helix() {
     h.app.start("cam.op.bore");
     h.frames(2);
     // Its own rows: no stepdown or passes, a depth per turn and the direction.
-    assert!(h.widget("BORE").is_some() && h.widget("Depth per turn").is_some() && h.widget("Climb").is_some());
+    assert!(card_titled(&h, "Bore") && h.widget("Depth per turn").is_some() && h.widget("Climb").is_some());
     assert!(h.widget("Stepdown").is_none() && h.widget("Passes").is_none() && h.widget("Ramp angle").is_none());
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
     (f.bottom, f.pitch, f.climb) = ("-5".into(), "1.5 mm".into(), false);
@@ -1464,7 +1473,7 @@ fn a_chamfer_form_takes_its_depth_from_its_width() {
     h.app.start("cam.op.chamfer");
     h.frames(2);
     // No bottom, stepdown or passes: the width, the tip offset, outside or inside.
-    assert!(h.widget("CHAMFER").is_some() && h.widget("Chamfer width").is_some() && h.widget("Tip offset").is_some());
+    assert!(card_titled(&h, "Chamfer") && h.widget("Chamfer width").is_some() && h.widget("Tip offset").is_some());
     assert!(h.widget("Bottom").is_none() && h.widget("Stepdown").is_none() && h.widget("Passes").is_none());
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
     (f.tool, f.width, f.side) = ("1".into(), "0.8 mm".into(), 1);
@@ -1518,17 +1527,8 @@ fn an_adaptive_form_clears_a_pocket_at_a_steady_load() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.adaptive");
     h.frames(2);
-    for row in [
-        "ADAPTIVE",
-        "Stepover (%)",
-        "Helix angle",
-        "Helix largest (%)",
-        "Helix smallest (%)",
-        "Rest of tool",
-        "Finish allowance",
-        "Stepdown",
-        "Climb",
-    ] {
+    assert!(card_titled(&h, "Adaptive"));
+    for row in ["Stepover (%)", "Helix angle", "Helix largest (%)", "Helix smallest (%)", "Rest of tool", "Finish allowance", "Stepdown", "Climb"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
@@ -1562,7 +1562,8 @@ fn a_3d_adaptive_form_roughs_the_stock_with_or_without_a_sketch() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.adaptive3d");
     h.frames(2);
-    for row in ["3D ADAPTIVE", "Sketch", "Stepover (%)", "Stock to leave", "Step-up height", "Helix angle", "Stepdown", "Climb"] {
+    assert!(card_titled(&h, "3D Adaptive"));
+    for row in ["Sketch", "Stepover (%)", "Stock to leave", "Step-up height", "Helix angle", "Stepdown", "Climb"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     for row in ["Rest of tool", "Finish allowance"] {
@@ -1606,7 +1607,8 @@ fn a_3d_parallel_form_finishes_the_part_s_box_or_inside_a_sketch() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.parallel3d");
     h.frames(2);
-    for row in ["3D PARALLEL", "Sketch", "Stepover", "Pass angle", "Stock to leave", "Both ways (zigzag)", "Only what earlier operations left"] {
+    assert!(card_titled(&h, "3D Parallel"));
+    for row in ["Sketch", "Stepover", "Pass angle", "Stock to leave", "Both ways (zigzag)", "Only what earlier operations left"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     assert!(h.widget("Stepdown").is_none(), "one layer, following the surface");
@@ -1648,7 +1650,8 @@ fn a_3d_z_level_form_finishes_the_walls() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.zlevel3d");
     h.frames(2);
-    for row in ["3D Z-LEVEL", "Sketch", "Level step", "Walls from", "Stock to leave", "Climb", "Only what earlier operations left"] {
+    assert!(card_titled(&h, "3D Z-Level"));
+    for row in ["Sketch", "Level step", "Walls from", "Stock to leave", "Climb", "Only what earlier operations left"] {
         assert!(h.widget(row).is_some(), "{row}");
     }
     assert!(h.widget("Stepdown").is_none(), "its level step instead");
@@ -1727,7 +1730,7 @@ fn the_manufacture_folder_menu_and_preferences_set_the_display() {
     h.app.prefs_window.open = true;
     h.app.prefs_window.section = crate::prefs::PAGE_GRAPHICS;
     h.frames(3);
-    for row in ["Toolpath colour", "Toolpath width", "Panel fade", "Simulation detail", "Rapid rate"] {
+    for row in ["Toolpath colour", "Toolpath width", "Simulation detail", "Rapid rate"] {
         assert!(h.widget(row).is_some(), "{row} in the Preferences");
     }
 }
@@ -2028,7 +2031,7 @@ fn a_v_carve_form_carves_with_a_v_bit() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.vcarve");
     h.frames(2);
-    assert!(h.widget("V-CARVE").is_some() && h.widget("Deepest").is_some() && h.widget("Bottom").is_none());
+    assert!(card_titled(&h, "V-Carve") && h.widget("Deepest").is_some() && h.widget("Bottom").is_none());
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
     (f.tool, f.stepover, f.max_depth) = ("3".into(), "0.25 mm".into(), "2 mm".into());
     apply(&mut h.app);
@@ -2052,7 +2055,7 @@ fn a_thread_form_mills_a_thread_in_a_hole() {
     fill(&mut h, "cam.setup.create", |_| {});
     h.app.start("cam.op.thread");
     h.frames(2);
-    assert!(h.widget("THREAD").is_some() && h.widget("Pitch").is_some());
+    assert!(card_titled(&h, "Thread") && h.widget("Pitch").is_some());
     let Some(Form::Op(f)) = &mut h.app.manufacture.form else { panic!("no operation form") };
     (f.tool, f.bottom) = ("4".into(), "-8".into());
     let wanted = missing(h.app.manufacture.form.as_ref().unwrap(), &choices(&h.app, &json!({}), &json!({})));

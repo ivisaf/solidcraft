@@ -1034,11 +1034,6 @@ preference_settings! {
     /// From how thick material left on the part the simulated stock shows it (index into the
     /// Manufacture panel's choices).
     cam_leftover_shown: usize = 2;
-    /// The Manufacture and Tool Library panels' widths as dragged (0: their docked width), and
-    /// how far their background fades while the pointer is elsewhere (index into the panel's choices).
-    cam_panel_width: f32 = 0.0;
-    cam_tools_width: f32 = 0.0;
-    cam_panel_fade: usize = 1;
     /// How fast this machine's rapids move (mm/min), for the time a played program takes.
     cam_rapid_rate: f32 = 5000.0;
     /// The fastest this machine's spindle turns (rev/min; 0: no limit): a speed worked out from a

@@ -5,7 +5,7 @@
 //! command the toolbar started, and Post Process. Toolpaths come from `cam.toolpath` and are
 //! redrawn when the design changes.
 
-use crate::ui_kit::{self, Button, button};
+use crate::ui_kit::{self, Button, StatusTone, button};
 use egui::{RichText, Stroke};
 use serde_json::{Value, json};
 use solidcraft_engine::geom::Vec3;
@@ -715,9 +715,6 @@ pub struct CamUi {
     pub folded: bool,
     pub tools_folded: bool,
     panel: Option<egui::Rect>,
-    /// How far each panel was dragged from its docked place by its header (zero: docked).
-    pub offset: egui::Vec2,
-    pub tools_offset: egui::Vec2,
     /// The setup, or the operation of a setup, picked in the browser.
     pub picked: Option<(u64, Option<u64>)>,
     /// The browser's eye keeps the toolpaths drawn while the Manufacture panel is closed.
@@ -761,9 +758,6 @@ pub struct CamUi {
     pub air_height: f64,
     /// A program waiting to be written once its rapids into material are confirmed.
     pub confirm_post: Option<PendingPost>,
-    /// How the Manufacture and Tool Library panels are shown (kept with the preferences).
-    pub look: PanelLook,
-    pub tools_look: PanelLook,
     /// The setup last simulated (simulated again when the detail changes), and what of it.
     simulated: Option<u64>,
     scope: SimScope,
@@ -854,8 +848,6 @@ impl Default for CamUi {
             folded: false,
             tools_folded: false,
             panel: None,
-            offset: egui::Vec2::ZERO,
-            tools_offset: egui::Vec2::ZERO,
             picked: None,
             pinned_paths: false,
             browser_listing: None,
@@ -875,8 +867,6 @@ impl Default for CamUi {
             sim_detail: 1,
             path_width: 1,
             path_colour: 0,
-            look: PanelLook { width: 0.0, fade: 1, resizing: false },
-            tools_look: PanelLook { width: 0.0, fade: 1, resizing: false },
             simulated: None,
             scope: SimScope::default(),
             posted_at: None,
@@ -1729,10 +1719,15 @@ pub fn setup_form(setup: &Value) -> Option<Form> {
 
 /// 3D finishing's rest row: only where earlier operations of the setup left material.
 fn rest_row(ui: &mut egui::Ui, rest: &mut bool) {
-    row_label(ui, "Rest", None);
-    let r = crate::ui_kit::checkbox(ui, tm("Only what earlier operations left"), rest);
-    explained(r, "Rest", None);
-    ui.end_row();
+    check_row(ui, "Rest", "Only what earlier operations left", rest);
+}
+
+/// A form row with a check box after its label, and what the row is for on hover.
+fn check_row(ui: &mut egui::Ui, label: &str, text: &str, on: &mut bool) {
+    labelled(ui, label, |ui| {
+        let r = crate::ui_kit::checkbox(ui, tm(text), on);
+        explained(r, label, None);
+    });
 }
 
 /// A form filled in from an operation as `cam.list` reports it.
@@ -2357,7 +2352,7 @@ fn tick(app: &mut SolveApp, ctx: &egui::Context) {
 fn play_controls(ui: &mut egui::Ui, cam: &mut CamUi, asked: &mut Asked) {
     let t = Tokens::get();
     let Some(setup) = cam.simulated else { return };
-    ui.add_space(4.0);
+    ui.add_space(t.space_4);
     let Some(play) = cam.play.as_mut() else {
         if button(ui, tm("Play the program"), Button::Normal)
             .on_hover_text(tm("Show the tool moving along the toolpaths and cutting the stock"))
@@ -2995,13 +2990,24 @@ fn needed<'a>(need: &'a [Need], label: &str) -> Option<&'a Need> {
     need.iter().find(|n| n.field == base(label))
 }
 
-/// A form row's label: in the error colour while its value is still needed, with what the row
-/// is for (and what it needs) on hover.
-fn row_label(ui: &mut egui::Ui, label: &str, need: Option<&Need>) {
-    let t = Tokens::get();
-    let text = if need.is_some() { RichText::new(tm(label)).color(t.error) } else { RichText::new(tm(label)) };
-    let r = ui.label(text);
-    explained(r, label, need);
+/// A form row as the app's dialogs have it (`ui_kit::row`): `label` in the form's label
+/// column and what `add` draws in its control column.
+fn labelled<R>(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    crate::ui_kit::row(ui, tm(label), add)
+}
+
+/// The form's label column and the gap after it, as [`form_body`] chose it for this frame.
+const LABEL_COLUMN: &str = "sc_cam_label_column";
+
+/// A line in a form's control column under the row before it, with no label of its own (a
+/// button that fills that row in).
+fn beneath<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let indent = ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new(LABEL_COLUMN))).unwrap_or(0.0);
+    ui.horizontal(|ui| {
+        ui.add_space((indent - ui.spacing().item_spacing.x).max(0.0));
+        add(ui)
+    })
+    .inner
 }
 
 /// `r` with what its row is for, and what it needs, on hover.
@@ -3023,20 +3029,18 @@ fn explained(r: egui::Response, label: &str, need: Option<&Need>) -> egui::Respo
     })
 }
 
-/// A frame in the error colour round a row's control while its value is still needed.
+/// A frame in the error colour inside a row's control while its value is still needed, as a
+/// text box the kit draws invalid has.
 fn mark(ui: &egui::Ui, r: &egui::Response, need: Option<&Need>) {
     if need.is_some() {
-        ui.painter().rect_stroke(r.rect.expand(1.0), 2.0, Stroke::new(1.5, Tokens::get().error), egui::StrokeKind::Outside);
+        let t = Tokens::get();
+        ui.painter().rect_stroke(r.rect, t.control_radius, Stroke::new(1.0, t.form_error), egui::StrokeKind::Inside);
     }
 }
 
-/// A form's text box, 140 pt wide; `invalid` draws it in the error colour (its value is still needed).
+/// A form's text box, as wide as its row leaves; `invalid` draws it in the error colour (its value is still needed).
 fn text_box(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, invalid: bool) -> egui::Response {
-    ui.scope(|ui| {
-        ui.set_max_width(FIELD_W);
-        crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, tm(hint), invalid)
-    })
-    .inner
+    crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_field", label)), value, tm(hint), invalid)
 }
 
 /// `add` with its buttons filled with `fill` and outlined with `stroke` (where set).
@@ -3059,23 +3063,23 @@ fn tinted<R>(ui: &mut egui::Ui, fill: Option<egui::Color32>, stroke: Option<Stro
 /// [`field`] for a height, with a button beside it that takes `picked`: the selection's height
 /// (its highest point for a top, its lowest for a bottom; `None` with nothing selected).
 /// `true` while the row is pointed at or typed in (the heights picture lights its line).
-fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) -> (bool, f32, f32) {
+fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, picked: Option<f64>) -> (bool, f32) {
     let need = needed(need, label);
-    // Its label leaves room on the left for the heights picture.
-    let left = ui.cursor().left();
-    let r = ui.horizontal(|ui| {
-        ui.add_space(SCHEME_W);
-        row_label(ui, label, need);
-    });
-    let (mut lit, middle) = (r.response.hovered(), r.response.rect.center().y);
-    ui.horizontal(|ui| {
-        let r = text_box(ui, label, value, hint, need.is_some());
+    let middle = ui.cursor().top() + crate::ui_kit::row_height() / 2.0;
+    let mut lit = ui.rect_contains_pointer(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), crate::ui_kit::row_height())));
+    labelled(ui, label, |ui| {
+        let side = crate::ui_kit::row_height();
+        let r = ui
+            .scope(|ui| {
+                ui.set_max_width((ui.available_width() - side - ui.spacing().item_spacing.x).max(0.0));
+                text_box(ui, label, value, hint, need.is_some())
+            })
+            .inner;
         lit |= r.hovered() || r.has_focus();
         let r = explained(r, label, need);
         crate::params_dialog::complete(ui, &r, value);
         let mm = |z: f64| format!("{} mm", shown((z * 1e3).round() / 1e3 + 0.0, 3));
         let name = tf("manufacture.from_the_selection", &[("label", tm(label))]);
-        let side = crate::ui_kit::row_height();
         let b = ui
             .add_enabled_ui(picked.is_some(), |ui| {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
@@ -3094,8 +3098,7 @@ fn height_field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut Strin
             *value = mm(z);
         }
     });
-    ui.end_row();
-    (lit, middle, left)
+    (lit, middle)
 }
 
 /// [`field`], also saying whether its row is pointed at or typed in.
@@ -3106,14 +3109,14 @@ fn field_seen(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String,
 /// [`field_seen`], greyed out with `unused` saying why while it is `Some`.
 fn field_unless(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str, unused: Option<&str>) -> (bool, bool) {
     let need = needed(need, label);
-    row_label(ui, label, need);
-    let r = ui.add_enabled_ui(unused.is_none(), |ui| text_box(ui, label, value, hint, need.is_some())).inner;
-    let r = r.on_disabled_hover_text(tm(unused.unwrap_or_default()));
-    let lit = r.hovered() || r.has_focus();
-    let r = explained(r, label, need);
-    let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
-    ui.end_row();
-    (lit, changed)
+    labelled(ui, label, |ui| {
+        let r = ui.add_enabled_ui(unused.is_none(), |ui| text_box(ui, label, value, hint, need.is_some())).inner;
+        let r = r.on_disabled_hover_text(tm(unused.unwrap_or_default()));
+        let lit = r.hovered() || r.has_focus();
+        let r = explained(r, label, need);
+        let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
+        (lit, changed)
+    })
 }
 
 /// Which line of the heights picture a form row stands for.
@@ -3165,15 +3168,14 @@ fn heights_picture(painter: &egui::Painter, p: &Picture) {
     }
 }
 
-/// A labelled text box in a form's grid; `true` when its text changed this frame.
+/// A labelled text box in a form; `true` when its text changed this frame.
 fn field(ui: &mut egui::Ui, need: &[Need], label: &str, value: &mut String, hint: &str) -> bool {
     let need = needed(need, label);
-    row_label(ui, label, need);
-    let r = text_box(ui, label, value, hint, need.is_some());
-    let r = explained(r, label, need);
-    let changed = r.changed() | crate::params_dialog::complete(ui, &r, value);
-    ui.end_row();
-    changed
+    labelled(ui, label, |ui| {
+        let r = text_box(ui, label, value, hint, need.is_some());
+        let r = explained(r, label, need);
+        r.changed() | crate::params_dialog::complete(ui, &r, value)
+    })
 }
 
 /// A number as forms show it: at most `decimals` decimals, none wasted.
@@ -3259,33 +3261,35 @@ fn link_chip_load(rpm: &str, flutes: Option<f64>, feed: &mut String, chip: &mut 
 }
 
 fn choice(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, index: &mut usize, options: &[&str]) {
-    row_label(ui, label, needed(need, label));
-    let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
-    let r = fitted_dropdown(ui, id, index, &options, FIELD_W);
-    explained(r, label, None);
-    ui.end_row();
+    let need = needed(need, label);
+    labelled(ui, label, |ui| {
+        let options: Vec<&str> = options.iter().map(|o| tm(o)).collect();
+        let r = crate::ui_kit::dropdown(ui, id, index, &options);
+        mark(ui, &r, need);
+        explained(r, label, need);
+    });
 }
 
 /// A text value chosen from a list (`(value, label)`); a value not in the list is shown as it is.
 fn pick(ui: &mut egui::Ui, need: &[Need], id: &str, label: &str, value: &mut String, options: &[(String, String)]) {
     let need = needed(need, label);
-    row_label(ui, label, need);
-    // Indexed for the kit's drop-down; a value not in the list shows as it is, chosen by none.
-    let mut labels: Vec<&str> = options.iter().map(|(_, l)| tm(l)).collect();
-    let mut index = options.iter().position(|(v, _)| v == value).unwrap_or_else(|| {
-        labels.push(value.as_str());
-        labels.len() - 1
+    labelled(ui, label, |ui| {
+        // Indexed for the kit's drop-down; a value not in the list shows as it is, chosen by none.
+        let mut labels: Vec<&str> = options.iter().map(|(_, l)| tm(l)).collect();
+        let mut index = options.iter().position(|(v, _)| v == value).unwrap_or_else(|| {
+            labels.push(value.as_str());
+            labels.len() - 1
+        });
+        let before = index;
+        let r = crate::ui_kit::dropdown(ui, id, &mut index, &labels);
+        if index != before
+            && let Some((v, _)) = options.get(index)
+        {
+            *value = v.clone();
+        }
+        mark(ui, &r, need);
+        explained(r, label, need);
     });
-    let before = index;
-    let r = fitted_dropdown(ui, id, &mut index, &labels, FIELD_W);
-    if index != before
-        && let Some((v, _)) = options.get(index)
-    {
-        *value = v.clone();
-    }
-    mark(ui, &r, need);
-    explained(r, label, need);
-    ui.end_row();
 }
 
 /// A tool's cutting data, as forms fill it in.
@@ -3436,8 +3440,6 @@ fn speeds(tool: &Value, cut: Option<&Value>, max_rpm: f32) -> (Option<f64>, Opti
 }
 
 fn form_ui(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need]) {
-    // A form's labels stay on one line each.
-    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     if let Form::Tool(f) = form {
         tool_assistant(ui, f, need, &choices.materials, &choices.holders);
         return;
@@ -3660,11 +3662,10 @@ fn tool_picture(ui: &mut egui::Ui, shape: &ToolShape, lit: Option<Dim>, size: eg
 /// The tool assistant: the kind (tiles), the shape (with its dimensioned picture), the cutting data.
 fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials: &[String], holders: &[String]) {
     let t = Tokens::get();
-    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     // Where it is: three steps, each a button back to it.
     let steps = [tm("1  Kind"), tm("2  Shape"), tm("3  Cutting data")];
     crate::ui_kit::segmented(ui, &mut f.step, &steps, crate::ui_kit::Segments::default());
-    ui.add_space(6.0);
+    ui.add_space(t.space_8);
     match f.step {
         0 => {
             ui.label(RichText::new(tm("What kind of tool is it?")).color(t.text_dim));
@@ -3712,18 +3713,18 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
         }
         1 => {
             let mut lit = None;
+            // The rows, and the dimensioned picture right of them.
+            let picture = egui::vec2(170.0, 250.0);
             ui.horizontal_top(|ui| {
-                egui::Grid::new("sc_cam_tool_shape").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                let rows = (ui.available_width() - picture.x - t.space_12).max(0.0);
+                ui.allocate_ui_with_layout(egui::vec2(rows, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(rows);
                     if f.editing {
-                        row_label(ui, "Number", None);
-                        ui.label(format!("T{}", f.number));
-                        ui.end_row();
+                        labelled(ui, "Number", |ui| ui.label(format!("T{}", f.number)));
                     } else {
                         field(ui, need, "Number", &mut f.number, "1");
                     }
-                    row_label(ui, "Kind", None);
-                    ui.label(tm(TOOL_KIND_NAMES.get(f.kind).copied().unwrap_or_default()));
-                    ui.end_row();
+                    labelled(ui, "Kind", |ui| ui.label(tm(TOOL_KIND_NAMES.get(f.kind).copied().unwrap_or_default())));
                     field(ui, need, "Description", &mut f.description, "");
                     let mut row = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, d: Dim| {
                         if field_seen(ui, need, label, value, hint).0 {
@@ -3767,8 +3768,8 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                         field(ui, need, "Holder length", &mut f.holder_length, "not known");
                     }
                 });
-                ui.add_space(12.0);
-                tool_picture(ui, &ToolShape::of(f), lit, egui::vec2(170.0, 250.0), true);
+                ui.add_space(t.space_12 - ui.spacing().item_spacing.x);
+                tool_picture(ui, &ToolShape::of(f), lit, picture, true);
             });
         }
         _ => {
@@ -3793,7 +3794,7 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                     (true, v) => tf("manufacture.the_tools_value", &[("value", v)]),
                 }
             };
-            egui::Grid::new("sc_cam_tool_cutting").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            {
                 let mut chosen = f.material.clone();
                 pick(ui, need, "sc_cam_tool_material", "Material", &mut chosen, &options);
                 f.show_material(&chosen);
@@ -3814,7 +3815,7 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
                 field(ui, need, "Plunge feed (mm/min)", &mut f.plunge_feed, &hint(&own.plunge_feed, "feed / 3"));
                 field(ui, need, "Stepdown (mm)", &mut f.stepdown, &hint(&own.stepdown, "half the diameter"));
                 field(ui, need, "Stepover (mm)", &mut f.stepover, &hint(&own.stepover, "by operation"));
-            });
+            }
             let note = if in_material {
                 "Rows left empty take the tool's own value. A setup whose stock is of this material cuts with these."
             } else if options.len() > 1 {
@@ -3822,10 +3823,10 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
             } else {
                 "Materials are added in the Tool Library; a tool can then have data for each."
             };
-            ui.add(egui::Label::new(RichText::new(tm(note)).color(Tokens::get().text_dim)).wrap());
+            crate::ui_kit::status_line(ui, tm(note), crate::ui_kit::StatusTone::Dim);
         }
     }
-    ui.add_space(4.0);
+    ui.add_space(t.space_8);
     ui.horizontal(|ui| {
         if button(ui, tm("< Back"), ui_kit::Button::Enabled(f.step > 0)).clicked() {
             f.step -= 1;
@@ -3840,15 +3841,11 @@ fn tool_assistant(ui: &mut egui::Ui, f: &mut ToolForm, need: &[Need], materials:
 /// How wide the heights picture is, left of the height rows' labels.
 const SCHEME_W: f32 = 64.0;
 
-/// How wide a form's text boxes are, and its drop-downs at least.
-const FIELD_W: f32 = 140.0;
-
 /// A 3D operation form's face roles: what they are, a button to machine every face again, and
 /// buttons giving the selected faces a role.
 fn face_roles_rows(ui: &mut egui::Ui, f: &mut OpForm, selected: &[(String, Vec3)]) {
     let t = Tokens::get();
-    row_label(ui, "Face roles", None);
-    ui.horizontal(|ui| {
+    labelled(ui, "Face roles", |ui| {
         if f.face_roles.is_empty() {
             ui.label(RichText::new(tm("none: every face is machined")).color(t.text_dim));
         } else {
@@ -3863,7 +3860,6 @@ fn face_roles_rows(ui: &mut egui::Ui, f: &mut OpForm, selected: &[(String, Vec3)
             }
         }
     });
-    ui.end_row();
     if selected.is_empty() {
         return;
     }
@@ -3873,42 +3869,42 @@ fn face_roles_rows(ui: &mut egui::Ui, f: &mut OpForm, selected: &[(String, Vec3)
     let mut chosen: Option<(FaceRoleKind, f64)> = None;
     let n = selected.len().to_string();
     // One role a line, so the form keeps its width with faces selected.
-    ui.label("");
-    ui.vertical(|ui| {
+    beneath(ui, |ui| {
         if button(ui, tf("manufacture.ignore_selected", &[("count", &n)]), Button::Small)
             .on_hover_text(tm("Leave them out of the part this operation follows: the tool may cut through them"))
             .clicked()
         {
             chosen = Some((FaceRoleKind::Ignore, 0.0));
         }
-        ui.horizontal(|ui| {
-            if button(ui, tf("manufacture.avoid_selected", &[("count", &n)]), ui_kit::Button::Enabled(clearance.is_some()))
-                .on_hover_text(tm("Keep the tool at least this far off them"))
-                .clicked()
-                && let Some(c) = clearance
-            {
-                chosen = Some((FaceRoleKind::Avoid, c));
-            }
-            ui.scope(|ui| {
-                ui.set_max_width(60.0);
-                ui_kit::text_field(ui, &mut f.role_clearance, "1 mm");
-            });
-        });
-        ui.horizontal(|ui| {
-            if button(ui, tf("manufacture.leave_on_selected", &[("count", &n)]), ui_kit::Button::Enabled(leave.is_some()))
-                .on_hover_text(tm("Leave this much on them instead of the operation's own allowance"))
-                .clicked()
-                && let Some(l) = leave
-            {
-                chosen = Some((FaceRoleKind::Leave, l));
-            }
-            ui.scope(|ui| {
-                ui.set_max_width(60.0);
-                ui_kit::text_field(ui, &mut f.role_leave, "0.3 mm");
-            });
+    });
+    // A role's amount: a short box after its button.
+    let amount = t.form_label_width;
+    beneath(ui, |ui| {
+        if button(ui, tf("manufacture.avoid_selected", &[("count", &n)]), ui_kit::Button::Enabled(clearance.is_some()))
+            .on_hover_text(tm("Keep the tool at least this far off them"))
+            .clicked()
+            && let Some(c) = clearance
+        {
+            chosen = Some((FaceRoleKind::Avoid, c));
+        }
+        ui.scope(|ui| {
+            ui.set_max_width(amount);
+            ui_kit::text_field(ui, &mut f.role_clearance, "1 mm");
         });
     });
-    ui.end_row();
+    beneath(ui, |ui| {
+        if button(ui, tf("manufacture.leave_on_selected", &[("count", &n)]), ui_kit::Button::Enabled(leave.is_some()))
+            .on_hover_text(tm("Leave this much on them instead of the operation's own allowance"))
+            .clicked()
+            && let Some(l) = leave
+        {
+            chosen = Some((FaceRoleKind::Leave, l));
+        }
+        ui.scope(|ui| {
+            ui.set_max_width(amount);
+            ui_kit::text_field(ui, &mut f.role_leave, "0.3 mm");
+        });
+    });
     if let Some((role, mm)) = chosen {
         // A face given a role again takes the new one.
         f.face_roles.retain(|r| !selected.iter().any(|(body, at)| *body == r.body && *at == r.at));
@@ -3918,7 +3914,7 @@ fn face_roles_rows(ui: &mut egui::Ui, f: &mut OpForm, selected: &[(String, Vec3)
 
 /// The form's rows; an operation form leaves its heights in `picture` for beside them.
 fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], choices: &Choices, need: &[Need], picture: &mut Option<Picture>) {
-    egui::Grid::new("sc_cam_form").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| match form {
+    match form {
         // Tools have an assistant of their own (`tool_assistant`).
         Form::Tool(_) => {}
         Form::Setup(f) => {
@@ -3927,22 +3923,24 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             // The part: every body, or those named.
             field(ui, need, "Part bodies", &mut f.bodies, "every body");
             if !choices.bodies.is_empty() && choices.bodies.join(", ") != f.bodies {
-                ui.label("");
-                if button(ui, tf("manufacture.part_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small).clicked() {
-                    f.bodies = choices.bodies.join(", ");
-                }
-                ui.end_row();
+                beneath(ui, |ui| {
+                    if button(ui, tf("manufacture.part_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small)
+                        .clicked()
+                    {
+                        f.bodies = choices.bodies.join(", ");
+                    }
+                });
             }
             // What holds the stock: bodies that are never the part, kept clear of.
             field(ui, need, "Fixtures", &mut f.fixtures, "none");
             if !choices.bodies.is_empty() && choices.bodies.join(", ") != f.fixtures {
-                ui.label("");
-                if button(ui, tf("manufacture.fixtures_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small)
-                    .clicked()
-                {
-                    f.fixtures = choices.bodies.join(", ");
-                }
-                ui.end_row();
+                beneath(ui, |ui| {
+                    if button(ui, tf("manufacture.fixtures_the_selected_bodies", &[("count", &choices.bodies.len().to_string())]), Button::Small)
+                        .clicked()
+                    {
+                        f.fixtures = choices.bodies.join(", ");
+                    }
+                });
             }
             let shapes = STOCK_SHAPES.map(|(_, label)| label);
             choice(ui, need, "sc_cam_setup_stock", "Stock", &mut f.stock_shape, &shapes);
@@ -3968,25 +3966,27 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             choice(ui, need, "sc_cam_setup_origin", "Origin on", &mut f.origin, &ORIGINS);
             if f.origin == 3 {
                 // What was picked, and a button that takes what is selected now.
-                row_label(ui, "Origin point", needed(need, "Origin point"));
-                let shown = match &f.edge {
-                    Some((body, _)) => tf("manufacture.on_the_body", &[("body", body)]),
-                    None => tm("nothing picked yet").to_string(),
-                };
-                explained(ui.label(shown), "Origin point", needed(need, "Origin point"));
-                ui.end_row();
+                let wanted = needed(need, "Origin point");
+                labelled(ui, "Origin point", |ui| {
+                    let t = Tokens::get();
+                    let shown = match &f.edge {
+                        Some((body, _)) => RichText::new(tf("manufacture.on_the_body", &[("body", body)])),
+                        None => RichText::new(tm("nothing picked yet")).color(if wanted.is_some() { t.error } else { t.text_dim }),
+                    };
+                    explained(ui.label(shown), "Origin point", wanted);
+                });
                 let now = choices.origin_pick.as_ref().map(|(body, at, _)| (body.clone(), *at));
                 if let Some((body, at, on)) = choices.origin_pick.as_ref().filter(|_| now != f.edge) {
-                    ui.label("");
-                    if button(ui, tm("Take the selected corner or edge"), Button::Small).clicked() {
-                        f.edge = Some((body.clone(), *at));
-                        f.edge_on = match on {
-                            solidcraft_engine::doc::manufacture::EdgePoint::Vertex => 0,
-                            solidcraft_engine::doc::manufacture::EdgePoint::Middle => 1,
-                            solidcraft_engine::doc::manufacture::EdgePoint::Center => 2,
-                        };
-                    }
-                    ui.end_row();
+                    beneath(ui, |ui| {
+                        if button(ui, tm("Take the selected corner or edge"), Button::Small).clicked() {
+                            f.edge = Some((body.clone(), *at));
+                            f.edge_on = match on {
+                                solidcraft_engine::doc::manufacture::EdgePoint::Vertex => 0,
+                                solidcraft_engine::doc::manufacture::EdgePoint::Middle => 1,
+                                solidcraft_engine::doc::manufacture::EdgePoint::Center => 2,
+                            };
+                        }
+                    });
                 }
                 choice(ui, need, "sc_cam_setup_edge_on", "Origin at", &mut f.edge_on, &EDGE_POINTS.map(|e| e.1));
                 choice(ui, need, "sc_cam_setup_edge_z", "Origin Z", &mut f.edge_z, &ORIGIN_ZS.map(|z| z.1));
@@ -4014,43 +4014,45 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             let mut gone = None;
             for (k, c) in f.clamps.iter_mut().enumerate() {
                 let label = tf("manufacture.clamp_number", &[("number", &(k + 1).to_string())]);
-                explained(ui.label(&label), "Clamps", None);
-                ui.horizontal(|ui| {
+                crate::ui_kit::row(ui, &label, |ui| {
+                    // Five boxes sharing the row with the remove button.
+                    let gap = ui.spacing().item_spacing.x;
+                    let each = ((ui.available_width() - crate::ui_kit::row_height() - gap * 5.0) / 5.0).max(0.0);
                     for (i, (text, hint)) in c.iter_mut().zip(["X from", "Y from", "X to", "Y to", "top Z"]).enumerate() {
                         ui.scope(|ui| {
-                            ui.set_max_width(52.0);
-                            crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_clamp", k, i)), text, tm(hint), false);
+                            ui.set_max_width(each);
+                            let r = crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_clamp", k, i)), text, tm(hint), false);
+                            explained(r, "Clamps", None);
                         });
                     }
                     if ui_kit::compact_button(ui, "×", tm("Remove this clamp"), true, false).clicked() {
                         gone = Some(k);
                     }
                 });
-                ui.end_row();
             }
             if let Some(k) = gone {
                 f.clamps.remove(k);
             }
             // Copies of the part: how many along X and Y, then how far apart.
             for (label, range, hints) in [("Copies", 0..2, ["along X", "along Y"]), ("Spacing", 2..4, ["X apart", "Y apart"])] {
-                explained(ui.label(tm(label)), label, None);
-                ui.horizontal(|ui| {
+                labelled(ui, label, |ui| {
+                    let each = ((ui.available_width() - ui.spacing().item_spacing.x) / 2.0).max(0.0);
                     for (i, hint) in range.zip(hints) {
                         ui.scope(|ui| {
-                            ui.set_max_width(68.0);
+                            ui.set_max_width(each);
                             if let Some(text) = f.copies.get_mut(i) {
-                                crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_copies", i)), text, tm(hint), false);
+                                let r = crate::ui_kit::cell_editor(ui, ui.make_persistent_id(("cam_copies", i)), text, tm(hint), false);
+                                explained(r, label, None);
                             }
                         });
                     }
                 });
-                ui.end_row();
             }
-            ui.label("");
-            if button(ui, tm("Add Clamp"), Button::Small).on_hover_text(tm(help("Clamps").unwrap_or_default())).clicked() && f.clamps.len() < 64 {
-                f.clamps.push(Default::default());
-            }
-            ui.end_row();
+            beneath(ui, |ui| {
+                if button(ui, tm("Add Clamp"), Button::Small).on_hover_text(tm(help("Clamps").unwrap_or_default())).clicked() && f.clamps.len() < 64 {
+                    f.clamps.push(Default::default());
+                }
+            });
             let mut materials: Vec<(String, String)> = vec![(String::new(), tm("not said").into())];
             materials.extend(choices.materials.iter().map(|m| (m.clone(), m.clone())));
             pick(ui, need, "sc_cam_setup_material", "Material", &mut f.material, &materials);
@@ -4079,21 +4081,19 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     pick(ui, need, "sc_cam_sketch", "Sketch", &mut f.sketch, &choices.sketches);
                 }
             } else {
-                row_label(ui, "Faces", None);
-                ui.horizontal(|ui| {
+                labelled(ui, "Faces", |ui| {
                     ui.label(tf("manufacture.faces_picked", &[("count", &f.faces.len().to_string())]));
                     if button(ui, tm("Use a sketch"), Button::Small).clicked() {
                         f.faces.clear();
                     }
                 });
-                ui.end_row();
             }
             if !selected.is_empty() && selected != f.faces.as_slice() {
-                ui.label("");
-                if button(ui, tf("manufacture.cut_the_selected_faces", &[("count", &selected.len().to_string())]), Button::Small).clicked() {
-                    f.faces = selected.to_vec();
-                }
-                ui.end_row();
+                beneath(ui, |ui| {
+                    if button(ui, tf("manufacture.cut_the_selected_faces", &[("count", &selected.len().to_string())]), Button::Small).clicked() {
+                        f.faces = selected.to_vec();
+                    }
+                });
             }
             if f.kind.follows_the_model() {
                 face_roles_rows(ui, f, selected);
@@ -4138,21 +4138,32 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
             let mut lit = None;
             // Where the height rows are: the picture left of them draws each line level with its row.
             let (mut rows, mut left) = (Vec::new(), 0.0);
-            let mut row = |ui: &mut egui::Ui, line: HeightLine, label: &str, value: &mut String, hint: &str, picked: Option<f64>| {
-                let (on, middle, x) = height_field(ui, need, label, value, hint, picked);
-                rows.push((line, middle));
-                left = x;
-                if on {
-                    lit = Some(line);
-                }
-            };
-            row(ui, HeightLine::Clearance, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high);
-            row(ui, HeightLine::Retract, "Retract", &mut f.retract, &automatic(seen.map(|h| h.retract), "2 mm over the top"), high);
-            row(ui, HeightLine::Top, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high);
-            // A chamfer's depth comes from its width, a V-carve's from its shape.
-            if !matches!(f.kind, OpKind::Chamfer | OpKind::VCarve) {
-                row(ui, HeightLine::Bottom, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low);
-            }
+            // The picture takes the start of the label column; the rows' own, narrower label
+            // column ends where the form's does, so their boxes line up with the other rows'.
+            let indent = ui.ctx().data(|d| d.get_temp::<f32>(egui::Id::new(LABEL_COLUMN))).unwrap_or(0.0);
+            ui.horizontal_top(|ui| {
+                left = ui.cursor().left();
+                ui.allocate_exact_size(egui::vec2(SCHEME_W, 0.0), egui::Sense::hover());
+                let labels = (indent - Tokens::get().space_14 - SCHEME_W - ui.spacing().item_spacing.x).max(0.0);
+                ui.vertical(|ui| {
+                    crate::ui_kit::settings_form(ui, labels, |ui| {
+                        let mut row = |ui: &mut egui::Ui, line: HeightLine, label: &str, value: &mut String, hint: &str, picked: Option<f64>| {
+                            let (on, middle) = height_field(ui, need, label, value, hint, picked);
+                            rows.push((line, middle));
+                            if on {
+                                lit = Some(line);
+                            }
+                        };
+                        row(ui, HeightLine::Clearance, "Clearance", &mut f.clearance, &automatic(seen.map(|h| h.clearance), "10 mm over all"), high);
+                        row(ui, HeightLine::Retract, "Retract", &mut f.retract, &automatic(seen.map(|h| h.retract), "2 mm over the top"), high);
+                        row(ui, HeightLine::Top, "Top", &mut f.top, &auto(top, given.map(|h| h.0)), high);
+                        // A chamfer's depth comes from its width, a V-carve's from its shape.
+                        if !matches!(f.kind, OpKind::Chamfer | OpKind::VCarve) {
+                            row(ui, HeightLine::Bottom, "Bottom", &mut f.bottom, &auto(bottom, given.map(|h| h.1)), low);
+                        }
+                    });
+                });
+            });
             // Drilling has no stepdown (its peck depth is further down).
             // Not used while a number of passes divides the depth.
             let unused =
@@ -4192,10 +4203,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     if SIDES.get(f.side) != Some(&"on") {
                         field(ui, need, "Finish allowance", &mut f.finish, "none");
                     }
-                    row_label(ui, "Tabs", None);
-                    let r = crate::ui_kit::checkbox(ui, tm("Hold the part"), &mut f.tabs);
-                    explained(r, "Tabs", None);
-                    ui.end_row();
+                    check_row(ui, "Tabs", "Hold the part", &mut f.tabs);
                     if f.tabs {
                         field(ui, need, "Tab count", &mut f.tab_count, "4 on each loop");
                         field(ui, need, "Tab width", &mut f.tab_width, "6 mm");
@@ -4203,17 +4211,11 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     }
                     field(ui, need, "Onion skin", &mut f.skin, "none");
                     if !f.skin.trim().is_empty() {
-                        row_label(ui, "Skin", None);
-                        let r = crate::ui_kit::checkbox(ui, tm("Cut it off last"), &mut f.skin_last);
-                        explained(r, "Skin", None);
-                        ui.end_row();
+                        check_row(ui, "Skin", "Cut it off last", &mut f.skin_last);
                     }
                     // Arcs onto the wall, from off the part.
                     field(ui, need, "Lead-in radius", &mut f.lead, "none: ramps along the loop");
-                    row_label(ui, "Dogbones", None);
-                    let r = crate::ui_kit::checkbox(ui, tm("Into sharp inside corners"), &mut f.dogbones);
-                    explained(r, "Dogbones", None);
-                    ui.end_row();
+                    check_row(ui, "Dogbones", "Into sharp inside corners", &mut f.dogbones);
                 }
                 OpKind::Pocket => {
                     field(ui, need, "Stepover", &mut f.stepover, "the tool's, or 40% of its diameter");
@@ -4223,10 +4225,7 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     let mut options: Vec<(String, String)> = vec![(String::new(), tm("none: the whole pocket").into())];
                     options.extend(choices.tools.iter().filter(|(n, _)| *n != f.tool).cloned());
                     pick(ui, need, "sc_cam_rest_from", "Rest of tool", &mut f.rest_from, &options);
-                    row_label(ui, "Dogbones", None);
-                    let r = crate::ui_kit::checkbox(ui, tm("Into sharp inside corners"), &mut f.dogbones);
-                    explained(r, "Dogbones", None);
-                    ui.end_row();
+                    check_row(ui, "Dogbones", "Into sharp inside corners", &mut f.dogbones);
                 }
                 OpKind::ZLevel3d => {
                     field(ui, need, "Level step", &mut f.level_step, "a twelfth of the tool's diameter");
@@ -4238,10 +4237,10 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     field(ui, need, "Stepover", &mut f.stepover, "a tenth of the tool's diameter");
                     field(ui, need, "Pass angle", &mut f.pass_angle, "0° (along X)");
                     field(ui, need, "Stock to leave", &mut f.stock_to_leave, "0 mm");
-                    row_label(ui, "Direction", None);
-                    let r = crate::ui_kit::checkbox(ui, tm("Both ways (zigzag)"), &mut f.zigzag);
-                    explained(r, "Zigzag", None);
-                    ui.end_row();
+                    labelled(ui, "Direction", |ui| {
+                        let r = crate::ui_kit::checkbox(ui, tm("Both ways (zigzag)"), &mut f.zigzag);
+                        explained(r, "Zigzag", None);
+                    });
                     rest_row(ui, &mut f.rest3d);
                 }
                 OpKind::Adaptive3d => {
@@ -4311,15 +4310,11 @@ fn form_grid(ui: &mut egui::Ui, form: &mut Form, selected: &[(String, Vec3)], ch
                     | OpKind::VCarve
                     | OpKind::Thread
             ) {
-                row_label(ui, "Direction", None);
-                crate::ui_kit::checkbox(ui, tm("Climb"), &mut f.climb);
-                ui.end_row();
+                check_row(ui, "Direction", "Climb", &mut f.climb);
             }
-            row_label(ui, "Coolant", None);
-            crate::ui_kit::checkbox(ui, tm("On"), &mut f.coolant);
-            ui.end_row();
+            check_row(ui, "Coolant", "On", &mut f.coolant);
         }
-    });
+    }
 }
 
 /// The heights the open operation form's geometry gives, when they are known.
@@ -4431,259 +4426,220 @@ fn need_text(need: &[Need]) -> String {
     lines.join("\n")
 }
 
-/// The form's title, grid and OK / Cancel; `true` when OK was pressed.
-fn form_block(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], lists: &Choices, asked: &mut Asked) -> bool {
-    let Some(form) = &mut cam.form else { return false };
-    ui.add_space(6.0);
-    let title = match form {
+/// Which form is open, as its heading in the catalog says it: a form that changes kind (or
+/// opens anew) starts scrolled to its top.
+fn form_heading(form: &Form) -> &'static str {
+    match form {
         Form::Tool(f) if f.editing => "EDIT TOOL",
         Form::Tool(_) => "NEW TOOL",
         Form::Setup(f) if f.editing.is_some() => "EDIT SETUP",
         Form::Setup(_) => "NEW SETUP",
         Form::Op(f) if f.editing.is_some() => "EDIT OPERATION",
         Form::Op(f) => f.kind.title(),
+    }
+}
+
+/// The card's icon and title, as the app's command dialogs have them: the command's own icon
+/// and name, and "Edit …" for a form that changes what is there.
+fn form_title(form: &Form) -> (&'static str, String) {
+    let command = match form {
+        Form::Tool(_) => "cam.tool.define",
+        Form::Setup(_) => "cam.setup.create",
+        Form::Op(f) => f.kind.command(),
     };
+    let spec = solidcraft_engine::find_command(command);
+    let icon = spec.as_ref().map_or("", |s| s.icon);
+    let title = match form {
+        Form::Tool(f) if !f.editing => tm("New Tool").to_string(),
+        Form::Setup(f) if f.editing.is_none() => {
+            spec.as_ref().map_or_else(|| tm(form_heading(form)).to_string(), |s| crate::i18n::tr_label(s.label).to_string())
+        }
+        Form::Op(f) if f.editing.is_none() => {
+            spec.as_ref().map_or_else(|| tm(form_heading(form)).to_string(), |s| crate::i18n::tr_label(s.label).to_string())
+        }
+        _ => tm(form_heading(form)).to_string(),
+    };
+    (icon, title)
+}
+
+/// The open form as the app's command dialogs are (`ui_kit::Panel::feature`): docked at the
+/// right under the view cube and dragged with them, its header, the rows scrolling between it
+/// and the footer with OK and Cancel (or OK and Cancel in the header, with Preferences ›
+/// Interface › Dialog buttons at the top). Enter, with nothing typed in, is OK; Esc (when no
+/// command dialog took it, `esc_taken`) is Cancel. → where it was drawn, and whether it took Esc.
+#[allow(clippy::too_many_arguments)]
+fn form_card(
+    ctx: &egui::Context,
+    cam: &mut CamUi,
+    selected: &[(String, Vec3)],
+    lists: &Choices,
+    docked: egui::Pos2,
+    bounds: egui::Rect,
+    layout: crate::shell::LayoutMode,
+    esc_taken: bool,
+    asked: &mut Asked,
+) -> (Option<egui::Rect>, bool) {
+    let Some(form) = &cam.form else { return (None, false) };
+    let heading = form_heading(form);
+    let (icon, title) = form_title(form);
     let need = missing(form, lists);
     let t = Tokens::get();
-    let mut ok = false;
-    let mut cancel = false;
-    let shown = egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-        ui.label(RichText::new(tm(title)).strong());
-        ui.add_space(4.0);
-        form_ui(ui, form, selected, lists, &need);
-        ui.add_space(6.0);
-        // OK stays off until nothing is missing; what is missing is said under it.
-        let wanted = need_text(&need);
-        ui.horizontal(|ui| {
-            ok = button(ui, tm("OK"), ui_kit::Button::Enabled(need.is_empty())).on_disabled_hover_text(&wanted).clicked();
-            cancel = button(ui, tm("Cancel"), Button::Normal).clicked();
-            // An operation is simulated as the form has it, before OK.
-            if matches!(form, Form::Op(_)) {
-                asked.save_default = button(ui, tm("Save as Default"), Button::Small)
-                    .on_hover_text(tm(
-                        "New operations of this kind start with this form's tool, speeds, stepdown and the like (not its geometry or heights)",
-                    ))
-                    .clicked();
-                asked.forget_default = button(ui, tm("Built-in Defaults"), Button::Small)
-                    .on_hover_text(tm("New operations of this kind start with SolidCraft's own defaults again"))
-                    .clicked();
-                asked.simulate_form = button(ui, tm("Simulate"), ui_kit::Button::Enabled(need.is_empty()))
-                    .on_hover_text(tm("Cut this operation, with the values in the form, on what the operations before it leave; OK still applies it"))
-                    .on_disabled_hover_text(&wanted)
-                    .clicked();
-            }
+    let side = crate::frame::Side::Right;
+    let drag_key = side.dialog_offset_key();
+    let moved = crate::frame::dock_offset(ctx, drag_key);
+    let anchor = crate::frame::offset_anchor(docked, moved, bounds, side);
+    let frame = crate::ui_kit::Panel::feature_frame(ctx, layout, side);
+    // Two cards wide: the rows, the heights picture and the tool's picture need the room.
+    let width = (t.form_card_width * 2.0).min(bounds.width());
+    let panel = crate::ui_kit::Panel::new(&title, egui::Id::new(FORM_CARD), anchor, bounds, side, frame)
+        .width(width)
+        .reset_scroll(cam.form_seen != Some(heading));
+    cam.form_seen = Some(heading);
+    let mut answer = (false, crate::ui_kit::Action::None);
+    let response = panel.window(ctx).show(ctx, |ui| {
+        let options = crate::ui_kit::FeatureOptions { icon, title: &title, drag_key, moved, docked, apply_label: None };
+        answer = panel.feature(ui, options, false, need.is_empty(), |ui| {
+            form_body(ui, cam, selected, lists, &need, asked);
+            crate::ui_kit::ComputeStatus { text: None, busy: false, applying: false }
         });
-        if !need.is_empty() {
-            ui.add(egui::Label::new(RichText::new(wanted).color(t.error)).wrap());
-        }
-        // What stops the toolpath, said before OK.
-        match (&*form, &cam.preview) {
-            (Form::Op(_), Some((_, _, Err(e)))) => {
-                ui.add(egui::Label::new(RichText::new(tf("manufacture.cannot_be_cut", &[("why", e)])).color(t.error)).wrap());
-            }
-            (Form::Op(_), Some((_, _, Ok(solidcraft_engine::CamPreview { warning: Some(w), .. })))) => {
-                ui.add(egui::Label::new(RichText::new(tf("manufacture.toolpath_warning", &[("warning", &engine_text(w))])).color(t.warning)).wrap());
-            }
-            _ => {}
-        }
     });
-    // A form that has just opened is scrolled into view, its title at the panel's top.
-    if cam.form_seen != Some(title) {
-        shown.response.scroll_to_me_animation(Some(egui::Align::TOP), egui::style::ScrollAnimation::none());
-        cam.form_seen = Some(title);
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let (closed, action) = answer;
+    let mut took_esc = false;
+    match action {
+        crate::ui_kit::Action::Ok => asked.apply = true,
+        // Esc a command dialog answered first is not this form's too.
+        crate::ui_kit::Action::Cancel if !(esc && esc_taken) => {
+            (cam.form, cam.error) = (None, None);
+            took_esc = esc;
+        }
+        _ if closed => (cam.form, cam.error) = (None, None),
+        _ => {}
     }
-    if cancel {
-        cam.form = None;
-        cam.error = None;
-    }
-    ok
+    (response.map(|r| r.response.rect), took_esc)
 }
 
-/// Where a panel docks, and how tall it may get.
+/// Closes the open form without running its command, as its Cancel does (Esc).
+pub fn cancel_form(app: &mut SolveApp) {
+    (app.manufacture.form, app.manufacture.error) = (None, None);
+}
+
+/// What the form's card holds: what went wrong, the rows, what an operation form also offers
+/// (its defaults, a simulation of it), what the form still needs and what stops its toolpath.
+fn form_body(ui: &mut egui::Ui, cam: &mut CamUi, selected: &[(String, Vec3)], lists: &Choices, need: &[Need], asked: &mut Asked) {
+    let t = Tokens::get();
+    if let Some(e) = &cam.error {
+        crate::ui_kit::status_line(ui, e, StatusTone::Error);
+    }
+    let Some(form) = &mut cam.form else { return };
+    // One label column for every row: as wide as the kit lets a wide card's grow, or wider
+    // where a height's label beside the heights picture needs it; never more than half the row.
+    let heights = ["Clearance", "Retract", "Top", "Bottom"].map(|l| crate::ui_kit::ContentWidth::label(ui, tm(l))).into_iter().fold(0.0, f32::max);
+    let kit = (t.form_label_width + t.space_24 + t.space_10) * LABEL_GROWTH;
+    let column = kit.max(SCHEME_W + ui.spacing().item_spacing.x + heights + t.space_4).min(ui.available_width() * 0.5);
+    ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(LABEL_COLUMN), column + t.space_14));
+    crate::ui_kit::settings_form(ui, column, |ui| form_ui(ui, form, selected, lists, need));
+    let wanted = need_text(need);
+    if matches!(form, Form::Op(_)) {
+        ui.add_space(t.space_8);
+        ui.horizontal_wrapped(|ui| {
+            // An operation is simulated as the form has it, before OK.
+            asked.simulate_form = button(ui, tm("Simulate"), ui_kit::Button::Enabled(need.is_empty()))
+                .on_hover_text(tm("Cut this operation, with the values in the form, on what the operations before it leave; OK still applies it"))
+                .on_disabled_hover_text(&wanted)
+                .clicked();
+            asked.save_default = button(ui, tm("Save as Default"), Button::Small)
+                .on_hover_text(tm(
+                    "New operations of this kind start with this form's tool, speeds, stepdown and the like (not its geometry or heights)",
+                ))
+                .clicked();
+            asked.forget_default = button(ui, tm("Built-in Defaults"), Button::Small)
+                .on_hover_text(tm("New operations of this kind start with SolidCraft's own defaults again"))
+                .clicked();
+        });
+    }
+    // OK stays off until nothing is missing; what is missing is said here.
+    if !need.is_empty() {
+        crate::ui_kit::status_line(ui, &wanted, StatusTone::Error);
+    }
+    // What stops the toolpath, said before OK.
+    let op = matches!(form, Form::Op(_));
+    match (op, &cam.preview) {
+        (true, Some((_, _, Err(e)))) => {
+            crate::ui_kit::status_line(ui, &tf("manufacture.cannot_be_cut", &[("why", e)]), StatusTone::Error);
+        }
+        (true, Some((_, _, Ok(solidcraft_engine::CamPreview { warning: Some(w), .. })))) => {
+            crate::ui_kit::status_line(ui, &tf("manufacture.toolpath_warning", &[("warning", &engine_text(w))]), StatusTone::Warning);
+        }
+        _ => {}
+    }
+    if op {
+        simulation_block(ui, cam, asked);
+    }
+}
+
+/// The form card's id.
+const FORM_CARD: &str = "sc_cam_form";
+/// How far the kit lets a wide card's label column grow past its basis.
+const LABEL_GROWTH: f32 = 1.6;
+
+/// Where a panel docks: its top right corner, the room it is dragged in, and the window's
+/// layout, which the kit's frame follows.
 #[derive(Clone, Copy)]
 struct Dock {
-    /// The panel's top right corner.
     anchor: egui::Pos2,
-    /// The window's layout, which the kit's panel frame follows.
+    bounds: egui::Rect,
     layout: crate::shell::LayoutMode,
-    max_height: f32,
-    /// The viewport, which a dragged panel stays inside.
-    viewport: egui::Rect,
 }
 
-/// Let `band` (a panel's header) drag the panel: the drag adds to `offset`, its distance from
-/// its docked place; `applied` of it is where the panel is now, after keeping it on screen. A
-/// double-click docks it again. Called before the header's buttons, so they keep their clicks.
-fn drag_header(ui: &egui::Ui, id: &str, band: egui::Rect, offset: &mut egui::Vec2, applied: egui::Vec2) {
-    let response = ui.interact(band, egui::Id::new((id, "drag")), egui::Sense::click_and_drag());
-    crate::scenario::publish_handle(&format!("{id}:title"), band.center());
-    // The drag runs from where the press started, so no movement is lost while egui decides it is a drag.
-    let base = egui::Id::new((id, "drag_base"));
-    if response.drag_started()
-        && let Some(origin) = ui.input(|i| i.pointer.press_origin())
-    {
-        ui.ctx().data_mut(|d| d.insert_temp(base, (applied, origin)));
-    }
-    if response.double_clicked() {
-        *offset = egui::Vec2::ZERO;
-    } else if response.dragged() || response.drag_stopped() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        let start = ui.ctx().data(|d| d.get_temp::<(egui::Vec2, egui::Pos2)>(base));
-        *offset = match (start, ui.input(|i| i.pointer.latest_pos())) {
-            (Some((start, from)), Some(now)) => start + (now - from),
-            _ => applied + response.drag_delta(),
-        };
-    } else {
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
-        }
-        // Kept on screen: remember where it is, not where it was dragged off to.
-        *offset = applied;
-    }
-}
-
-/// A panel docked at the right of the viewport, as the app's command dialogs are: no title
-/// bar, a header row with "−" to fold it, its name and "×" to close it, and a body that scrolls
-/// when it is taller than the viewport. Its header drags it away from the dock (`offset`).
+/// A panel as the app's managers are (`ui_kit::Panel::feature_collapsible`, as Parameters):
+/// docked at the right, dragged by its header on its own (`drag_key`), folded to its header,
+/// closed by its × or the footer's Close. Esc leaves it open: it is no dialog to cancel.
 /// → whether it stays open, and where it was drawn.
 #[allow(clippy::too_many_arguments)]
-fn docked_panel(
+fn overview_card(
     ctx: &egui::Context,
     id: &str,
+    drag_key: &'static str,
+    icon: &str,
     title: &str,
     dock: Dock,
     folded: &mut bool,
-    offset: &mut egui::Vec2,
-    look: &mut PanelLook,
     body: impl FnOnce(&mut egui::Ui),
 ) -> (bool, Option<egui::Rect>) {
-    use crate::frame::Side;
     let t = Tokens::get();
-    // The kit's feature frame, with a window's margin round what the panel holds.
-    let mut frame = crate::ui_kit::Panel::feature_frame(ctx, dock.layout, Side::Right).inner_margin(egui::Margin::same(6));
-    // As wide as dragged (or as a wide dialog), and never wider than the viewport has room for.
-    let widest = (dock.viewport.width() - 40.0).max(PANEL_MIN_W);
-    let w = if look.width > 0.0 { look.width.clamp(PANEL_MIN_W, widest) } else { DIALOG_WIDE_MAX_W.min(widest) };
-    // The background fades while the pointer is elsewhere and nothing in the panel is being typed into.
-    let last = ctx.memory(|m| m.area_rect(egui::Id::new(id)));
-    let over = ctx.pointer_latest_pos().is_some_and(|p| last.is_some_and(|r| r.expand(6.0).contains(p)));
-    let solid = ctx.animate_bool(egui::Id::new((id, "solid")), over || ctx.egui_wants_keyboard_input() || look.resizing);
-    let faded = PANEL_FADES.get(look.fade).map_or(1.0, |f| f.1);
-    let alpha = faded + (1.0 - faded) * solid;
-    frame.fill = frame.fill.gamma_multiply(alpha);
-    frame.shadow.color = frame.shadow.color.gamma_multiply(alpha);
-    let margin = frame.inner_margin.leftf() + frame.inner_margin.rightf() + 2.0 * frame.stroke.width;
-    // Kept inside the viewport, as wide as it was last drawn (its top right corner is the anchor).
-    let width = ctx.memory(|m| m.area_rect(egui::Id::new(id))).map_or(crate::frame::DIALOG_MIN_W, |r| r.width());
-    let vp = dock.viewport;
-    let p = dock.anchor + *offset;
-    // The kit's panels keep `space_8` off the viewport's right edge.
-    let right = vp.right() - t.space_8;
-    let x = if vp.left() + width <= right { p.x.clamp(vp.left() + width, right) } else { dock.anchor.x };
-    let y = if vp.top() <= vp.bottom() - 40.0 { p.y.clamp(vp.top(), vp.bottom() - 40.0) } else { dock.anchor.y };
-    let anchor = egui::pos2(x, y);
-    let max_height = dock.max_height - (anchor.y - dock.anchor.y);
-    let mut keep = true;
-    let response =
-        crate::ui_kit::Panel::new(title, egui::Id::new(id), anchor, dock.viewport, Side::Right, frame).width(w).window(ctx).show(ctx, |ui| {
-            // Long texts (errors, notes) wrap instead of widening the panel.
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            let min_w = if look.width > 0.0 { w - margin } else { 480.0 - margin };
-            ui.set_min_width(min_w);
-            ui.set_max_width(w - margin);
-            // What it was last frame, but never more than the panel's width now (once dragged narrower).
-            let total = content_width(ui, egui::Id::new((id, "w")), min_w).min(w - margin);
-            let band = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(total, ui.spacing().interact_size.y + 2.0));
-            drag_header(ui, id, band, offset, anchor - dock.anchor);
-            ui.horizontal(|ui| {
-                if crate::ui_kit::compact_button(ui, if *folded { "+" } else { "−" }, tm(if *folded { "Expand" } else { "Collapse" }), true, false)
-                    .clicked()
-                {
-                    *folded = !*folded;
-                }
-                // Not selectable: a drag on the title moves the panel.
-                ui.add(egui::Label::new(RichText::new(tm(title)).strong().size(t.font_label)).selectable(false))
-                    .on_hover_text(tm("Drag to move, double-click to dock again"));
-                let width = ui.spacing().interact_size.x;
-                right_aligned(ui, total, width, |ui| {
-                    if crate::ui_kit::compact_button(ui, "×", tm("Close"), true, false).clicked() {
-                        keep = false;
-                    }
-                });
-            });
-            if *folded {
-                return;
-            }
-            ui.add_space(2.0);
-            let height = (max_height - ui.min_rect().height() - 28.0).max(80.0);
-            // A sizing pass offers almost no height to an auto-sized window: give the body the viewport's.
-            egui::ScrollArea::vertical().id_salt((id, "body")).min_scrolled_height(height).max_height(height).show(ui, body);
-            remember_width(ui, egui::Id::new((id, "w")));
+    let side = crate::frame::Side::Right;
+    let moved = crate::frame::dock_offset(ctx, drag_key);
+    let anchor = crate::frame::offset_anchor(dock.anchor, moved, dock.bounds, side);
+    let frame = crate::ui_kit::Panel::feature_frame(ctx, dock.layout, side);
+    let width = (t.form_card_width * 2.0).min(dock.bounds.width());
+    let panel = crate::ui_kit::Panel::new(title, egui::Id::new(id), anchor, dock.bounds, side, frame).width(width).actions("", "Close");
+    let mut answer = (false, crate::ui_kit::Action::None);
+    let response = panel.window(ctx).show(ctx, |ui| {
+        let options = crate::ui_kit::FeatureOptions { icon, title, drag_key, moved, docked: dock.anchor, apply_label: None };
+        answer = panel.feature_collapsible(ui, options, false, true, folded, |ui| {
+            body(ui);
+            crate::ui_kit::ComputeStatus { text: None, busy: false, applying: false }
         });
-    let rect = response.map(|r| r.response.rect);
-    // A grip along the left edge: drag to make the panel wider or narrower, double-click for its usual width.
-    look.resizing = false;
-    if let Some(rect) = rect {
-        let grip = egui::Rect::from_min_max(egui::pos2(rect.left() - 4.0, rect.top()), egui::pos2(rect.left() + 3.0, rect.bottom()));
-        crate::ui_kit::Container::new(ctx, crate::ui_kit::Surface::Feature)
-            .area(egui::Id::new((id, "grip")))
-            .order(egui::Order::Foreground)
-            .fixed_pos(grip.min)
-            .show(ctx, |ui| {
-                let (_, r) = ui.allocate_exact_size(grip.size(), egui::Sense::click_and_drag());
-                if r.hovered() || r.dragged() {
-                    ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                }
-                if r.dragged() {
-                    look.width = (rect.width() - r.drag_delta().x).clamp(PANEL_MIN_W, widest);
-                    look.resizing = true;
-                }
-                if r.double_clicked() {
-                    look.width = 0.0;
-                }
-                r.on_hover_text(tm("Drag to make the panel wider or narrower; double-click for its usual width"));
-            });
+    });
+    // Its own handles beside the kit's shared ones, so automation can tell the panels apart.
+    if let Some(header) = crate::scenario::rect_of("dialog:header") {
+        crate::scenario::publish_handle(&format!("{id}:title"), header.center());
     }
-    (keep, rect)
+    let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let (closed, action) = answer;
+    let close = closed || (action == crate::ui_kit::Action::Cancel && !esc);
+    (!close, response.map(|r| r.response.rect))
 }
 
-/// How wide a CAM panel is when docked (and the widest it gets without being dragged wider).
-const DIALOG_WIDE_MAX_W: f32 = 560.0;
-
-/// How wide a panel's content was last frame (at least `min`).
-fn content_width(ui: &egui::Ui, key: egui::Id, min: f32) -> f32 {
-    ui.ctx().data(|d| d.get_temp::<f32>(key)).unwrap_or(min).max(min)
+/// A command's icon and its name in this language, for the card that shows it.
+fn command_heading(command: &str) -> (&'static str, String) {
+    let spec = solidcraft_engine::find_command(command);
+    (spec.as_ref().map_or("", |s| s.icon), spec.as_ref().map_or_else(String::new, |s| crate::i18n::tr_label(s.label).to_string()))
 }
 
-/// Remembers a panel's content width for the next frame (at the end of its content).
-fn remember_width(ui: &egui::Ui, key: egui::Id) {
-    let w = ui.min_rect().width();
-    ui.ctx().data_mut(|d| d.insert_temp(key, w));
-}
-
-/// In a row: pushes what `add` draws (`width` wide) to the right edge of a content `total` wide.
-fn right_aligned<R>(ui: &mut egui::Ui, total: f32, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let used = ui.min_rect().width();
-    let gap = (total - used - width - ui.spacing().item_spacing.x).max(0.0);
-    ui.add_space(gap);
-    add(ui)
-}
-
-/// How a panel is shown: its width as dragged (0: its usual width), how far its background
-/// fades while the pointer is elsewhere (index into [`PANEL_FADES`]), and whether it is being resized.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PanelLook {
-    pub width: f32,
-    pub fade: usize,
-    resizing: bool,
-}
-
-/// How far a panel's background fades while the pointer is elsewhere: a name and its opacity.
-const PANEL_FADES: [(&str, f32); 3] = [("off", 1.0), ("light", 0.5), ("strong", 0.25)];
 /// The Manufacture panel's id.
 const MANUFACTURE_PANEL: &str = "sc_cam_window";
-/// Narrowest a panel is dragged to (points).
-const PANEL_MIN_W: f32 = 400.0;
 
 /// What a window asks for once it has been drawn.
 #[derive(Default)]
@@ -4921,20 +4877,19 @@ fn tool_table(ui: &mut egui::Ui, id: &str, tools: &[Value], library: bool, picke
 
 /// The Tool Library window: the machine's tools, which every design can use. Pick a tool to
 /// change or remove it; a form appears only for New Tool and Edit.
-fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &Choices, dock: Dock, asked: &mut Asked) {
+fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, dock: Dock, asked: &mut Asked) {
     let t = Tokens::get();
     let mut folded = cam.tools_folded;
-    let mut offset = cam.tools_offset;
-    let mut look = cam.tools_look;
-    let (open, _) = docked_panel(ctx, "sc_cam_tools", "TOOL LIBRARY", dock, &mut folded, &mut offset, &mut look, |ui| {
+    let (icon, title) = command_heading("cam.library.list");
+    let (open, _) = overview_card(ctx, "sc_cam_tools", "CAM_TOOLS", icon, &title, dock, &mut folded, |ui| {
         {
             // Everything is as wide as the panel, never wider: tables scroll inside it.
             ui.set_max_width(ui.available_width());
-            if let Some(e) = cam.error.as_ref().filter(|_| !cam.open) {
-                ui.label(RichText::new(e).color(t.error));
+            if let Some(e) = cam.error.as_ref().filter(|_| !cam.open && cam.form.is_none()) {
+                crate::ui_kit::status_line(ui, e, StatusTone::Error);
             }
             if let Some(e) = library["error"].as_str() {
-                ui.label(RichText::new(e).color(t.error));
+                crate::ui_kit::status_line(ui, e, StatusTone::Error);
             }
             let tools = library["tools"].as_array().cloned().unwrap_or_default();
             let own = library["only_in_design"].as_array().cloned().unwrap_or_default();
@@ -4943,30 +4898,21 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
             if cam.selected_tool.is_some_and(|(in_library, number)| listed(in_library, number).is_none()) {
                 cam.selected_tool = None;
             }
-            egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(tm("This machine's tools")).strong());
-                    ui.label(RichText::new(tm("shared by every design")).color(t.text_dim)).on_hover_text(text(library, "path"));
-                });
-                ui.add_space(4.0);
+            crate::ui_kit::section_count(ui, "sc_cam_tools_machine", tm("This machine's tools"), true, Some(tools.len()), |ui| {
+                crate::ui_kit::status_line(ui, tm("shared by every design"), StatusTone::Dim).on_hover_text(text(library, "path"));
                 if tools.is_empty() {
-                    ui.label(RichText::new(tm("No tools yet. New Tool adds the first.")).color(t.text_dim));
+                    crate::ui_kit::status_line(ui, tm("No tools yet. New Tool adds the first."), StatusTone::Dim);
                 } else {
                     tool_table(ui, "sc_cam_tool_table", &tools, true, &mut cam.selected_tool);
                 }
             });
             if !own.is_empty() {
-                ui.add_space(6.0);
-                egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(tm("Only in this design")).strong());
-                        ui.label(RichText::new(tm("not in the machine's library")).color(t.text_dim));
-                    });
-                    ui.add_space(4.0);
+                crate::ui_kit::section_count(ui, "sc_cam_tools_design", tm("Only in this design"), true, Some(own.len()), |ui| {
+                    crate::ui_kit::status_line(ui, tm("not in the machine's library"), StatusTone::Dim);
                     tool_table(ui, "sc_cam_design_tools", &own, false, &mut cam.selected_tool);
                 });
             }
-            ui.add_space(6.0);
+            ui.add_space(t.space_8);
             // What can be done: always New Tool and the library file; with a tool picked, to that tool.
             ui.horizontal_wrapped(|ui| {
                 if button(ui, tm("New Tool"), Button::Normal).clicked() {
@@ -5004,59 +4950,37 @@ fn tools_window(ctx: &egui::Context, cam: &mut CamUi, library: &Value, lists: &C
                 asked.export = button(ui, tm("Export…"), Button::Normal).on_hover_text(tm("Write this machine's library to a file")).clicked();
             });
             for (k, line) in cam.import_notes.iter().enumerate() {
-                let colour = if k == 0 { t.text_dim } else { t.warning };
-                ui.add(egui::Label::new(RichText::new(line).color(colour)).wrap());
+                crate::ui_kit::status_line(ui, line, if k == 0 { StatusTone::Dim } else { StatusTone::Warning });
             }
-            if matches!(cam.form, Some(Form::Tool(_))) {
-                asked.apply |= form_block(ui, cam, &[], lists, asked);
-            }
-            ui.add_space(6.0);
+            ui.add_space(t.space_8);
             materials_block(ui, cam, library, asked);
-            ui.add_space(6.0);
             holders_block(ui, cam, library, asked);
         }
     });
     cam.tools_folded = folded;
-    cam.tools_offset = offset;
-    (cam.tools_look.width, cam.tools_look.resizing) = (look.width, look.resizing);
     cam.tools_open = open;
 }
 
 /// The Manufacture window: setups with their operations, what is drawn, and the open setup or operation form.
-fn manufacture_window(
-    ctx: &egui::Context,
-    cam: &mut CamUi,
-    listed: &Value,
-    lists: &Choices,
-    selected: &[(String, Vec3)],
-    dock: Dock,
-    asked: &mut Asked,
-) {
+fn manufacture_window(ctx: &egui::Context, cam: &mut CamUi, listed: &Value, dock: Dock, asked: &mut Asked) {
     let t = Tokens::get();
     let mut folded = cam.folded;
-    let mut offset = cam.offset;
-    let mut look = cam.look;
-    let (open, rect) = docked_panel(ctx, MANUFACTURE_PANEL, "MANUFACTURE", dock, &mut folded, &mut offset, &mut look, |ui| {
+    let (icon, title) = command_heading("cam.list");
+    let (open, rect) = overview_card(ctx, MANUFACTURE_PANEL, "CAM_MANUFACTURE", icon, &title, dock, &mut folded, |ui| {
         {
             if let Some(e) = &cam.error {
-                ui.label(RichText::new(e).color(t.error));
-            }
-            // While a form is open the panel is the form; the browser shows the setups and operations.
-            if matches!(cam.form, Some(Form::Setup(_) | Form::Op(_))) {
-                asked.apply |= form_block(ui, cam, selected, lists, asked);
-                simulation_block(ui, cam, asked);
-                return;
+                crate::ui_kit::status_line(ui, e, StatusTone::Error);
             }
             let setups = listed["setups"].as_array().cloned().unwrap_or_default();
             steps(ui, cam, &setups, asked);
-            ui.add_space(4.0);
+            ui.add_space(t.space_4);
             if setups.is_empty() {
                 ui.label(RichText::new(tm("No setup yet: New Setup on the toolbar makes the first")).color(t.text_dim));
             }
             for setup in &setups {
                 let id = setup["id"].as_u64().unwrap_or(0);
                 let ops = setup["operations"].as_array().cloned().unwrap_or_default();
-                ui.add_space(4.0);
+                ui.add_space(t.space_4);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(text(setup, "name")).strong());
                     if !ops.is_empty() {
@@ -5067,14 +4991,14 @@ fn manufacture_window(
                     }
                 });
                 if let Some(e) = setup.get("error").and_then(Value::as_str) {
-                    ui.label(RichText::new(e).color(t.error));
+                    crate::ui_kit::status_line(ui, e, StatusTone::Error);
                 }
                 let to_check = ops.iter().filter(|o| o.get("error").is_some() || o.get("warning").is_some()).count();
                 if to_check > 0 {
                     ui.label(RichText::new(tf("manufacture.ops_to_check", &[("count", &to_check.to_string())])).color(t.warning));
                 }
                 // How the program is written this time.
-                ui.add_space(4.0);
+                ui.add_space(t.space_4);
                 ui.horizontal_wrapped(|ui| {
                     crate::ui_kit::checkbox(ui, tm("Stop before each operation (M1)"), &mut cam.optional_stops).on_hover_text(tm(
                         "An optional stop before every operation after the first: the machine pauses there when its optional stop switch is on",
@@ -5086,7 +5010,7 @@ fn manufacture_window(
                     }
                 });
                 // The setup's whole program: the one thing everything here leads to.
-                ui.add_space(4.0);
+                ui.add_space(t.space_4);
                 let label = RichText::new(format!("{}  ({})", tm("Post Process"), text(setup, "post"))).strong().size(t.font_heading).color(t.text);
                 let post = ui.add_enabled_ui(!ops.is_empty(), |ui| {
                     ui.vertical_centered_justified(|ui| {
@@ -5108,9 +5032,6 @@ fn manufacture_window(
         }
     });
     cam.folded = folded;
-    cam.offset = offset;
-    // The panel's own changes (its width); the fade is chosen inside it, on `cam` itself.
-    (cam.look.width, cam.look.resizing) = (look.width, look.resizing);
     cam.panel = rect;
     cam.open = open;
 }
@@ -5165,8 +5086,8 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     // cube; left of a command dialog that is open, and the Tool Library left of the Manufacture panel.
     let vp = crate::shell::content_rect(app, app.viewport.rect.unwrap_or_else(|| ctx.content_rect()));
     let top = crate::shell::panel_top(app, vp, vp.bottom(), crate::frame::Side::Right);
-    let right = app.viewport.dialog_rect.filter(|_| app.dialog.is_some()).map_or(vp.right(), |r| r.left() - 6.0);
-    let max_height = vp.bottom() - top - 8.0;
+    let gap = Tokens::get().space_8;
+    let right = app.viewport.dialog_rect.filter(|_| app.dialog.is_some()).map_or(vp.right(), |r| r.left() - gap);
     let mut asked = Asked::default();
     app.manufacture.posted_now = app.manufacture.posted_at == Some(app.session.revision);
     if app.manufacture.form.is_none() {
@@ -5176,33 +5097,31 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
     let prefs = &app.preferences;
     (app.manufacture.sim_detail, app.manufacture.path_width, app.manufacture.path_colour) =
         (prefs.cam_sim_detail, prefs.cam_path_width, prefs.cam_path_colour);
-    (app.manufacture.look.width, app.manufacture.tools_look.width) = (prefs.cam_panel_width, prefs.cam_tools_width);
-    (app.manufacture.look.fade, app.manufacture.tools_look.fade) = (prefs.cam_panel_fade, prefs.cam_panel_fade);
     app.manufacture.rapid_rate = f64::from(prefs.cam_rapid_rate);
     let layout = app.ui.layout;
+    let bounds = crate::shell::tool_drag_rect(app, vp);
     let mut cam = std::mem::take(&mut app.manufacture);
-    if cam.open {
-        manufacture_window(
-            ctx,
-            &mut cam,
-            &listed,
-            &lists,
-            &selected,
-            Dock { anchor: egui::pos2(right, top), layout, max_height, viewport: vp },
-            &mut asked,
-        );
+    // An open form is a card of its own where the Manufacture panel docks; the panel waits
+    // under it (the browser lists the setups and operations meanwhile).
+    if cam.form.is_some() {
+        let (rect, took_esc) = form_card(ctx, &mut cam, &selected, &lists, egui::pos2(right, top), bounds, layout, app.esc_handled, &mut asked);
+        app.esc_handled |= took_esc;
+        cam.panel = rect;
+    } else if cam.open {
+        manufacture_window(ctx, &mut cam, &listed, Dock { anchor: egui::pos2(right, top), bounds, layout }, &mut asked);
     }
     if cam.tools_open {
         // Beside where the Manufacture panel docks, wherever it was dragged to.
         // The kit's panels keep `space_8` off the viewport's right edge.
-        let docked = right.min(vp.right() - Tokens::get().space_8);
-        let beside = if cam.open { docked - cam.panel.map_or(DIALOG_WIDE_MAX_W, |r| r.width()) - 6.0 } else { right };
-        tools_window(ctx, &mut cam, &library, &lists, Dock { anchor: egui::pos2(beside, top), layout, max_height, viewport: vp }, &mut asked);
+        let docked = right.min(vp.right() - gap);
+        let beside = match cam.panel.filter(|_| cam.open || cam.form.is_some()) {
+            Some(panel) => docked - panel.width() - gap,
+            None => right,
+        };
+        tools_window(ctx, &mut cam, &library, Dock { anchor: egui::pos2(beside, top), bounds, layout }, &mut asked);
     }
     (app.preferences.cam_sim_detail, app.preferences.cam_path_width, app.preferences.cam_path_colour) =
         (cam.sim_detail, cam.path_width, cam.path_colour);
-    (app.preferences.cam_panel_width, app.preferences.cam_tools_width, app.preferences.cam_panel_fade) =
-        (cam.look.width, cam.tools_look.width, cam.look.fade);
     app.preferences.cam_rapid_rate = cam.rapid_rate as f32;
     // A simulation of a form as it stood goes when the form closes.
     if cam.form.is_none() && cam.scope.draft.is_some() {
@@ -5222,14 +5141,10 @@ pub fn show(app: &mut SolveApp, ctx: &egui::Context) {
 fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mut Asked) {
     let t = Tokens::get();
     let materials: Vec<&str> = library["materials"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(tm("Materials")).strong());
-            ui.label(RichText::new(tm("what stock is made of: a tool can have cutting data for each")).color(t.text_dim));
-        });
-        ui.add_space(4.0);
+    crate::ui_kit::section_count(ui, "sc_cam_materials", tm("Materials"), true, Some(materials.len()), |ui| {
+        crate::ui_kit::status_line(ui, tm("what stock is made of: a tool can have cutting data for each"), StatusTone::Dim);
         if materials.is_empty() {
-            ui.label(RichText::new(tm("None yet. Add one, then give tools their data for it (Edit, Cutting data).")).color(t.text_dim));
+            crate::ui_kit::status_line(ui, tm("None yet. Add one, then give tools their data for it (Edit, Cutting data)."), StatusTone::Dim);
         }
         ui.horizontal_wrapped(|ui| {
             for m in &materials {
@@ -5240,13 +5155,13 @@ fn materials_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &
                 {
                     asked.run.push(("cam.material.remove", json!({ "name": m })));
                 }
-                ui.add_space(6.0);
+                ui.add_space(t.space_8);
             }
         });
         ui.horizontal(|ui| {
             let (enter, _) = ui
                 .scope(|ui| {
-                    ui.set_max_width(180.0);
+                    ui.set_max_width(t.form_card_width);
                     ui_kit::text_field(ui, &mut cam.new_material, tm("Plywood, MDF, Aluminium…"))
                 })
                 .inner;
@@ -5302,14 +5217,10 @@ impl HolderDraft {
 fn holders_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mut Asked) {
     let t = Tokens::get();
     let holders = library["holders"].as_array().cloned().unwrap_or_default();
-    egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(tm("Holders")).strong());
-            ui.label(RichText::new(tm("what tools sit in, by their shape: checked against clamps and fixtures")).color(t.text_dim));
-        });
-        ui.add_space(4.0);
+    crate::ui_kit::section_count(ui, "sc_cam_holders", tm("Holders"), true, Some(holders.len()), |ui| {
+        crate::ui_kit::status_line(ui, tm("what tools sit in, by their shape: checked against clamps and fixtures"), StatusTone::Dim);
         if holders.is_empty() {
-            ui.label(RichText::new(tm("None yet. Type one in below, then pick it in a tool's shape.")).color(t.text_dim));
+            crate::ui_kit::status_line(ui, tm("None yet. Type one in below, then pick it in a tool's shape."), StatusTone::Dim);
         }
         for h in &holders {
             let name = text(h, "name");
@@ -5334,19 +5245,13 @@ fn holders_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mu
                 }
             });
         }
-        ui.add_space(6.0);
+        ui.add_space(t.space_8);
         let d = &mut cam.new_holder;
         if d.sections.is_empty() {
             d.sections.push(Default::default());
         }
-        ui.horizontal(|ui| {
-            ui.label(tm("Name"));
-            ui.scope(|ui| {
-                ui.set_max_width(180.0);
-                ui_kit::text_field(ui, &mut d.name, tm("ER20 collet chuck…"));
-            });
-        });
-        egui::Grid::new("sc_cam_holder_sections").num_columns(5).spacing([8.0, 4.0]).show(ui, |ui| {
+        crate::ui_kit::row(ui, tm("Name"), |ui| ui_kit::text_field(ui, &mut d.name, tm("ER20 collet chuck…")));
+        egui::Grid::new("sc_cam_holder_sections").num_columns(5).spacing([t.space_8, t.space_4]).show(ui, |ui| {
             ui.label("");
             for heading in ["Length", "Diameter", "Top diameter"] {
                 ui.label(RichText::new(tm(heading)).color(t.text_dim));
@@ -5358,7 +5263,7 @@ fn holders_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mu
                 ui.label((k + 1).to_string());
                 for (cell, hint) in row.iter_mut().zip(["20 mm", "35 mm", tm("the same")]) {
                     ui.scope(|ui| {
-                        ui.set_max_width(70.0);
+                        ui.set_max_width(t.form_label_width);
                         ui_kit::text_field(ui, cell, hint);
                     });
                 }
@@ -5373,9 +5278,10 @@ fn holders_block(ui: &mut egui::Ui, cam: &mut CamUi, library: &Value, asked: &mu
                 d.sections.remove(k);
             }
         });
-        ui.label(
-            RichText::new(tm("Sections from where the tool comes out of the holder, upward. A top diameter makes a cone, as a collet nut is."))
-                .color(t.text_dim),
+        crate::ui_kit::status_line(
+            ui,
+            tm("Sections from where the tool comes out of the holder, upward. A top diameter makes a cone, as a collet nut is."),
+            StatusTone::Dim,
         );
         ui.horizontal(|ui| {
             if button(ui, tm("Add section"), ui_kit::Button::Enabled(d.sections.len() < solidcraft_engine::cam::MAX_HOLDER_SECTIONS)).clicked() {
@@ -5770,13 +5676,12 @@ pub fn folder_menu_items(app: &SolveApp) -> Vec<crate::context_menu::Item> {
         choices("Toolpath colour", "colour", &PATH_COLOURS, prefs.cam_path_colour),
         choices("Toolpath width", "width", &PATH_WIDTHS.map(|w| w.0), prefs.cam_path_width),
         choices("Leftover shown from", "leftover", &LEFTOVER_SHOWN.map(|l| l.0), prefs.cam_leftover_shown),
-        choices("Panel fade", "fade", &PANEL_FADES.map(|f| f.0), prefs.cam_panel_fade),
     ]);
     items
 }
 
 /// The Manufacture section of the Preferences' Graphics page: how toolpaths are drawn and
-/// simulated, the panels' fade and the machine's rapid rate.
+/// simulated, and the machine's rapid rate and spindle.
 pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
     let prefs = &mut app.preferences;
     crate::ui_kit::section(ui, "cam_preferences", tm("Manufacture"), true, |ui| {
@@ -5787,7 +5692,6 @@ pub fn preferences(app: &mut SolveApp, ui: &mut egui::Ui) {
         };
         choice(ui, "pref_cam_colour", "Toolpath colour", &mut prefs.cam_path_colour, &PATH_COLOURS);
         choice(ui, "pref_cam_width", "Toolpath width", &mut prefs.cam_path_width, &PATH_WIDTHS.map(|w| w.0));
-        choice(ui, "pref_cam_fade", "Panel fade", &mut prefs.cam_panel_fade, &PANEL_FADES.map(|f| f.0));
         choice(ui, "pref_cam_detail", "Simulation detail", &mut prefs.cam_sim_detail, &SIM_DETAIL.map(|d| d.0));
         choice(ui, "pref_cam_leftover", "Leftover shown from", &mut prefs.cam_leftover_shown, &LEFTOVER_SHOWN.map(|l| l.0));
         crate::ui_kit::row(ui, tm("Rapid rate"), |ui| crate::ui_kit::number_field(ui, &mut prefs.cam_rapid_rate, 100.0..=100_000.0, 50.0, " mm/min"))
@@ -5853,7 +5757,6 @@ pub fn menu_action(app: &mut SolveApp, p: &Value) {
         "colour" => return prefs.cam_path_colour = index.min(PATH_COLOURS.len() - 1),
         "width" => return prefs.cam_path_width = index.min(PATH_WIDTHS.len() - 1),
         "leftover" => return prefs.cam_leftover_shown = index.min(LEFTOVER_SHOWN.len() - 1),
-        "fade" => return prefs.cam_panel_fade = index.min(PANEL_FADES.len() - 1),
         _ => {}
     }
     let (Some(setup), op) = (p["setup"].as_u64(), p["op"].as_u64()) else { return };

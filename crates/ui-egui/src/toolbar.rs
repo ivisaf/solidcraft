@@ -2324,6 +2324,8 @@ pub fn shortcuts(app: &mut SolveApp, ctx: &egui::Context) {
                     crate::tools::finish(app);
                 } else if app.dialog.is_some() || app.pending_feature_edit.is_some() {
                     crate::dialogs::cancel(app);
+                } else if app.manufacture.form.is_some() {
+                    crate::cam_ui::cancel_form(app);
                 } else if !app.session.selection.is_empty() || app.session.active_sketch.is_none() {
                     crate::edit_clipboard::drop_cut(app);
                     app.tree.picked_joints.clear();
