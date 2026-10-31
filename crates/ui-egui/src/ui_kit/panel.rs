@@ -1117,7 +1117,8 @@ impl<'a> Window<'a> {
     /// The same bounded card frame, either movable or an input-blocking modal.
     pub(super) fn surface(&self, ctx: &egui::Context, modal: bool, add: impl FnOnce(&mut Ui) -> (bool, super::Action)) -> (bool, super::Action) {
         let frame = if self.page_chrome {
-            super::navigation_popup_frame().inner_margin(0).fill(Tokens::get().dialog_body.gamma_multiply(0.97))
+            // A system window covers what is behind it, like every other window (#9078).
+            super::navigation_popup_frame().inner_margin(0).fill(Tokens::get().dialog_body)
         } else {
             Panel::card_frame(ctx)
         };

@@ -15,6 +15,12 @@ it.
 | Construct | offset plane (at a distance or through a point), plane at angle, plane along path |
 | Inspect | measure, section analysis, interference, compare bodies, curvature comb and map, zebra, draft, minimum radius, isocurves, centre of mass |
 
+**Quick measurement** (off by default; turn it on under Preferences › Interface): with edges,
+faces, sketch curves or points selected, the view's bottom right corner, above History, shows
+what they measure: an edge's length (Ø and R for a round one), a face's area, a point's position,
+two items' distance and angle, several edges' or faces' total. A click copies it. The Measure tool
+(I) does more.
+
 Extrude, Revolve, Sweep, Loft, Coil and the Box, Cylinder, Sphere and Torus choose their
 operation from what their material does, until you pick one: **Join** when it makes one body with
 a body it touches (a block against a wall, a ring round a hole, a boss meeting only part of a

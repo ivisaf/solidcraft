@@ -267,6 +267,7 @@ pub(crate) fn view_frame(
     crate::gpu::Frame {
         product: false,
         product_lights: None,
+        upload_error: None,
         key: model.0,
         slot: model.1.clone(),
         sketch_key: 0,
@@ -282,7 +283,7 @@ pub(crate) fn view_frame(
         clip: [0.0; 4],
         cap: [0.0; 4],
         images: Vec::new(),
-        points: Vec::new(),
+        clouds: Vec::new(),
         analysis: [0.0; 8],
         analysis_colors: crate::gpu::analysis_colors(&t.analysis),
         access: None,

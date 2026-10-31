@@ -33,6 +33,7 @@ pub(crate) struct Segments<'a> {
 }
 
 pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], config: Segments<'_>) -> bool {
+    crate::prefs_search::note_unlabelled(ui, options);
     if crate::prefs_search::suppress_chrome(ui) && !crate::prefs_search::texts_hit(ui, options) {
         return false;
     }
@@ -58,7 +59,10 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
     let t = Tokens::get();
     let catalog = super::layout::in_catalog(ui);
     let font_size = if small || catalog { t.font_small } else { t.font_label };
-    let natural: Vec<_> = options
+    // Callers pass English source labels or text they translated; either way a segment shows it
+    // translated, as the dropdown it falls back to does. Handles keep the option as passed.
+    let shown: Vec<&str> = options.iter().map(|option| crate::i18n::tr_label(option)).collect();
+    let natural: Vec<_> = shown
         .iter()
         .enumerate()
         .map(|(index, option)| {
@@ -69,9 +73,9 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
         .collect();
     let total = natural.iter().sum::<f32>();
     let segment_width = dimension(ui.available_width()) / options.len().max(1) as f32;
-    let widest = options
+    let widest = shown
         .iter()
-        .map(|option| ui.painter().layout_no_wrap(crate::i18n::tr_label(option).to_string(), crate::fonts::semibold(font_size), t.form_ink).size().x)
+        .map(|option| ui.painter().layout_no_wrap((*option).to_owned(), crate::fonts::semibold(font_size), t.form_ink).size().x)
         .fold(0.0, f32::max);
     // Judged on the whole row, which is what a scrollbar narrows, not on one segment.
     let need = if intrinsic { total } else { (widest + 2.0 * t.space_8) * options.len() as f32 };
@@ -107,7 +111,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
     let equal_width = rect.width() / options.len().max(1) as f32;
     let mut clicked = false;
     let mut x = rect.left();
-    for (index, option) in options.iter().enumerate() {
+    for (index, (option, text)) in options.iter().zip(&shown).enumerate() {
         let width =
             if (intrinsic || proportional) && total > 0.0 { natural.get(index).copied().unwrap_or(0.0) * rect.width() / total } else { equal_width };
         let segment = egui::Rect::from_min_size(egui::pos2(x, rect.top()), vec2(width, rect.height()));
@@ -149,7 +153,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
             ui.painter().vline(segment.left(), segment.y_range(), t.control_border_stroke(t.control_border));
         }
         let font = if on { crate::fonts::semibold(font_size) } else { egui::FontId::proportional(font_size) };
-        let galley = ui.painter().layout_no_wrap((*option).to_string(), font.clone(), t.form_ink);
+        let galley = ui.painter().layout_no_wrap((*text).to_string(), font.clone(), t.form_ink);
         let icon_width = if icons.get(index).is_some() { t.space_14 + t.space_6 } else { 0.0 };
         let text_rect = egui::Rect::from_min_size(
             egui::pos2(segment.center().x - (galley.size().x + icon_width) / 2.0 + icon_width, segment.top()),
@@ -166,7 +170,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
         paint_text(
             ui,
             text_rect,
-            option,
+            text,
             font,
             if !segment_enabled {
                 t.form_dim
@@ -182,7 +186,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
             false,
         );
         t.button_bevel_with_radius(ui, &response, on, rounding);
-        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, segment_enabled, on, *option));
+        response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, segment_enabled, on, *text));
         scenario::publish_target(&format!("dialog:{}:{option}", label(ui)), segment);
         if let Some(target) = targets.get(index) {
             let visible = segment.intersect(ui.clip_rect());
@@ -190,7 +194,7 @@ pub(crate) fn segmented(ui: &mut Ui, selected: &mut usize, options: &[&str], con
                 scenario::publish_target(target, visible);
             }
         }
-        let response = if let Some(reason) = reason { response.on_disabled_hover_text(reason) } else { response.on_hover_text(*option) };
+        let response = if let Some(reason) = reason { response.on_disabled_hover_text(reason) } else { response.on_hover_text(*text) };
         if response.clicked() && segment_enabled {
             *selected = index;
             clicked = true;
@@ -621,6 +625,19 @@ pub(crate) fn popup_list(
     let t = crate::theme::Tokens::get();
     let mut chosen = None;
     let mut rows = Vec::with_capacity(options.len());
+    // Wide enough for the longest suggestion; still capped so a hostile name cannot fill the screen (#8533).
+    let mono = egui::FontId::monospace(t.font_body);
+    let kind_font = egui::FontId::proportional(t.font_small);
+    let content_w = options
+        .iter()
+        .map(|option| {
+            let text_w = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(option.text.to_owned(), mono.clone(), option.color)).size().x;
+            let kind = crate::i18n::tr_label(option.kind);
+            let kind_w = ctx.fonts_mut(|fonts| fonts.layout_no_wrap(kind.to_owned(), kind_font.clone(), t.form_dim)).size().x;
+            text_w + kind_w + t.space_8 * 3.0
+        })
+        .fold(0.0_f32, f32::max);
+    let width = anchor.width().max(t.form_card_width - t.space_16 * 2.0 - t.space_2).max(content_w).min(t.form_card_width * 2.5);
     let popup = Container::new(ctx, Surface::Popup).area(id);
     let area = popup.order(egui::Order::Tooltip).fixed_pos(anchor.left_bottom() + egui::vec2(0.0, t.space_2)).show(ctx, |ui| {
         Container::popup_frame(ui.style())
@@ -630,7 +647,7 @@ pub(crate) fn popup_list(
             .inner_margin(t.space_4)
             .show(ui, |ui| {
                 super::scope(ui, |ui| {
-                    ui.set_width(anchor.width().max(t.form_card_width - t.space_16 * 2.0 - t.space_2));
+                    ui.set_width(width);
                     for (index, option) in options.iter().enumerate() {
                         let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), t.control_height), egui::Sense::CLICK);
                         rows.push(rect);
@@ -645,23 +662,12 @@ pub(crate) fn popup_list(
                             inner.min,
                             egui::pos2((inner.right() - kind_width - t.space_8).max(inner.left()), inner.bottom()),
                         );
-                        super::text::paint_text(
-                            ui,
-                            text_rect,
-                            option.text,
-                            egui::FontId::monospace(t.font_body),
-                            if picked { t.form_primary } else { option.color },
-                            false,
-                        );
-                        ui.painter().text(
-                            inner.right_center(),
-                            egui::Align2::RIGHT_CENTER,
-                            kind,
-                            egui::FontId::proportional(t.font_small),
-                            t.form_dim,
-                        );
+                        super::text::paint_text(ui, text_rect, option.text, mono.clone(), if picked { t.form_primary } else { option.color }, false);
+                        ui.painter().text(inner.right_center(), egui::Align2::RIGHT_CENTER, kind, kind_font.clone(), t.form_dim);
                         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, ui.is_enabled(), picked, option.text));
-                        let response = response.on_hover_text(option.detail);
+                        // Tip the full name first: long identifiers still clip inside a capped popup.
+                        let tip = if option.detail.is_empty() { option.text.to_owned() } else { format!("{}\n{}", option.text, option.detail) };
+                        let response = response.on_hover_text(tip);
                         crate::scenario::publish_handle(&format!("dialog:suggestion:{index}"), response.rect.center());
                         if response.clicked() {
                             chosen = Some(index);

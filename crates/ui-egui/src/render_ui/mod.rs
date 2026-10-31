@@ -201,7 +201,7 @@ pub(crate) fn overlays(app: &mut SolveApp, ui: &mut egui::Ui) {
     if !focused(app) {
         shots_pill(app, ui, free);
     }
-    crate::viewport::transient_messages(app, ui, viewport);
+    crate::viewport::transient_messages(app, ui, viewport, None);
 }
 
 /// Shared kit chip at the Browser's remembered side, below the stage bar.

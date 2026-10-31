@@ -1308,8 +1308,7 @@ fn progressive_image_controls_route_to_the_registered_host() {
     let host = match host {
         Ok(host) => host,
         Err(e) => {
-            let vulkan = egui_wgpu::wgpu::Backends::VULKAN;
-            let expected = solidcraft_gpu::select::native_backends().contains(vulkan);
+            let expected = !solidcraft_gpu::select::path_backends().is_empty();
             assert!(!expected || std::env::var_os("SOLIDCRAFT_REQUIRE_GPU").is_none(), "required GPU unavailable: {e}");
             eprintln!("skipping progressive UI device test: {e}");
             return;
@@ -1404,6 +1403,7 @@ fn clicked_render_workspace_saves_one_setup_and_restores_design_view() {
     for language in ["en", "de", "ko", "ru"] {
         let mut h = Harness::new();
         h.app.preferences.language = language.into();
+        h.app.preferences.perspective_fov = 50f64.to_radians();
         h.app.run("solid.box", json!({"length":10,"width":20,"height":5})).unwrap();
         h.app.session.mark_saved();
         h.frames(3);
@@ -1422,6 +1422,7 @@ fn clicked_render_workspace_saves_one_setup_and_restores_design_view() {
         h.step(&json!({"click":{"handle":"render:scene:frame"}})).unwrap();
         assert_eq!(h.app.render_workspace.view.inspector.page, inspector::Page::Camera);
         h.step(&json!({"widget":perspective})).unwrap();
+        assert_eq!(h.app.cam.fov, 50f64.to_radians(), "{language}: Perspective takes the Field of view preference's angle (#5364)");
         assert!(!h.app.session.is_dirty(), "preview edits are staged");
         h.step(&json!({"widget":save})).unwrap();
         assert_eq!(h.app.session.undo.len(), undo + 1);
@@ -3520,7 +3521,7 @@ fn full_detail_preview_source_can_exceed_legacy_128_mib_without_mesh_reduction()
 fn refused_product_capture_is_cached_until_identity_changes_or_explicit_retry() {
     let mut h = Harness::new();
     let calls = std::cell::Cell::new(0);
-    let signature = (7, 123, 99);
+    let signature = (7, 123, 99, MAX_GEOMETRY_BYTES as u64);
     for _ in 0..8 {
         assert_eq!(
             h.app
@@ -3539,7 +3540,7 @@ fn refused_product_capture_is_cached_until_identity_changes_or_explicit_retry() 
     assert!(
         h.app
             .render_workspace
-            .prepare_preview((8, 123, 99), || {
+            .prepare_preview((8, 123, 99, MAX_GEOMETRY_BYTES as u64), || {
                 calls.set(calls.get() + 1);
                 Err("new revision".into())
             })
@@ -3795,7 +3796,7 @@ fn render_workspace_focus_restores_docks_without_design_history_or_camera_change
         h.app.preferences.render_browser_width = 350.0;
         h.app.preferences.render_inspector_width = 390.0;
         h.app.preferences.render_shots_strip = shots;
-        h.app.tree.panel_collapsed = folded;
+        h.app.preferences.browser_collapsed = folded;
         h.app.shell.render_browser_open = folded;
         h.frames(3);
         let dock_preferences = h.app.prefs();
@@ -3830,7 +3831,7 @@ fn render_workspace_focus_restores_docks_without_design_history_or_camera_change
             assert_eq!(restored_edge.as_ref().map(std::mem::discriminant), edge.as_ref().map(std::mem::discriminant));
         }
         assert_eq!(h.app.prefs(), dock_preferences);
-        assert_eq!(h.app.tree.panel_collapsed, folded);
+        assert_eq!(h.app.preferences.browser_collapsed, folded);
         assert_eq!(h.app.shell.render_browser_open, folded);
         assert_eq!((h.app.cam, h.app.session.camera), camera);
         assert!(Arc::ptr_eq(&h.app.session.doc, &document));
@@ -6309,4 +6310,100 @@ fn render_lighting_shadow_edits_are_undoable_and_preset_reviews_reject_changed_d
     assert!(h.widget(h.app.tr("render.lighting_consent")).is_none());
     assert_eq!(h.app.session.doc, before);
     assert_eq!(h.app.render_workspace.view.draft.width, 1200);
+}
+
+#[test]
+fn geometry_budget_follows_the_device_buffer_limit_and_keeps_the_web_cap() {
+    // The standard 256 MiB device buffers: 2 GiB, far past the old fixed 128 MiB.
+    assert_eq!(geometry_budget(256 << 20, false), 2 << 30);
+    assert!(admit_geometry(129 << 20, geometry_budget(256 << 20, false)).is_ok());
+    // A smaller device gets less, a larger one no more than the ceiling.
+    assert_eq!(geometry_budget(64 << 20, false), 512 << 20);
+    assert_eq!(geometry_budget(u64::MAX, false), DESKTOP_GEOMETRY_CEILING);
+    for device in [0, 256 << 20, u64::MAX] {
+        let budget = geometry_budget(device, true);
+        assert_eq!(budget, 128 << 20);
+        assert!(admit_geometry(budget, budget).is_ok());
+        assert!(admit_geometry(budget + 1, budget).is_err());
+    }
+}
+
+#[test]
+fn geometry_refusal_reports_scene_size_limit_and_recovery() {
+    use solidcraft_engine::{
+        geom::{Aabb3, Mesh},
+        render::ProductMesh,
+    };
+    let scene = ProductScene {
+        meshes: vec![ProductMesh {
+            name: "Synthetic assembly".into(),
+            mesh: Arc::new(Mesh { triangles: vec![[0; 3]; 1 << 20], ..Default::default() }),
+            color: [128; 3],
+            opacity: 1.0,
+            surface: Some(
+                solidcraft_engine::render::surface::OpaqueSurface::new(solidcraft_engine::geom::Vec3::new(0.5, 0.5, 0.5), 0.0, 0.5, 1.5).unwrap(),
+            ),
+            transmission: None,
+            faces: Vec::new(),
+        }],
+        bounds: Aabb3::EMPTY,
+    };
+    let error = gpu_scene_with_budget(&scene, WEB_GEOMETRY_BYTES).err().unwrap();
+    assert!(error.contains("144.0 MiB"), "{error}");
+    assert!(error.contains("128.0 MiB"), "{error}");
+    assert!(error.contains("Hide bodies in Design"), "{error}");
+    let refused = upload_refusal(144 << 20, "Out of Memory");
+    assert!(refused.contains("144.0 MiB") && refused.contains("Out of Memory") && refused.contains("Hide bodies in Design"), "{refused}");
+}
+
+#[test]
+fn previous_geometry_budget_restores_the_fixed_limit() {
+    for web in [false, true] {
+        for device in [64 << 20, 256 << 20, u64::MAX] {
+            let device_budget = geometry_budget(device, web);
+            assert_eq!(preferred_geometry_budget(device_budget, false), device_budget);
+            let previous = preferred_geometry_budget(device_budget, true);
+            assert_eq!(previous, MAX_GEOMETRY_BYTES as u64);
+            assert!(admit_geometry(previous, previous).is_ok());
+            assert!(admit_geometry(previous + 1, previous).is_err());
+        }
+    }
+}
+
+#[test]
+fn geometry_budget_change_retries_cached_admission_without_document_changes() {
+    let mut session = Session::default();
+    session.execute("solid.box", &json!({"length":1,"width":1,"height":1})).unwrap();
+    let scene = solidcraft_engine::product_scene::extract(&session).unwrap();
+    let bytes = preview_upload_plan(&scene, usize::MAX).unwrap().bytes().unwrap() as u64;
+    let mut state = State::default();
+    assert!(state.prepare_preview((7, 123, 99, bytes - 1), || Ok(scene.clone())).is_err());
+    state.prepare_preview((7, 123, 99, bytes), || Ok(scene)).unwrap();
+    assert_eq!(state.preview_upload_bytes, Some(bytes as usize));
+    assert!(state.scene_error.is_none());
+}
+
+/// The Field of view preference (#5364) rescales the design view only: navigating the result image
+/// turns Perspective view off and on around it without a rescale, and an angle changed while Render
+/// is open leaves Render's camera alone and reaches the design view when it's back.
+#[test]
+fn the_field_of_view_rescales_only_the_design_view() {
+    let mut h = Harness::new();
+    h.app.run("solid.box", json!({"length":10,"width":20,"height":5})).unwrap();
+    h.call("ui.set", json!({"perspective": true}));
+    h.frames(3);
+    let design = h.app.cam;
+    let size = |cam: Camera, fov: f64| Camera { fov, ..cam }.half_height();
+    enter(&mut h.app, true).unwrap();
+    h.frames(2);
+    with_result_camera(&mut h.app, |app| app.cam.distance *= 1.0);
+    h.frames(2);
+    let render = h.app.cam;
+    h.call("ui.prefs", json!({"perspective_fov": 1.2}));
+    h.frames(2);
+    assert_eq!(h.app.cam, render, "Render's camera is its own");
+    enter(&mut h.app, false).unwrap();
+    h.frames(2);
+    assert!(h.app.ui.perspective);
+    assert!((size(h.app.cam, 1.2) / size(design, 0.6) - 1.0).abs() < 1e-9, "the design view keeps its size: {:?}", h.app.cam);
 }

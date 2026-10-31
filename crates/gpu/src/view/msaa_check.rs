@@ -97,6 +97,7 @@ impl Renderer {
         let frame = Frame {
             product_lights: None,
             product: false,
+            upload_error: None,
             key: 1,
             slot: slot(Some(model)),
             sketch_key: 2,
@@ -112,7 +113,7 @@ impl Renderer {
             clip: [0.0; 4],
             cap: [0.0; 4],
             images: Vec::new(),
-            points: Vec::new(),
+            clouds: Vec::new(),
             analysis: [0.0; 8],
             analysis_colors: [0.0; 36],
             access: None,

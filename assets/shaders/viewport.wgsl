@@ -697,38 +697,96 @@ fn fs_line_all(i: LOut) -> @location(0) vec4<f32> {
     return out_color(i.c);
 }
 
-// Point clouds: each point is a round dot a few pixels across, facing the screen, depth-tested
-// and written like the model's faces, so the model hides the points behind it and they hide it.
-// The colour's alpha carries the dot's size (eighths of a pixel).
+// Point clouds (`view/clouds.rs`): each point is a round dot a few pixels across, facing the
+// screen, depth-tested and written like the model's faces, so the model hides the points behind
+// it and they hide it. The cloud's style colours them by their own colour, a ramp or a palette,
+// and shows only those whose filtered values lie in its ranges or sets.
 
-struct POut {
+struct Cloud {
+    style: vec4<f32>,               // x: colour (0 own, 1 ramp, 2 palette), y: dot size (px), z, w: ramp range
+    filters: array<vec4<f32>, 4>,   // x: kind (0 off, 1 range y…z, 2 whole values y + i for the bits i of w)
+};
+@group(1) @binding(3) var<uniform> cloud: Cloud;
+
+struct CIn {
+    @location(0) p: vec3<f32>,
+    @location(1) v: f32,
+    @location(2) f: vec4<f32>,
+    @location(3) rgb: vec4<f32>,
+};
+
+struct COut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) c: vec4<f32>,
-    @location(1) wp: vec3<f32>,
-    @location(2) at: vec2<f32>,
+    @location(0) wp: vec3<f32>,
+    @location(1) v: f32,
+    @location(2) f: vec4<f32>,
+    @location(3) rgb: vec3<f32>,
+    @location(4) at: vec2<f32>,    // the place on its disc
+    @location(5) @interpolate(flat) has: u32,
 };
 
 @vertex
-fn vs_point(@builtin(vertex_index) vi: u32, @location(0) p: vec3<f32>, @location(1) c: vec4<f32>) -> POut {
+fn vs_cloud_dot(@builtin(vertex_index) vi: u32, i: CIn) -> COut {
     var xs = array<f32, 6>(-1.0, 1.0, 1.0, -1.0, 1.0, -1.0);
     var ys = array<f32, 6>(-1.0, -1.0, 1.0, -1.0, 1.0, 1.0);
     let at = vec2<f32>(xs[vi], ys[vi]);
-    let size = max(c.a * 255.0 / 8.0, 1.0);
-    let centre = u.vp * vec4<f32>(p, 1.0);
-    let half = u.screen.xy * 0.5;
-    var o: POut;
-    o.pos = vec4<f32>(centre.xy + at * size * 0.5 / half * centre.w, centre.z, centre.w);
+    let size = max(cloud.style.y, 1.0);
+    let centre = u.vp * vec4<f32>(i.p, 1.0);
+    var o: COut;
+    o.pos = vec4<f32>(centre.xy + at * size / u.screen.xy * centre.w, centre.z, centre.w);
     // Behind the eye: nothing.
     if (near_z(centre) < 0.0) { o.pos = vec4<f32>(0.0, 0.0, 0.0, -1.0); }
-    o.c = vec4<f32>(c.rgb, 1.0);
-    o.wp = p;
+    o.wp = i.p;
+    o.v = i.v;
+    o.f = i.f;
+    o.rgb = i.rgb.rgb;
+    o.has = u32(round(i.rgb.a * 255.0));
     // Dots under two pixels are squares: a disc that small loses its centre pixel.
     o.at = at * select(1.0, 0.0, size < 2.0);
     return o;
 }
 
+/// Whether filter `f` keeps the value `v`.
+fn cloud_keeps(f: vec4<f32>, v: f32) -> bool {
+    if (f.x < 0.5) { return true; }
+    if (f.x < 1.5) { return v >= f.y && v <= f.z; }
+    let k = i32(round(v)) - i32(round(f.y));
+    return k >= 0 && k < 32 && ((bitcast<u32>(f.w) >> u32(k)) & 1u) != 0u;
+}
+
+fn cloud_ramp(t: f32) -> vec3<f32> {
+    var stops = array<vec3<f32>, 5>(
+        vec3<f32>(40.0, 70.0, 200.0), vec3<f32>(30.0, 170.0, 230.0), vec3<f32>(60.0, 200.0, 90.0),
+        vec3<f32>(240.0, 220.0, 60.0), vec3<f32>(230.0, 70.0, 50.0));
+    let k = clamp(t, 0.0, 1.0) * 4.0;
+    let j = min(u32(k), 3u);
+    return mix(stops[j], stops[j + 1u], k - f32(j)) / 255.0;
+}
+
+fn cloud_palette(v: f32) -> vec3<f32> {
+    var colours = array<vec3<f32>, 10>(
+        vec3<f32>(240.0, 140.0, 40.0), vec3<f32>(245.0, 205.0, 65.0), vec3<f32>(230.0, 65.0, 65.0),
+        vec3<f32>(165.0, 75.0, 190.0), vec3<f32>(65.0, 190.0, 115.0), vec3<f32>(75.0, 150.0, 220.0),
+        vec3<f32>(240.0, 120.0, 180.0), vec3<f32>(140.0, 105.0, 75.0), vec3<f32>(120.0, 215.0, 215.0),
+        vec3<f32>(190.0, 190.0, 80.0));
+    if (v < -0.5) { return vec3<f32>(150.0, 160.0, 176.0) / 255.0; }
+    return colours[u32(round(v)) % 10u] / 255.0;
+}
+
+
 @fragment
-fn fs_point(i: POut) -> @location(0) vec4<f32> {
-    if (clipped(i.wp) || dot(i.at, i.at) > 1.0) { discard; }
-    return out_color(i.c);
+fn fs_cloud(o: COut) -> @location(0) vec4<f32> {
+    var out = clipped(o.wp) || dot(o.at, o.at) > 1.0;
+    for (var k = 0u; k < 4u; k++) {
+        out = out || (((o.has >> k) & 1u) != 0u && !cloud_keeps(cloud.filters[k], o.f[k]));
+    }
+    if (out) { discard; }
+    var c = o.rgb;
+    let mode = cloud.style.x;
+    if ((o.has & 16u) != 0u && mode > 1.5) {
+        c = cloud_palette(o.v);
+    } else if ((o.has & 16u) != 0u && mode > 0.5) {
+        c = cloud_ramp((o.v - cloud.style.z) / max(cloud.style.w - cloud.style.z, 1e-12));
+    }
+    return out_color(vec4<f32>(c, 1.0));
 }
