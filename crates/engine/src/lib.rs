@@ -33,6 +33,7 @@ pub mod slicer_files;
 mod slicer_icon;
 pub mod slicers;
 pub mod snap;
+pub mod status_details;
 pub mod status_items;
 pub mod timing;
 pub mod toollib;
@@ -176,6 +177,32 @@ pub enum Sel {
         body: String,
         point: Vec3,
     },
+}
+
+impl Sel {
+    /// The body this item names, when it names one: the body itself, or the body a face, edge
+    /// or vertex belongs to. Session state that names a body has to follow its renames (#9737).
+    pub(crate) fn body_name(&self) -> Option<&str> {
+        match self {
+            Sel::Body { name } => Some(name),
+            Sel::Face { body, .. } | Sel::Edge { body, .. } | Sel::Vertex { body, .. } => Some(body),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the document differs from the one its file holds, as last worked out for this pair
+/// of documents at this revision. The window asks every frame for every tab (the tab strip, the
+/// autosave), and a large design compared field by field cost more than the rest of an idle
+/// frame. Holding both documents keeps their contents fixed and their addresses unused by
+/// another document while the answer stands: shared, a document can't be edited in place (an
+/// edit copies it to a new address), and [`Session::doc_mut`] lets the answer go first so an
+/// edit stays in place.
+struct DirtyAnswer {
+    revision: u64,
+    doc: Arc<Document>,
+    saved: Arc<Document>,
+    differs: bool,
 }
 
 /// A body rename between two designs (see `Session::body_renames`).
@@ -434,6 +461,8 @@ pub struct Session {
     /// Revision increments caused only by visibility. Comparing both counters proves that
     /// every intervening increment left an editor's document and model untouched.
     visibility_revision: u64,
+    /// [`Document::browser_stamp`] when the browser's groups and order were last checked.
+    browser_stamp: [u64; 6],
     /// This open design's id for programs that follow it (`document.revision`, #6646): kept
     /// while it stays open, through saves and renames; another for each design started or opened.
     pub document_id: String,
@@ -462,12 +491,18 @@ pub struct Session {
     /// (see [`Session::solve_joints`]).
     joints_settled: Option<(Arc<Document>, std::sync::Weak<solidcraft_doc::ModelState>)>,
     occurrence_visibility_cache: std::sync::Mutex<Option<occurrences::VisibilityCache>>,
+    /// The hidden joints and folders of the view, as sets: the browser asks about every joint
+    /// of the design on every frame (#3892), and an answer that walked the hidden lists made a
+    /// frame cost grow with the size of the design.
+    visibility_index_cache: std::sync::Mutex<Option<occurrences::VisibilityIndex>>,
     removed_later_cache: std::sync::Mutex<Option<occurrences::RemovedLaterCache>>,
     /// `cam.list` as it was last worked out, for the revision and the document it was for: the
     /// Manufacture panel asks for it every frame, and it builds every toolpath.
     cam_list_cache: std::sync::Mutex<Option<(u64, Arc<solidcraft_doc::Document>, serde_json::Value)>>,
     occurrence_bodies_cache: std::sync::Mutex<Option<occurrences::OccurrenceBodiesCache>>,
     placement_index_cache: std::sync::Mutex<Option<occurrences::PlacementIndex>>,
+    /// The last answer of [`Session::is_dirty`] on the document (see [`DirtyAnswer`]).
+    dirty_cache: std::sync::Mutex<Option<DirtyAnswer>>,
     /// Pairs `inspect.clearance` measured, by the bodies' geometry where they stood (shared with
     /// scratch copies): a body that did not change or move is not measured again.
     clearance_cache: std::sync::Arc<std::sync::Mutex<cmd::clearance::PairCache>>,
@@ -588,6 +623,8 @@ pub struct ContinuitySeam {
     pub points: Vec<Vec3>,
     /// The seam's worst verdict along its length.
     pub verdict: kernel::SeamVerdict,
+    /// Successful measurement settings and diagnostics, owned by this particular seam.
+    pub details: status_details::ContinuityDetail,
 }
 
 impl SurfaceAnalysis {
@@ -658,6 +695,7 @@ impl Session {
             log: Vec::new(),
             revision: 1,
             visibility_revision: 0,
+            browser_stamp: [0; 6],
             document_id: cmd::inspect::new_document_id(),
             followed: None,
             auto_project: true,
@@ -670,10 +708,12 @@ impl Session {
             world_cache: Default::default(),
             joints_settled: None,
             occurrence_visibility_cache: Default::default(),
+            visibility_index_cache: Default::default(),
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
             placement_index_cache: Default::default(),
+            dirty_cache: Default::default(),
             clearance_cache: Default::default(),
             cam_path_cache: Default::default(),
             body_renames: Vec::new(),
@@ -740,9 +780,34 @@ impl Session {
 
     /// The design has changes not in its file: in the document, or in what is hidden.
     pub fn is_dirty(&self) -> bool {
-        (!Arc::ptr_eq(&self.doc, &self.saved) && *self.doc != *self.saved) || self.visibility != self.saved_visibility
+        self.document_differs() || self.visibility != self.saved_visibility
     }
+
+    /// The document is not the one its file holds: compared once per pair of documents and
+    /// revision ([`DirtyAnswer`]).
+    fn document_differs(&self) -> bool {
+        if Arc::ptr_eq(&self.doc, &self.saved) {
+            return false;
+        }
+        let Ok(mut answer) = self.dirty_cache.lock() else { return *self.doc != *self.saved };
+        let same = |a: &DirtyAnswer| a.revision == self.revision && Arc::ptr_eq(&a.doc, &self.doc) && Arc::ptr_eq(&a.saved, &self.saved);
+        if let Some(a) = answer.as_ref().filter(|a| same(a)) {
+            return a.differs;
+        }
+        let differs = *self.doc != *self.saved;
+        *answer = Some(DirtyAnswer { revision: self.revision, doc: self.doc.clone(), saved: self.saved.clone(), differs });
+        differs
+    }
+
+    /// Let the unsaved-changes answer go, with the documents it holds.
+    fn forget_dirty_answer(&self) {
+        if let Ok(mut answer) = self.dirty_cache.lock() {
+            *answer = None;
+        }
+    }
+
     pub fn mark_saved(&mut self) {
+        self.forget_dirty_answer();
         self.saved = self.doc.clone();
         self.saved_visibility = self.visibility.clone();
     }
@@ -848,6 +913,7 @@ impl Session {
         if let Ok(mut index) = self.placement_index_cache.lock() {
             *index = None;
         }
+        self.forget_dirty_answer();
         Arc::make_mut(&mut self.doc)
     }
 
@@ -948,6 +1014,22 @@ impl Session {
         }
     }
 
+    /// The model body a name means: one of the model's own bodies as it is named, else the body
+    /// a placed copy shows (`KB (K:2)`, the name `inspect.measure` lists), as `appearance.assign`
+    /// takes it (#9740). `None` when neither names it.
+    pub(crate) fn own_body_name(&self, name: &str) -> Option<String> {
+        if self.model.state().body(name).is_some() {
+            return Some(name.to_string());
+        }
+        self.body_frames().iter().find(|(world, ..)| world == name).map(|(_, own, _)| own.clone())
+    }
+
+    /// A component by its id or name, or by the name of one of its placements (`K:2`); never the
+    /// root.
+    pub(crate) fn component_or_placement(&self, key: &str) -> Option<u64> {
+        self.doc.find_component(key).or_else(|| self.doc.occurrences.iter().find(|o| o.name == key).map(|o| o.component)).filter(|id| *id != 0)
+    }
+
     pub fn refresh(&mut self) {
         if self.model.evaluate_shared(&self.doc) {
             #[cfg(test)]
@@ -957,6 +1039,15 @@ impl Session {
         }
         self.revision += 1;
         self.prune_occurrence_state();
+        // Looked at only when what the groups can name has changed, not on every refresh.
+        let stamp = self.doc.browser_stamp();
+        if stamp != self.browser_stamp {
+            if let Some((groups, order)) = self.doc.browser_pruned() {
+                let d = self.doc_mut();
+                (d.browser_groups, d.browser_order) = (groups, order);
+            }
+            self.browser_stamp = self.doc.browser_stamp();
+        }
         // Joints follow the geometry their origins snap to.
         if !self.doc.assembly.joints.is_empty() {
             // A solve that moves parts changes what features reading where a part is placed
@@ -1008,6 +1099,13 @@ impl Session {
         self.follow_axis_point_renames(previous);
         let rename = self.body_rename(previous);
         self.remap_hidden_bodies(previous, &self.model.state(), rename.as_ref().map(|(old, new, _)| (old.as_str(), new.as_str())));
+        // Locked bodies follow the rename here rather than in `body.rename`, so a rename that
+        // reaches the design any other way (undo, an outside edit) is covered too (#9737).
+        if let Some((old, new, _)) = &rename {
+            for b in self.visibility.locked_bodies.iter_mut().filter(|b| **b == *old) {
+                *b = new.clone();
+            }
+        }
         if let Some((old, new, names_only)) = rename
             && names_only
             && self.model.rename_body(&self.doc, &old, &new)
@@ -1137,14 +1235,15 @@ impl Session {
         }
     }
 
-    /// Only persistent render intent, part properties or appearances changed. Never evaluate or
-    /// clear a stale model here.
+    /// Only persistent render intent, part properties, appearances or the browser's groups changed.
+    /// Never evaluate or clear a stale model here.
     fn render_only_change(&self, before: &Snapshot) -> bool {
         self.active_sketch == before.active_sketch
             && self.pending_moves == before.pending_moves
             && (self.doc.differs_only_in_render(&before.doc)
                 || self.doc.differs_only_in_part_properties(&before.doc)
-                || self.doc.differs_only_in_appearance(&before.doc))
+                || self.doc.differs_only_in_appearance(&before.doc)
+                || self.doc.differs_only_in_browser(&before.doc))
     }
 
     /// Only what is hidden or shown changed (`browser.visibility`): the document and the model
@@ -1202,6 +1301,10 @@ impl Session {
     /// as before. Otherwise store each sketch whose values changed as solved, so the next edit
     /// continues from it (see `Model::adopt_solved_sketches`).
     pub(crate) fn settle_value_edit(&mut self, solved_before: &SketchValues) -> Result<()> {
+        // The solved geometry each sketch had before the edit, for the shrink/fling checks
+        // after the refresh below (the same checks `settle` runs on an edit's own solve).
+        let solved_geometry: std::collections::BTreeMap<u64, solidcraft_sketch::Sketch> =
+            self.model.results.iter().filter_map(|r| r.state.sketch(r.id).map(|k| (r.id, k.sketch.clone()))).collect();
         // Quantity changes alter topology, so store the regenerated instances in the same
         // transaction as the parameter edit. Later picks and undo must see those same ids.
         let mut updated: Vec<_> = self
@@ -1230,8 +1333,19 @@ impl Session {
         self.refresh();
         for r in &self.model.results {
             let (Some(before), Some(k)) = (solved_before.get(&r.id), r.state.sketch(r.id)) else { continue };
-            if !k.report.keeps_orientation() && own_values(&k.sketch) != *before {
+            if own_values(&k.sketch) == *before {
+                continue;
+            }
+            if !k.report.keeps_orientation() {
                 let why = k.report.failure(|f| format!("its constraints would conflict ({f})"));
+                return Err(EngineError::Other(format!("sketch `{}`: {why}; the values were not changed", r.name)));
+            }
+            // The value changed this sketch and it still solves: refuse it the way `settle`
+            // refuses an edit's solve when the curve was squeezed away or points thrown far,
+            // so a zero (or wild) value is never stored as a sketch that can't be solved back.
+            if let Some(before_sketch) = solved_geometry.get(&r.id)
+                && let Some(why) = cmd::collapse_reason(before_sketch, &k.sketch)
+            {
                 return Err(EngineError::Other(format!("sketch `{}`: {why}; the values were not changed", r.name)));
             }
         }
@@ -1240,6 +1354,7 @@ impl Session {
             if let Ok(mut index) = self.placement_index_cache.lock() {
                 *index = None;
             }
+            self.forget_dirty_answer();
             self.model.adopt_solved_sketches(Arc::make_mut(&mut self.doc));
         }
         Ok(())
@@ -1457,8 +1572,13 @@ impl Session {
     /// Go back to checkpoint `id` as if nothing since had happened (the undo history too). It
     /// and later checkpoints are used up.
     pub fn restore_checkpoint(&mut self, id: u64) -> Result<()> {
-        let i = self.checkpoints.iter().position(|c| c.id == id).ok_or_else(|| EngineError::Other(format!("no checkpoint {id}")))?;
-        let Some(c) = self.checkpoints.drain(i..).next() else { return Err(EngineError::Other(format!("no checkpoint {id}"))) };
+        let missing = || {
+            EngineError::Other(format!(
+                "no checkpoint {id} (used up by restoring or forgetting it or an earlier one, or dropped: only the last {MAX_CHECKPOINTS} are kept)"
+            ))
+        };
+        let i = self.checkpoints.iter().position(|c| c.id == id).ok_or_else(missing)?;
+        let Some(c) = self.checkpoints.drain(i..).next() else { return Err(missing()) };
         let before = Snapshot {
             label: String::new(),
             doc: self.doc.clone(),
@@ -1511,6 +1631,7 @@ impl Session {
             log: Vec::new(),
             revision: self.revision,
             visibility_revision: self.visibility_revision,
+            browser_stamp: self.browser_stamp,
             document_id: self.document_id.clone(),
             followed: None,
             auto_project: self.auto_project,
@@ -1523,10 +1644,12 @@ impl Session {
             world_cache: std::sync::Mutex::new(self.world_cache.lock().ok().and_then(|cache| cache.clone())),
             joints_settled: self.joints_settled.clone(),
             occurrence_visibility_cache: Default::default(),
+            visibility_index_cache: Default::default(),
             removed_later_cache: Default::default(),
             cam_list_cache: Default::default(),
             occurrence_bodies_cache: Default::default(),
             placement_index_cache: Default::default(),
+            dirty_cache: Default::default(),
             clearance_cache: self.clearance_cache.clone(),
             cam_path_cache: self.cam_path_cache.clone(),
             body_renames: self.body_renames.clone(),

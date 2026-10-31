@@ -626,7 +626,9 @@ fn run_shape(app: &mut SolveApp, t: &Tool) -> Result<Vec<String>, String> {
             v
         }
         "sketch.circle.two_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1])}),
-        "sketch.circle.three_point" => json!({"p0": xy(&p[0]), "p1": xy(&p[1]), "p2": xy(&p[2])}),
+        // Each click goes as its snap, as the 3-Point Arc's do: a click snapped to a point or
+        // curve keeps the circle on it (#9858).
+        "sketch.circle.three_point" => json!({"p0": arg(&p[0]), "p1": arg(&p[1]), "p2": arg(&p[2])}),
         "sketch.arc.three_point" => json!({"start": arg(&p[0]), "end": arg(&p[1]), "through": arg(&p[2])}),
         "sketch.arc.center_point" => {
             // A centre snapped to an existing point goes as its place, where `connect` ties
@@ -1155,13 +1157,14 @@ pub fn preview(app: &SolveApp, t: &Tool, painter: &egui::Painter, proj: &Proj) {
         if snap.as_deref() == Some("Midpoint") && t.kind == Kind::HorizontalVertical {
             painter.circle_stroke(sp, 8.0, Stroke::new(2.0, tk.accent));
         }
-        painter.text(
-            sp + egui::vec2(10.0, 10.0),
+        let readout = painter.text(
+            crate::tool_cursor::readout_at(painter, proj.rect, sp),
             egui::Align2::LEFT_TOP,
             format!("{}, {}", crate::prefs::show_mm(app, hp.x, 1), crate::prefs::show_mm(app, hp.y, 1)),
             egui::FontId::proportional(crate::theme::Tokens::get().font_small),
             tk.text_dim,
         );
+        crate::scenario::publish_rect("viewport:readout", readout);
     }
     if matches!(t.kind, Kind::HorizontalVertical | Kind::Dimension) {
         for target in &t.point_picks {

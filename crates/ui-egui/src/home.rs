@@ -860,7 +860,8 @@ fn start_content(app: &mut SolveApp, ui: &mut egui::Ui, action: &mut Option<File
         if !app.home.recent.is_empty() {
             FileView::recent_list(ui, |ui| {
                 for (index, path) in app.home.recent.clone().iter().enumerate() {
-                    let name = std::path::Path::new(path).file_stem().map(|name| name.to_string_lossy()).unwrap_or_else(|| path.as_str().into());
+                    // Keep the extension so plate.step and plate.stl are not both "plate" (#9081).
+                    let name = std::path::Path::new(path).file_name().map(|name| name.to_string_lossy()).unwrap_or_else(|| path.as_str().into());
                     let missing = !available(app, path);
                     let when = if app.session.path.as_ref() == Some(path) { app.tr("home.open_now").to_string() } else { recent_time(app, path) };
                     let shown_path = if missing {
@@ -872,6 +873,7 @@ fn start_content(app: &mut SolveApp, ui: &mut egui::Ui, action: &mut Option<File
                     } else {
                         friendly_path(path)
                     };
+                    let kind = recent_kind(app, path);
                     let response = FileView::recent_row(
                         ui,
                         &format!("home:recent:{index}"),
@@ -879,7 +881,7 @@ fn start_content(app: &mut SolveApp, ui: &mut egui::Ui, action: &mut Option<File
                             title: &name,
                             path: &shown_path,
                             when: &when,
-                            workspace: app.tr("home.design_workspace"),
+                            workspace: &kind,
                             thumbnail: texture(app.home.thumbs.get(path).and_then(Option::as_ref)),
                             // A design whose picture could not be made shows a dimmed placeholder,
                             // distinct from the one shown while a picture is still loading (#4655).
@@ -946,6 +948,30 @@ fn abbreviated_path(path: &str, home: Option<&std::path::Path>) -> String {
     } else {
         path.to_owned()
     }
+}
+
+/// Kind column for a recent file: Design for `.sc`/legacy, else STEP, STL, … (#9081).
+fn recent_kind(app: &SolveApp, path: &str) -> String {
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("");
+    if solidcraft_engine::io::is_design_ext(ext) || ext.eq_ignore_ascii_case("json") {
+        return app.tr("home.design_workspace").to_string();
+    }
+    if solidcraft_engine::io::is_drawing_path(path) {
+        return app.tr_label("Drawing").to_string();
+    }
+    let label = match ext.to_ascii_lowercase().as_str() {
+        "step" | "stp" => "STEP",
+        "igs" | "iges" => "IGES",
+        "stl" => "STL",
+        "3mf" => "3MF",
+        "obj" => "OBJ",
+        "glb" | "gltf" => "glTF",
+        "fcstd" => "FreeCAD",
+        "3dm" => "Rhino",
+        other if !other.is_empty() => return other.to_ascii_uppercase(),
+        _ => return app.tr("home.design_workspace").to_string(),
+    };
+    label.to_string()
 }
 
 fn recent_time(app: &SolveApp, path: &str) -> String {
@@ -1110,6 +1136,31 @@ mod tests {
         assert_eq!(abbreviated_path("/Users/sample", home), "~");
         assert_eq!(abbreviated_path("/Users/sample-other/plate.solidcraft", home), "/Users/sample-other/plate.solidcraft");
         assert_eq!(abbreviated_path("/disk/design.solidcraft", None), "/disk/design.solidcraft");
+    }
+
+    #[test]
+    fn recent_kind_names_imports_by_extension() {
+        let app = crate::test_support::sample_app();
+        assert_eq!(recent_kind(&app, "/tmp/plate.sc"), "Design");
+        assert_eq!(recent_kind(&app, "/tmp/plate.solidcraft"), "Design");
+        assert_eq!(recent_kind(&app, "/tmp/plate.step"), "STEP");
+        assert_eq!(recent_kind(&app, "/tmp/plate.STL"), "STL");
+        assert_eq!(recent_kind(&app, "/tmp/plate.3mf"), "3MF");
+        assert_eq!(recent_kind(&app, "/tmp/plate.obj"), "OBJ");
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_both_ends_of_a_path() {
+        let ctx = crate::fonts::test_context();
+        let mut shown = String::new();
+        crate::test_support::frame(&ctx, egui::RawInput::default(), |ui| {
+            let font = egui::FontId::monospace(12.0);
+            let full = "~/Projects/exports/out/plate.step";
+            shown = crate::ui_kit::ellipsize_middle(ui, full, font, 80.0);
+        });
+        assert!(shown.contains('…'), "{shown}");
+        assert!(shown.ends_with("plate.step") || shown.ends_with(".step"), "{shown}");
+        assert!(shown.starts_with('~') || shown.starts_with("~/P"), "{shown}");
     }
 
     #[test]

@@ -579,6 +579,71 @@ fn exact_extend_takes_one_of_two_stops_at_the_same_distance() {
 }
 
 #[test]
+fn extend_does_not_treat_a_line_end_inside_a_circle_as_lying_on_it() {
+    // #9731: the "lies on a circle" test was true for every end *inside* a circle, so a large
+    // construction circle around the drawing made Extend treat a free end as held and lay a
+    // loose new line instead of lengthening the line. Only an end on the circle is held.
+    let mut s = new_sketch();
+    let l1 = ids(&run(&mut s, "sketch.line", json!({"points":[[0,5],[10,5]],"connect":false,"infer":false}))["curves"])[0].clone();
+    let l2 = ids(&run(&mut s, "sketch.line", json!({"points":[[20,-10],[20,20]],"connect":false,"infer":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.circle.center", json!({"center":[5,5],"radius":60}));
+    run(&mut s, "sketch.extend", json!({"curve": l1, "at": [9,5]}));
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), 3, "the circle around the drawing must not add a line");
+    let end = sk.resolve_point(&format!("{l1}.end")).expect("l1's end");
+    assert!(sk.point(end).is_some_and(|p| p.dist(Vec2::new(20.0, 5.0)) < 1e-6), "l1 reaches l2: {:?}", sk.point(end));
+    let l2i = sk.curve_index(&l2).expect("l2");
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::PointOnCurve { p, c } if p == end && c == l2i)),
+        "the extended end is held on l2"
+    );
+
+    // The same end deep inside a far larger circle behaves the same way.
+    let mut s = new_sketch();
+    let l1 = ids(&run(&mut s, "sketch.line", json!({"points":[[0,5],[10,5]],"connect":false,"infer":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.line", json!({"points":[[20,-10],[20,20]],"connect":false,"infer":false}));
+    run(&mut s, "sketch.circle.center", json!({"center":[100,100],"radius":200}));
+    run(&mut s, "sketch.extend", json!({"curve": l1, "at": [9,5]}));
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), 3, "an end inside a circle is not held by it");
+    let end = sk.resolve_point(&format!("{l1}.end")).expect("l1's end");
+    assert!(sk.point(end).is_some_and(|p| p.dist(Vec2::new(20.0, 5.0)) < 1e-6), "{:?}", sk.point(end));
+
+    // An end that lies ON the circle is still held: Extend adds a new line from it.
+    let mut s = new_sketch();
+    let l1 = ids(&run(&mut s, "sketch.line", json!({"points":[[0,5],[10,5]],"connect":false,"infer":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.line", json!({"points":[[20,-10],[20,20]],"connect":false,"infer":false}));
+    run(&mut s, "sketch.circle.center", json!({"center":[5,5],"radius":5}));
+    run(&mut s, "sketch.extend", json!({"curve": l1, "at": [9,5]}));
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), 4, "an end on the circle stays put and gains a new line");
+    let end = sk.resolve_point(&format!("{l1}.end")).expect("l1's end");
+    assert!(sk.point(end).is_some_and(|p| p.dist(Vec2::new(10.0, 5.0)) < 1e-6), "l1 stays put: {:?}", sk.point(end));
+}
+
+#[test]
+fn extend_from_a_held_end_is_pinned_to_the_curve_it_stops_on() {
+    // The end being extended carries geometry (another line meets it there), so the extension is
+    // a new line. It stops in the middle of a third curve: the new end point is held on that
+    // curve, as the free-end path holds its end, instead of lying loose over it.
+    let mut s = new_sketch();
+    let both = ids(&run(&mut s, "sketch.line", json!({"points":[[0,0],[10,0],[10,10]],"connect":false,"infer":false}))["curves"]);
+    let l1 = both[0].clone();
+    let wall = ids(&run(&mut s, "sketch.line", json!({"points":[[20,-10],[20,10]],"connect":false,"infer":false}))["curves"])[0].clone();
+    run(&mut s, "sketch.extend", json!({"curve": l1, "at": [10,0]}));
+    let sk = sketch(&s);
+    assert_eq!(sk.curves.len(), 4, "the held end stays and a new line is added");
+    let new_line = sk.curves.last().expect("the new line");
+    let CurveKind::Line { b, .. } = new_line.kind else { panic!("the new curve is a line: {new_line:?}") };
+    assert!(sk.point(b).is_some_and(|p| p.dist(Vec2::new(20.0, 0.0)) < 1e-6), "the new line stops on the wall: {:?}", sk.point(b));
+    let walli = sk.curve_index(&wall).expect("the wall");
+    assert!(
+        sk.constraints.iter().any(|c| matches!(c.kind, ConstraintKind::PointOnCurve { p, c } if p == b && c == walli)),
+        "the new end point is held on the curve it stops on"
+    );
+}
+
+#[test]
 fn fillet_keeps_expression_corner_when_parameter_changes() {
     let mut s = new_sketch();
     run(&mut s, "parameters.add", json!({"name": "W", "expression": "40 mm"}));
@@ -1082,6 +1147,53 @@ fn centre_circle_through_a_point_keeps_it_on_the_circle() {
     // Through a plain position: nothing to keep it on.
     let r = run(&mut s, "sketch.circle.center", json!({"center": [100, 0], "radius": 5, "through": [105, 0]}));
     let ci = sketch(&s).curve_index(&ids(&r["curves"])[0]).unwrap();
+    assert!(!sketch(&s).constraints.iter().any(|k| matches!(k.kind, ConstraintKind::PointOnCurve { c, .. } if c == ci)));
+}
+
+/// #9858: a 3-point circle drawn on snapped clicks keeps them. Drawn through a line's start,
+/// its midpoint and another line's end, the circle stays on those points when the line is
+/// dimensioned.
+#[test]
+fn three_point_circle_keeps_snapped_points() {
+    let mut s = new_sketch();
+    let l = ids(&run(&mut s, "sketch.line", json!({"points": [[0, 0], [40, 0]]}))["curves"])[0].clone();
+    let v = ids(&run(&mut s, "sketch.line", json!({"points": [[20, 5], [20, 30]]}))["curves"])[0].clone();
+    let r = run(&mut s, "sketch.circle.three_point", json!({"p0": format!("{l}.start"), "p1": format!("mid:{l}"), "p2": format!("{v}.end")}));
+    let c = ids(&r["curves"])[0].clone();
+    assert_eq!(ids(&r["constraints"]).len(), 3, "{r}");
+    let sk = sketch(&s);
+    let ci = sk.curve_index(&c).unwrap();
+    let on_circle =
+        |sk: &solidcraft_sketch::Sketch, p: usize, c: usize| sk.constraints.iter().any(|k| k.kind == ConstraintKind::PointOnCurve { p, c });
+    let (start, tip) = (sk.resolve_point(&format!("{l}.start")).unwrap(), sk.resolve_point(&format!("{v}.end")).unwrap());
+    // The midpoint snap holds its point at the line's midpoint, and the circle keeps it too.
+    let mid = sk
+        .constraints
+        .iter()
+        .find_map(|k| match k.kind {
+            ConstraintKind::Midpoint { p, .. } => Some(p),
+            _ => None,
+        })
+        .expect("midpoint snap point");
+    for p in [start, mid, tip] {
+        assert!(on_circle(&sk, p, ci), "{:?} is not on the circle: {:?}", sk.points[p].id, sk.constraints);
+    }
+    // Seeded as the circumcircle of the three clicks.
+    let (o, rad) = (sk.center(ci).unwrap(), sk.radius(ci).unwrap());
+    for p in [start, mid, tip] {
+        assert!(close(o.dist(sk.points[p].pos), rad), "the circle does not pass its click: {o:?} {rad}");
+    }
+    // Dimensioning the line: the circle stays on the start, midpoint and end.
+    run(&mut s, "sketch.dimension", json!({"entities": [l], "value": 60}));
+    let sk = sketch(&s);
+    let (o, rad) = (sk.center(ci).unwrap(), sk.radius(ci).unwrap());
+    for p in [start, mid, tip] {
+        assert!(close(o.dist(sk.points[p].pos), rad), "the circle left a snapped point: {:?}", sk.points);
+    }
+    // Plain positions: nothing to keep.
+    let r = run(&mut s, "sketch.circle.three_point", json!({"p0": [100, 0], "p1": [110, 0], "p2": [105, 8]}));
+    let ci = sketch(&s).curve_index(&ids(&r["curves"])[0]).unwrap();
+    assert!(ids(&r["constraints"]).is_empty());
     assert!(!sketch(&s).constraints.iter().any(|k| matches!(k.kind, ConstraintKind::PointOnCurve { c, .. } if c == ci)));
 }
 

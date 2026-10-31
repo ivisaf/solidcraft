@@ -195,6 +195,7 @@ pub mod op_auto;
 pub mod open_elsewhere;
 pub(crate) mod open_meshing;
 pub mod params_dialog;
+pub mod personal_sheet_rules;
 pub(crate) mod pick_index;
 pub(crate) mod place_gizmo;
 pub(crate) mod plugins;
@@ -285,6 +286,7 @@ mod sweep_dialog_tests;
 pub(crate) mod test_boat;
 pub mod theme;
 pub mod theme_files;
+mod theme_options;
 #[cfg(test)]
 mod thin_extrude_tests;
 pub mod timeline;
@@ -304,6 +306,7 @@ pub(crate) mod view_angles;
 mod view_confirm;
 pub mod view_pick;
 pub mod viewport;
+mod viewport_details;
 mod viewport_layout;
 mod viewport_status;
 mod viewport_status_fixture;
@@ -366,6 +369,18 @@ pub struct UiState {
     /// The running tool's icon rides beside the pointer in the viewport (View settings; off by
     /// default).
     pub tool_cursor: bool,
+}
+
+impl UiState {
+    fn pick_mode(&self) -> &'static str {
+        if self.pick_components {
+            "component"
+        } else if self.pick_bodies {
+            "body"
+        } else {
+            "face"
+        }
+    }
 }
 
 impl Default for UiState {
@@ -491,6 +506,9 @@ pub struct SolveApp {
     /// The views around opening the open sketch. Leaving it goes back to the earlier one as the
     /// "When a sketch ends" preference says (#7038).
     pub pre_sketch_cam: Option<PreSketchView>,
+    /// The view from before Extrude turned it to isometric (#9176); the view goes back to it when
+    /// the dialog closes, as the "and back when it closes" preference says.
+    pub pre_extrude_cam: Option<Camera>,
     /// The component active before Edit Sketch activated the one the sketch is in (#8127);
     /// leaving the sketch makes it active again.
     pub pre_sketch_component: Option<PreSketchComponent>,
@@ -597,6 +615,9 @@ pub struct SolveApp {
     /// The bodies (or components) the last copy or cut took, with the design they were in, to
     /// paste into another design (`component.paste_from_design`).
     pub foreign_copy: Option<std::sync::Arc<solidcraft_engine::ForeignCopy>>,
+    /// The sketch geometry the last copy or cut took, when it was sketch geometry: a sketch of
+    /// another design pastes it (#9258).
+    pub foreign_sketch_clip: Option<solidcraft_engine::cmd::sketch_clipboard::SketchClip>,
     /// Esc was already acted on this frame (by the shortcuts), so later handlers skip it.
     pub esc_handled: bool,
     pub(crate) escape_owner: Option<EscapeOwner>,
@@ -747,6 +768,7 @@ impl SolveApp {
             now: 0.0,
             pre_sketch_marker: None,
             pre_sketch_cam: None,
+            pre_extrude_cam: None,
             pre_sketch_component: None,
             services,
             file_picker: None,
@@ -802,6 +824,7 @@ impl SolveApp {
             clipboard_stamp: 0,
             own_clipboard_stamp: 0,
             foreign_copy: None,
+            foreign_sketch_clip: None,
             esc_handled: false,
             escape_owner: None,
             last_escape: None,
@@ -965,7 +988,7 @@ impl SolveApp {
 
     /// Preferences kept between runs (JSON), for the host to store.
     pub fn prefs(&self) -> String {
-        json!({
+        let mut v = json!({
             "dark": self.ui.dark,
             "grid": self.ui.show_grid,
             "navigation_bar": self.ui.show_navigation_bar,
@@ -988,8 +1011,19 @@ impl SolveApp {
             "agent_cursor": self.ui.agent_cursor,
             "preferences": self.preferences,
             "gpu_path_setup_seconds": self.render_workspace.setup_seconds,
-        })
-        .to_string()
+        });
+        // While the Preferences dialog is open the file holds what Cancel would restore: a change
+        // that was never applied must not reach disk through the periodic save, a quit or a
+        // window close (#9730). One change covers every writer — desktop save and on_exit, the
+        // web app's save, and the control channel.
+        if let Some(held) = prefs::held_overlay(self)
+            && let Some(obj) = v.as_object_mut()
+        {
+            for (key, value) in held {
+                obj.insert(key, value);
+            }
+        }
+        v.to_string()
     }
 
     /// Restore preferences saved with [`SolveApp::prefs`].
@@ -1462,16 +1496,21 @@ impl SolveApp {
 
     /// Start an interactive command with its menu anchored below the invoking button.
     pub(crate) fn start_at(&mut self, id: &str, opener: Option<egui::Rect>) {
-        self.start_with_variant_memory(id, true, opener);
+        self.start_with_variant_memory(id, true, opener, false);
     }
 
     /// A dedicated toolbar button starts its exact tool without replacing the sketch family's
     /// main button. Choosing a variant from a menu still uses `start` and remembers that choice.
     pub(crate) fn start_pinned(&mut self, id: &str, opener: Option<egui::Rect>) {
-        self.start_with_variant_memory(id, false, opener);
+        self.start_with_variant_memory(id, false, opener, false);
     }
 
-    fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>) {
+    /// Existing Section editor uses the normal command-start lifecycle, with explicit edit intent.
+    pub(crate) fn start_section_edit(&mut self) {
+        self.start_with_variant_memory("inspect.section", true, None, true);
+    }
+
+    fn start_with_variant_memory(&mut self, id: &str, remember_variant: bool, opener: Option<egui::Rect>, section_edit: bool) {
         self.tree.clear_folder_pick();
         if id == "timeline.play" {
             if let Err(why) = self.run(id, json!({})) {
@@ -1721,7 +1760,7 @@ impl SolveApp {
             });
             return;
         }
-        if !sketch_tools::start_hook(self, id) {
+        if !section_edit && !sketch_tools::start_hook(self, id) {
             return;
         }
         if remember_variant && solidcraft_engine::find_command(id).is_some_and(|c| c.info(&self.session).enabled) {
@@ -1758,6 +1797,10 @@ impl SolveApp {
         // Inspect → Measure → Properties: the window, not a reply nobody sees (#8095).
         if matches!(id, "component.properties" | "occurrence.properties") {
             design_properties::open_selected(self);
+            return;
+        }
+        if id == "sketch.edit" {
+            self.start_sketch_edit(opener);
             return;
         }
         if id == "sketch.finish" {
@@ -1910,7 +1953,11 @@ impl SolveApp {
             if d.wants_picks() && !self.session.selection.is_empty() {
                 let _ = self.session.execute("select.clear", &json!({}));
             }
+            let extrude = matches!(d.kind, dialogs::Kind::Extrude { .. });
             self.dialog = Some(d);
+            if extrude {
+                self.turn_for_extrude();
+            }
             return;
         }
         // Undo and redo can recompute much of the history: off the window thread when slow.
@@ -1929,6 +1976,37 @@ impl SolveApp {
     /// Does starting `id` open a tool or a dialog?
     fn interactive(&self, id: &str) -> bool {
         tools::Tool::for_command(id).is_some() || dialogs::Dialog::for_command(self, id).is_some()
+    }
+
+    /// The ribbon has no sketch argument: use one unambiguous sketch pick, otherwise ask.
+    fn start_sketch_edit(&mut self, opener: Option<egui::Rect>) {
+        use solidcraft_engine::{Sel, doc::FeatureKind};
+        let mut sketches: Vec<u64> = self
+            .session
+            .selection
+            .iter()
+            .filter_map(|s| match s {
+                Sel::Feature { id } => Some(*id),
+                Sel::Profile { sketch, .. } | Sel::ExternalSketchCurve { sketch, .. } | Sel::ExternalSketchPoint { sketch, .. } => Some(*sketch),
+                Sel::SketchCurve { sketch, .. } => *sketch,
+                _ => None,
+            })
+            .filter(|id| self.session.doc.feature(*id).is_some_and(|f| matches!(f.kind, FeatureKind::Sketch { .. })))
+            .collect();
+        sketches.sort_unstable();
+        sketches.dedup();
+        let sketch = match sketches.as_slice() {
+            [id] => Some(*id),
+            [] => self.session.active_sketch,
+            _ => None,
+        };
+        if let Some(id) = sketch {
+            self.edit_feature(id);
+        } else {
+            dialogs::cancel(self);
+            self.tool = None;
+            self.open_choice_menu(opener, context_menu::Target::EditSketch);
+        }
     }
 
     /// Edit a feature: sketches open in sketch mode; other features roll the
@@ -2048,6 +2126,30 @@ impl SolveApp {
         turn
     }
 
+    /// Extrude opened: turn the view to isometric when Preferences say so, and remember the view
+    /// from before for when the dialog closes (#9176).
+    fn turn_for_extrude(&mut self) {
+        if !self.preferences.extrude_view_isometric {
+            return;
+        }
+        let before = self.settled_cam();
+        let mut to = before;
+        to.set_view(StandardView::Iso);
+        self.pre_extrude_cam = self.preferences.extrude_view_return.then_some(before);
+        self.animate_to(to);
+    }
+
+    /// Once Extrude has closed, however it closed, the view goes back to where it was before
+    /// Extrude turned it (#9176). Going back keeps the projection, as at the end of a sketch.
+    fn return_from_extrude_view(&mut self) {
+        if self.dialog.as_ref().is_some_and(|d| matches!(d.kind, dialogs::Kind::Extrude { .. })) {
+            return;
+        }
+        if let Some(before) = self.pre_extrude_cam.take() {
+            self.animate_to(Camera { fov: self.settled_cam().fov, ..before });
+        }
+    }
+
     /// Where the camera is going: the end of the running camera animation, else where it is.
     pub(crate) fn settled_cam(&self) -> Camera {
         self.cam_anim.map_or(self.cam, |a| a.to)
@@ -2110,6 +2212,12 @@ impl SolveApp {
         // Rolling forward past the features after the sketch recomputes them (an edited sketch
         // under a text cut): off the window thread when it takes a while.
         let _ = self.run_heavy("timeline.roll_to", marker.map(|m| json!({ "position": m })).unwrap_or_else(|| json!({})));
+    }
+
+    /// Visibility in the editor's scene: hidden face-profile sources are temporarily shown
+    /// without changing the session's visibility or either history stack.
+    pub(crate) fn body_visible(&self, name: &str) -> bool {
+        self.session.body_visible(name) || self.dialog.as_ref().is_some_and(|d| d.edit_source_bodies.iter().any(|source| source == name))
     }
 
     /// Everything shown as selected: the selection plus the open dialog's inputs.
@@ -2302,7 +2410,7 @@ impl SolveApp {
     fn try_fitted_bounds(&self, cam: Camera, bounds: &solidcraft_engine::geom::Aabb3) -> Option<Camera> {
         let layout = self.viewport.layout.as_ref()?;
         if render_workspace::active(self) {
-            return viewport_layout::fit_product_bounds(cam, bounds, layout);
+            return viewport_layout::fit_product_bounds(cam, bounds, &render_workspace::picture_layout(self, layout));
         }
         viewport_layout::fit_bounds(cam, bounds, layout, self.view_fov())
     }
@@ -2526,7 +2634,7 @@ impl SolveApp {
         if first_pass {
             self.escape_owner = None;
         }
-        if first_pass || !self.preferences.viewport_analysis_status {
+        if first_pass || !crate::viewport_status::enabled(self) {
             self.esc_handled = false;
         }
         prefs::apply(self, ctx);
@@ -2539,6 +2647,7 @@ impl SolveApp {
             theme::apply(ctx);
             self.styled = true;
         }
+        theme::TabAccent::publish(self, ctx);
         if !self.fitted {
             self.fit_view();
             self.fitted = true;
@@ -2551,7 +2660,9 @@ impl SolveApp {
         self.poll_control_jobs(ctx);
         self.drain_control(ctx);
         self.follow_view_request(true);
+        self.return_from_extrude_view();
         agent_cursor::step(self, ctx);
+        browser::eye_drag_frame(self, ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         }
@@ -2639,6 +2750,7 @@ impl SolveApp {
     /// Lay out the whole window.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         value_step::set_enabled(ui.ctx(), self.preferences.step_values);
+        canvas::set_boxes_shown(ui.ctx(), self.preferences.value_boxes_in_view);
         let t0 = now_ms();
         // The first frames draw with the bundled faces while the system's CJK, Hangul and Thai
         // faces are read on a thread; the fonts are installed again once they are there.

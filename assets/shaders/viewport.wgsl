@@ -243,6 +243,44 @@ fn pushed(z: f32) -> f32 {
     return clamp(z - select(-push, push, reversed()), 0.0, 1.0);
 }
 
+/// A far wall seen through the cut where another body's face lying on it was drawn in front of
+/// it (a shaft in its bore, #9407): its cap colour again, at its depth pulled toward the eye by
+/// `touch_depth`, so it wins over that face, which is faceted another way.
+@fragment
+fn fs_solid_touch(i: TOut, @builtin(front_facing) front: bool) -> CutOut {
+    var o: CutOut;
+    // Derivatives (in `touch_depth`) first, before `solid` may discard.
+    o.depth = touch_depth(i.wp, i.pos.z);
+    o.c = solid(i, front);
+    return o;
+}
+
+@fragment
+fn fs_solid_touch_flat(i: FOut, @builtin(front_facing) front: bool) -> CutOut {
+    let t = flat_fragment(i, front);
+    var o: CutOut;
+    o.depth = touch_depth(t.wp, t.pos.z);
+    o.c = solid(t, front);
+    return o;
+}
+
+/// The depth of `wp` (depth `z`) pulled toward the eye by what may part two faceted copies of
+/// one surface: 3 pixels' width along the view ray (display refinement keeps a facet's sag about
+/// a pixel) and 2 pixels of the face's own depth slope (more where it turns from the eye).
+fn touch_depth(wp: vec3<f32>, z: f32) -> f32 {
+    let px = min(length(dpdx(wp)), length(dpdy(wp)));
+    let slope = max(abs(dpdx(z)), abs(dpdy(z)));
+    var dir = -u.back.xyz;
+    if (u.eye.w > 0.5) { dir = wp - u.eye.xyz; }
+    let len = length(dir);
+    if (len < 1e-12) { return z; }
+    let c = u.vp * vec4<f32>(wp - dir * (3.0 * px / len), 1.0);
+    if (c.w <= 0.0) { return z; }
+    let pulled = c.z / c.w;
+    if (reversed()) { return clamp(max(pulled, z) + 2.0 * slope, 0.0, 1.0); }
+    return clamp(min(pulled, z) - 2.0 * slope, 0.0, 1.0);
+}
+
 /// Depth of the section plane on the view ray through `wp` (a far wall seen through the cut),
 /// never behind the wall itself (`z`).
 fn cap_depth(wp: vec3<f32>, z: f32) -> f32 {
@@ -385,8 +423,13 @@ fn analysis(i: TOut, k: f32) -> vec4<f32> {
         let r = reflect(-v, n);
         var side = cross(v, vec3<f32>(0.0, 0.0, 1.0));
         if (length(side) < 1e-3) { side = vec3<f32>(1.0, 0.0, 0.0); }
-        let s = sin(dot(r, normalize(side)) * u.ana.y * 3.14159265);
-        let c = select(0.08, 0.95, s > 0.0);
+        let x = dot(r, normalize(side));
+        let s = sin(x * u.ana.y * 3.14159265);
+        // A face whose normal lies in the upright plane through the view (every horizontal
+        // face) reflects straight ahead: its sideways part is zero, on the edge between a black
+        // and a white stripe, and rounding picked one or the other from frame to frame while
+        // the view turned (#2153). Straight ahead is white.
+        let c = select(0.08, 0.95, s > 0.0 || abs(x) < 1e-4);
         return out_color(vec4<f32>(vec3<f32>(c), 1.0));
     }
     if (u.ana.x > 4.5) {

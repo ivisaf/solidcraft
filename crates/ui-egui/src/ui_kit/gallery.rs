@@ -981,6 +981,12 @@ const ELEMENTS: &[Element] = &[
             removable_header(ui, "Width");
         });
     }),
+    element!("sort_header", |ui, _| {
+        ui.allocate_ui(vec2(140.0, row_height()), |ui| {
+            ui.set_min_size(vec2(140.0, row_height()));
+            sort_header(ui, "Name", &mut Sort::Ascending);
+        });
+    }),
     element!("plus_header", |ui, _| {
         ui.allocate_ui(vec2(140.0, row_height()), |ui| {
             ui.set_min_size(vec2(140.0, row_height()));
@@ -1326,6 +1332,13 @@ const ELEMENTS: &[Element] = &[
     element!("dropdown", "dialog:row:Gallery", Some("dialog:Gallery"), |ui, s| {
         row(ui, "Gallery", |ui| {
             dropdown(ui, "gallery", &mut s.selected, &["One", "Two"]);
+        });
+    }),
+    element!("dropdown_previews", "dialog:row:Gallery", Some("dialog:Gallery"), |ui, s| {
+        row(ui, "Gallery", |ui| {
+            dropdown_previews(ui, "gallery_previews", &mut s.selected, &["One", "Two"], |ui, index| {
+                ui.label(if index == 0 { "One" } else { "Two" });
+            });
         });
     }),
     element!("dropdown_picked", "dialog:row:Gallery", Some("dialog:Gallery"), |ui, s| {
@@ -1926,8 +1939,8 @@ fn gallery_covers_every_inline_element() {
                 && matches!(&item.vis, syn::Visibility::Restricted(v) if v.path.is_ident("crate"))
             {
                 let name = item.sig.ident.to_string();
-                // The inherited row label is metadata, not a renderable element.
-                if name != "label" {
+                // The inherited row label and the eye-drag state key are metadata, not renderable elements.
+                if name != "label" && name != "eye_drag_id" {
                     assert!(names.contains(name.as_str()), "{file}: {name} needs a gallery entry");
                 }
             }

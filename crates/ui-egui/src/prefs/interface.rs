@@ -31,6 +31,7 @@ pub(super) fn interface(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
     ui_kit::settings_heading(ui, app.tr("prefs.interface"), app.tr("prefs.interface_note"));
     ui_kit::settings_section(ui, "theme", app.tr("ui.theme"), |ui| {
         theme_row(app, ui);
+        theme_options_row(app, ui);
         ui_kit::tab_accent_strip(ui);
         // The 3D view in the theme's colours, or the Light or Dark theme's (#4146).
         ui_kit::settings_form(ui, t.form_label_width + t.space_16 + t.space_6, |ui| {
@@ -101,6 +102,18 @@ pub(super) fn interface(app: &mut SolveApp, ui: &mut egui::Ui, t: &Tokens) {
                     ui_kit::row(ui, "", |ui| {
                         let check = setting::viewport_analysis_status(app, ui).on_hover_text(app.tr("prefs.viewport_analysis_status_help"));
                         crate::scenario::publish_target("prefs:viewport_analysis_status", check.rect);
+                    });
+                    ui_kit::row(ui, "", |ui| {
+                        let check = setting::viewport_section_status(app, ui).on_hover_text(app.tr("prefs.viewport_section_status_help"));
+                        crate::scenario::publish_target("prefs:viewport_section_status", check.rect);
+                    });
+                    ui_kit::row(ui, "", |ui| {
+                        let check = setting::viewport_status_details(app, ui).on_hover_text(app.tr("prefs.viewport_status_details_help"));
+                        crate::scenario::publish_target("prefs:viewport_status_details", check.rect);
+                    });
+                    ui_kit::row(ui, "", |ui| {
+                        let check = setting::viewport_status_summary(app, ui).on_hover_text(app.tr("prefs.viewport_status_summary_help"));
+                        crate::scenario::publish_target("prefs:viewport_status_summary", check.rect);
                     });
                     // The SKETCH tab outside a sketch too (#7904).
                     ui_kit::row(ui, "", |ui| {
